@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
-# BonitoWorker — thin WS relay running on the machine where claude-agent-acp executes.
-#
-# Usage:
-#   BONITOTEAM_WORKER_SECRET=<shared-secret> bonitoteam-worker
+# BonitoWorker — outbound-only WS relay. Dials the BonitoTeam server.
 #
 # Env:
-#   BONITOTEAM_WORKER_SECRET   — shared secret for auth (required)
-#   BONITOTEAM_WORKER_PORT     — listen port (default: 8039)
-#   BONITOTEAM_WORKER_HOST     — bind address (default: 0.0.0.0)
-#   BONITOTEAM_SERVER_URL      — server URL for self-registration (optional)
-#   BONITOTEAM_MCP_BIN         — path to bonitoteam-mcp (default: ../BonitoMCP/bin/bonitoteam-mcp)
-#   BONITOTEAM_PROJECTS_ROOT   — root for rsync'd projects (default: ~/bonitoteam-projects)
-#   BONITOTEAM_REGISTER_HOST   — override hostname reported during self-registration
-#   CLAUDE_AGENT_ACP           — path to claude-agent-acp binary (optional)
+#   BONITOTEAM_WORKER_SECRET   shared secret for auth (required)
+#   BONITOTEAM_SERVER_URL      e.g. http://server:8038 (required)
+#   BONITOTEAM_WORKER_NAME     display name (default: hostname)
+#   BONITOTEAM_PROJECTS_ROOT   root for rsync'd projects (default: ~/bonitoteam-projects)
+#   BONITOTEAM_MCP_BIN         path to bonitoteam-mcp (default: ../BonitoMCP/bin/bonitoteam-mcp)
+#   CLAUDE_AGENT_ACP           path to claude-agent-acp binary (auto-detected via PATH)
 set -euo pipefail
 
 # Resolve symlinks so we find the bundle dir even when invoked via
@@ -24,6 +19,10 @@ MONOREPO_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 
 if [[ -z "${BONITOTEAM_WORKER_SECRET:-}" ]]; then
     echo "ERROR: BONITOTEAM_WORKER_SECRET must be set" >&2
+    exit 1
+fi
+if [[ -z "${BONITOTEAM_SERVER_URL:-}" ]]; then
+    echo "ERROR: BONITOTEAM_SERVER_URL must be set" >&2
     exit 1
 fi
 

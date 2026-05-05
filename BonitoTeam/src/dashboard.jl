@@ -92,70 +92,9 @@ function load_projects!()
     end
 end
 
-# ── Worker registration / probe ───────────────────────────────────────────────
-
-"""
-Register or update a worker; probes it to learn hostname / mcp_path / projects_root.
-Throws on probe failure.
-"""
-function register_worker!(name::String, url::String, secret::String;
-                          ssh_target::Union{String,Nothing} = nothing)
-    caps = probe(url, secret)
-    w = WorkerInfo(name, url, secret, ssh_target,
-                   String(get(caps, "hostname", "")),
-                   String(get(caps, "home", "")),
-                   String(get(caps, "mcp_path", "")),
-                   String(get(caps, "projects_root", "")),
-                   :online, now(UTC))
-    WORKERS[name] = w
-    save_workers!()
-    bump_state!()
-    return w
-end
-
-"""
-Health-check an existing worker. Updates `status` and `last_check` in-place.
-"""
-function check_worker!(w::WorkerInfo)
-    w.last_check = now(UTC)
-    new_status = try
-        probe(w.url, w.secret; timeout = 3.0)
-        :online
-    catch
-        :offline
-    end
-    if new_status != w.status
-        w.status = new_status
-        bump_state!()
-    end
-    return w
-end
-
-# Periodic heartbeat: probes every registered worker every `interval` seconds.
-# Started by `serve()`; stopped by setting HEARTBEAT_RUNNING[] = false.
-const HEARTBEAT_RUNNING = Ref(false)
-
-function start_heartbeat!(interval::Real = 10.0)
-    HEARTBEAT_RUNNING[] && return   # already running
-    HEARTBEAT_RUNNING[] = true
-    @async while HEARTBEAT_RUNNING[]
-        for w in collect(values(WORKERS))   # collect → safe over concurrent register
-            HEARTBEAT_RUNNING[] || break
-            try
-                check_worker!(w)
-            catch e
-                @warn "heartbeat error" worker=w.name exception=e
-            end
-        end
-        # Sleep in small slices so shutdown is responsive
-        for _ in 1:Int(interval * 4)
-            HEARTBEAT_RUNNING[] || break
-            sleep(0.25)
-        end
-    end
-end
-
-stop_heartbeat!() = (HEARTBEAT_RUNNING[] = false)
+# Worker registration is now handled in worker_client.jl when the worker
+# dials the server's /worker-ws endpoint. Liveness comes from the WS itself;
+# no periodic probing or heartbeat task.
 
 # ── Rsync orchestration ───────────────────────────────────────────────────────
 
@@ -226,8 +165,9 @@ end
 Create a new project on the named worker. Steps:
 1. Seed `<server_working_dir>/<name>` from the picked source folder (if not
    already there).
-2. Mirror to `<worker.projects_root>/<name>`.
-3. Build chat_app wired to an ACP session on the worker (with bonitoteam MCP).
+2. Mirror to `<worker.projects_root>/<name>` (via rsync — local or ssh).
+3. Build chat_app whose client_factory asks the worker (over its control WS)
+   to spawn an ACP session and dial back; we drive that session from here.
 4. Register `/p/<id>` route on the live server.
 """
 function create_project!(srv::Bonito.Server, name::String, src_path::String,
@@ -244,8 +184,7 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
     server_path = joinpath(working_dir(), name)
     worker_path = joinpath(w.projects_root, name)
 
-    # 1. Seed the canonical server-side copy from the picked source (no-op if
-    #    the user picked exactly server_path).
+    # 1. Seed the canonical server-side copy.
     if abspath(src_path) != abspath(server_path)
         @info "Seeding server-side mirror" src_path server_path
         mkpath(working_dir())
@@ -255,22 +194,14 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
     # 2. Mirror server → worker.
     rsync_push_to_worker!(server_path, w.ssh_target, worker_path)
 
-    # 3. Build the chat app — one ACP session per project, started inside
-    #    chat_app via client_factory.
-    mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
-        [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path)]
-    client_factory = on_update -> connect_worker(w.url, w.secret, worker_path;
-                                                  on_update, mcp_servers = mcp)
-    app = chat_app(server_path; mcp_servers = mcp, client_factory = client_factory)
-
-    PROJECT_APPS[id] = app
-    PROJECTS[id] = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
+    p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
+    PROJECTS[id] = p
     save_projects!()
 
-    # 4. Register the per-project route.
-    Bonito.route!(srv, "/p/$id" => app)
+    # 3 + 4: build the chat app + register the route.
+    ensure_project_session!(p, srv)
     bump_state!()
-    return PROJECTS[id]
+    return p
 end
 
 """
@@ -279,7 +210,7 @@ Bidirectional sync for an existing project. Pulls worker → server first
 Both passes use --update so newer files win on each side per-file.
 """
 function sync_project!(p::ProjectInfo)
-    haskey(WORKERS, p.worker_name) || error("Worker '$(p.worker_name)' not registered")
+    haskey(WORKERS, p.worker_name) || error("Worker '$(p.worker_name)' not connected")
     w = WORKERS[p.worker_name]
     rsync_pull_from_worker!(p.worker_path, w.ssh_target, p.server_path)
     rsync_push_to_worker!(p.server_path,    w.ssh_target, p.worker_path)
@@ -287,21 +218,34 @@ function sync_project!(p::ProjectInfo)
 end
 
 """
-Re-attach an already-loaded project (called at server startup for each entry
-in projects.json). Does NOT rsync; assumes mirrors are already in sync.
+Build the chat_app + register the /p/<id> route for `p` if not done yet.
+Called both from `create_project!` and from `handle_worker_control` (when a
+worker reconnects, projects belonging to it become serviceable again).
 """
-function reattach_project!(srv::Bonito.Server, p::ProjectInfo)
-    haskey(WORKERS, p.worker_name) || (@warn "Project worker missing" project=p.name worker=p.worker_name; return)
+function ensure_project_session!(p::ProjectInfo, srv::Union{Bonito.Server,Nothing} = nothing)
+    haskey(PROJECT_APPS, p.id) && return PROJECT_APPS[p.id]
+    haskey(WORKERS, p.worker_name) ||
+        error("Worker '$(p.worker_name)' is not connected")
     w = WORKERS[p.worker_name]
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
         [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path)]
-    client_factory = on_update -> connect_worker(w.url, w.secret, p.worker_path;
-                                                  on_update, mcp_servers = mcp)
+
+    client_factory = on_update -> start_session_on_worker(w.name, p.worker_path;
+                                                           on_update, mcp_servers = mcp)
     app = chat_app(p.server_path; mcp_servers = mcp, client_factory = client_factory)
+
     PROJECT_APPS[p.id] = app
-    Bonito.route!(srv, "/p/$(p.id)" => app)
-    return nothing
+    if srv !== nothing
+        Bonito.route!(srv, "/p/$(p.id)" => app)
+    elseif SERVER_REF[] !== nothing
+        Bonito.route!(SERVER_REF[], "/p/$(p.id)" => app)
+    end
+    return app
 end
+
+# Module-level handle to the live server, set by serve(). Used so the worker
+# control handler (which reconnects asynchronously) can register routes.
+const SERVER_REF = Ref{Union{Bonito.Server,Nothing}}(nothing)
 
 # ── Dashboard styles ──────────────────────────────────────────────────────────
 

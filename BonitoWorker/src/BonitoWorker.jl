@@ -1,133 +1,141 @@
 module BonitoWorker
 
-# Thin WebSocket → claude-agent-acp relay. Runs on the worker machine.
-# Has NO knowledge of the ACP message format — it just shuttles bytes between
-# the WS frame and the subprocess stdio, frame-per-line.
+# Outbound-only worker: dials the BonitoTeam server, holds a "control" WS open,
+# spawns claude-agent-acp + a dedicated per-session WS each time the server
+# requests a new session.
 #
-#   BonitoWorker.serve(; secret) — blocks; accepts WS auth then spawns claude-agent-acp
-#
-# The server-side counterpart (Worker.connect — needs AgentClientProtocol)
-# lives in the BonitoTeam package, not here.
+# Worker has NO inbound listener — no firewall hole on the worker side.
+# Single port to open is on the server (8038), already needed for browsers.
 
 using HTTP, HTTP.WebSockets, JSON
 
-"""
-    BonitoWorker.serve(; host, port, secret, agent_bin)
+# ── Public entry ──────────────────────────────────────────────────────────────
 
-Start the worker WebSocket server. Each incoming connection must authenticate
-with the shared secret before an agent subprocess is spawned. Blocks until
-the listener is stopped. Use `BonitoWorker.serve!` for the non-blocking variant.
 """
-function serve(; host::String  = "0.0.0.0",
-                 port::Int     = 8039,
-                 secret::String,
-                 agent_bin::String = find_agent_bin())
-    @info "BonitoWorker listening" host port
-    WebSockets.listen(host, port) do ws
-        handle_session(ws, secret, agent_bin)
+    BonitoWorker.connect_and_serve(; server_url, secret, name, mcp_path,
+                                   projects_root, agent_bin, retry_delay = 5.0)
+
+Open a control WS to `server_url/worker-ws`, send the hello frame, then loop
+on commands. Reconnects with `retry_delay` between attempts. Blocks forever.
+"""
+function connect_and_serve(; server_url::String,
+                            secret::String,
+                            name::String         = gethostname(),
+                            mcp_path::String     = "",
+                            projects_root::String = joinpath(get(ENV, "HOME", ""), "bonitoteam-projects"),
+                            agent_bin::String     = find_agent_bin(),
+                            retry_delay::Real     = 5.0)
+    while true
+        try
+            run_control_session(; server_url, secret, name, mcp_path,
+                                  projects_root, agent_bin)
+        catch e
+            e isa InterruptException && rethrow()
+            @error "BonitoWorker: control session crashed; reconnecting" exception=(e, catch_backtrace())
+        end
+        @info "BonitoWorker: reconnecting in $(retry_delay)s"
+        sleep(retry_delay)
     end
 end
 
-serve!(; kw...) = @async serve(; kw...)
+# ── Control WS lifecycle ──────────────────────────────────────────────────────
 
-# Best-effort error response — WS may already be closed, that's fine.
-function try_send_error(ws, msg::String)
-    try
-        WebSockets.send(ws, JSON.json(Dict("error" => msg)))
-    catch e
-        e isa WebSockets.WebSocketError && return
-        e isa Base.IOError              && return
-        @warn "BonitoWorker: failed to send error response" exception=e
+function run_control_session(; server_url, secret, name, mcp_path,
+                               projects_root, agent_bin)
+    control_url = ws_url(server_url, "/worker-ws")
+    @info "BonitoWorker: connecting to control WS" control_url name
+    WebSockets.open(control_url) do ws
+        WebSockets.send(ws, JSON.json(Dict(
+            "type"          => "hello",
+            "secret"        => secret,
+            "name"          => name,
+            "hostname"      => gethostname(),
+            "username"      => get(ENV, "USER", ""),
+            "home"          => get(ENV, "HOME", ""),
+            "mcp_path"      => mcp_path,
+            "projects_root" => projects_root,
+        )))
+
+        ack_raw = WebSockets.receive(ws)
+        ack = JSON.parse(String(ack_raw))
+        if !get(ack, "ok", false)
+            error("server rejected hello: $(get(ack, "error", "unknown"))")
+        end
+        @info "BonitoWorker: registered with server" name=name
+
+        for frame in ws
+            cmd = JSON.parse(String(frame))
+            t = get(cmd, "type", "")
+            if t == "open_session"
+                @async handle_open_session(server_url, secret, agent_bin, cmd)
+            elseif t == "ping"
+                WebSockets.send(ws, JSON.json(Dict("type" => "pong")))
+            else
+                @warn "BonitoWorker: unknown control frame" type=t
+            end
+        end
+        @info "BonitoWorker: control WS closed by server"
     end
 end
 
-# Per-connection handler.
-function handle_session(ws, secret::String, agent_bin::String)
-    # First frame must be our auth+config envelope (not ACP).
-    raw = try
-        WebSockets.receive(ws)
-    catch e
-        e isa WebSockets.WebSocketError && return
-        e isa Base.IOError              && return
-        @warn "BonitoWorker: error receiving auth frame" exception=e
-        return
-    end
+# ── Per-session WS handler ────────────────────────────────────────────────────
 
-    msg = try
-        JSON.parse(String(raw))
-    catch e
-        @warn "BonitoWorker: invalid auth frame (not valid JSON)" exception=e
-        try_send_error(ws, "invalid auth frame")
-        return
-    end
+function handle_open_session(server_url::String, secret::String, agent_bin::String,
+                              cmd::AbstractDict)
+    sid = String(get(cmd, "sid", ""))
+    cwd = String(get(cmd, "cwd", pwd()))
+    env_overrides = Dict{String,String}(get(cmd, "env", Dict{String,String}()))
+    isempty(sid) && (@error "open_session missing sid"; return)
 
-    if get(msg, "auth", "") != secret
-        try_send_error(ws, "unauthorized")
-        return
-    end
+    isdir(cwd) || try mkpath(cwd) catch end
 
-    # ACK before spawning so the client's WS open() returns cleanly.
-    # Report worker capabilities so the server can pass MCP config, display
-    # the worker by hostname, and rsync into a known projects-root path.
-    ack = Dict{String,Any}(
-        "ok"            => true,
-        "hostname"      => gethostname(),
-        "username"      => get(ENV, "USER", ""),
-        "home"          => get(ENV, "HOME", ""),
-        "mcp_path"      => get(ENV, "BONITOTEAM_MCP_BIN",
-                               joinpath(get(ENV, "HOME", ""), ".local", "bin", "bonitoteam-mcp")),
-        "projects_root" => get(ENV, "BONITOTEAM_PROJECTS_ROOT",
-                               joinpath(get(ENV, "HOME", ""), "bonitoteam-projects")),
-    )
-    try
-        WebSockets.send(ws, JSON.json(ack))
-    catch e
-        @warn "BonitoWorker: failed to send auth ACK" exception=e
-        return
-    end
-
-    # Probe-only handshake: dashboard registration / health check, no agent spawn.
-    get(msg, "probe", false) === true && return
-
-    cwd           = get(msg, "cwd", pwd())
-    env_overrides = Dict{String,String}(get(msg, "env", Dict{String,String}()))
-
-    env = merge(Dict(string(k) => string(v) for (k,v) in ENV),
+    env = merge(Dict(string(k) => string(v) for (k, v) in ENV),
                 Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
                      "CLAUDE_MAX_TURNS"       => "100"),
                 env_overrides)
 
     proc = try
-        open(Cmd(`$agent_bin`; env, dir=cwd), "r+")
+        open(Cmd(`$agent_bin`; env, dir = cwd), "r+")
     catch e
-        @warn "BonitoWorker: failed to spawn agent" exception=e cwd
-        try_send_error(ws, "spawn failed: $e")
+        @error "BonitoWorker: failed to spawn agent" exception=e cwd
         return
     end
+    @info "BonitoWorker: ACP session started" sid cwd pid=getpid()
 
-    @info "BonitoWorker: session started" cwd pid=getpid()
-
-    ws_to_proc = @async relay_ws_to_proc(ws, proc)
-    proc_to_ws = @async relay_proc_to_ws(proc, ws)
-
+    acp_url = ws_url(server_url, "/worker-acp")
     try
-        wait(ws_to_proc)
-    finally
-        try
-            isopen(proc) && kill(proc)
-        catch e
-            @warn "BonitoWorker: kill failed" exception=e
-        end
-        wait(proc_to_ws)
-        try
-            close(proc)
-        catch e
-            e isa Base.IOError || @warn "BonitoWorker: close proc failed" exception=e
-        end
-    end
+        WebSockets.open(acp_url) do ws
+            # Tell the server which session this WS belongs to.
+            WebSockets.send(ws, JSON.json(Dict("secret" => secret, "sid" => sid)))
+            ack = JSON.parse(String(WebSockets.receive(ws)))
+            get(ack, "ok", false) ||
+                error("server rejected ACP session: $(get(ack, "error", "unknown"))")
 
-    @info "BonitoWorker: session ended" cwd
+            ws_to_proc = @async relay_ws_to_proc(ws, proc)
+            proc_to_ws = @async relay_proc_to_ws(proc, ws)
+            try
+                wait(ws_to_proc)
+            finally
+                try
+                    isopen(proc) && kill(proc)
+                catch e
+                    @warn "BonitoWorker: kill failed" exception=e
+                end
+                wait(proc_to_ws)
+                try
+                    close(proc)
+                catch e
+                    e isa Base.IOError || @warn "BonitoWorker: close proc failed" exception=e
+                end
+            end
+        end
+    catch e
+        @error "BonitoWorker: ACP session error" sid exception=e
+    end
+    @info "BonitoWorker: ACP session ended" sid cwd
 end
+
+# ── Byte-shuttle between WS frame and subprocess stdio ────────────────────────
 
 function relay_ws_to_proc(ws, proc)
     try
@@ -143,9 +151,7 @@ function relay_ws_to_proc(ws, proc)
         e isa Base.IOError              && return
         @warn "BonitoWorker ws→proc relay error" exception=e
     finally
-        try
-            close(proc.in)
-        catch e
+        try close(proc.in) catch e
             e isa Base.IOError || @warn "BonitoWorker: close proc.in failed" exception=e
         end
     end
@@ -154,19 +160,29 @@ end
 function relay_proc_to_ws(proc, ws)
     try
         while isopen(proc)
-            line = readline(proc.out; keep=true)
+            line = readline(proc.out; keep = true)
             isempty(line) && break
             WebSockets.send(ws, line)
         end
     catch e
-        e isa EOFError     && return
-        e isa Base.IOError && return
-        WebSockets.isclosed(ws) && return
+        e isa EOFError                  && return
+        e isa Base.IOError              && return
+        WebSockets.isclosed(ws)         && return
         @warn "BonitoWorker proc→ws relay error" exception=e
     end
 end
 
-# ── Binary discovery ──────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+function ws_url(http_url::AbstractString, path::AbstractString)
+    if startswith(http_url, "http://")
+        return "ws://" * replace(http_url, "http://" => ""; count = 1) * path
+    elseif startswith(http_url, "https://")
+        return "wss://" * replace(http_url, "https://" => ""; count = 1) * path
+    else
+        return http_url * path
+    end
+end
 
 function find_agent_bin()
     explicit = get(ENV, "CLAUDE_AGENT_ACP", "")

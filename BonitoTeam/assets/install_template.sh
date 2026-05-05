@@ -13,7 +13,6 @@ set -eu
 
 SERVER="{{SERVER_URL}}"
 SECRET="{{WORKER_SECRET}}"
-PORT="{{WORKER_PORT}}"
 INSTALL_ROOT="$HOME/.local/share/bonitoteam"
 MCP_DIR="$INSTALL_ROOT/BonitoMCP"
 WORKER_DIR="$INSTALL_ROOT/BonitoWorker"
@@ -22,7 +21,6 @@ PROJECTS_ROOT="$HOME/bonitoteam-projects"
 
 echo "==> BonitoTeam worker installer"
 echo "    Server : $SERVER"
-echo "    Port   : $PORT"
 
 mkdir -p "$INSTALL_ROOT" "$BIN_DIR" "$PROJECTS_ROOT"
 
@@ -92,18 +90,14 @@ ln -sf "$WORKER_DIR/bin/bonitoteam-worker" "$BIN_DIR/bonitoteam-worker"
 cat > "$BIN_DIR/bonitoteam-worker-start" << 'STARTSCRIPT'
 #!/usr/bin/env sh
 export BONITOTEAM_WORKER_SECRET="__SECRET__"
-export BONITOTEAM_WORKER_PORT="${BONITOTEAM_WORKER_PORT:-__PORT__}"
-export BONITOTEAM_WORKER_HOST="${BONITOTEAM_WORKER_HOST:-0.0.0.0}"
+export BONITOTEAM_SERVER_URL="${BONITOTEAM_SERVER_URL:-__SERVER__}"
 export BONITOTEAM_MCP_BIN="${BONITOTEAM_MCP_BIN:-__BINDIR__/bonitoteam-mcp}"
 export BONITOTEAM_PROJECTS_ROOT="${BONITOTEAM_PROJECTS_ROOT:-__PROJROOT__}"
-export BONITOTEAM_SERVER_URL="${BONITOTEAM_SERVER_URL:-__SERVER__}"
-# Override BONITOTEAM_REGISTER_HOST if `hostname` doesn't resolve from the server side.
 export PATH="$HOME/.juliaup/bin:$PATH"
 exec "__BINDIR__/bonitoteam-worker"
 STARTSCRIPT
 sed -i.bak \
     -e "s@__SECRET__@$SECRET@g" \
-    -e "s@__PORT__@$PORT@g" \
     -e "s@__BINDIR__@$BIN_DIR@g" \
     -e "s@__PROJROOT__@$PROJECTS_ROOT@g" \
     -e "s@__SERVER__@$SERVER@g" \
@@ -145,6 +139,6 @@ fi
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
 echo "==> Installation complete."
-echo "    On startup the worker self-registers with $SERVER and appears in the dashboard."
-echo "    If $(hostname) doesn't resolve from the server, set BONITOTEAM_REGISTER_HOST=<reachable-ip>"
-echo "    in $BIN_DIR/bonitoteam-worker-start, then: systemctl --user restart bonitoteam-worker"
+echo "    The worker holds an outbound WebSocket to $SERVER — no inbound port,"
+echo "    no firewall rules needed on this machine. It appears in the dashboard"
+echo "    as soon as the connection is up."

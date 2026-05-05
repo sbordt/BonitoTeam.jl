@@ -6,12 +6,38 @@
 #   julia --project=<path>/BonitoWorker worker_standalone.jl
 # All config is via env vars — see bin/bonitoteam-worker for the wrapper.
 
-using HTTP, JSON, BonitoWorker
+using HTTP, JSON, Sockets, BonitoWorker
+
+# Discover the local IP the server can actually reach back on. We open a TCP
+# socket to the server's host:port, then read getsockname() — that's the
+# local address the OS routed the connection through, i.e. the IP the server
+# saw as the connection's peer. Works on LAN; on NAT the worker still sees
+# its private IP, in which case the operator must set BONITOTEAM_REGISTER_HOST
+# explicitly (e.g. to a port-forwarded public IP).
+function discover_reachable_host(server_url::AbstractString)
+    uri = HTTP.URI(server_url)
+    host = String(uri.host)
+    port = isempty(uri.port) ? (uri.scheme == "https" ? 443 : 80) : parse(Int, uri.port)
+    sock = Sockets.connect(host, port)
+    try
+        addr, _ = Sockets.getsockname(sock)
+        return string(addr)
+    finally
+        close(sock)
+    end
+end
 
 # Self-register with the server. Best-effort: if the server is down, log + carry
 # on listening — the operator can register later via the dashboard.
 function self_register!(server_url::String, secret::String, port::Int)
-    register_host = get(ENV, "BONITOTEAM_REGISTER_HOST", gethostname())
+    register_host = get(ENV, "BONITOTEAM_REGISTER_HOST") do
+        try
+            discover_reachable_host(server_url)
+        catch e
+            @warn "Worker: reachable-host discovery failed; falling back to gethostname()" exception=e
+            gethostname()
+        end
+    end
     register_name = get(ENV, "BONITOTEAM_WORKER_NAME", register_host)
     body = JSON.json(Dict(
         "secret" => secret,

@@ -53,10 +53,10 @@ function self_register!(server_url::String, secret::String, port::Int)
         if r.status == 200
             @info "BonitoWorker: registered" response=String(r.body)
         else
-            @warn "BonitoWorker: registration failed" status=r.status body=String(r.body)
+            @error "BonitoWorker: REGISTRATION FAILED" status=r.status body=String(r.body) hint="server probe back to ws://$(register_host):$(port) likely blocked by firewall — open port $(port) on this host"
         end
     catch e
-        @warn "BonitoWorker: registration POST failed (server unreachable?)" exception=e
+        @error "BonitoWorker: REGISTRATION POST FAILED" exception=e hint="server at $(server_url) unreachable from this worker"
     end
 end
 

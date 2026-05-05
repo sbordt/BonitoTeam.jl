@@ -61,6 +61,7 @@ struct ToolCallNotif <: SessionUpdate
     status::String     # "pending" | "in_progress" | "completed" | "failed"
     content::Vector    # Vector of ContentBlock | DiffContent
     locations::Vector{ToolCallLocation}
+    raw::AbstractDict  # untouched ACP update params (for round-trip persistence)
 end
 
 struct ToolCallUpdateNotif <: SessionUpdate
@@ -70,6 +71,7 @@ struct ToolCallUpdateNotif <: SessionUpdate
     status::Union{String,Nothing}
     content::Vector
     locations::Vector{ToolCallLocation}
+    raw::AbstractDict
 end
 
 struct UnknownUpdate <: SessionUpdate
@@ -123,7 +125,7 @@ function parse_session_update(params::AbstractDict)::SessionUpdate
             get(params, "title", ""),
             get(params, "kind", "other"),
             get(params, "status", "pending"),
-            content, locs
+            content, locs, params
         )
     elseif kind == "tool_call_update"
         content = [parse_tool_content_item(c) for c in get(params, "content", [])]
@@ -133,7 +135,7 @@ function parse_session_update(params::AbstractDict)::SessionUpdate
             get(params, "title", nothing),
             get(params, "kind", nothing),
             get(params, "status", nothing),
-            content, locs
+            content, locs, params
         )
     else
         return UnknownUpdate(kind, params)

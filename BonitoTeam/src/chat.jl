@@ -17,7 +17,7 @@ mutable struct ToolMsg <: ChatMsg
     kind::String
     title::String
     status::String
-    content::Vector{Any}      # raw ACP content blocks (TextContent / DiffContent / ImageContent)
+    summary::String           # cached header summary; full content lives on disk
 end
 
 mutable struct ThoughtMsg <: ChatMsg
@@ -70,8 +70,9 @@ function content_summary(kind::AbstractString, content::AbstractVector)
     return ""
 end
 
-# Header info shipped to JS at message-create time. The full content is NOT
-# included — JS asks via requestToolRender(id) when the user expands.
+# Header info shipped to JS at message-create time. Full content is NOT
+# included — JS asks via requestToolRender(id), Julia loads the persisted
+# ACP params from disk and ships the rendered DOM via Bonito.dom_in_js.
 function tool_header_dict(m::ToolMsg)
     Dict{String,Any}(
         "type"    => "tool",
@@ -80,7 +81,7 @@ function tool_header_dict(m::ToolMsg)
         "icon"    => tool_icon(m.kind),
         "title"   => m.title,
         "status"  => m.status,
-        "summary" => content_summary(m.kind, m.content),
+        "summary" => m.summary,
     )
 end
 
@@ -147,10 +148,26 @@ function render_text_block(text::AbstractString)
     return DOM.div(Markdown.parse(text), class = "bt-tool-md")
 end
 
-function render_tool_body(m::ToolMsg)
+# Load the persisted ACP params for `tool_id` and parse the content array back
+# into TextContent / DiffContent / ImageContent. Returns an empty vector if
+# there's no saved snapshot (e.g. history loaded from chat.md but the tools/
+# directory was never created on this server).
+function load_tool_content(cwd::AbstractString, tool_id::AbstractString)
+    params = load_tool_file(String(cwd), String(tool_id))
+    params === nothing && return Any[]
+    raw = get(params, "content", nothing)
+    raw === nothing && return Any[]
+    return Any[parse_tool_content_item(c) for c in raw if c isa AbstractDict]
+end
+
+function render_tool_body(m::ToolMsg, cwd::AbstractString)
+    content = load_tool_content(cwd, m.id)
+    isempty(content) &&
+        return DOM.div("(no body — tool details not persisted for this entry)",
+                       class = "bt-tool-empty")
+
     if m.kind == "edit"
-        # Find a DiffContent block; render Monaco DiffEditor.
-        for c in m.content
+        for c in content
             if c isa DiffContent
                 lang = detect_language(c.path)
                 return BonitoBook.DiffEditor(
@@ -164,11 +181,11 @@ function render_tool_body(m::ToolMsg)
     end
 
     if m.kind in ("execute", "read")
-        # Concatenate text blocks; render with MonacoEditor (read-only).
-        text = join((c.text for c in m.content if c isa TextContent), "\n")
+        text = join((c.text for c in content if c isa TextContent), "\n")
         if !isempty(text)
             lang = m.kind == "read" ? detect_language(m.title) : "shell"
-            return BonitoBook.MonacoEditor(text; language = lang, options = Dict(:readOnly => true))
+            return BonitoBook.MonacoEditor(text; language = lang,
+                                           options = Dict(:readOnly => true))
         end
     end
 
@@ -176,7 +193,7 @@ function render_tool_body(m::ToolMsg)
     # text blocks that ARE a fenced code block become Monaco; mixed prose stays
     # markdown. Diff blocks render via DiffEditor inline.
     parts = []
-    for c in m.content
+    for c in content
         if c isa TextContent
             push!(parts, render_text_block(c.text))
         elseif c isa DiffContent
@@ -282,8 +299,9 @@ function chat_app(cwd::String;
 
     function on_update(upd::ToolCallNotif)
         finalize_streaming!()
-        msg = ToolMsg(upd.tool_call_id, upd.kind, upd.title,
-                      upd.status, collect(upd.content))
+        update_tool_file!(cwd, upd.tool_call_id, upd.raw)
+        summary = content_summary(upd.kind, upd.content)
+        msg = ToolMsg(upd.tool_call_id, upd.kind, upd.title, upd.status, summary)
         push_msg!(msg)
         upd.status in ("completed", "failed") && append_tool(chat_session, msg)
     end
@@ -292,18 +310,19 @@ function chat_app(cwd::String;
         idx = findfirst(m -> m isa ToolMsg && m.id == upd.tool_call_id, msgs_store)
         idx === nothing && return
         m = msgs_store[idx]
+        merged = update_tool_file!(cwd, upd.tool_call_id, upd.raw)
         upd.status !== nothing && (m.status = upd.status)
         upd.title  !== nothing && (m.title  = upd.title)
-        if !isempty(upd.content)
-            # ACP tool-call updates often carry the COMPLETE current content,
-            # not just an incremental delta. Replace, don't append.
-            m.content = collect(upd.content)
-        end
+        # Recompute summary from the merged on-disk content (so status-only
+        # updates don't blank a previously computed summary).
+        merged_blocks = Any[parse_tool_content_item(c)
+                            for c in get(merged, "content", []) if c isa AbstractDict]
+        m.summary = content_summary(m.kind, merged_blocks)
         emit(Dict{String,Any}("type"    => "tool_update",
                               "id"      => m.id,
                               "status"  => m.status,
                               "title"   => m.title,
-                              "summary" => content_summary(m.kind, m.content)))
+                              "summary" => m.summary))
         m.status in ("completed", "failed") && append_tool(chat_session, m)
     end
 
@@ -403,7 +422,7 @@ function chat_app(cwd::String;
             isempty(tool_id) && return
             idx = findfirst(m -> m isa ToolMsg && m.id == tool_id, msgs_store)
             idx === nothing && return
-            body = render_tool_body(msgs_store[idx])
+            body = render_tool_body(msgs_store[idx], cwd)
             try
                 Bonito.dom_in_js(bonito_session, body, js"""(elem) => {
                     const slot = document.querySelector(

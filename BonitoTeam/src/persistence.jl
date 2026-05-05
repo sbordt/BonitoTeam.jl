@@ -18,6 +18,41 @@ function session_file(cwd::String)
     joinpath(session_dir(cwd), "chat.md")
 end
 
+# Per-tool JSON snapshot of the latest ACP params (the wire format itself), so
+# tool bodies survive restarts and don't have to live in process memory.
+function tools_dir(cwd::String)
+    d = joinpath(session_dir(cwd), "tools")
+    mkpath(d)
+    return d
+end
+
+function tool_file(cwd::String, tool_id::String)
+    joinpath(tools_dir(cwd), tool_id * ".json")
+end
+
+# Merge `params` into the persisted snapshot for `tool_id`. ACP updates carry
+# either a full content array or none at all (status-only); preserve the prior
+# `content` / `locations` if the new update leaves them empty.
+function update_tool_file!(cwd::String, tool_id::String, params::AbstractDict)
+    path = tool_file(cwd, tool_id)
+    existing = isfile(path) ? open(JSON.parse, path) : Dict{String,Any}()
+    merged = Dict{String,Any}(existing)
+    for (k, v) in params
+        if (k == "content" || k == "locations") && (v === nothing || isempty(v))
+            continue
+        end
+        merged[String(k)] = v
+    end
+    open(io -> JSON.print(io, merged), path, "w")
+    return merged
+end
+
+function load_tool_file(cwd::String, tool_id::String)::Union{AbstractDict,Nothing}
+    path = tool_file(cwd, tool_id)
+    isfile(path) || return nothing
+    return open(JSON.parse, path)
+end
+
 # Load or create a session
 function load_session(cwd::String)::ChatSession
     path = session_file(cwd)
@@ -102,12 +137,11 @@ function append_tool(session::ChatSession, msg::ToolMsg)
         meta = "$(msg.kind) · $(msg.status) · $(msg.id)"
         println(io, "!!! tool \"$meta\"")
         println(io, "    `$(msg.title)`")
-        # Brief summary instead of the (potentially large) full content; chat.md
-        # is a "what happened" log, full reproduction lives in claude's session.
-        summary = content_summary(msg.kind, msg.content)
-        if !isempty(summary)
+        # Brief summary on the collapsed header; full ACP body lives in
+        # .bonitoTeam/tools/<id>.json (see update_tool_file!).
+        if !isempty(msg.summary)
             println(io, "")
-            println(io, "    $summary")
+            println(io, "    $(msg.summary)")
         end
         println(io)
     end
@@ -149,11 +183,17 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
             # title encodes "kind · status · id"
             parts = split(node.t.title, " · "; limit=3)
             kind, status, id = length(parts) == 3 ? parts : ("other", "completed", "")
-            # extract tool name from first line of body (`title`)
+            # body is `<tool title>`\n\n<summary>; first backticked run is the
+            # title, anything after is the cached summary line.
             title_line = match(r"`([^`]*)`", body)
             title = title_line !== nothing ? title_line.captures[1] : ""
+            summary = ""
+            if title_line !== nothing
+                tail = strip(body[nextind(body, title_line.offset + length(title_line.match) - 1):end])
+                summary = String(tail)
+            end
             push!(msgs, ToolMsg(string(id), string(kind), string(title),
-                                string(status), Any[]))
+                                string(status), summary))
         elseif cat == "plan"
             entries = PlanEntry[]
             for line in split(body, '\n')

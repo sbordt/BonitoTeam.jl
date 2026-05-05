@@ -21,6 +21,9 @@ const PENDING_ACP_SESSIONS = Dict{String,Channel{Any}}()
 # directional file transfer (server-side counterpart to handle_open_sync on
 # the worker)
 const PENDING_SYNC_SESSIONS = Dict{String,Channel{Any}}()
+# request_id → Channel{Dict} where worker's list_dir_response is handed back
+# to the dashboard task that issued the RPC
+const PENDING_LIST_DIR = Dict{String,Channel{Dict}}()
 
 # Send a JSON command to a worker over its control WS. Throws if the worker
 # isn't currently connected.
@@ -74,15 +77,21 @@ function handle_worker_control(ws, worker_secret::String)
             end
         end
 
-        # Process inbound frames from the worker. The only one with
-        # significance right now is "delta" — live file sync from the worker.
+        # Process inbound frames from the worker.
         for frame in ws
             try
                 cmd = JSON.parse(String(frame))
-                if get(cmd, "type", "") == "delta"
+                t = get(cmd, "type", "")
+                if t == "delta"
                     payload = get(cmd, "has_payload", false) ?
                                   WebSockets.receive(ws) : UInt8[]
                     apply_worker_delta!(cmd, payload)
+                elseif t == "list_dir_response"
+                    rid = String(get(cmd, "request_id", ""))
+                    if haskey(PENDING_LIST_DIR, rid)
+                        ch = pop!(PENDING_LIST_DIR, rid)
+                        put!(ch, Dict{String,Any}(cmd))
+                    end
                 end
             catch e
                 @warn "Worker control frame error" exception=e
@@ -160,8 +169,7 @@ function handle_worker_acp(ws, worker_secret::String)
     end
 end
 
-# ── Server-side ACP client over an accepted WS ────────────────────────────────
-
+# Server-side ACP client over an accepted WS
 """
     start_session_on_worker(worker_name, cwd; on_update, mcp_servers,
                              request_handler) → AgentClientProtocol.Client
@@ -225,14 +233,13 @@ function start_session_on_worker(worker_name::String, cwd::String;
     return AgentClientProtocol.Client(conn, session_id, cwd)
 end
 
-# ── File transport over WS ────────────────────────────────────────────────────
+# File transport over WS
 
 """
-    push_dir_to_worker!(worker_name, src, dst) → tree_hash::Vector{UInt8}
+    push_dir_to_worker!(worker_name, src, dst)
 
 Tar `src` on the server, stream it to the worker over a /worker-sync WS, and
-have the worker extract into `dst`. Returns the tree hash of `src` after the
-transfer (so the caller can stash it as the project's base_checksum).
+have the worker extract into `dst`.
 """
 function push_dir_to_worker!(worker_name::String, src::String, dst::String)
     isdir(src) || error("Source path is not a directory: $src")
@@ -252,13 +259,12 @@ function push_dir_to_worker!(worker_name::String, src::String, dst::String)
 
     ws = take!(ch)
     try
-        # Tar src in a tmpfile (gzipped); send size header + binary frame
         tmp = tempname() * ".tar.gz"
         try
             run(Cmd(`tar -czf $tmp .`; dir = src))
             data = read(tmp)
             WebSockets.send(ws, JSON.json(Dict("type"=>"tar", "size"=>length(data))))
-            WebSockets.send(ws, data)        # binary frame
+            WebSockets.send(ws, data)
             ack = JSON.parse(String(WebSockets.receive(ws)))
             get(ack, "ok", false) ||
                 error("worker rejected sync: $(get(ack, "error", "unknown"))")
@@ -268,12 +274,11 @@ function push_dir_to_worker!(worker_name::String, src::String, dst::String)
     finally
         try close(ws) catch end
     end
-
-    return tree_hash(src)
+    return nothing
 end
 
 """
-    pull_dir_from_worker!(worker_name, src, dst) → tree_hash
+    pull_dir_from_worker!(worker_name, src, dst)
 
 Inverse of `push_dir_to_worker!` — tells the worker to tar `src` (its path)
 and stream it back; we extract into `dst` (server path).
@@ -312,8 +317,37 @@ function pull_dir_from_worker!(worker_name::String, src::String, dst::String)
     finally
         try close(ws) catch end
     end
+    return nothing
+end
 
-    return tree_hash(dst)
+"""
+    list_worker_dir(worker_name, path; timeout=5.0) → (path, entries) | error
+
+Ask the named worker to readdir() `path` over its control WS. Empty `path`
+asks for the worker's \$HOME. Returns a NamedTuple of (path, entries) where
+entries is a Vector of NamedTuple (name, dir).
+"""
+function list_worker_dir(worker_name::String, path::AbstractString;
+                          timeout::Real = 5.0)
+    haskey(WORKER_CONTROL_WS, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+
+    rid = string(uuid4())
+    ch = Channel{Dict}(1)
+    PENDING_LIST_DIR[rid] = ch
+
+    send_command(worker_name, Dict(
+        "type"       => "list_dir",
+        "request_id" => rid,
+        "path"       => String(path),
+    ))
+
+    @async (sleep(timeout); isopen(ch) && put!(ch, Dict("error" => "list_dir timed out")))
+    resp = take!(ch)
+    haskey(resp, "error") && error("list_dir on '$worker_name': $(resp["error"])")
+    return (path = String(resp["path"]),
+            entries = [(name = String(e["name"]), dir = Bool(e["dir"]))
+                       for e in resp["entries"]])
 end
 
 """

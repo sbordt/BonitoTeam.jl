@@ -118,8 +118,7 @@ function julia_list_sessions_handler(::AbstractDict)
     )
 end
 
-# ──── tool registration ────────────────────────────────────────────────────────
-
+# tool registration
 register!(
     "bt_julia_eval",
     """

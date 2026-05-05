@@ -1,12 +1,12 @@
 const ChatStyles = Bonito.Styles(
-    # ── Global reset ────────────────────────────────────────────────────────
+    # Global reset
     CSS("html, body",
         "height"   => "100%",
         "margin"   => "0",
         "padding"  => "0",
         "overflow" => "hidden"),
 
-    # ── App shell — full-viewport flex column ────────────────────────────────
+    # App shell — full-viewport flex column
     CSS(".bt-app",
         "display"        => "flex",
         "flex-direction" => "column",
@@ -17,7 +17,7 @@ const ChatStyles = Bonito.Styles(
         "box-sizing"     => "border-box",
         "overscroll-behavior" => "none"),      # prevent pull-to-refresh swallowing
 
-    # ── Header ───────────────────────────────────────────────────────────────
+    # Header
     CSS(".bt-header",
         "padding"       => "10px 16px",
         "border-bottom" => "1px solid #ddd",
@@ -29,7 +29,7 @@ const ChatStyles = Bonito.Styles(
         "align-items"   => "center",
         "gap"           => "8px"),
 
-    # ── Messages container — scrollable, virtual-scroll aware ────────────────
+    # Messages container — scrollable, virtual-scroll aware
     CSS(".bt-messages",
         "flex"                    => "1 1 0",
         "min-height"              => "0",
@@ -48,7 +48,7 @@ const ChatStyles = Bonito.Styles(
         "flex-shrink"     => "0",
         "overflow-anchor" => "none"),   # must not anchor, or scroll jumps
 
-    # ── Message bubbles ───────────────────────────────────────────────────────
+    # Message bubbles
     CSS(".bt-user-msg",
         "align-self"    => "flex-end",
         "max-width"     => "80%",
@@ -82,7 +82,7 @@ const ChatStyles = Bonito.Styles(
         CSS("0%, 100%", "opacity" => "1"),
         CSS("50%",      "opacity" => "0")),
 
-    # ── Thought bubble (extended thinking) ───────────────────────────────────
+    # Thought bubble (extended thinking)
     CSS(".bt-thought-msg",
         "align-self"    => "flex-start",
         "max-width"     => "85%",
@@ -111,7 +111,7 @@ const ChatStyles = Bonito.Styles(
         "line-height" => "1.4",
         "border-top"  => "1px solid #f0f0f0"),
 
-    # ── Tool call card ────────────────────────────────────────────────────────
+    # Tool call card
     CSS(".bt-tool-msg",
         "align-self"    => "flex-start",
         "max-width"     => "92%",
@@ -163,7 +163,7 @@ const ChatStyles = Bonito.Styles(
         "white-space" => "pre-wrap",
         "word-break"  => "break-all"),
 
-    # ── Plan ─────────────────────────────────────────────────────────────────
+    # Plan
     CSS(".bt-plan-msg",
         "align-self"    => "flex-start",
         "max-width"     => "88%",
@@ -183,7 +183,7 @@ const ChatStyles = Bonito.Styles(
         "flex-shrink" => "0",
         "text-align" => "center"),
 
-    # ── Markdown inside agent bubbles ─────────────────────────────────────────
+    # Markdown inside agent bubbles
     CSS(".bt-agent-msg .markdown-body, .bt-agent-msg .markdown",
         "background"   => "none",
         "border"       => "none",
@@ -218,7 +218,7 @@ const ChatStyles = Bonito.Styles(
         "background" => "none",
         "padding"    => "0"),
 
-    # ── Busy indicator ────────────────────────────────────────────────────────
+    # Busy indicator
     CSS(".bt-busy",
         "flex-shrink" => "0",
         "height"      => "0",
@@ -247,7 +247,7 @@ const ChatStyles = Bonito.Styles(
         CSS("0%, 100%", "opacity" => "0.3", "transform" => "scale(0.8)"),
         CSS("50%",      "opacity" => "1",   "transform" => "scale(1.2)")),
 
-    # ── Input area — sticks to bottom, mobile-safe ────────────────────────────
+    # Input area — sticks to bottom, mobile-safe
     CSS(".bt-input-area",
         "flex-shrink"  => "0",
         "border-top"   => "1px solid #ddd",

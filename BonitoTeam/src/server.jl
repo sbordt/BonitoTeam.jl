@@ -76,8 +76,7 @@ function serve(; host::String        = "0.0.0.0",
     return srv
 end
 
-# ── HTTP routes ───────────────────────────────────────────────────────────────
-
+# HTTP routes
 function add_install_routes!(srv::Bonito.Server, public_url::String, worker_secret::String)
     Bonito.route!(srv, "/install.sh" => function(context)
         script = render_install_script(public_url, worker_secret)
@@ -96,8 +95,7 @@ function render_install_script(public_url::String, worker_secret::String)
     )
 end
 
-# ── WebSocket routes (worker-side connection terminus) ────────────────────────
-
+# WebSocket routes (worker-side connection terminus)
 function add_worker_ws_routes!(srv::Bonito.Server, worker_secret::String)
     Bonito.HTTPServer.websocket_route!(srv, "/worker-ws" => function(_ctx, ws)
         handle_worker_control(ws, worker_secret)

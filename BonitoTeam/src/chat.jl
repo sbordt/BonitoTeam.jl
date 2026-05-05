@@ -1,7 +1,6 @@
 const BonitoTeamJS = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "bonitoteam.js"))
 
-# ── Message types ─────────────────────────────────────────────────────────────
-
+# Message types
 abstract type ChatMsg end
 
 struct UserMsg <: ChatMsg
@@ -30,8 +29,7 @@ struct PlanMsg <: ChatMsg
     entries::Vector{PlanEntry}
 end
 
-# ── Tool kind → icon ──────────────────────────────────────────────────────────
-
+# Tool kind → icon
 const TOOL_ICONS = Dict(
     "read"    => "📄",
     "edit"    => "✏️",
@@ -46,8 +44,7 @@ const TOOL_ICONS = Dict(
 
 tool_icon(kind) = get(TOOL_ICONS, kind, "⚙")
 
-# ── Serialise messages to JSON dicts for JS ───────────────────────────────────
-
+# Serialise messages to JSON dicts for JS
 function msg_to_dict(m::UserMsg)
     Dict{String,Any}("type" => "user", "text" => m.text)
 end
@@ -81,8 +78,7 @@ function msg_to_dict(m::PlanMsg)
     Dict{String,Any}("type" => "plan", "html" => rows)
 end
 
-# ── Content preview (for tool calls) ─────────────────────────────────────────
-
+# Content preview (for tool calls)
 function content_preview(items)
     for item in items
         item isa TextContent && return item.text[1:min(end, 120)]
@@ -91,8 +87,7 @@ function content_preview(items)
     return ""
 end
 
-# ── Chat app ──────────────────────────────────────────────────────────────────
-
+# Chat app
 function chat_app(cwd::String;
                   mcp_servers    = AgentClientProtocol.MCPServer[],
                   client_factory = nothing)   # (on_update::Function) → AgentClientProtocol.Client
@@ -102,7 +97,7 @@ function chat_app(cwd::String;
     thought_id   = Ref("")   # id of current streaming ThoughtMsg
     client       = Ref{Union{AgentClientProtocol.Client,Nothing}}(nothing)
 
-    # ── Observables ───────────────────────────────────────────────────────────
+    # Observables
     # Julia → JS
     total_count    = Observable(length(msgs_store))
     new_msg_obs    = Observable("")   # JSON: typed event (see bonitoteam.js)
@@ -121,8 +116,7 @@ function chat_app(cwd::String;
         new_msg_obs[] = JSON.json(event)
     end
 
-    # ── ACP update handlers ───────────────────────────────────────────────────
-
+    # ACP update handlers
     function on_update(upd::AgentMessageChunk)
         upd.content isa TextContent || return
         text = upd.content.text
@@ -213,7 +207,7 @@ function chat_app(cwd::String;
 
     on_update(::SessionUpdate) = nothing
 
-    # ── Range request handler (JS asks for a slice of msgs_store) ─────────────
+    # Range request handler (JS asks for a slice of msgs_store)
     on(request_range) do rng
         isempty(rng) && return
         s = Int(rng[1]);  e = Int(rng[2])
@@ -224,7 +218,7 @@ function chat_app(cwd::String;
         range_response[] = JSON.json(Dict{String,Any}("start" => s, "messages" => batch))
     end
 
-    # ── Start ACP session ─────────────────────────────────────────────────────
+    # Start ACP session
     client[] = if client_factory !== nothing
         client_factory(on_update)
     else
@@ -233,7 +227,7 @@ function chat_app(cwd::String;
     # Persist the session ID so we can display it; actual resume is via ACP protocol
     update_session_id!(chat_session, client[].session_id)
 
-    # ── Bonito App ────────────────────────────────────────────────────────────
+    # Bonito App
     App() do bonito_session
         text_val  = Observable("")
         send_btn  = Bonito.Button("▶"; style=nothing, class="bt-send-btn")

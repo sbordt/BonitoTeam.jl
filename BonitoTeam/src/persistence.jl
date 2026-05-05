@@ -1,7 +1,6 @@
 import CommonMark as CM
 
-# ── Session metadata + file path ──────────────────────────────────────────────
-
+# Session metadata + file path
 struct ChatSession
     session_id::String      # ACP session ID (for --resume)
     cwd::String
@@ -19,8 +18,7 @@ function session_file(cwd::String)
     joinpath(session_dir(cwd), "chat.md")
 end
 
-# ── Load or create a session ──────────────────────────────────────────────────
-
+# Load or create a session
 function load_session(cwd::String)::ChatSession
     path = session_file(cwd)
     if isfile(path)
@@ -77,8 +75,7 @@ function update_session_id!(session::ChatSession, new_id::String)
     end
 end
 
-# ── Append messages ───────────────────────────────────────────────────────────
-
+# Append messages
 function append_user(session::ChatSession, msg::UserMsg)
     open(session.path, "a") do io
         println(io, "!!! user \"$(now(UTC))\"")
@@ -129,8 +126,7 @@ function append_plan(session::ChatSession, msg::PlanMsg)
     end
 end
 
-# ── Load history from file ────────────────────────────────────────────────────
-
+# Load history from file
 function load_history(session::ChatSession)::Vector{ChatMsg}
     isfile(session.path) || return ChatMsg[]
     src = read(session.path, String)

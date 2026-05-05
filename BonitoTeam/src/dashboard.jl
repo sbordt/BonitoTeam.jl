@@ -1,5 +1,4 @@
-# ── Persistent server state (workers + projects) ──────────────────────────────
-
+# Persistent server state (workers + projects)
 const SERVER_STATE_DIR  = Ref(joinpath(homedir(), ".local", "share", "bonitoteam-server"))
 # Where canonical project copies live on the SERVER. Each project lives at
 # `<SERVER_WORKING_DIR>/<name>` and is mirrored onto the worker at
@@ -57,8 +56,7 @@ const PROJECT_APPS = Dict{String,Bonito.App}()
 const STATE_VERSION = Observable(0)
 bump_state!() = (STATE_VERSION[] = STATE_VERSION[] + 1)
 
-# ── Persistence ───────────────────────────────────────────────────────────────
-
+# Persistence
 function save_workers!()
     mkpath(state_dir())
     data = [Dict("name" => w.name, "url" => w.url, "secret" => w.secret,
@@ -108,8 +106,7 @@ end
 # dials the server's /worker-ws endpoint. Liveness comes from the WS itself;
 # no periodic probing or heartbeat task.
 
-# ── Project lock ──────────────────────────────────────────────────────────────
-
+# Project lock
 """
 Mark a project locked by a worker (active ACP session). Errors if the project
 is already locked by a different worker.
@@ -187,6 +184,34 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
 end
 
 """
+Create a project rooted at an existing folder ON THE WORKER. The worker's
+folder stays in place (becomes `worker_path`); we pull a copy to the server
+as the canonical mirror, then start the session like any other project.
+"""
+function create_project_from_worker!(srv::Bonito.Server, worker_name::String,
+                                      worker_path::String;
+                                      name::String = basename(rstrip(worker_path, '/')))
+    haskey(WORKERS, worker_name) || error("Unknown worker: $worker_name")
+    isempty(name) && error("Project name must not be empty (folder has no basename?)")
+    occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
+        error("Project name must be alphanumeric/_/- only — got '$name'")
+    isempty(worker_path) && error("Worker path is required (pick a folder).")
+
+    id = string(uuid4())[1:8]
+    server_path = joinpath(working_dir(), name)
+    @info "Pulling project from worker" worker=worker_name worker_path server_path
+    pull_dir_from_worker!(worker_name, worker_path, server_path)
+
+    p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
+    PROJECTS[id] = p
+    save_projects!()
+
+    ensure_project_session!(p, srv)
+    bump_state!()
+    return p
+end
+
+"""
 Build the chat_app + register the /p/<id> route for `p` if not done yet.
 Called both from `create_project!` and from `handle_worker_control` (when a
 worker reconnects, projects belonging to it become serviceable again).
@@ -222,8 +247,7 @@ end
 # control handler (which reconnects asynchronously) can register routes.
 const SERVER_REF = Ref{Union{Bonito.Server,Nothing}}(nothing)
 
-# ── Dashboard styles ──────────────────────────────────────────────────────────
-
+# Dashboard styles
 const DashboardStyles = Bonito.Styles(
     CSS(".bt-dash",
         "font-family"  => "system-ui, -apple-system, sans-serif",
@@ -296,8 +320,7 @@ const DashboardStyles = Bonito.Styles(
         "align-items" => "center", "gap" => "8px"),
 )
 
-# ── Folder picker component ───────────────────────────────────────────────────
-
+# Folder picker component
 """
 Slim server-side folder picker. `selected` is an Observable{String} the caller
 listens to. Renders as: current path + Browse / Up / Choose buttons + (when
@@ -357,19 +380,91 @@ function folder_picker_render(p::FolderPicker)
         list)
 end
 
-# ── Dashboard app ─────────────────────────────────────────────────────────────
+# Remote folder picker — same shape as FolderPicker but reads the worker's
+# filesystem over its control WS via `list_worker_dir`. Used by the per-worker
+# "new project" flow.
+mutable struct RemoteFolderPicker
+    worker_name::String
+    cur::Observable{String}
+    selected::Observable{String}
+    expanded::Observable{Bool}
+end
 
+RemoteFolderPicker(worker_name::String, start::String = "") = RemoteFolderPicker(
+    worker_name, Observable(start), Observable(""), Observable(false))
+
+function remote_folder_picker_render(p::RemoteFolderPicker)
+    browse_btn = Bonito.Button("Browse"; class = "bt-btn bt-btn-secondary")
+    up_btn     = Bonito.Button("↑ Up"; class = "bt-btn bt-btn-secondary")
+    choose_btn = Bonito.Button("Choose"; class = "bt-btn")
+
+    # On first browse, request the worker's $HOME (cur="" means "default").
+    on(browse_btn.value) do clicked
+        clicked && (p.expanded[] = !p.expanded[])
+    end
+    on(up_btn.value) do clicked
+        clicked || return
+        cur = p.cur[]
+        isempty(cur) && return
+        parent = dirname(rstrip(cur, '/'))
+        !isempty(parent) && parent != cur && (p.cur[] = parent)
+    end
+    on(choose_btn.value) do clicked
+        clicked || return
+        p.selected[] = p.cur[]
+        p.expanded[] = false
+    end
+
+    # Resolves cur="" → worker's $HOME on first expand by querying the worker.
+    list = map(p.cur, p.expanded) do path, show
+        show || return DOM.div()
+        local resp
+        try
+            resp = list_worker_dir(p.worker_name, path)
+        catch e
+            return DOM.div("error: $e", class = "bt-picker", style = "color:#991b1b")
+        end
+        # Update the path display once we know it (e.g. resolved $HOME)
+        resp.path != path && (p.cur[] = resp.path)
+        dirs = filter(e -> e.dir, resp.entries)
+        rows = isempty(dirs) ?
+            [DOM.div("(no subfolders)", class = "bt-picker-row", style = "color:#9ca3af")] :
+            [DOM.div("📁 $(e.name)",
+                class = "bt-picker-row",
+                onclick = js"event => $(p.cur).notify($(joinpath(resp.path, e.name)));")
+             for e in dirs]
+        DOM.div(rows...; class = "bt-picker")
+    end
+
+    DOM.div(
+        DOM.div(
+            DOM.span(p.cur, style = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap"),
+            DOM.div(up_btn, browse_btn, choose_btn,
+                    style = "display:flex;gap:6px;flex-shrink:0"),
+            class = "bt-picker-cur"),
+        list)
+end
+
+# Dashboard app
 status_pill(s::Symbol) = DOM.span(string(s);
     class = "bt-pill bt-pill-$s")
 
-function worker_card(w::WorkerInfo)
+function worker_card(w::WorkerInfo, srv_ref::Ref{Bonito.Server},
+                     error_obs::Observable{String}, picker_state::Observable{String})
+    new_proj_btn = Bonito.Button("+ Project"; class = "bt-btn bt-btn-secondary")
+    on(new_proj_btn.value) do clicked
+        clicked || return
+        # Toggle the per-worker picker; only one worker's picker open at a time.
+        picker_state[] = picker_state[] == w.name ? "" : w.name
+        error_obs[] = ""
+    end
     DOM.div(
         DOM.div(
             DOM.div(w.name, " ", status_pill(w.status), class = "bt-card-title"),
             DOM.div(w.url, " · ",
                 isempty(w.hostname) ? "?" : w.hostname,
-                w.ssh_target === nothing ? "" : " · ssh: $(w.ssh_target)",
                 class = "bt-card-meta")),
+        DOM.div(new_proj_btn, style = "display:flex;gap:8px"),
         class = "bt-card")
 end
 
@@ -395,7 +490,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     # Workers self-register over WS when they dial /worker-ws — no manual
     # "Add worker" form needed. The dashboard just lists them as they connect.
 
-    # ── New Project form ──────────────────────────────────────────────────────
+    # New Project form
     new_proj_show = Observable(false)
     np_name = Observable("")
     np_picker = FolderPicker(working_dir())   # default to server's project working dir
@@ -436,9 +531,38 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
             error_obs[] = "Register a worker before creating a project."
             return
         end
-        np_worker[] = first(keys(WORKERS))   # default selection
+        np_worker[] = first(keys(WORKERS))
         new_proj_show[] = true
         error_obs[] = ""
+    end
+
+    # Per-worker remote-folder pickers (persistent across re-renders so the
+    # current path / expanded state survives bump_state! triggers). The
+    # `picker_state` observable holds the name of the worker whose picker
+    # form is currently visible (""  → none).
+    picker_state = Observable("")
+    remote_pickers = Dict{String,RemoteFolderPicker}()
+
+    function get_remote_picker(name)
+        haskey(remote_pickers, name) || (remote_pickers[name] = RemoteFolderPicker(name))
+        remote_pickers[name]
+    end
+
+    function submit_remote_pick(w_name::String)
+        rp = get_remote_picker(w_name)
+        chosen = String(strip(rp.selected[]))
+        if isempty(chosen)
+            error_obs[] = "Pick a folder on the worker first (Browse → Choose)."
+            return
+        end
+        try
+            create_project_from_worker!(srv_ref[], w_name, chosen)
+            error_obs[] = ""
+            picker_state[] = ""
+            rp.selected[] = ""
+        catch e
+            error_obs[] = "Failed to create project from worker: $e"
+        end
     end
 
     text_input(obs::Observable, ph::String) = DOM.input(
@@ -462,14 +586,41 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         DOM.div(np_cancel, np_submit, class = "bt-form-actions"),
         class = "bt-form")
 
-    # ── Layout ────────────────────────────────────────────────────────────────
+    function remote_picker_form(w_name::String)
+        rp = get_remote_picker(w_name)
+        create_btn = Bonito.Button("Create"; class = "bt-btn")
+        cancel_btn = Bonito.Button("Cancel"; class = "bt-btn bt-btn-secondary")
+        on(create_btn.value) do clicked
+            clicked && submit_remote_pick(w_name)
+        end
+        on(cancel_btn.value) do clicked
+            clicked && (picker_state[] = ""; error_obs[] = "")
+        end
+        DOM.div(
+            DOM.label("Folder on $(w_name)"),
+            DOM.div(remote_folder_picker_render(rp),
+                    map(rp.selected) do sel
+                        isempty(sel) ? DOM.div() :
+                            DOM.div("✓ selected: $sel",
+                                    style = "color:#065f46;font-size:12px;margin-top:4px")
+                    end),
+            DOM.div(cancel_btn, create_btn, class = "bt-form-actions"),
+            class = "bt-form")
+    end
+
+    # Layout
     App() do session
-        # Re-render lists whenever STATE_VERSION bumps
-        worker_list = map(STATE_VERSION) do _
-            isempty(WORKERS) ?
-                DOM.div("No workers registered yet. Run the install script on a worker.",
-                        class = "bt-empty") :
-                DOM.div((worker_card(w) for w in values(WORKERS))...)
+        # Re-render lists whenever STATE_VERSION bumps OR picker_state changes
+        worker_list = map(STATE_VERSION, picker_state) do _, picked_worker
+            isempty(WORKERS) && return DOM.div(
+                "No workers registered yet. Run the install script on a worker.",
+                class = "bt-empty")
+            rows = []
+            for w in values(WORKERS)
+                push!(rows, worker_card(w, srv_ref, error_obs, picker_state))
+                picked_worker == w.name && push!(rows, remote_picker_form(w.name))
+            end
+            DOM.div(rows...)
         end
 
         project_list = map(STATE_VERSION) do _

@@ -9,8 +9,7 @@ module BonitoWorker
 
 using HTTP, HTTP.WebSockets, JSON, SHA
 
-# ── Public entry ──────────────────────────────────────────────────────────────
-
+# Public entry
 """
     BonitoWorker.connect_and_serve(; server_url, secret, name, mcp_path,
                                    projects_root, agent_bin, retry_delay = 5.0)
@@ -38,8 +37,7 @@ function connect_and_serve(; server_url::String,
     end
 end
 
-# ── Control WS lifecycle ──────────────────────────────────────────────────────
-
+# Control WS lifecycle
 function run_control_session(; server_url, secret, name, mcp_path,
                                projects_root, agent_bin)
     control_url = ws_url(server_url, "/worker-ws")
@@ -70,6 +68,8 @@ function run_control_session(; server_url, secret, name, mcp_path,
                 @async handle_open_session(server_url, secret, agent_bin, cmd, ws)
             elseif t == "open_sync"
                 @async handle_open_sync(server_url, secret, cmd)
+            elseif t == "list_dir"
+                @async handle_list_dir(ws, cmd)
             elseif t == "ping"
                 WebSockets.send(ws, JSON.json(Dict("type" => "pong")))
             else
@@ -80,8 +80,7 @@ function run_control_session(; server_url, secret, name, mcp_path,
     end
 end
 
-# ── Per-session WS handler ────────────────────────────────────────────────────
-
+# Per-session WS handler
 function handle_open_session(server_url::String, secret::String, agent_bin::String,
                               cmd::AbstractDict, control_ws)
     sid        = String(get(cmd, "sid", ""))
@@ -147,8 +146,47 @@ function handle_open_session(server_url::String, secret::String, agent_bin::Stri
     @info "BonitoWorker: ACP session ended" sid cwd
 end
 
-# ── Live polling task ─────────────────────────────────────────────────────────
+# Filesystem listing RPC
+"""
+Respond to `{type:"list_dir", request_id, path}` — used by the dashboard's
+remote folder picker. Empty/missing path defaults to the worker's \$HOME.
+Reply over the same control WS:
 
+    {type: "list_dir_response", request_id, path, entries: [{name, dir}, …]}
+
+Entries are sorted; dotfiles, .git/, .bonitoTeam/ skipped to keep noise down.
+On error, returns `{type: "list_dir_response", request_id, error: "..."}`.
+"""
+function handle_list_dir(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    raw_path   = String(get(cmd, "path", ""))
+    path       = isempty(raw_path) ? get(ENV, "HOME", "/") : raw_path
+
+    response = try
+        isdir(path) || error("not a directory: $path")
+        entries = []
+        for name in sort!(readdir(path))
+            startswith(name, ".") && continue
+            full = joinpath(path, name)
+            push!(entries, Dict("name" => name, "dir" => isdir(full)))
+        end
+        Dict("type"       => "list_dir_response",
+             "request_id" => request_id,
+             "path"       => abspath(path),
+             "entries"    => entries)
+    catch e
+        Dict("type"       => "list_dir_response",
+             "request_id" => request_id,
+             "error"      => sprint(showerror, e))
+    end
+    try
+        WebSockets.send(ws, JSON.json(response))
+    catch e
+        @warn "list_dir response failed" exception=e
+    end
+end
+
+# Live polling task
 """
     poll_and_push(control_ws, project_id, cwd, stop_ref; interval=0.5)
 
@@ -208,8 +246,7 @@ function send_delta(control_ws, project_id::String, cwd::String,
     end
 end
 
-# ── File transport over /worker-sync ──────────────────────────────────────────
-
+# File transport over /worker-sync
 function handle_open_sync(server_url::String, secret::String, cmd::AbstractDict)
     sync_id   = String(get(cmd, "sync_id", ""))
     direction = String(get(cmd, "direction", ""))
@@ -268,8 +305,7 @@ function handle_open_sync(server_url::String, secret::String, cmd::AbstractDict)
     end
 end
 
-# ── Byte-shuttle between WS frame and subprocess stdio ────────────────────────
-
+# Byte-shuttle between WS frame and subprocess stdio
 function relay_ws_to_proc(ws, proc)
     try
         while !WebSockets.isclosed(ws)
@@ -305,8 +341,7 @@ function relay_proc_to_ws(proc, ws)
     end
 end
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
+# Helpers
 function ws_url(http_url::AbstractString, path::AbstractString)
     if startswith(http_url, "http://")
         return "ws://" * replace(http_url, "http://" => ""; count = 1) * path
@@ -317,8 +352,7 @@ function ws_url(http_url::AbstractString, path::AbstractString)
     end
 end
 
-# ── Snapshot + diff (used by both worker poller and server divergence scanner) ─
-
+# Snapshot + diff (used by both worker poller and server divergence scanner)
 # Snapshot entry: (size, mtime_ns, content_hash). Used as the value of the
 # Dict returned by `compute_snapshot`.
 const FileEntry = Tuple{Int,Float64,Vector{UInt8}}

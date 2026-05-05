@@ -318,6 +318,15 @@ const DashboardStyles = Bonito.Styles(
         "margin-bottom" => "6px",
         "display" => "flex", "justify-content" => "space-between",
         "align-items" => "center", "gap" => "8px"),
+    # Spinner shown while a create operation is in progress
+    CSS(".bt-spinner-row",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "color" => "#6b7280", "font-size" => "13px"),
+    CSS(".bt-spinner",
+        "width" => "14px", "height" => "14px", "border-radius" => "50%",
+        "border" => "2px solid #e5e7eb", "border-top-color" => "#2563eb",
+        "animation" => "bt-spin 0.8s linear infinite", "flex-shrink" => "0"),
+    CSS("@keyframes bt-spin", CSS("to", "transform" => "rotate(360deg)")),
 )
 
 # Folder picker component
@@ -336,9 +345,9 @@ FolderPicker(start::String = pwd()) = FolderPicker(
     Observable(abspath(start)), Observable(""), Observable(false))
 
 function folder_picker_render(p::FolderPicker)
-    browse_btn = Bonito.Button("Browse"; class = "bt-btn bt-btn-secondary")
-    up_btn     = Bonito.Button("↑ Up"; class = "bt-btn bt-btn-secondary")
-    choose_btn = Bonito.Button("Choose"; class = "bt-btn")
+    browse_btn = Bonito.Button("Browse"; style=nothing, class = "bt-btn bt-btn-secondary")
+    up_btn     = Bonito.Button("↑ Up"; style=nothing, class = "bt-btn bt-btn-secondary")
+    choose_btn = Bonito.Button("Choose"; style=nothing, class = "bt-btn")
 
     on(browse_btn.value) do clicked
         clicked && (p.expanded[] = !p.expanded[])
@@ -394,9 +403,9 @@ RemoteFolderPicker(worker_name::String, start::String = "") = RemoteFolderPicker
     worker_name, Observable(start), Observable(""), Observable(false))
 
 function remote_folder_picker_render(p::RemoteFolderPicker)
-    browse_btn = Bonito.Button("Browse"; class = "bt-btn bt-btn-secondary")
-    up_btn     = Bonito.Button("↑ Up"; class = "bt-btn bt-btn-secondary")
-    choose_btn = Bonito.Button("Choose"; class = "bt-btn")
+    browse_btn = Bonito.Button("Browse"; style=nothing, class = "bt-btn bt-btn-secondary")
+    up_btn     = Bonito.Button("↑ Up"; style=nothing, class = "bt-btn bt-btn-secondary")
+    choose_btn = Bonito.Button("Choose"; style=nothing, class = "bt-btn")
 
     # On first browse, request the worker's $HOME (cur="" means "default").
     on(browse_btn.value) do clicked
@@ -451,7 +460,7 @@ status_pill(s::Symbol) = DOM.span(string(s);
 
 function worker_card(w::WorkerInfo, srv_ref::Ref{Bonito.Server},
                      error_obs::Observable{String}, picker_state::Observable{String})
-    new_proj_btn = Bonito.Button("+ Project"; class = "bt-btn bt-btn-secondary")
+    new_proj_btn = Bonito.Button("+ Project"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(new_proj_btn.value) do clicked
         clicked || return
         # Toggle the per-worker picker; only one worker's picker open at a time.
@@ -502,29 +511,38 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         np_name[] = basename(rstrip(sel, '/'))
     end
     np_worker = Observable("")
-    np_submit = Bonito.Button("Create"; class = "bt-btn")
-    np_cancel = Bonito.Button("Cancel"; class = "bt-btn bt-btn-secondary")
+    busy_msg  = Observable("")   # "" = idle; non-empty = operation in progress
+
+    np_submit = Bonito.Button("Create"; style=nothing, class = "bt-btn")
+    np_cancel = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
 
     on(np_submit.value) do clicked
         clicked || return
-        try
-            create_project!(srv_ref[], String(strip(np_name[])),
-                             String(strip(np_picker.selected[])),
-                             String(strip(np_worker[])))
-            error_obs[] = ""
-            new_proj_show[] = false
-            np_name[] = ""; np_picker.selected[] = ""; np_worker[] = ""
-        catch e
-            error_obs[] = "Failed to create project: $e"
+        isempty(busy_msg[]) || return   # guard: ignore clicks while busy
+        busy_msg[] = "Syncing files…"
+        @async begin
+            try
+                create_project!(srv_ref[], String(strip(np_name[])),
+                                 String(strip(np_picker.selected[])),
+                                 String(strip(np_worker[])))
+                error_obs[] = ""
+                new_proj_show[] = false
+                np_name[] = ""; np_picker.selected[] = ""; np_worker[] = ""
+            catch e
+                error_obs[] = "Failed to create project: $e"
+            finally
+                busy_msg[] = ""
+            end
         end
     end
     on(np_cancel.value) do clicked
         clicked || return
+        isempty(busy_msg[]) || return   # don't cancel mid-create
         new_proj_show[] = false
         error_obs[] = ""
     end
 
-    new_proj_btn = Bonito.Button("+ New project"; class = "bt-btn bt-btn-secondary")
+    new_proj_btn = Bonito.Button("+ New project"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(new_proj_btn.value) do clicked
         clicked || return
         if isempty(WORKERS)
@@ -549,19 +567,25 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     end
 
     function submit_remote_pick(w_name::String)
+        isempty(busy_msg[]) || return   # guard: ignore if already creating
         rp = get_remote_picker(w_name)
         chosen = String(strip(rp.selected[]))
         if isempty(chosen)
             error_obs[] = "Pick a folder on the worker first (Browse → Choose)."
             return
         end
-        try
-            create_project_from_worker!(srv_ref[], w_name, chosen)
-            error_obs[] = ""
-            picker_state[] = ""
-            rp.selected[] = ""
-        catch e
-            error_obs[] = "Failed to create project from worker: $e"
+        busy_msg[] = "Pulling project from worker…"
+        @async begin
+            try
+                create_project_from_worker!(srv_ref[], w_name, chosen)
+                error_obs[] = ""
+                picker_state[] = ""
+                rp.selected[] = ""
+            catch e
+                error_obs[] = "Failed to create project from worker: $e"
+            finally
+                busy_msg[] = ""
+            end
         end
     end
 
@@ -569,6 +593,11 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         type = "text", placeholder = ph,
         value = obs,    # Julia → JS: pushed back when obs changes (e.g. auto-fill)
         oninput = js"event => $(obs).notify(event.target.value)")
+
+    spinner_row(msg) = DOM.div(
+        DOM.div(class = "bt-spinner"),
+        DOM.span(msg),
+        class = "bt-spinner-row")
 
     new_proj_form() = DOM.div(
         DOM.label("Name"),   text_input(np_name, "e.g. my-project"),
@@ -583,18 +612,24 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         DOM.select(
             (DOM.option(name; value=name) for name in keys(WORKERS))...;
             onchange = js"event => $(np_worker).notify(event.target.value)"),
-        DOM.div(np_cancel, np_submit, class = "bt-form-actions"),
+        map(busy_msg) do msg
+            isempty(msg) ?
+                DOM.div(np_cancel, np_submit, class = "bt-form-actions") :
+                DOM.div(spinner_row(msg), class = "bt-form-actions")
+        end,
         class = "bt-form")
 
     function remote_picker_form(w_name::String)
         rp = get_remote_picker(w_name)
-        create_btn = Bonito.Button("Create"; class = "bt-btn")
-        cancel_btn = Bonito.Button("Cancel"; class = "bt-btn bt-btn-secondary")
+        create_btn = Bonito.Button("Create"; style=nothing, class = "bt-btn")
+        cancel_btn = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
         on(create_btn.value) do clicked
             clicked && submit_remote_pick(w_name)
         end
         on(cancel_btn.value) do clicked
-            clicked && (picker_state[] = ""; error_obs[] = "")
+            clicked || return
+            isempty(busy_msg[]) || return   # don't cancel mid-create
+            picker_state[] = ""; error_obs[] = ""
         end
         DOM.div(
             DOM.label("Folder on $(w_name)"),
@@ -604,7 +639,11 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
                             DOM.div("✓ selected: $sel",
                                     style = "color:#065f46;font-size:12px;margin-top:4px")
                     end),
-            DOM.div(cancel_btn, create_btn, class = "bt-form-actions"),
+            map(busy_msg) do msg
+                isempty(msg) ?
+                    DOM.div(cancel_btn, create_btn, class = "bt-form-actions") :
+                    DOM.div(spinner_row(msg), class = "bt-form-actions")
+            end,
             class = "bt-form")
     end
 

@@ -103,6 +103,7 @@ function add_install_routes!(srv::Bonito.Server, public_url::String,
     # Self-registration: worker POSTs {secret, host, port, name} on startup.
     # Server probes the worker, stores it in WORKERS, dashboard re-renders.
     Bonito.route!(srv, "/api/workers/register" => function(context)
+        local name = "?", url = "?"
         try
             body = JSON.parse(String(context.request.body))
             get(body, "secret", "") == worker_secret ||
@@ -113,11 +114,14 @@ function add_install_routes!(srv::Bonito.Server, public_url::String,
             name = String(get(body, "name", host))
             url  = "ws://$host:$port"
             w = register_worker!(name, url, worker_secret)
+            @info "Worker registered" name=w.name url=w.url
             HTTP.Response(200, ["Content-Type" => "application/json"],
                           body = JSON.json(Dict("ok"=>true, "name"=>w.name, "url"=>w.url)))
         catch e
+            err = sprint(showerror, e)
+            @error "Worker registration failed (server can't reach back; firewall?)" name url error=err
             HTTP.Response(500, ["Content-Type" => "application/json"],
-                          body = JSON.json(Dict("error" => string(e))))
+                          body = JSON.json(Dict("error" => err)))
         end
     end)
 end

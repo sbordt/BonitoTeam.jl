@@ -596,7 +596,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         # Re-render lists whenever STATE_VERSION bumps
         worker_list = map(STATE_VERSION) do _
             isempty(WORKERS) ?
-                DOM.div("No workers registered. Run the install script on a worker, then click + Add worker.",
+                DOM.div("No workers registered yet. Run the install script on a worker.",
                         class = "bt-empty") :
                 DOM.div((worker_card(w) for w in values(WORKERS))...)
         end

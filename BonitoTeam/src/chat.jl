@@ -310,14 +310,14 @@ function chat_app(cwd::String;
         idx = findfirst(m -> m isa ToolMsg && m.id == upd.tool_call_id, msgs_store)
         idx === nothing && return
         m = msgs_store[idx]
-        merged = update_tool_file!(cwd, upd.tool_call_id, upd.raw)
+        update_tool_file!(cwd, upd.tool_call_id, upd.raw)
         upd.status !== nothing && (m.status = upd.status)
         upd.title  !== nothing && (m.title  = upd.title)
-        # Recompute summary from the merged on-disk content (so status-only
-        # updates don't blank a previously computed summary).
-        merged_blocks = Any[parse_tool_content_item(c)
-                            for c in get(merged, "content", []) if c isa AbstractDict]
-        m.summary = content_summary(m.kind, merged_blocks)
+        # Only refresh summary when this update actually carries content
+        # (status-only updates leave the prior summary in place).
+        if !isempty(upd.content)
+            m.summary = content_summary(m.kind, upd.content)
+        end
         emit(Dict{String,Any}("type"    => "tool_update",
                               "id"      => m.id,
                               "status"  => m.status,

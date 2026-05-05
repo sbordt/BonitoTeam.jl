@@ -30,21 +30,15 @@ function tool_file(cwd::String, tool_id::String)
     joinpath(tools_dir(cwd), tool_id * ".json")
 end
 
-# Merge `params` into the persisted snapshot for `tool_id`. ACP updates carry
-# either a full content array or none at all (status-only); preserve the prior
-# `content` / `locations` if the new update leaves them empty.
+# ACP sends either a full snapshot (initial notif + final update with content)
+# or status-only updates with `content: []`. We only persist when there's real
+# content; status/title transitions live in memory on ToolMsg.
 function update_tool_file!(cwd::String, tool_id::String, params::AbstractDict)
+    content = get(params, "content", nothing)
+    (content === nothing || isempty(content)) && return nothing
     path = tool_file(cwd, tool_id)
-    existing = isfile(path) ? open(JSON.parse, path) : Dict{String,Any}()
-    merged = Dict{String,Any}(existing)
-    for (k, v) in params
-        if (k == "content" || k == "locations") && (v === nothing || isempty(v))
-            continue
-        end
-        merged[String(k)] = v
-    end
-    open(io -> JSON.print(io, merged), path, "w")
-    return merged
+    open(io -> JSON.print(io, params), path, "w")
+    return params
 end
 
 function load_tool_file(cwd::String, tool_id::String)::Union{AbstractDict,Nothing}

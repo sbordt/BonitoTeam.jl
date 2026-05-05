@@ -7,7 +7,7 @@ module BonitoWorker
 # Worker has NO inbound listener — no firewall hole on the worker side.
 # Single port to open is on the server (8038), already needed for browsers.
 
-using HTTP, HTTP.WebSockets, JSON
+using HTTP, HTTP.WebSockets, JSON, SHA
 
 # ── Public entry ──────────────────────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ function run_control_session(; server_url, secret, name, mcp_path,
             cmd = JSON.parse(String(frame))
             t = get(cmd, "type", "")
             if t == "open_session"
-                @async handle_open_session(server_url, secret, agent_bin, cmd)
+                @async handle_open_session(server_url, secret, agent_bin, cmd, ws)
             elseif t == "open_sync"
                 @async handle_open_sync(server_url, secret, cmd)
             elseif t == "ping"
@@ -83,9 +83,10 @@ end
 # ── Per-session WS handler ────────────────────────────────────────────────────
 
 function handle_open_session(server_url::String, secret::String, agent_bin::String,
-                              cmd::AbstractDict)
-    sid = String(get(cmd, "sid", ""))
-    cwd = String(get(cmd, "cwd", pwd()))
+                              cmd::AbstractDict, control_ws)
+    sid        = String(get(cmd, "sid", ""))
+    project_id = String(get(cmd, "project_id", ""))
+    cwd        = String(get(cmd, "cwd", pwd()))
     env_overrides = Dict{String,String}(get(cmd, "env", Dict{String,String}()))
     isempty(sid) && (@error "open_session missing sid"; return)
 
@@ -113,11 +114,20 @@ function handle_open_session(server_url::String, secret::String, agent_bin::Stri
             get(ack, "ok", false) ||
                 error("server rejected ACP session: $(get(ack, "error", "unknown"))")
 
+            # Live worker→server file sync. Each tick computes a snapshot of
+            # `cwd`, diffs against the previous one, and pushes any changes
+            # over the control WS as a {type: "delta"} envelope + tarball.
+            stop_polling = Ref(false)
+            polling_task = isempty(project_id) ? nothing :
+                @async poll_and_push(control_ws, project_id, cwd, stop_polling)
+
             ws_to_proc = @async relay_ws_to_proc(ws, proc)
             proc_to_ws = @async relay_proc_to_ws(proc, ws)
             try
                 wait(ws_to_proc)
             finally
+                stop_polling[] = true
+                polling_task !== nothing && (try wait(polling_task) catch end)
                 try
                     isopen(proc) && kill(proc)
                 catch e
@@ -135,6 +145,67 @@ function handle_open_session(server_url::String, secret::String, agent_bin::Stri
         @error "BonitoWorker: ACP session error" sid exception=e
     end
     @info "BonitoWorker: ACP session ended" sid cwd
+end
+
+# ── Live polling task ─────────────────────────────────────────────────────────
+
+"""
+    poll_and_push(control_ws, project_id, cwd, stop_ref; interval=0.5)
+
+Tick every `interval` seconds. Compute a snapshot of `cwd`, diff against the
+last one, and if anything changed, send a delta envelope over `control_ws`:
+
+    Frame 1 (text):   {"type":"delta","project_id":...,"deletes":[...],"has_payload":bool}
+    Frame 2 (binary): tar.gz of created+modified files (only if has_payload=true)
+"""
+function poll_and_push(control_ws, project_id::String, cwd::String,
+                       stop_ref::Ref{Bool}; interval::Real = 0.5)
+    prev = compute_snapshot(cwd)   # baseline; don't ship the initial state
+    while !stop_ref[]
+        sleep(interval)
+        stop_ref[] && break
+        local cur
+        try
+            cur = compute_snapshot(cwd; prev = prev)
+        catch e
+            @warn "BonitoWorker: snapshot scan failed" cwd exception=e
+            continue
+        end
+        d = diff_snapshots(prev, cur)
+        if isempty(d.created) && isempty(d.modified) && isempty(d.deleted)
+            prev = cur
+            continue
+        end
+        try
+            send_delta(control_ws, project_id, cwd, d)
+        catch e
+            @warn "BonitoWorker: failed to push delta" exception=e
+            # Don't bail — try again next tick.
+        end
+        prev = cur
+    end
+end
+
+function send_delta(control_ws, project_id::String, cwd::String,
+                    d::NamedTuple)
+    changed = vcat(d.created, d.modified)
+    has_payload = !isempty(changed)
+    header = Dict(
+        "type"        => "delta",
+        "project_id"  => project_id,
+        "deletes"     => d.deleted,
+        "has_payload" => has_payload,
+    )
+    WebSockets.send(control_ws, JSON.json(header))
+    if has_payload
+        tmp = tempname() * ".tar.gz"
+        try
+            run(Cmd(`tar -czf $tmp $changed`; dir = cwd))
+            WebSockets.send(control_ws, read(tmp))
+        finally
+            rm(tmp; force = true)
+        end
+    end
 end
 
 # ── File transport over /worker-sync ──────────────────────────────────────────
@@ -244,6 +315,89 @@ function ws_url(http_url::AbstractString, path::AbstractString)
     else
         return http_url * path
     end
+end
+
+# ── Snapshot + diff (used by both worker poller and server divergence scanner) ─
+
+# Snapshot entry: (size, mtime_ns, content_hash). Used as the value of the
+# Dict returned by `compute_snapshot`.
+const FileEntry = Tuple{Int,Float64,Vector{UInt8}}
+
+const SNAPSHOT_IGNORE_DIRS = (".git", ".bonitoTeam")
+
+"""
+    compute_snapshot(root; prev=nothing) → Dict{String,FileEntry}
+
+Walk `root` (skipping .git/ + .bonitoTeam/) and produce {relpath → (size, mtime, sha256)}.
+
+If `prev` is given, files whose `(size, mtime)` are unchanged inherit the old
+content_hash without re-reading the file — keeps the cost of a no-change scan
+to ~one stat() per file.
+"""
+function compute_snapshot(root::AbstractString;
+                          prev::Union{Nothing,Dict{String,FileEntry}} = nothing)
+    files = Dict{String,FileEntry}()
+    isdir(root) || return files
+    for (dir, dirs, fnames) in walkdir(root; topdown = true)
+        filter!(d -> !(d in SNAPSHOT_IGNORE_DIRS), dirs)
+        for fname in fnames
+            full = joinpath(dir, fname)
+            isfile(full) || continue
+            rel = relpath(full, root)
+            st = stat(full)
+            size = Int(st.size)
+            mtime = st.mtime
+            if prev !== nothing && haskey(prev, rel)
+                old_size, old_mtime, old_hash = prev[rel]
+                if old_size == size && old_mtime == mtime
+                    files[rel] = (size, mtime, old_hash)
+                    continue
+                end
+            end
+            files[rel] = (size, mtime, open(SHA.sha256, full))
+        end
+    end
+    return files
+end
+
+"""
+    tree_hash(root) → Vector{UInt8}
+
+Single sha256 over the snapshot — used by the divergence scanner.
+"""
+function tree_hash(root::AbstractString)
+    snap = compute_snapshot(root)
+    h = SHA.SHA256_CTX()
+    for rel in sort!(collect(keys(snap)))
+        size, mtime, content_hash = snap[rel]
+        SHA.update!(h, codeunits(string(rel, "\0", size, "\0", mtime, "\0",
+                                        bytes2hex(content_hash))))
+    end
+    return SHA.digest!(h)
+end
+
+"""
+    diff_snapshots(prev, current) → (created, modified, deleted)
+
+Each return field is a `Vector{String}` of relpaths.
+"""
+function diff_snapshots(prev::Dict{String,FileEntry},
+                        current::Dict{String,FileEntry})
+    created  = String[]
+    modified = String[]
+    deleted  = String[]
+    for (rel, (sz, mt, h)) in current
+        if haskey(prev, rel)
+            _, _, prev_h = prev[rel]
+            prev_h != h && push!(modified, rel)
+        else
+            push!(created, rel)
+        end
+    end
+    for rel in keys(prev)
+        haskey(current, rel) || push!(deleted, rel)
+    end
+    return (created = created, modified = modified, deleted = deleted)
 end
 
 function find_agent_bin()

@@ -74,10 +74,19 @@ function handle_worker_control(ws, worker_secret::String)
             end
         end
 
-        # Block on incoming control frames from the worker (pong, etc.).
-        for _ in ws
-            # Currently no inbound control frames besides pongs; loop just
-            # blocks until the worker disconnects.
+        # Process inbound frames from the worker. The only one with
+        # significance right now is "delta" — live file sync from the worker.
+        for frame in ws
+            try
+                cmd = JSON.parse(String(frame))
+                if get(cmd, "type", "") == "delta"
+                    payload = get(cmd, "has_payload", false) ?
+                                  WebSockets.receive(ws) : UInt8[]
+                    apply_worker_delta!(cmd, payload)
+                end
+            catch e
+                @warn "Worker control frame error" exception=e
+            end
         end
     finally
         delete!(WORKER_CONTROL_WS, name)
@@ -179,9 +188,18 @@ function start_session_on_worker(worker_name::String, cwd::String;
                      "env"     => [Dict("name" => k, "value" => v) for (k,v) in s.env])
                 for s in mcp_servers]
 
+    # Find the project this session belongs to so the worker can tag its
+    # delta frames with project_id (server uses it to apply diffs to the
+    # right server_path).
+    project_id = ""
+    for p in values(PROJECTS)
+        p.worker_name == worker_name && p.worker_path == cwd && (project_id = p.id; break)
+    end
+
     send_command(worker_name, Dict(
         "type"       => "open_session",
         "sid"        => sid,
+        "project_id" => project_id,
         "cwd"        => cwd,
         "env"        => Dict{String,String}(),
         "mcpServers" => mcp_list,
@@ -298,29 +316,51 @@ function pull_dir_from_worker!(worker_name::String, src::String, dst::String)
     return tree_hash(dst)
 end
 
-# Tree hash: walk + sha256 over (relpath, size, mtime, content_hash) entries,
-# combined into a final sha256. Skips .git/ + .bonitoTeam/.
-function tree_hash(root::String)
-    h = SHA.SHA256_CTX()
-    paths = String[]
-    if isdir(root)
-        for (dir, dirs, fnames) in walkdir(root; topdown = true)
-            filter!(d -> !(d in (".git", ".bonitoTeam")), dirs)
-            for fname in fnames
-                full = joinpath(dir, fname)
-                isfile(full) && push!(paths, relpath(full, root))
-            end
-        end
-        sort!(paths)
-        for p in paths
-            full = joinpath(root, p)
-            st = stat(full)
-            entry = string(p, "\0", st.size, "\0", st.mtime, "\0",
-                           bytes2hex(open(SHA.sha256, full)))
-            SHA.update!(h, codeunits(entry))
+# tree_hash is provided by BonitoWorker (shared with the worker-side poller).
+# Re-export for callers in this module.
+const tree_hash = BonitoWorker.tree_hash
+
+"""
+Apply a delta sent from a worker to the corresponding project's server_path.
+The delta envelope identifies the project by id; payload (if any) is a tar.gz
+of created+modified files.
+"""
+function apply_worker_delta!(cmd::AbstractDict, payload::AbstractVector{UInt8})
+    project_id = String(get(cmd, "project_id", ""))
+    haskey(PROJECTS, project_id) || (@warn "delta for unknown project" project_id; return)
+    p = PROJECTS[project_id]
+
+    deletes = String[]
+    for d in get(cmd, "deletes", [])
+        push!(deletes, String(d))
+    end
+
+    if !isempty(payload)
+        tmp = tempname() * ".tar.gz"
+        try
+            write(tmp, payload)
+            mkpath(p.server_path)
+            run(Cmd(`tar -xzf $tmp`; dir = p.server_path))
+        finally
+            rm(tmp; force = true)
         end
     end
-    return SHA.digest!(h)
+
+    for rel in deletes
+        full = joinpath(p.server_path, rel)
+        try
+            isfile(full) && rm(full)
+        catch e
+            @warn "delta delete failed" path=full exception=e
+        end
+    end
+
+    # The worker's pushed state is the new authoritative content for
+    # base_checksum; reset divergence so the scanner doesn't false-positive.
+    p.base_checksum = tree_hash(p.server_path)
+    p.diverged      = false
+    bump_state!()
+    return nothing
 end
 
 # Build an AgentClientProtocol.Connection backed by a WebSocket. Each ACP

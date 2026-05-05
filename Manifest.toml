@@ -53,7 +53,7 @@ uuid = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
 version = "0.1.0"
 
 [[deps.BonitoWorker]]
-deps = ["HTTP", "JSON", "Sockets"]
+deps = ["HTTP", "JSON", "SHA", "Sockets"]
 path = "BonitoWorker"
 uuid = "98909ed9-6989-4829-81af-73688ee23085"
 version = "0.1.0"

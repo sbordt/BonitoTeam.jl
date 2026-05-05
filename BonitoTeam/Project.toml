@@ -21,9 +21,10 @@ UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 AgentClientProtocol = {path = "../AgentClientProtocol"}
 BonitoMCP           = {path = "../BonitoMCP"}
 BonitoWorker        = {path = "../BonitoWorker"}
-# Use the local dev'd Bonito (sibling of the monorepo) so our patches to
-# relative_url etc. take effect without round-tripping a release.
-Bonito              = {path = "../../Bonito"}
+# Pinned to the branch where the proxy_url="." fix lives (relative_url emits
+# server-absolute paths so sub-route /p/<id> assets resolve correctly).
+# Drop this once the branch is merged + tagged.
+Bonito = {url = "https://github.com/SimonDanisch/Bonito.jl.git", rev = "sd/terminal-output"}
 
 [compat]
 HTTP = "1"

@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "8c3d0339bf19d4d1f9fc69f19c5adb17484ecde6"
+project_hash = "33d71d391933d110e62a6ae00da1bde020ae48e6"
 
 [[deps.ANSIColoredPrinters]]
 git-tree-sha1 = "574baf8110975760d391c710b6341da1afa48d8c"
@@ -34,7 +34,9 @@ version = "0.1.9"
 
 [[deps.Bonito]]
 deps = ["ANSIColoredPrinters", "Base64", "CodecZlib", "Colors", "CommonMark", "Dates", "Deno_jll", "HTTP", "Hyperscript", "JSON", "LinearAlgebra", "Markdown", "MbedTLS", "MsgPack", "Observables", "OrderedCollections", "Random", "RelocatableFolders", "SHA", "Sockets", "Tables", "ThreadPools", "URIs", "UUIDs", "WidgetsBase"]
-path = "../Bonito"
+git-tree-sha1 = "30095745fb2a9e4b15a6ab0542d9e751d1d19afa"
+repo-rev = "sd/terminal-output"
+repo-url = "https://github.com/SimonDanisch/Bonito.jl.git"
 uuid = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 version = "4.2.0"
 

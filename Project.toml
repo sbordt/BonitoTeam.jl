@@ -1,16 +1,25 @@
 # Top-level monorepo env. `julia --project=.` from this directory pulls in
-# every sibling package (BonitoTeam, BonitoMCP, BonitoWorker, AgentClientProtocol)
-# via [sources]. Use this on the SERVER. Workers use the leaner
-# BonitoWorker/ env directly.
+# every sibling package via [sources]. Use this on the SERVER.
+# Workers use the leaner BonitoWorker/ env directly.
+#
+# Note: [sources] entries in transitive deps are ignored by Pkg, so they
+# must be repeated here for the monorepo env to resolve correctly.
 
 [deps]
-BonitoTeam = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
+AgentClientProtocol = "a1b2c3d4-1234-5678-abcd-a1b2c3d4e5f6"
+Bonito              = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
+BonitoMCP           = "4a1c91af-1c90-46a4-8594-a3846516869d"
+BonitoTeam          = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
+BonitoWorker        = "98909ed9-6989-4829-81af-73688ee23085"
 
-# Only direct deps may appear in [sources]. The transitive paths
-# (BonitoMCP, BonitoWorker, AgentClientProtocol) are declared inside
-# BonitoTeam/Project.toml and resolved from there.
 [sources]
-BonitoTeam = {path = "BonitoTeam"}
+AgentClientProtocol = {path = "AgentClientProtocol"}
+BonitoMCP           = {path = "BonitoMCP"}
+BonitoTeam          = {path = "BonitoTeam"}
+BonitoWorker        = {path = "BonitoWorker"}
+# Pinned to the branch with the proxy_url="." fix (server-absolute asset URLs
+# so /p/<id> sub-routes resolve assets correctly). Drop once merged + tagged.
+Bonito              = {url = "https://github.com/SimonDanisch/Bonito.jl.git", rev = "sd/terminal-output"}
 
 [compat]
 julia = "1.11"

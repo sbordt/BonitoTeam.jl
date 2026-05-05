@@ -102,13 +102,12 @@ function append_tool(session::ChatSession, msg::ToolMsg)
         meta = "$(msg.kind) · $(msg.status) · $(msg.id)"
         println(io, "!!! tool \"$meta\"")
         println(io, "    `$(msg.title)`")
-        if !isempty(msg.preview)
+        # Brief summary instead of the (potentially large) full content; chat.md
+        # is a "what happened" log, full reproduction lives in claude's session.
+        summary = content_summary(msg.kind, msg.content)
+        if !isempty(summary)
             println(io, "")
-            println(io, "    ```")
-            for line in split(msg.preview, '\n')
-                println(io, "    ", line)
-            end
-            println(io, "    ```")
+            println(io, "    $summary")
         end
         println(io)
     end
@@ -154,7 +153,7 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
             title_line = match(r"`([^`]*)`", body)
             title = title_line !== nothing ? title_line.captures[1] : ""
             push!(msgs, ToolMsg(string(id), string(kind), string(title),
-                                string(status), ""))
+                                string(status), Any[]))
         elseif cat == "plan"
             entries = PlanEntry[]
             for line in split(body, '\n')

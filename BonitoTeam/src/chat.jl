@@ -53,11 +53,11 @@ function content_summary(kind::AbstractString, content::AbstractVector)
                 old_n = length(split(something(c.old_text, ""), '\n'))
                 new_n = length(split(c.new_text, '\n'))
                 d     = new_n - old_n
-                return "$(basename(c.path)) · $(d > 0 ? "+$d" : d) lines"
+                noun  = abs(d) == 1 ? "line" : "lines"
+                return "$(basename(c.path)) · $(d > 0 ? "+$d" : d) $noun"
             end
         end
     end
-    # Default: count lines / bytes from the first text-y block
     for c in content
         if c isa TextContent
             n = count('\n', c.text) + 1
@@ -149,19 +149,18 @@ function render_tool_body(m::ToolMsg)
         end
     end
 
-    if m.kind in ("execute", "read") || m.kind == "other"
+    if m.kind in ("execute", "read")
         # Concatenate text blocks; render with MonacoEditor (read-only).
         text = join((c.text for c in m.content if c isa TextContent), "\n")
         if !isempty(text)
-            lang = m.kind == "read" ? detect_language(m.title) :
-                   m.kind == "execute" ? "shell" : "plaintext"
+            lang = m.kind == "read" ? detect_language(m.title) : "shell"
             return BonitoBook.MonacoEditor(text; language = lang, options = Dict(:readOnly => true))
         end
     end
 
-    # Default / "think" / mixed: render text blocks as Markdown so agents that
-    # emit ```julia ... ``` etc. get language-aware code blocks. Diff blocks
-    # render via DiffEditor inline among them.
+    # Default / "think" / "other" / "search" / "fetch" / mixed:
+    # render text blocks as Markdown so agents that emit ```julia ... ``` etc.
+    # get language-aware code blocks. Diff blocks render via DiffEditor inline.
     parts = []
     for c in m.content
         if c isa TextContent

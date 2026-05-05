@@ -134,6 +134,32 @@ function detect_language(path::AbstractString)
     return "plaintext"
 end
 
+# Read-only Monaco that sizes itself to content height exactly once.
+# automaticLayout=false stops the polling loop that fights ResizeObserver.
+# The js_init_func runs after the editor Promise resolves and sets an explicit
+# pixel height so Monaco never gets a 0-height container.
+const MONACO_RESIZE_INIT = js"""(monacoEditor) => {
+    monacoEditor.editor.then(editor => {
+        const div = monacoEditor.editor_div;
+        const h = editor.getContentHeight();
+        div.style.height = h + 'px';
+        editor.layout({ width: div.offsetWidth || 600, height: h });
+    });
+}"""
+
+function monaco_readonly(text::AbstractString, lang::AbstractString)
+    BonitoBook.MonacoEditor(
+        text;
+        language            = lang,
+        readOnly            = true,
+        automaticLayout     = false,
+        scrollBeyondLastLine = false,
+        lineNumbers         = "off",
+        minimap             = Dict(:enabled => false),
+        js_init_func        = MONACO_RESIZE_INIT,
+    )
+end
+
 # If `text` is exactly a fenced code block (```lang\n...\n```), render it as a
 # read-only Monaco editor with the matching language. Otherwise fall back to
 # Markdown.parse so prose with inline formatting still works.
@@ -142,8 +168,7 @@ function render_text_block(text::AbstractString)
     if m !== nothing
         lang = isempty(m.captures[1]) ? "plaintext" : String(m.captures[1])
         code = String(m.captures[2])
-        return BonitoBook.MonacoEditor(code; language = lang,
-                                       options = Dict(:readOnly => true))
+        return monaco_readonly(code, lang)
     end
     return DOM.div(Markdown.parse(text), class = "bt-tool-md")
 end
@@ -184,8 +209,7 @@ function render_tool_body(m::ToolMsg, cwd::AbstractString)
         text = join((c.text for c in content if c isa TextContent), "\n")
         if !isempty(text)
             lang = m.kind == "read" ? detect_language(m.title) : "shell"
-            return BonitoBook.MonacoEditor(text; language = lang,
-                                           options = Dict(:readOnly => true))
+            return monaco_readonly(text, lang)
         end
     end
 

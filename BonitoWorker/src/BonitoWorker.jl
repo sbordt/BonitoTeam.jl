@@ -318,6 +318,7 @@ function relay_ws_to_proc(ws, proc)
     catch e
         e isa WebSockets.WebSocketError && return
         e isa Base.IOError              && return
+        e isa EOFError                  && return
         @warn "BonitoWorker ws→proc relay error" exception=e
     finally
         try close(proc.in) catch e

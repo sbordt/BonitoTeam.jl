@@ -10,7 +10,10 @@
 # Cold start (first run): ~5-15s while Julia precompiles BonitoMCP.
 # Subsequent starts: ~1-3s from the precompile cache.
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks so we find the bundle dir even when invoked via
+# ~/.local/bin/bonitoteam-mcp (a symlink the installer creates).
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 exec julia \

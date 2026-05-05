@@ -15,7 +15,10 @@
 #   CLAUDE_AGENT_ACP           — path to claude-agent-acp binary (optional)
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks so we find the bundle dir even when invoked via
+# ~/.local/bin/bonitoteam-worker (a symlink the installer creates).
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MONOREPO_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 

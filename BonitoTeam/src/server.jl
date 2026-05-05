@@ -71,6 +71,8 @@ function serve(; host::String        = "0.0.0.0",
     add_install_routes!(srv, base_url, worker_secret)
     add_worker_ws_routes!(srv, worker_secret)
 
+    start_divergence_scanner!()
+
     @info "BonitoTeam dashboard running" url="http://localhost:$port" state=SERVER_STATE_DIR[]
     @info "Worker install endpoint"      url="$base_url/install.sh"
     return srv

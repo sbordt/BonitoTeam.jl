@@ -85,6 +85,16 @@ function handle_worker_control(ws, worker_secret::String)
             WORKERS[name].status = :offline
             bump_state!()
         end
+        # Auto-release any project locks held by this worker — its claude
+        # processes are gone, so the locks are stale.
+        release_locks_for_worker!(name)
+        # Tear down the chat_app's PROJECT_APPS entry so the next reconnect
+        # builds a fresh ACP session.
+        for p in values(PROJECTS)
+            if p.worker_name == name
+                delete!(PROJECT_APPS, p.id)
+            end
+        end
         @info "Worker disconnected" name=name
     end
 end

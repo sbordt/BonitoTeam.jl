@@ -1,0 +1,14 @@
+name = "BonitoWorker"
+uuid = "98909ed9-6989-4829-81af-73688ee23085"
+authors = ["Simon Danisch <sdanisch@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+
+[compat]
+HTTP = "1"
+JSON = "0.21, 1"
+julia = "1.10"

@@ -1,18 +1,16 @@
-name = "BonitoTeam"
-uuid = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
-authors = ["Simon Danisch <sdanisch@gmail.com>"]
-version = "0.1.0"
+# Top-level monorepo env. `julia --project=.` from this directory pulls in
+# every sibling package (BonitoTeam, BonitoMCP, BonitoWorker, AgentClientProtocol)
+# via [sources]. Use this on the SERVER. Workers use the leaner
+# BonitoWorker/ env directly.
 
 [deps]
-Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
-HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
-JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
-Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
-Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
-UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
+BonitoTeam = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
+
+# Only direct deps may appear in [sources]. The transitive paths
+# (BonitoMCP, BonitoWorker, AgentClientProtocol) are declared inside
+# BonitoTeam/Project.toml and resolved from there.
+[sources]
+BonitoTeam = {path = "BonitoTeam"}
 
 [compat]
-HTTP = "1"
-JSON = "0.21, 1"
-julia = "1.9"
+julia = "1.11"

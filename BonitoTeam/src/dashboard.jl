@@ -513,6 +513,13 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     new_proj_show = Observable(false)
     np_name = Observable("")
     np_picker = FolderPicker(working_dir())   # default to server's project working dir
+    # Auto-fill the project name from the picked folder's basename when the
+    # user hasn't typed anything yet. Their typing always wins.
+    on(np_picker.selected) do sel
+        isempty(strip(np_name[])) || return
+        isempty(sel) && return
+        np_name[] = basename(rstrip(sel, '/'))
+    end
     np_worker = Observable("")
     np_submit = Bonito.Button("Create"; class = "bt-btn")
     np_cancel = Bonito.Button("Cancel"; class = "bt-btn bt-btn-secondary")
@@ -557,6 +564,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
 
     text_input(obs::Observable, ph::String) = DOM.input(
         type = "text", placeholder = ph,
+        value = obs,    # Julia → JS: pushed back when obs changes (e.g. auto-fill)
         oninput = js"event => $(obs).notify(event.target.value)")
 
     add_worker_form() = DOM.div(

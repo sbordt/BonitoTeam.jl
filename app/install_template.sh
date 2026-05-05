@@ -1,0 +1,144 @@
+#!/usr/bin/env sh
+# BonitoTeam worker installer — idempotent.
+# Usage:    curl -fsSL {{SERVER_URL}}/install.sh | sh
+# Re-runs:  same command — every step is "check / update / create".
+#
+# Layout after install:
+#   ~/.local/share/bonitoteam/BonitoTeam/   package files (Project.toml, src, bin)
+#   ~/.local/bin/{bonitoteam-worker,bonitoteam-mcp,bonitoteam-worker-start}
+#   ~/.config/systemd/user/bonitoteam-worker.service
+#   ~/bonitoteam-projects/                  rsync target for project sources
+set -eu
+
+SERVER="{{SERVER_URL}}"
+SECRET="{{WORKER_SECRET}}"
+PORT="{{WORKER_PORT}}"
+INSTALL_ROOT="$HOME/.local/share/bonitoteam"
+PKG_DIR="$INSTALL_ROOT/BonitoTeam"
+BIN_DIR="$HOME/.local/bin"
+PROJECTS_ROOT="$HOME/bonitoteam-projects"
+
+echo "==> BonitoTeam worker installer"
+echo "    Server : $SERVER"
+echo "    Port   : $PORT"
+
+mkdir -p "$INSTALL_ROOT" "$BIN_DIR" "$PROJECTS_ROOT"
+
+# Make user-local bins available for the rest of this script
+export PATH="$BIN_DIR:$HOME/.juliaup/bin:$PATH"
+
+step() { echo ""; echo "==> $*"; }
+
+# ── Prerequisites: claude, claude-agent-acp, npm (user-managed) ──────────────
+# We assume you've already installed and logged in to Claude Code via your usual
+# means (e.g. `npm install -g @anthropic-ai/claude-code` + `claude login`). The
+# installer only verifies they're on PATH.
+step "Prerequisites in PATH"
+missing=""
+for bin in npm claude claude-agent-acp; do
+    if command -v "$bin" > /dev/null 2>&1; then
+        echo "    ok   : $bin → $(command -v "$bin")"
+    else
+        echo "    MISS : $bin"
+        missing="$missing $bin"
+    fi
+done
+if [ -n "$missing" ]; then
+    echo ""
+    echo "ERROR: missing required binaries:$missing"
+    echo "       Install with:"
+    echo "         npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp"
+    echo "         claude login"
+    exit 1
+fi
+
+# ── Julia (via juliaup; no-sudo, downloads official tarball) ──────────────────
+step "Julia"
+if ! command -v juliaup > /dev/null 2>&1; then
+    echo "    juliaup missing — installing..."
+    curl -fsSL https://install.julialang.org | sh -s -- --yes
+    export PATH="$HOME/.juliaup/bin:$PATH"
+fi
+if ! command -v julia > /dev/null 2>&1; then
+    juliaup add lts && juliaup default lts
+fi
+echo "    julia: $(julia --version)"
+
+# ── BonitoTeam package bundle ────────────────────────────────────────────────
+step "BonitoTeam package bundle"
+TMP_TAR="$(mktemp -t bonitoteam-bundle.XXXXXX.tar.gz)"
+trap 'rm -f "$TMP_TAR"' EXIT
+echo "    fetching $SERVER/worker/bundle.tar.gz..."
+curl -fsSL "$SERVER/worker/bundle.tar.gz" -o "$TMP_TAR"
+tar -xzf "$TMP_TAR" -C "$INSTALL_ROOT"
+chmod +x "$PKG_DIR/bin/"*
+echo "    extracted to $PKG_DIR"
+
+step "Julia env (instantiate + precompile)"
+julia --project="$PKG_DIR" --startup-file=no \
+    -e 'import Pkg; Pkg.instantiate(); Pkg.precompile()'
+
+# ── Wrappers + startup shim ──────────────────────────────────────────────────
+step "Wrappers + startup shim"
+ln -sf "$PKG_DIR/bin/bonitoteam-mcp"    "$BIN_DIR/bonitoteam-mcp"
+ln -sf "$PKG_DIR/bin/bonitoteam-worker" "$BIN_DIR/bonitoteam-worker"
+
+cat > "$BIN_DIR/bonitoteam-worker-start" << 'STARTSCRIPT'
+#!/usr/bin/env sh
+export BONITOTEAM_WORKER_SECRET="__SECRET__"
+export BONITOTEAM_WORKER_PORT="${BONITOTEAM_WORKER_PORT:-__PORT__}"
+export BONITOTEAM_WORKER_HOST="${BONITOTEAM_WORKER_HOST:-0.0.0.0}"
+export BONITOTEAM_MCP_BIN="${BONITOTEAM_MCP_BIN:-__BINDIR__/bonitoteam-mcp}"
+export BONITOTEAM_PROJECTS_ROOT="${BONITOTEAM_PROJECTS_ROOT:-__PROJROOT__}"
+export BONITOTEAM_SERVER_URL="${BONITOTEAM_SERVER_URL:-__SERVER__}"
+# Override BONITOTEAM_REGISTER_HOST if `hostname` doesn't resolve from the server side.
+export PATH="$HOME/.juliaup/bin:$PATH"
+exec "__BINDIR__/bonitoteam-worker"
+STARTSCRIPT
+sed -i.bak \
+    -e "s@__SECRET__@$SECRET@g" \
+    -e "s@__PORT__@$PORT@g" \
+    -e "s@__BINDIR__@$BIN_DIR@g" \
+    -e "s@__PROJROOT__@$PROJECTS_ROOT@g" \
+    -e "s@__SERVER__@$SERVER@g" \
+    "$BIN_DIR/bonitoteam-worker-start"
+rm -f "$BIN_DIR/bonitoteam-worker-start.bak"
+chmod +x "$BIN_DIR/bonitoteam-worker-start"
+
+# ── systemd user service: enable + start ─────────────────────────────────────
+step "systemd user service"
+if command -v systemctl > /dev/null 2>&1; then
+    SVCDIR="$HOME/.config/systemd/user"
+    mkdir -p "$SVCDIR"
+    cat > "$SVCDIR/bonitoteam-worker.service" << SVCFILE
+[Unit]
+Description=BonitoTeam agent worker
+After=network.target
+
+[Service]
+ExecStart=$BIN_DIR/bonitoteam-worker-start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+SVCFILE
+    systemctl --user daemon-reload
+    systemctl --user enable bonitoteam-worker > /dev/null 2>&1 || true
+    systemctl --user restart bonitoteam-worker
+    sleep 1
+    if systemctl --user is-active --quiet bonitoteam-worker; then
+        echo "    bonitoteam-worker.service: active"
+    else
+        echo "    bonitoteam-worker.service failed to start. Check: journalctl --user -u bonitoteam-worker -e"
+    fi
+else
+    echo "    no systemctl — start manually: $BIN_DIR/bonitoteam-worker-start"
+fi
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+echo ""
+echo "==> Installation complete."
+echo "    On startup the worker self-registers with $SERVER and appears in the dashboard."
+echo "    If $(hostname) doesn't resolve from the server, set BONITOTEAM_REGISTER_HOST=<reachable-ip>"
+echo "    in $BIN_DIR/bonitoteam-worker-start, then: systemctl --user restart bonitoteam-worker"

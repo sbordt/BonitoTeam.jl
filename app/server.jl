@@ -1,0 +1,133 @@
+using Bonito, AgentClientProtocol, Dates, TOML, UUIDs, HTTP
+
+include("styles.jl")
+include("chat.jl")                  # defines message types (UserMsg, AgentMsg, …)
+include("persistence.jl")           # uses those types in its method signatures
+include("../src/Worker/Worker.jl")
+include("dashboard.jl")             # WORKERS / PROJECTS state + dashboard_app
+
+const INSTALL_TEMPLATE = read(joinpath(@__DIR__, "install_template.sh"), String)
+const BONITOTEAM_PKG_DIR = normpath(joinpath(@__DIR__, ".."))   # dev/BonitoTeam
+
+# Lazily-built tarball of the BonitoTeam package files the worker needs.
+# Rebuilt on every request so local edits during development show up without
+# restarting the server. (Negligible cost: a few KB of source.)
+const WORKER_BUNDLE_PATHS = [
+    "Project.toml",
+    "src/BonitoTeam.jl",
+    "src/MCP",
+    "src/Worker/worker_standalone.jl",
+    "bin/bonitoteam-mcp",
+    "bin/bonitoteam-worker",
+]
+
+function build_worker_bundle()::Vector{UInt8}
+    tmp = tempname() * ".tar.gz"
+    # Tar from inside the package dir; --transform prefixes every path with
+    # "BonitoTeam/" so the archive extracts as $INSTALL_ROOT/BonitoTeam/...
+    run(Cmd(`tar -czf $tmp --transform=s,^,BonitoTeam/, $(WORKER_BUNDLE_PATHS)`;
+            dir = BONITOTEAM_PKG_DIR))
+    bytes = read(tmp)
+    rm(tmp; force=true)
+    return bytes
+end
+
+"""
+    serve(; host, port, public_url, worker_secret, worker_port, state_dir) → Bonito.Server
+
+Start the BonitoTeam dashboard server. Routes:
+
+  /                  — dashboard (workers + projects)
+  /p/<project_id>    — chat UI for one project
+  /install.sh        — worker installer (curl-pipeable)
+  /worker/bundle.tar.gz — package files the installer downloads
+
+`worker_secret` is the shared secret used by every worker spawned via the
+install script. `public_url` is the base URL the install script tells workers
+to fetch the bundle from; defaults to `http://localhost:<port>`.
+
+`state_dir` overrides where workers.json / projects.json are persisted
+(default: `~/.local/share/bonitoteam-server`).
+"""
+function serve(; host::String        = "0.0.0.0",
+                 port::Int           = 8038,
+                 public_url::Union{String,Nothing} = nothing,
+                 worker_secret::String,
+                 worker_port::Int    = 8039,
+                 state_dir::Union{String,Nothing} = nothing)
+
+    state_dir === nothing || (SERVER_STATE_DIR[] = state_dir)
+    load_workers!()
+    load_projects!()
+
+    # The dashboard needs a handle to the live Server to register per-project
+    # routes after construction. Create the Ref first; fill it after Server() returns.
+    srv_ref = Ref{Bonito.Server}()
+    dash = dashboard_app(srv_ref)
+
+    # proxy_url="." → relative WebSocket URLs; required for access through any reverse proxy or tunnel
+    srv = Bonito.Server(dash, host, port; proxy_url = ".")
+    srv_ref[] = srv
+
+    base_url = something(public_url, "http://localhost:$port")
+    add_install_routes!(srv, base_url, worker_secret, worker_port)
+
+    # Re-attach previously-saved projects (registers /p/<id> for each)
+    for p in values(PROJECTS)
+        try
+            reattach_project!(srv, p)
+        catch e
+            @warn "Failed to reattach project" project=p.name exception=e
+        end
+    end
+
+    start_heartbeat!()
+
+    @info "BonitoTeam dashboard running" url="http://localhost:$port" state=SERVER_STATE_DIR[]
+    @info "Worker install endpoint"      url="$base_url/install.sh"
+    return srv
+end
+
+# ── Worker install routes ──────────────────────────────────────────────────────
+
+function add_install_routes!(srv::Bonito.Server, public_url::String,
+                              worker_secret::String, worker_port::Int)
+    Bonito.route!(srv, "/install.sh" => function(context)
+        script = render_install_script(public_url, worker_secret, worker_port)
+        HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], body=script)
+    end)
+
+    Bonito.route!(srv, "/worker/bundle.tar.gz" => function(context)
+        bytes = build_worker_bundle()
+        HTTP.Response(200, ["Content-Type" => "application/gzip"], body=bytes)
+    end)
+
+    # Self-registration: worker POSTs {secret, host, port, name} on startup.
+    # Server probes the worker, stores it in WORKERS, dashboard re-renders.
+    Bonito.route!(srv, "/api/workers/register" => function(context)
+        try
+            body = JSON.parse(String(context.request.body))
+            get(body, "secret", "") == worker_secret ||
+                return HTTP.Response(401, JSON.json(Dict("error" => "unauthorized")))
+            host = String(get(body, "host", ""))
+            isempty(host) && return HTTP.Response(400, JSON.json(Dict("error" => "missing host")))
+            port = Int(get(body, "port", worker_port))
+            name = String(get(body, "name", host))
+            url  = "ws://$host:$port"
+            w = register_worker!(name, url, worker_secret)
+            HTTP.Response(200, ["Content-Type" => "application/json"],
+                          body = JSON.json(Dict("ok"=>true, "name"=>w.name, "url"=>w.url)))
+        catch e
+            HTTP.Response(500, ["Content-Type" => "application/json"],
+                          body = JSON.json(Dict("error" => string(e))))
+        end
+    end)
+end
+
+function render_install_script(public_url::String, worker_secret::String, worker_port::Int)
+    replace(INSTALL_TEMPLATE,
+        "{{SERVER_URL}}"     => public_url,
+        "{{WORKER_SECRET}}"  => worker_secret,
+        "{{WORKER_PORT}}"    => string(worker_port),
+    )
+end

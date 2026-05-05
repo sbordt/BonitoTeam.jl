@@ -1,0 +1,9 @@
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+/docs/build/
+/docs/site/
+.DS_Store
+.vscode/
+.idea/
+node_modules/

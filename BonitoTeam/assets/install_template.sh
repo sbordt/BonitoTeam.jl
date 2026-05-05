@@ -4,17 +4,19 @@
 # Re-runs:  same command — every step is "check / update / create".
 #
 # Layout after install:
-#   ~/.local/share/bonitoteam/BonitoTeam/   package files (Project.toml, src, bin)
+#   ~/.local/share/bonitoteam/BonitoMCP/      stdio MCP server (own Julia env)
+#   ~/.local/share/bonitoteam/BonitoWorker/   WS relay (own Julia env)
 #   ~/.local/bin/{bonitoteam-worker,bonitoteam-mcp,bonitoteam-worker-start}
 #   ~/.config/systemd/user/bonitoteam-worker.service
-#   ~/bonitoteam-projects/                  rsync target for project sources
+#   ~/bonitoteam-projects/                    rsync target for project sources
 set -eu
 
 SERVER="{{SERVER_URL}}"
 SECRET="{{WORKER_SECRET}}"
 PORT="{{WORKER_PORT}}"
 INSTALL_ROOT="$HOME/.local/share/bonitoteam"
-PKG_DIR="$INSTALL_ROOT/BonitoTeam"
+MCP_DIR="$INSTALL_ROOT/BonitoMCP"
+WORKER_DIR="$INSTALL_ROOT/BonitoWorker"
 BIN_DIR="$HOME/.local/bin"
 PROJECTS_ROOT="$HOME/bonitoteam-projects"
 
@@ -37,7 +39,7 @@ step "Prerequisites in PATH"
 missing=""
 for bin in npm claude claude-agent-acp; do
     if command -v "$bin" > /dev/null 2>&1; then
-        echo "    ok   : $bin → $(command -v "$bin")"
+        echo "    ok   : $bin -> $(command -v "$bin")"
     else
         echo "    MISS : $bin"
         missing="$missing $bin"
@@ -52,7 +54,7 @@ if [ -n "$missing" ]; then
     exit 1
 fi
 
-# ── Julia (via juliaup; no-sudo, downloads official tarball) ──────────────────
+# ── Julia (via juliaup) ───────────────────────────────────────────────────────
 step "Julia"
 if ! command -v juliaup > /dev/null 2>&1; then
     echo "    juliaup missing — installing..."
@@ -64,24 +66,28 @@ if ! command -v julia > /dev/null 2>&1; then
 fi
 echo "    julia: $(julia --version)"
 
-# ── BonitoTeam package bundle ────────────────────────────────────────────────
-step "BonitoTeam package bundle"
+# ── Worker bundle (BonitoMCP + BonitoWorker source trees) ────────────────────
+step "Worker bundle"
 TMP_TAR="$(mktemp -t bonitoteam-bundle.XXXXXX.tar.gz)"
 trap 'rm -f "$TMP_TAR"' EXIT
 echo "    fetching $SERVER/worker/bundle.tar.gz..."
 curl -fsSL "$SERVER/worker/bundle.tar.gz" -o "$TMP_TAR"
 tar -xzf "$TMP_TAR" -C "$INSTALL_ROOT"
-chmod +x "$PKG_DIR/bin/"*
-echo "    extracted to $PKG_DIR"
+chmod +x "$MCP_DIR/bin/"* "$WORKER_DIR/bin/"*
+echo "    extracted to $INSTALL_ROOT"
 
-step "Julia env (instantiate + precompile)"
-julia --project="$PKG_DIR" --startup-file=no \
+step "Instantiate Julia envs"
+echo "    BonitoMCP..."
+julia --project="$MCP_DIR" --startup-file=no \
+    -e 'import Pkg; Pkg.instantiate(); Pkg.precompile()'
+echo "    BonitoWorker..."
+julia --project="$WORKER_DIR" --startup-file=no \
     -e 'import Pkg; Pkg.instantiate(); Pkg.precompile()'
 
 # ── Wrappers + startup shim ──────────────────────────────────────────────────
 step "Wrappers + startup shim"
-ln -sf "$PKG_DIR/bin/bonitoteam-mcp"    "$BIN_DIR/bonitoteam-mcp"
-ln -sf "$PKG_DIR/bin/bonitoteam-worker" "$BIN_DIR/bonitoteam-worker"
+ln -sf "$MCP_DIR/bin/bonitoteam-mcp"       "$BIN_DIR/bonitoteam-mcp"
+ln -sf "$WORKER_DIR/bin/bonitoteam-worker" "$BIN_DIR/bonitoteam-worker"
 
 cat > "$BIN_DIR/bonitoteam-worker-start" << 'STARTSCRIPT'
 #!/usr/bin/env sh

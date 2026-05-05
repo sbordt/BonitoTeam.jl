@@ -1,6 +1,4 @@
-using Bonito, AgentClientProtocol, Markdown, JSON, UUIDs
-
-const BonitoTeamJS = Bonito.Asset(joinpath(@__DIR__, "bonitoteam.js"))
+const BonitoTeamJS = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "bonitoteam.js"))
 
 # ── Message types ─────────────────────────────────────────────────────────────
 

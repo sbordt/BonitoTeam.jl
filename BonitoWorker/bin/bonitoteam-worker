@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
-# BonitoTeam worker — run on the machine where claude-agent-acp executes.
+# BonitoWorker — thin WS relay running on the machine where claude-agent-acp executes.
 #
 # Usage:
 #   BONITOTEAM_WORKER_SECRET=<shared-secret> bonitoteam-worker
 #
-# The server connects to this worker at ws://<worker-host>:<port>
-# and routes the ACP session through the WebSocket tunnel.
-#
-# Environment variables:
+# Env:
 #   BONITOTEAM_WORKER_SECRET   — shared secret for auth (required)
-#   BONITOTEAM_WORKER_PORT     — port to listen on (default: 8039)
+#   BONITOTEAM_WORKER_PORT     — listen port (default: 8039)
 #   BONITOTEAM_WORKER_HOST     — bind address (default: 0.0.0.0)
-#   BONITOTEAM_MCP_BIN         — path to bonitoteam-mcp (auto: sibling of this script)
+#   BONITOTEAM_SERVER_URL      — server URL for self-registration (optional)
+#   BONITOTEAM_MCP_BIN         — path to bonitoteam-mcp (default: ../BonitoMCP/bin/bonitoteam-mcp)
 #   BONITOTEAM_PROJECTS_ROOT   — root for rsync'd projects (default: ~/bonitoteam-projects)
+#   BONITOTEAM_REGISTER_HOST   — override hostname reported during self-registration
 #   CLAUDE_AGENT_ACP           — path to claude-agent-acp binary (optional)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+MONOREPO_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 
 if [[ -z "${BONITOTEAM_WORKER_SECRET:-}" ]]; then
     echo "ERROR: BONITOTEAM_WORKER_SECRET must be set" >&2
     exit 1
 fi
 
-# Default MCP path to the sibling wrapper if not overridden
-export BONITOTEAM_MCP_BIN="${BONITOTEAM_MCP_BIN:-${SCRIPT_DIR}/bonitoteam-mcp}"
+# Default MCP path to the sibling BonitoMCP/bin/bonitoteam-mcp wrapper
+export BONITOTEAM_MCP_BIN="${BONITOTEAM_MCP_BIN:-${MONOREPO_DIR}/BonitoMCP/bin/bonitoteam-mcp}"
 
 exec julia \
     "--project=${PROJECT_DIR}" \
     --startup-file=no \
     --threads=auto \
-    "${PROJECT_DIR}/src/Worker/worker_standalone.jl"
+    "${PROJECT_DIR}/src/worker_standalone.jl"

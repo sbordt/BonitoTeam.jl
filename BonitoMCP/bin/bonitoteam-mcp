@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# Standalone wrapper for BonitoTeam.MCP stdio server.
+# Standalone wrapper for BonitoMCP stdio server.
 #
 # Configure in Claude Code (~/.claude.json mcpServers):
 #   "bonitoteam": {
 #     "type": "stdio",
-#     "command": "/path/to/dev/BonitoTeam/bin/bonitoteam-mcp"
+#     "command": "/path/to/BonitoMCP/bin/bonitoteam-mcp"
 #   }
 #
-# Cold start (first run): ~10-20s while Julia precompiles BonitoTeam.
-# Subsequent starts: ~3-5s from the precompile cache.
-# Run once manually in a terminal before registering to warm the cache.
+# Cold start (first run): ~5-15s while Julia precompiles BonitoMCP.
+# Subsequent starts: ~1-3s from the precompile cache.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -18,4 +17,4 @@ exec julia \
     "--project=${PROJECT_DIR}" \
     --startup-file=no \
     --threads=auto \
-    -e 'using BonitoTeam; BonitoTeam.MCP.run_stdio()'
+    -e 'using BonitoMCP; BonitoMCP.run_stdio()'

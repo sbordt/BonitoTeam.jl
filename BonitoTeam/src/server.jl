@@ -1,32 +1,21 @@
-using Bonito, AgentClientProtocol, Dates, TOML, UUIDs, HTTP
+# Path to the BonitoTeam package's assets/ (install_template.sh, bonitoteam.js)
+const ASSETS_DIR    = normpath(joinpath(@__DIR__, "..", "assets"))
+# Monorepo root (sibling of BonitoTeam/) — contains BonitoMCP/, BonitoWorker/, AgentClientProtocol/.
+const MONOREPO_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 
-include("styles.jl")
-include("chat.jl")                  # defines message types (UserMsg, AgentMsg, …)
-include("persistence.jl")           # uses those types in its method signatures
-include("../src/Worker/Worker.jl")
-include("dashboard.jl")             # WORKERS / PROJECTS state + dashboard_app
+const INSTALL_TEMPLATE = read(joinpath(ASSETS_DIR, "install_template.sh"), String)
 
-const INSTALL_TEMPLATE = read(joinpath(@__DIR__, "install_template.sh"), String)
-const BONITOTEAM_PKG_DIR = normpath(joinpath(@__DIR__, ".."))   # dev/BonitoTeam
-
-# Lazily-built tarball of the BonitoTeam package files the worker needs.
-# Rebuilt on every request so local edits during development show up without
-# restarting the server. (Negligible cost: a few KB of source.)
+# Worker bundle: ships the lean BonitoMCP and BonitoWorker packages. The worker
+# installs each into its own --project=<dir>. Rebuilt on every request so local
+# edits show up without restarting the server.
 const WORKER_BUNDLE_PATHS = [
-    "Project.toml",
-    "src/BonitoTeam.jl",
-    "src/MCP",
-    "src/Worker/worker_standalone.jl",
-    "bin/bonitoteam-mcp",
-    "bin/bonitoteam-worker",
+    "BonitoMCP",
+    "BonitoWorker",
 ]
 
 function build_worker_bundle()::Vector{UInt8}
     tmp = tempname() * ".tar.gz"
-    # Tar from inside the package dir; --transform prefixes every path with
-    # "BonitoTeam/" so the archive extracts as $INSTALL_ROOT/BonitoTeam/...
-    run(Cmd(`tar -czf $tmp --transform=s,^,BonitoTeam/, $(WORKER_BUNDLE_PATHS)`;
-            dir = BONITOTEAM_PKG_DIR))
+    run(Cmd(`tar -czf $tmp $(WORKER_BUNDLE_PATHS)`; dir = MONOREPO_ROOT))
     bytes = read(tmp)
     rm(tmp; force=true)
     return bytes
@@ -46,17 +35,24 @@ Start the BonitoTeam dashboard server. Routes:
 install script. `public_url` is the base URL the install script tells workers
 to fetch the bundle from; defaults to `http://localhost:<port>`.
 
-`state_dir` overrides where workers.json / projects.json are persisted
-(default: `~/.local/share/bonitoteam-server`).
+`state_dir`   overrides where workers.json / projects.json are persisted
+              (default: `~/.local/share/bonitoteam-server`).
+`working_dir` overrides where canonical project copies live on the server.
+              Each project lives at `<working_dir>/<name>` and is mirrored
+              onto the worker at `<worker.projects_root>/<name>`.
+              (default: `~/bonitoteam-server`)
 """
 function serve(; host::String        = "0.0.0.0",
                  port::Int           = 8038,
-                 public_url::Union{String,Nothing} = nothing,
+                 public_url::Union{String,Nothing}   = nothing,
                  worker_secret::String,
                  worker_port::Int    = 8039,
-                 state_dir::Union{String,Nothing} = nothing)
+                 state_dir::Union{String,Nothing}   = nothing,
+                 working_dir::Union{String,Nothing} = nothing)
 
-    state_dir === nothing || (SERVER_STATE_DIR[] = state_dir)
+    state_dir   === nothing || (SERVER_STATE_DIR[]   = state_dir)
+    working_dir === nothing || (SERVER_WORKING_DIR[] = working_dir)
+    mkpath(SERVER_WORKING_DIR[])
     load_workers!()
     load_projects!()
 
@@ -65,7 +61,9 @@ function serve(; host::String        = "0.0.0.0",
     srv_ref = Ref{Bonito.Server}()
     dash = dashboard_app(srv_ref)
 
-    # proxy_url="." → relative WebSocket URLs; required for access through any reverse proxy or tunnel
+    # proxy_url="." → page-relative asset URLs. Bonito's asset route is a
+    # regex (`/assets/<40hex>-...`) that matches at any prefix, so requests
+    # like /p/<id>/assets/<hex>-foo.js still reach the asset server.
     srv = Bonito.Server(dash, host, port; proxy_url = ".")
     srv_ref[] = srv
 

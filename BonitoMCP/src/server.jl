@@ -2,7 +2,7 @@
 # each response is one line on stdout. stderr is free for logging.
 
 # Structured logger (stderr) — never write non-MCP content to stdout
-log_info(msg) = println(stderr, "[BonitoTeam.MCP] ", msg)
+log_info(msg) = println(stderr, "[$SERVER_NAME] ", msg)
 
 function send!(out::IO, payload::AbstractDict)
     println(out, JSON.json(payload))

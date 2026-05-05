@@ -9,6 +9,7 @@ Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 BonitoMCP = "4a1c91af-1c90-46a4-8594-a3846516869d"
 BonitoWorker = "98909ed9-6989-4829-81af-73688ee23085"
+CommonMark = "a80b9123-70ca-4bc0-993e-6e3bcb318db6"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
@@ -20,6 +21,9 @@ UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 AgentClientProtocol = {path = "../AgentClientProtocol"}
 BonitoMCP           = {path = "../BonitoMCP"}
 BonitoWorker        = {path = "../BonitoWorker"}
+# Use the local dev'd Bonito (sibling of the monorepo) so our patches to
+# relative_url etc. take effect without round-tripping a release.
+Bonito              = {path = "../../Bonito"}
 
 [compat]
 HTTP = "1"

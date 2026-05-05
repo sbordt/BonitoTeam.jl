@@ -1,18 +1,22 @@
-using Bonito, AgentClientProtocol, JSON, UUIDs, Dates
-
 # ── Persistent server state (workers + projects) ──────────────────────────────
 
-const SERVER_STATE_DIR = Ref(joinpath(homedir(), ".local", "share", "bonitoteam-server"))
-state_dir() = SERVER_STATE_DIR[]
-workers_file()  = joinpath(state_dir(), "workers.json")
-projects_file() = joinpath(state_dir(), "projects.json")
+const SERVER_STATE_DIR  = Ref(joinpath(homedir(), ".local", "share", "bonitoteam-server"))
+# Where canonical project copies live on the SERVER. Each project lives at
+# `<SERVER_WORKING_DIR>/<name>` and is mirrored onto the worker at
+# `<worker.projects_root>/<name>`.
+const SERVER_WORKING_DIR = Ref(joinpath(homedir(), "bonitoteam-server"))
+
+state_dir()         = SERVER_STATE_DIR[]
+working_dir()       = SERVER_WORKING_DIR[]
+workers_file()      = joinpath(state_dir(), "workers.json")
+projects_file()     = joinpath(state_dir(), "projects.json")
 
 mutable struct WorkerInfo
     name::String                       # display name (unique key)
     url::String                        # ws://host:port
     secret::String
-    ssh_target::Union{String,Nothing}  # for rsync: "user@host", nothing → no rsync
-    # discovered via Worker.probe
+    ssh_target::Union{String,Nothing}  # for ssh-based rsync: "user@host". nothing → local rsync
+    # discovered via probe
     hostname::String
     home::String
     mcp_path::String                   # path on worker, used for MCPServer config
@@ -24,10 +28,10 @@ end
 
 mutable struct ProjectInfo
     id::String                         # short uuid
-    name::String                       # display + dst dir name
+    name::String                       # display name + dir name (server + worker)
     worker_name::String                # FK to WORKERS
-    src_path::String                   # absolute path on server (rsync source)
-    dst_path::String                   # absolute path on worker (rsync dest)
+    server_path::String                # canonical copy on server (= working_dir/name)
+    worker_path::String                # mirrored copy on worker (= worker.projects_root/name)
     created::DateTime
 end
 
@@ -70,7 +74,7 @@ end
 function save_projects!()
     mkpath(state_dir())
     data = [Dict("id" => p.id, "name" => p.name, "worker_name" => p.worker_name,
-                 "src_path" => p.src_path, "dst_path" => p.dst_path,
+                 "server_path" => p.server_path, "worker_path" => p.worker_path,
                  "created" => string(p.created))
             for p in values(PROJECTS)]
     open(projects_file(), "w") do io
@@ -82,7 +86,7 @@ function load_projects!()
     isfile(projects_file()) || return
     for d in JSON.parsefile(projects_file())
         p = ProjectInfo(d["id"], d["name"], d["worker_name"],
-                        d["src_path"], d["dst_path"],
+                        d["server_path"], d["worker_path"],
                         DateTime(d["created"]))
         PROJECTS[p.id] = p
     end
@@ -96,7 +100,7 @@ Throws on probe failure.
 """
 function register_worker!(name::String, url::String, secret::String;
                           ssh_target::Union{String,Nothing} = nothing)
-    caps = Worker.probe(url, secret)
+    caps = probe(url, secret)
     w = WorkerInfo(name, url, secret, ssh_target,
                    String(get(caps, "hostname", "")),
                    String(get(caps, "home", "")),
@@ -115,7 +119,7 @@ Health-check an existing worker. Updates `status` and `last_check` in-place.
 function check_worker!(w::WorkerInfo)
     w.last_check = now(UTC)
     new_status = try
-        Worker.probe(w.url, w.secret; timeout = 3.0)
+        probe(w.url, w.secret; timeout = 3.0)
         :online
     catch
         :offline
@@ -156,27 +160,75 @@ stop_heartbeat!() = (HEARTBEAT_RUNNING[] = false)
 # ── Rsync orchestration ───────────────────────────────────────────────────────
 
 """
-Push `src` → `ssh_target:dst` via rsync. Creates dst's parent dir on the
-worker first. Source ends in `/` so contents are placed *into* dst.
+Push `src` → `dst` via rsync. If `ssh_target` is `nothing` the destination
+is treated as a local path (server and worker share filesystem); otherwise
+the rsync goes over ssh to `ssh_target:dst`. Source contents (not the dir
+itself) are placed into `dst`.
 """
-function rsync_to_worker(src::String, ssh_target::String, dst::String)
+function rsync_to_worker(src::String, ssh_target::Union{String,Nothing}, dst::String)
     isdir(src) || error("Source path is not a directory: $src")
-    parent = dirname(rstrip(dst, '/'))
-    run(`ssh $ssh_target mkdir -p $parent`)
     src_with_slash = endswith(src, '/') ? src : src * "/"
-    @info "rsync" src_with_slash ssh_target dst
-    run(`rsync -az --delete $src_with_slash $ssh_target:$dst/`)
+    parent = dirname(rstrip(dst, '/'))
+
+    if ssh_target === nothing
+        @info "rsync (local)" src_with_slash dst
+        mkpath(parent)
+        run(`rsync -az --delete $src_with_slash $(dst)/`)
+    else
+        @info "rsync (ssh)" src_with_slash ssh_target dst
+        run(`ssh $ssh_target mkdir -p $parent`)
+        run(`rsync -az --delete $src_with_slash $ssh_target:$dst/`)
+    end
     return nothing
 end
 
 # ── Project lifecycle ─────────────────────────────────────────────────────────
 
+# rsync between worker and server for the bidirectional Sync button. --update
+# means "skip files that are newer on the destination" — newest version wins
+# per file.
+function rsync_pull_from_worker!(src_path_on_worker::String,
+                                  ssh_target::Union{String,Nothing},
+                                  dst_path_on_server::String)
+    src = endswith(src_path_on_worker, '/') ? src_path_on_worker : src_path_on_worker * "/"
+    dst = endswith(dst_path_on_server, '/') ? dst_path_on_server : dst_path_on_server * "/"
+    if ssh_target === nothing
+        @info "rsync pull (local)" src dst
+        mkpath(dst_path_on_server)
+        run(`rsync -azu $src $dst`)
+    else
+        @info "rsync pull (ssh)" src dst ssh_target
+        mkpath(dst_path_on_server)
+        run(`rsync -azu $ssh_target:$src $dst`)
+    end
+    return nothing
+end
+
+function rsync_push_to_worker!(src_path_on_server::String,
+                                ssh_target::Union{String,Nothing},
+                                dst_path_on_worker::String)
+    src = endswith(src_path_on_server, '/') ? src_path_on_server : src_path_on_server * "/"
+    dst = endswith(dst_path_on_worker, '/') ? dst_path_on_worker : dst_path_on_worker * "/"
+    parent = dirname(rstrip(dst, '/'))
+    if ssh_target === nothing
+        @info "rsync push (local)" src dst
+        mkpath(parent)
+        run(`rsync -azu $src $dst`)
+    else
+        @info "rsync push (ssh)" src dst ssh_target
+        run(`ssh $ssh_target mkdir -p $parent`)
+        run(`rsync -azu $src $ssh_target:$dst`)
+    end
+    return nothing
+end
+
 """
 Create a new project on the named worker. Steps:
-1. Validate worker + paths
-2. rsync src_path → worker:projects_root/name (only if worker has ssh_target)
-3. Build chat_app wired to ACP session on the worker (with bonitoteam MCP)
-4. Register `/p/<id>` route on the live server
+1. Seed `<server_working_dir>/<name>` from the picked source folder (if not
+   already there).
+2. Mirror to `<worker.projects_root>/<name>`.
+3. Build chat_app wired to an ACP session on the worker (with bonitoteam MCP).
+4. Register `/p/<id>` route on the live server.
 """
 function create_project!(srv::Bonito.Server, name::String, src_path::String,
                           worker_name::String)
@@ -184,48 +236,68 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
     isempty(name) && error("Project name must not be empty")
     occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
         error("Project name must be alphanumeric/_/- only")
+    isempty(src_path) && error("Source path is required (pick a folder).")
+    isdir(src_path)   || error("Source path is not a directory: $src_path")
 
     w = WORKERS[worker_name]
-    id = string(uuid4())[1:8]
-    dst_path = joinpath(w.projects_root, name)
+    id          = string(uuid4())[1:8]
+    server_path = joinpath(working_dir(), name)
+    worker_path = joinpath(w.projects_root, name)
 
-    # 1. Push source files to the worker
-    if w.ssh_target !== nothing && !isempty(src_path)
-        rsync_to_worker(src_path, w.ssh_target, dst_path)
-    else
-        @warn "Worker has no ssh_target — skipping rsync. Files must already exist on the worker." worker=worker_name dst_path
+    # 1. Seed the canonical server-side copy from the picked source (no-op if
+    #    the user picked exactly server_path).
+    if abspath(src_path) != abspath(server_path)
+        @info "Seeding server-side mirror" src_path server_path
+        mkpath(working_dir())
+        run(`rsync -az $(rstrip(src_path, '/'))/ $(rstrip(server_path, '/'))/`)
     end
 
-    # 2. Build the chat app (one ACP session per project, started lazily inside
-    #    chat_app via client_factory)
+    # 2. Mirror server → worker.
+    rsync_push_to_worker!(server_path, w.ssh_target, worker_path)
+
+    # 3. Build the chat app — one ACP session per project, started inside
+    #    chat_app via client_factory.
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
         [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path)]
-    client_factory = on_update -> Worker.connect(w.url, w.secret, dst_path;
+    client_factory = on_update -> connect_worker(w.url, w.secret, worker_path;
                                                   on_update, mcp_servers = mcp)
-    app = chat_app(dst_path; mcp_servers = mcp, client_factory = client_factory)
+    app = chat_app(server_path; mcp_servers = mcp, client_factory = client_factory)
 
     PROJECT_APPS[id] = app
-    PROJECTS[id] = ProjectInfo(id, name, worker_name, src_path, dst_path, now(UTC))
+    PROJECTS[id] = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     save_projects!()
 
-    # 3. Register the route so /p/<id> serves this project's chat
+    # 4. Register the per-project route.
     Bonito.route!(srv, "/p/$id" => app)
     bump_state!()
     return PROJECTS[id]
 end
 
 """
+Bidirectional sync for an existing project. Pulls worker → server first
+(picks up claude's edits), then pushes server → worker (any user edits).
+Both passes use --update so newer files win on each side per-file.
+"""
+function sync_project!(p::ProjectInfo)
+    haskey(WORKERS, p.worker_name) || error("Worker '$(p.worker_name)' not registered")
+    w = WORKERS[p.worker_name]
+    rsync_pull_from_worker!(p.worker_path, w.ssh_target, p.server_path)
+    rsync_push_to_worker!(p.server_path,    w.ssh_target, p.worker_path)
+    return nothing
+end
+
+"""
 Re-attach an already-loaded project (called at server startup for each entry
-in projects.json). Does NOT rsync; assumes files are already on the worker.
+in projects.json). Does NOT rsync; assumes mirrors are already in sync.
 """
 function reattach_project!(srv::Bonito.Server, p::ProjectInfo)
     haskey(WORKERS, p.worker_name) || (@warn "Project worker missing" project=p.name worker=p.worker_name; return)
     w = WORKERS[p.worker_name]
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
         [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path)]
-    client_factory = on_update -> Worker.connect(w.url, w.secret, p.dst_path;
+    client_factory = on_update -> connect_worker(w.url, w.secret, p.worker_path;
                                                   on_update, mcp_servers = mcp)
-    app = chat_app(p.dst_path; mcp_servers = mcp, client_factory = client_factory)
+    app = chat_app(p.server_path; mcp_servers = mcp, client_factory = client_factory)
     PROJECT_APPS[p.id] = app
     Bonito.route!(srv, "/p/$(p.id)" => app)
     return nothing
@@ -382,12 +454,25 @@ function worker_card(w::WorkerInfo)
         class = "bt-card")
 end
 
-function project_card(p::ProjectInfo)
+function project_card(p::ProjectInfo, error_obs::Observable{String})
+    sync_btn = Bonito.Button("⇅ Sync"; class = "bt-btn bt-btn-secondary")
+    on(sync_btn.value) do clicked
+        clicked || return
+        try
+            sync_project!(p)
+            error_obs[] = ""
+        catch e
+            error_obs[] = "Sync failed for $(p.name): $e"
+        end
+    end
     DOM.div(
         DOM.div(
             DOM.div(p.name, class = "bt-card-title"),
-            DOM.div(p.worker_name, " · ", p.dst_path, class = "bt-card-meta")),
-        DOM.a("Open chat →", href = "/p/$(p.id)", target = "_blank"),
+            DOM.div(p.worker_name, " · server: ", p.server_path,
+                    " · worker: ", p.worker_path, class = "bt-card-meta")),
+        DOM.div(sync_btn,
+                DOM.a("Open chat →", href = Bonito.Link("/p/$(p.id)"), target = "_blank"),
+                style = "display:flex;gap:12px;align-items:center"),
         class = "bt-card")
 end
 
@@ -427,7 +512,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     # ── New Project form ──────────────────────────────────────────────────────
     new_proj_show = Observable(false)
     np_name = Observable("")
-    np_picker = FolderPicker()           # `np_picker.selected[]` is the chosen folder
+    np_picker = FolderPicker(working_dir())   # default to server's project working dir
     np_worker = Observable("")
     np_submit = Bonito.Button("Create"; class = "bt-btn")
     np_cancel = Bonito.Button("Cancel"; class = "bt-btn bt-btn-secondary")
@@ -511,7 +596,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         project_list = map(STATE_VERSION) do _
             isempty(PROJECTS) ?
                 DOM.div("No projects yet.", class = "bt-empty") :
-                DOM.div((project_card(p) for p in values(PROJECTS))...)
+                DOM.div((project_card(p, error_obs) for p in values(PROJECTS))...)
         end
 
         worker_form_block = map(add_worker_show) do show

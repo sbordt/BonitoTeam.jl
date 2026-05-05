@@ -1,4 +1,4 @@
-module MCP
+module BonitoMCP
 
 # Standalone Julia stdio MCP server for Claude Code and other MCP clients.
 #
@@ -6,14 +6,14 @@ module MCP
 # Spec mirror: docs/external/mcp-spec-*.md
 #
 # Run:
-#   julia --project=BonitoTeam -e 'using BonitoTeam; BonitoTeam.MCP.run_stdio()'
+#   julia --project=BonitoMCP -e 'using BonitoMCP; BonitoMCP.run_stdio()'
 # or via the wrapper script:
-#   BonitoTeam/bin/bonitoteam-mcp
+#   BonitoMCP/bin/bonitoteam-mcp
 
 using JSON
 
 const PROTOCOL_VERSION = "2025-06-18"
-const SERVER_NAME = "BonitoTeam.MCP"
+const SERVER_NAME = "BonitoMCP"
 const SERVER_VERSION = "0.1.0"
 
 # Tool registry: every tool registers itself at module-init time via register!
@@ -37,4 +37,4 @@ include("server.jl")
 include("output_discipline.jl")
 include("tools/eval.jl")
 
-end # module MCP
+end # module BonitoMCP

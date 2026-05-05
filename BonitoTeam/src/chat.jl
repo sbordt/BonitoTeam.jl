@@ -17,7 +17,7 @@ mutable struct ToolMsg <: ChatMsg
     kind::String
     title::String
     status::String
-    preview::String
+    content::Vector{Any}      # raw ACP content blocks (TextContent / DiffContent / ImageContent)
 end
 
 mutable struct ThoughtMsg <: ChatMsg
@@ -44,7 +44,48 @@ const TOOL_ICONS = Dict(
 
 tool_icon(kind) = get(TOOL_ICONS, kind, "⚙")
 
-# Serialise messages to JSON dicts for JS
+# Short summary shown on the collapsed tool header (before expand).
+function content_summary(kind::AbstractString, content::AbstractVector)
+    isempty(content) && return ""
+    if kind == "edit"
+        for c in content
+            if c isa DiffContent
+                old_n = length(split(something(c.old_text, ""), '\n'))
+                new_n = length(split(c.new_text, '\n'))
+                d     = new_n - old_n
+                return "$(basename(c.path)) · $(d > 0 ? "+$d" : d) lines"
+            end
+        end
+    end
+    # Default: count lines / bytes from the first text-y block
+    for c in content
+        if c isa TextContent
+            n = count('\n', c.text) + 1
+            b = sizeof(c.text)
+            return n <= 1 ? "$(b) bytes" : "$(n) lines · $(b) bytes"
+        elseif c isa DiffContent
+            return basename(c.path)
+        end
+    end
+    return ""
+end
+
+# Header info shipped to JS at message-create time. The full content is NOT
+# included — JS asks via requestToolRender(id) when the user expands.
+function tool_header_dict(m::ToolMsg)
+    Dict{String,Any}(
+        "type"    => "tool",
+        "id"      => m.id,
+        "kind"    => m.kind,
+        "icon"    => tool_icon(m.kind),
+        "title"   => m.title,
+        "status"  => m.status,
+        "summary" => content_summary(m.kind, m.content),
+    )
+end
+
+# Same shape used by msg_to_dict so the JS virtual-scroll renderer treats
+# all messages uniformly.
 function msg_to_dict(m::UserMsg)
     Dict{String,Any}("type" => "user", "text" => m.text)
 end
@@ -54,17 +95,7 @@ function msg_to_dict(m::AgentMsg)
     Dict{String,Any}("type" => "agent", "id" => m.id, "html" => html)
 end
 
-function msg_to_dict(m::ToolMsg)
-    Dict{String,Any}(
-        "type"    => "tool",
-        "id"      => m.id,
-        "kind"    => m.kind,
-        "icon"    => tool_icon(m.kind),
-        "title"   => m.title,
-        "status"  => m.status,
-        "preview" => m.preview,
-    )
-end
+msg_to_dict(m::ToolMsg) = tool_header_dict(m)
 
 function msg_to_dict(m::ThoughtMsg)
     html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
@@ -78,33 +109,96 @@ function msg_to_dict(m::PlanMsg)
     Dict{String,Any}("type" => "plan", "html" => rows)
 end
 
-# Content preview (for tool calls)
-function content_preview(items)
-    for item in items
-        item isa TextContent && return item.text[1:min(end, 120)]
-        item isa DiffContent && return "+ $(item.path)"
+# Tool-body rendering (Bonito DOM tree, includes BonitoBook MonacoEditor /
+# DiffEditor instances). Called only when the user clicks expand; output is
+# shipped to JS via Bonito.dom_in_js, which mounts the sub-DOM (Monaco etc.)
+# inside the placeholder. Collapse on the JS side just empties the placeholder
+# and lets the browser GC the editor instances.
+
+function detect_language(path::AbstractString)
+    ext = lowercase(splitext(path)[2])
+    ext == ".jl"                       && return "julia"
+    ext in (".py", ".pyw")             && return "python"
+    ext in (".js", ".mjs", ".cjs")     && return "javascript"
+    ext in (".ts", ".tsx")             && return "typescript"
+    ext in (".md", ".markdown")        && return "markdown"
+    ext in (".html", ".htm")           && return "html"
+    ext == ".css"                      && return "css"
+    ext == ".json"                     && return "json"
+    ext in (".yml", ".yaml")           && return "yaml"
+    ext == ".toml"                     && return "toml"
+    ext in (".sh", ".bash", ".zsh")    && return "shell"
+    ext in (".rs",)                    && return "rust"
+    ext in (".go",)                    && return "go"
+    return "plaintext"
+end
+
+function render_tool_body(m::ToolMsg)
+    if m.kind == "edit"
+        # Find a DiffContent block; render Monaco DiffEditor.
+        for c in m.content
+            if c isa DiffContent
+                lang = detect_language(c.path)
+                return BonitoBook.DiffEditor(
+                    something(c.old_text, ""),
+                    c.new_text;
+                    language = lang,
+                    renderSideBySide = false,
+                )
+            end
+        end
     end
-    return ""
+
+    if m.kind in ("execute", "read") || m.kind == "other"
+        # Concatenate text blocks; render with MonacoEditor (read-only).
+        text = join((c.text for c in m.content if c isa TextContent), "\n")
+        if !isempty(text)
+            lang = m.kind == "read" ? detect_language(m.title) :
+                   m.kind == "execute" ? "shell" : "plaintext"
+            return BonitoBook.MonacoEditor(text; language = lang, options = Dict(:readOnly => true))
+        end
+    end
+
+    # Default / "think" / mixed: render text blocks as Markdown so agents that
+    # emit ```julia ... ``` etc. get language-aware code blocks. Diff blocks
+    # render via DiffEditor inline among them.
+    parts = []
+    for c in m.content
+        if c isa TextContent
+            push!(parts, DOM.div(Markdown.parse(c.text), class = "bt-tool-md"))
+        elseif c isa DiffContent
+            lang = detect_language(c.path)
+            push!(parts, BonitoBook.DiffEditor(something(c.old_text, ""), c.new_text;
+                                                language = lang,
+                                                renderSideBySide = false))
+        elseif c isa ImageContent
+            push!(parts, DOM.img(src = "data:$(c.mime_type);base64,$(c.data)",
+                                  style = "max-width:100%"))
+        end
+    end
+    isempty(parts) && return DOM.div("(empty)", class = "bt-tool-empty")
+    return DOM.div(parts...)
 end
 
 # Chat app
 function chat_app(cwd::String;
                   mcp_servers    = AgentClientProtocol.MCPServer[],
-                  client_factory = nothing)   # (on_update::Function) → AgentClientProtocol.Client
+                  client_factory = nothing)
     chat_session = load_session(cwd)
     msgs_store   = load_history(chat_session)
-    agent_id     = Ref("")   # id of current streaming AgentMsg
-    thought_id   = Ref("")   # id of current streaming ThoughtMsg
+    agent_id     = Ref("")
+    thought_id   = Ref("")
     client       = Ref{Union{AgentClientProtocol.Client,Nothing}}(nothing)
 
     # Observables
     # Julia → JS
     total_count    = Observable(length(msgs_store))
-    new_msg_obs    = Observable("")   # JSON: typed event (see bonitoteam.js)
-    range_response = Observable("")   # JSON: {start, messages}
+    new_msg_obs    = Observable("")           # JSON: typed event
+    range_response = Observable("")           # JSON: {start, messages}
 
     # JS → Julia
-    request_range  = Observable(Any[])  # [start_idx, end_idx]  (0-based)
+    request_range        = Observable(Any[])  # [start_idx, end_idx]
+    request_tool_render  = Observable("")     # tool_id
 
     function push_msg!(msg::ChatMsg)
         push!(msgs_store, msg)
@@ -176,9 +270,8 @@ function chat_app(cwd::String;
     function on_update(upd::ToolCallNotif)
         finalize_streaming!()
         msg = ToolMsg(upd.tool_call_id, upd.kind, upd.title,
-                      upd.status, content_preview(upd.content))
+                      upd.status, collect(upd.content))
         push_msg!(msg)
-        # Persist only when the notification itself is already terminal
         upd.status in ("completed", "failed") && append_tool(chat_session, msg)
     end
 
@@ -188,13 +281,16 @@ function chat_app(cwd::String;
         m = msgs_store[idx]
         upd.status !== nothing && (m.status = upd.status)
         upd.title  !== nothing && (m.title  = upd.title)
-        isempty(upd.content) || (m.preview = content_preview(upd.content))
+        if !isempty(upd.content)
+            # ACP tool-call updates often carry the COMPLETE current content,
+            # not just an incremental delta. Replace, don't append.
+            m.content = collect(upd.content)
+        end
         emit(Dict{String,Any}("type"    => "tool_update",
                               "id"      => m.id,
                               "status"  => m.status,
                               "title"   => m.title,
-                              "preview" => m.preview))
-        # Persist once the tool reaches a terminal state
+                              "summary" => content_summary(m.kind, m.content)))
         m.status in ("completed", "failed") && append_tool(chat_session, m)
     end
 
@@ -214,7 +310,7 @@ function chat_app(cwd::String;
         n = length(msgs_store)
         s = clamp(s, 0, n - 1);  e = clamp(e, 0, n - 1)
         s > e && return
-        batch = [msg_to_dict(msgs_store[i]) for i in s+1:e+1]  # 0→1 indexed
+        batch = [msg_to_dict(msgs_store[i]) for i in s+1:e+1]
         range_response[] = JSON.json(Dict{String,Any}("start" => s, "messages" => batch))
     end
 
@@ -224,7 +320,6 @@ function chat_app(cwd::String;
     else
         AgentClientProtocol.Client(cwd; on_update, mcp_servers)
     end
-    # Persist the session ID so we can display it; actual resume is via ACP protocol
     update_session_id!(chat_session, client[].session_id)
 
     # Bonito App
@@ -285,15 +380,40 @@ function chat_app(cwd::String;
             c !== nothing && AgentClientProtocol.cancel!(c)
         end
 
-        # Initialise BonitoChat; pass current count as plain number for immediate bootstrap
+        # Lazy tool-body rendering: when the user clicks expand on a tool, JS
+        # notifies request_tool_render with the tool_id; we look up the
+        # ToolMsg, build its body (Monaco / DiffEditor / Markdown), and ship
+        # it via Bonito.dom_in_js — which creates a sub-session, ships the
+        # rendered HTML+init JS, and runs the supplied function on the JS
+        # side to inject it into the right placeholder.
+        on(request_tool_render) do tool_id
+            isempty(tool_id) && return
+            idx = findfirst(m -> m isa ToolMsg && m.id == tool_id, msgs_store)
+            idx === nothing && return
+            body = render_tool_body(msgs_store[idx])
+            try
+                Bonito.dom_in_js(bonito_session, body, js"""(elem) => {
+                    const slot = document.querySelector(
+                        '.bt-tool-body[data-tool-id="' + $(tool_id) + '"]');
+                    if (slot) {
+                        slot.innerHTML = '';
+                        slot.appendChild(elem);
+                    }
+                }""")
+            catch e
+                @warn "tool render failed" tool_id exception=e
+            end
+        end
+
         n = length(msgs_store)
         evaljs(bonito_session, js"""
             window.initBonitoChat({
-                totalCount:    $(total_count),
-                requestRange:  $(request_range),
-                rangeResponse: $(range_response),
-                newMsg:        $(new_msg_obs),
-                initialCount:  $n,
+                totalCount:        $(total_count),
+                requestRange:      $(request_range),
+                rangeResponse:     $(range_response),
+                newMsg:            $(new_msg_obs),
+                requestToolRender: $(request_tool_render),
+                initialCount:      $n,
             });
         """)
 

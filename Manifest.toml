@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "33d71d391933d110e62a6ae00da1bde020ae48e6"
+project_hash = "debdaa6643b7b9a4b25d7a53a1f4d692a6dd26cf"
 
 [[deps.ANSIColoredPrinters]]
 git-tree-sha1 = "574baf8110975760d391c710b6341da1afa48d8c"
@@ -40,6 +40,27 @@ repo-url = "https://github.com/SimonDanisch/Bonito.jl.git"
 uuid = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 version = "4.2.0"
 
+[[deps.BonitoBook]]
+deps = ["ANSIColoredPrinters", "Base64", "Bonito", "CommonMark", "Dates", "FileWatching", "Glob", "InteractiveUtils", "JSON3", "Logging", "Markdown", "Observables", "Pkg", "REPL", "Random", "TOML", "Typst_jll", "UUIDs", "ZipFile", "p7zip_jll"]
+git-tree-sha1 = "21e3a641774e1b26fecb88c5b8485a1408c6048c"
+repo-rev = "sd/llm-improvements"
+repo-url = "https://github.com/SimonDanisch/BonitoBook.jl.git"
+uuid = "b416d416-7a6e-4336-8c1a-1f8a8cd59518"
+version = "0.2.0"
+
+    [deps.BonitoBook.extensions]
+    BonitoBookAlgebraOfGraphicsExt = "AlgebraOfGraphics"
+    BonitoBookMakieExt = "Makie"
+    BonitoBookPromptingToolsExt = "PromptingTools"
+    BonitoBookPythonCallExt = ["PythonCall", "CondaPkg"]
+
+    [deps.BonitoBook.weakdeps]
+    AlgebraOfGraphics = "cbdf2221-f076-402e-a563-3d30da359d67"
+    CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
+    Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
+    PromptingTools = "670122d1-24a8-4d70-bfce-740807c42192"
+    PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
+
 [[deps.BonitoMCP]]
 deps = ["Base64", "JSON", "Pkg"]
 path = "BonitoMCP"
@@ -47,7 +68,7 @@ uuid = "4a1c91af-1c90-46a4-8594-a3846516869d"
 version = "0.1.0"
 
 [[deps.BonitoTeam]]
-deps = ["AgentClientProtocol", "Base64", "Bonito", "BonitoMCP", "BonitoWorker", "CommonMark", "Dates", "HTTP", "JSON", "Markdown", "SHA", "TOML", "UUIDs"]
+deps = ["AgentClientProtocol", "Base64", "Bonito", "BonitoBook", "BonitoMCP", "BonitoWorker", "CommonMark", "Dates", "HTTP", "JSON", "Markdown", "SHA", "TOML", "UUIDs"]
 path = "BonitoTeam"
 uuid = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
 version = "0.1.0"
@@ -147,6 +168,11 @@ git-tree-sha1 = "05882d6995ae5c12bb5f36dd2ed3f61c98cbb172"
 uuid = "53c48c17-4a7d-5ca2-90c5-79b7896eea93"
 version = "0.8.5"
 
+[[deps.Glob]]
+git-tree-sha1 = "83cb0092e2792b9e3a865b6655e88f5b862607e2"
+uuid = "c27321d9-0574-5035-807b-f59d2c89b15c"
+version = "1.4.0"
+
 [[deps.HTTP]]
 deps = ["Base64", "CodecZlib", "ConcurrentUtilities", "Dates", "ExceptionUnwrapping", "Logging", "LoggingExtras", "MbedTLS", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "SimpleBufferStream", "Sockets", "URIs", "UUIDs"]
 git-tree-sha1 = "51059d23c8bb67911a2e6fd5130229113735fc7e"
@@ -185,6 +211,18 @@ version = "1.5.2"
     JSONArrowExt = ["ArrowTypes"]
 
     [deps.JSON.weakdeps]
+    ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
+
+[[deps.JSON3]]
+deps = ["Dates", "Mmap", "Parsers", "PrecompileTools", "StructTypes", "UUIDs"]
+git-tree-sha1 = "411eccfe8aba0814ffa0fdf4860913ed09c34975"
+uuid = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+version = "1.14.3"
+
+    [deps.JSON3.extensions]
+    JSON3ArrowExt = ["ArrowTypes"]
+
+    [deps.JSON3.weakdeps]
     ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
 
 [[deps.JuliaSyntaxHighlighting]]
@@ -253,6 +291,10 @@ git-tree-sha1 = "ff69a2b1330bcb730b9ac1ab7dd680176f5896b8"
 uuid = "c8ffd9c3-330d-5841-b78e-0817d7145fa1"
 version = "2.28.1010+0"
 
+[[deps.Mmap]]
+uuid = "a63ad114-7e13-5084-954f-fe012c677804"
+version = "1.11.0"
+
 [[deps.MozillaCACerts_jll]]
 uuid = "14a3606d-f60d-562e-9121-12d972cd8159"
 version = "2025.11.4"
@@ -303,12 +345,10 @@ version = "2.8.4"
 deps = ["Artifacts", "Dates", "Downloads", "FileWatching", "LibGit2", "Libdl", "Logging", "Markdown", "Printf", "Random", "SHA", "TOML", "Tar", "UUIDs", "p7zip_jll"]
 uuid = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 version = "1.12.1"
+weakdeps = ["REPL"]
 
     [deps.Pkg.extensions]
     REPLExt = "REPL"
-
-    [deps.Pkg.weakdeps]
-    REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
 
 [[deps.PrecompileTools]]
 deps = ["Preferences"]
@@ -325,6 +365,11 @@ version = "1.5.2"
 [[deps.Printf]]
 deps = ["Unicode"]
 uuid = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+version = "1.11.0"
+
+[[deps.REPL]]
+deps = ["InteractiveUtils", "JuliaSyntaxHighlighting", "Markdown", "Sockets", "StyledStrings", "Unicode"]
+uuid = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
 version = "1.11.0"
 
 [[deps.Random]]
@@ -384,6 +429,12 @@ version = "1.11.1"
     [deps.Statistics.weakdeps]
     SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
+[[deps.StructTypes]]
+deps = ["Dates", "UUIDs"]
+git-tree-sha1 = "159331b30e94d7b11379037feeb9b690950cace8"
+uuid = "856f2bd8-1eba-4b0a-8007-ebc267875bd4"
+version = "1.11.0"
+
 [[deps.StructUtils]]
 deps = ["Dates", "UUIDs"]
 git-tree-sha1 = "dd974aefe288ef2898733aecf40858dc86742d74"
@@ -442,6 +493,12 @@ git-tree-sha1 = "0c45878dcfdcfa8480052b6ab162cdd138781742"
 uuid = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 version = "0.11.3"
 
+[[deps.Typst_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "OpenSSL_jll"]
+git-tree-sha1 = "0fc7d5d3083a3753abe4b4eb10a87c0146fa5f20"
+uuid = "eb4b1da6-20f6-5c66-9826-fdb8ad410d0e"
+version = "0.14.2+0"
+
 [[deps.URIs]]
 git-tree-sha1 = "bef26fb046d031353ef97a82e3fdb6afe7f21b1a"
 uuid = "5c2747f8-b7ea-4ff2-ba2e-563bfd36b1d4"
@@ -461,6 +518,12 @@ deps = ["Observables"]
 git-tree-sha1 = "30a1d631eb06e8c868c559599f915a62d55c2601"
 uuid = "eead4739-05f7-45a1-878c-cee36b57321c"
 version = "0.1.4"
+
+[[deps.ZipFile]]
+deps = ["Libdl", "Printf", "Zlib_jll"]
+git-tree-sha1 = "f492b7fe1698e623024e873244f10d89c95c340a"
+uuid = "a5390f91-8eb1-5f08-bee0-b1d1ffed6cea"
+version = "0.10.1"
 
 [[deps.Zlib_jll]]
 deps = ["Libdl"]

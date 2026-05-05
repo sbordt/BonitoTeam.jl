@@ -18,6 +18,7 @@ using TOML
 using Base64
 using SHA
 
+import BonitoBook       # MonacoEditor / DiffEditor / Collapsible for tool rendering
 import BonitoMCP        # shipped to workers, also used by the bundle build
 import BonitoWorker     # ditto
 

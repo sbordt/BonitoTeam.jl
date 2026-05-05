@@ -65,19 +65,24 @@ function julia_eval_handler(args::AbstractDict)
     sess = _session_for(env_path)
     val, err_text, stdout_str = _eval_with_capture(sess, code)
 
+    # Always include the executed code as the first content block — ACP doesn't
+    # surface tool args, so this is how the chat UI shows what was run.
+    code_block = Dict("type" => "text", "text" => "```julia\n$code\n```")
+
     blocks = if err_text !== nothing
-        # On error: stdout (if any) then error text
-        out_blocks = Vector{Dict{String,Any}}()
+        out_blocks = Dict{String,Any}[code_block]
         if !isempty(stdout_str)
             push!(out_blocks, Dict("type" => "text", "text" => "stdout:\n$stdout_str"))
         end
         push!(out_blocks, Dict("type" => "text", "text" => "error:\n$err_text"))
         out_blocks
     else
-        format_for_mcp(val;
-                       full_output = full_output,
-                       max_response_bytes = max_bytes,
-                       stdout_text = stdout_str)
+        result_blocks = format_for_mcp(val;
+                                       full_output = full_output,
+                                       max_response_bytes = max_bytes,
+                                       stdout_text = stdout_str)
+        prepend!(result_blocks, [code_block])
+        result_blocks
     end
 
     return Dict{String,Any}(

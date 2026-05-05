@@ -1,4 +1,7 @@
-// BonitoTeam.js — client-side chat: virtual scroll, DOM windowing, streaming
+// BonitoTeam.js — client-side chat: virtual scroll, DOM windowing, streaming.
+// Tool-call bodies are lazy: collapsed by default, expand fires `requestToolRender(id)`
+// which reaches Julia; Julia answers via Bonito.dom_in_js by inserting a fully-
+// mounted Bonito sub-DOM (Monaco editors etc.) into the matching placeholder.
 
 class BonitoChat {
     constructor(container, obs) {
@@ -22,9 +25,9 @@ class BonitoChat {
         this.busyEl       = container.parentElement.querySelector('.bt-busy');
 
         // Julia → JS
-        obs.totalCount.on(n    => { this.totalCount = n; this.refresh(); });
-        obs.newMsg.on(str      => { if (str) this._onNewMsg(JSON.parse(str)); });
-        obs.rangeResponse.on(str => { if (str) this._onRange(JSON.parse(str)); });
+        obs.totalCount.on(n      => { this.totalCount = n; this.refresh(); });
+        obs.newMsg.on(str        => { if (str) this.handleNewMsg(JSON.parse(str)); });
+        obs.rangeResponse.on(str => { if (str) this.onRange(JSON.parse(str)); });
 
         // Bootstrap history on page load — totalCount.on only fires on future changes
         if (obs.initialCount > 0) {
@@ -35,28 +38,28 @@ class BonitoChat {
 
         // Scroll
         container.addEventListener('scroll', () => {
-            this.wasAtBottom = this._atBottom();
+            this.wasAtBottom = this.atBottom();
             this.refresh();
         }, { passive: true });
 
         // Mobile: keep input visible when virtual keyboard opens
         if (window.visualViewport) {
-            window.visualViewport.addEventListener('resize', () => this._onVPResize());
+            window.visualViewport.addEventListener('resize', () => this.onViewportResize());
         }
     }
 
-    // ── Range / virtual scroll ───────────────────────────────────────────────
+    // Range / virtual scroll
 
-    _visibleRange() {
+    visibleRange() {
         if (this.totalCount === 0) return [0, -1];
         const { scrollTop, clientHeight } = this.container;
         const over = this.OVERSCAN * this.EST_HEIGHT;
-        const s = this._indexAt(Math.max(0, scrollTop - over));
-        const e = this._indexAt(scrollTop + clientHeight + over);
+        const s = this.indexAt(Math.max(0, scrollTop - over));
+        const e = this.indexAt(scrollTop + clientHeight + over);
         return [s, Math.min(this.totalCount - 1, e)];
     }
 
-    _indexAt(offset) {
+    indexAt(offset) {
         let h = 0;
         for (let i = 0; i < this.totalCount; i++) {
             h += (this.heights.get(i) ?? this.EST_HEIGHT);
@@ -65,7 +68,7 @@ class BonitoChat {
         return Math.max(0, this.totalCount - 1);
     }
 
-    _cumHeight(from, to) {
+    cumHeight(from, to) {
         let h = 0;
         for (let i = from; i < to; i++) h += (this.heights.get(i) ?? this.EST_HEIGHT);
         return h;
@@ -73,34 +76,33 @@ class BonitoChat {
 
     refresh() {
         if (this.totalCount === 0) return;
-        const [s, e] = this._visibleRange();
+        const [s, e] = this.visibleRange();
 
-        // Collect missing indices → batch request to Julia
         const missing = [];
         for (let i = s; i <= e; i++) if (!this.cache.has(i)) missing.push(i);
         if (missing.length > 0)
             this.obs.requestRange.notify([missing[0], missing[missing.length - 1]]);
 
-        this._updateDOM(s, e);
+        this.updateDOM(s, e);
     }
 
-    _onRange({ start, messages }) {
+    onRange({ start, messages }) {
         messages.forEach((data, i) => {
             const idx = start + i;
             if (this.cache.has(idx)) return;
-            const node = this._createNode(data);
+            const node = this.createNode(data);
             this.cache.set(idx, node);
             if (data.id) this.nodeById.set(data.id, node);
-            this._observe(idx, node);
+            this.observe(idx, node);
         });
-        this._updateDOM(...this._visibleRange());
+        this.updateDOM(...this.visibleRange());
         if (this.initialLoad) {
             this.scrollToBottom();
             this.initialLoad = false;
         }
     }
 
-    _observe(idx, node) {
+    observe(idx, node) {
         const ro = new ResizeObserver(([e]) => {
             const h = e.contentRect.height;
             if (h > 0) { this.heights.set(idx, h); }
@@ -109,38 +111,33 @@ class BonitoChat {
         this.ros.set(idx, ro);
     }
 
-    _updateDOM(s, e) {
+    updateDOM(s, e) {
         if (s > e) return;
-
-        // Remove out-of-window
         for (const idx of [...this.rendered]) {
             if (idx < s || idx > e) {
                 this.cache.get(idx)?.remove();
                 this.rendered.delete(idx);
             }
         }
-
-        // Insert in-window, maintaining document order
         for (let i = s; i <= e; i++) {
             if (this.cache.has(i) && !this.rendered.has(i)) {
-                this._insertSorted(i, this.cache.get(i));
+                this.insertSorted(i, this.cache.get(i));
                 this.rendered.add(i);
             }
         }
-
-        this.spacerTop.style.height    = this._cumHeight(0, s) + 'px';
-        this.spacerBottom.style.height = this._cumHeight(e + 1, this.totalCount) + 'px';
+        this.spacerTop.style.height    = this.cumHeight(0, s) + 'px';
+        this.spacerBottom.style.height = this.cumHeight(e + 1, this.totalCount) + 'px';
     }
 
-    _insertSorted(idx, node) {
+    insertSorted(idx, node) {
         const sorted = [...this.rendered].filter(i => i > idx).sort((a,b) => a-b);
         const before = sorted.length ? this.cache.get(sorted[0]) : this.spacerBottom;
         this.container.insertBefore(node, before);
     }
 
-    // ── New messages + streaming ─────────────────────────────────────────────
+    // New messages + streaming
 
-    _onNewMsg(msg) {
+    handleNewMsg(msg) {
         if (msg.type === 'busy_start') { this.busyEl?.classList.add('bt-busy-active');    return; }
         if (msg.type === 'busy_end')   { this.busyEl?.classList.remove('bt-busy-active'); return; }
 
@@ -170,10 +167,9 @@ class BonitoChat {
                 const t = node.querySelector('.bt-tool-title');
                 if (t) t.textContent = msg.title;
             }
-            if (msg.preview != null) {
-                let pre = node.querySelector('.bt-tool-preview');
-                if (!pre) { pre = document.createElement('pre'); pre.className = 'bt-tool-preview'; node.appendChild(pre); }
-                pre.textContent = msg.preview;
+            if (msg.summary != null) {
+                const s = node.querySelector('.bt-tool-summary');
+                if (s) s.textContent = msg.summary;
             }
             return;
         }
@@ -196,23 +192,22 @@ class BonitoChat {
             return;
         }
 
-        // Regular new message — totalCount fires separately, so cache at that index
         const idx = this.totalCount - 1;
         if (!this.cache.has(idx)) {
-            const node = this._createNode(msg);
+            const node = this.createNode(msg);
             this.cache.set(idx, node);
             if (msg.id) this.nodeById.set(msg.id, node);
-            this._observe(idx, node);
+            this.observe(idx, node);
         }
         if (this.wasAtBottom) {
-            this._updateDOM(...this._visibleRange());
+            this.updateDOM(...this.visibleRange());
             this.scrollToBottom();
         }
     }
 
-    // ── DOM node creation ────────────────────────────────────────────────────
+    // DOM node creation
 
-    _createNode(msg) {
+    createNode(msg) {
         const div = document.createElement('div');
         switch (msg.type) {
             case 'user':
@@ -231,11 +226,12 @@ class BonitoChat {
                 break;
             case 'thought':
                 div.className = 'bt-thought-msg';
-                div.innerHTML = this._thoughtHTML(msg);
+                div.innerHTML = this.thoughtHTML(msg);
                 break;
             case 'tool':
                 div.className = 'bt-tool-msg';
-                div.innerHTML = this._toolHTML(msg);
+                div.innerHTML = this.toolHTML(msg);
+                this.wireToolToggle(div, msg.id);
                 break;
             case 'plan':
                 div.className = 'bt-plan-msg';
@@ -245,31 +241,55 @@ class BonitoChat {
         return div;
     }
 
-    _thoughtHTML(msg) {
-        const body = msg.streaming
-            ? `<span class="bt-stream-text"></span>`
-            : `<div class="bt-thought-body">${msg.html || ''}</div>`;
+    thoughtHTML(msg) {
         return `<details class="bt-thought-details">
             <summary class="bt-thought-summary">💭 Thinking…</summary>
             <div class="bt-thought-body">${msg.streaming ? '<span class="bt-stream-text"></span>' : (msg.html || '')}</div>
         </details>`;
     }
 
-    _toolHTML(msg) {
+    // Tool block: header + empty placeholder. Body is fetched lazily on expand.
+    toolHTML(msg) {
         const statusCls = `bt-tool-status bt-status-${msg.status || 'pending'}`;
-        const preview   = msg.preview
-            ? `<pre class="bt-tool-preview">${_esc(msg.preview)}</pre>` : '';
         return `
-            <div class="bt-tool-header">
+            <div class="bt-tool-header" data-expanded="false">
+                <span class="bt-tool-toggle">▶</span>
                 <span class="bt-tool-kind">${msg.icon || '⚙'}</span>
-                <span class="bt-tool-title">${_esc(msg.title || '')}</span>
-                <span class="${statusCls}">${_esc(msg.status || '')}</span>
-            </div>${preview}`;
+                <span class="bt-tool-title">${escapeHTML(msg.title || '')}</span>
+                <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
+                <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
+            </div>
+            <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
+    // Wire the click-to-expand on the tool header. On expand, ask Julia to
+    // ship the rendered body (Bonito.dom_in_js will inject it into the body
+    // div). On collapse, blank the body div so Monaco editors etc. drop out
+    // of the DOM.
+    wireToolToggle(node, toolId) {
+        const header = node.querySelector('.bt-tool-header');
+        const toggle = header.querySelector('.bt-tool-toggle');
+        const body   = node.querySelector('.bt-tool-body');
+        if (!header || !body) return;
+        header.style.cursor = 'pointer';
+        header.addEventListener('click', () => {
+            const expanded = header.dataset.expanded === 'true';
+            if (expanded) {
+                body.innerHTML = '';
+                header.dataset.expanded = 'false';
+                toggle.textContent = '▶';
+            } else {
+                body.innerHTML = '<div class="bt-tool-loading">loading…</div>';
+                this.obs.requestToolRender.notify(toolId);
+                header.dataset.expanded = 'true';
+                toggle.textContent = '▼';
+            }
+        });
+    }
 
-    _atBottom() {
+    // Helpers
+
+    atBottom() {
         const { scrollTop, scrollHeight, clientHeight } = this.container;
         return scrollHeight - scrollTop - clientHeight < 60;
     }
@@ -278,7 +298,7 @@ class BonitoChat {
         this.container.scrollTop = this.container.scrollHeight;
     }
 
-    _onVPResize() {
+    onViewportResize() {
         const vv  = window.visualViewport;
         const app = document.querySelector('.bt-app');
         if (app) app.style.height = vv.height + 'px';
@@ -286,15 +306,18 @@ class BonitoChat {
     }
 }
 
-function _esc(str) {
-    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function escapeHTML(str) {
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function escapeAttr(str) {
+    return escapeHTML(str).replace(/"/g, '&quot;');
 }
 
 // Entry point called from Julia evaljs after session is ready
 function initBonitoChat(obs) {
     const container = document.querySelector('.bt-messages');
     if (!container) { requestAnimationFrame(() => initBonitoChat(obs)); return; }
-    window._bonitochat = new BonitoChat(container, obs);
+    window.bonitochat = new BonitoChat(container, obs);
 }
 
 window.BonitoChat     = BonitoChat;

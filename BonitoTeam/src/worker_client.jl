@@ -17,6 +17,10 @@ using HTTP, HTTP.WebSockets, JSON, AgentClientProtocol
 const WORKER_CONTROL_WS = Dict{String,Any}()
 # sid → Channel{Any} where the matching /worker-acp upgrade hands off the WS
 const PENDING_ACP_SESSIONS = Dict{String,Channel{Any}}()
+# sync_id → Channel{Any} where /worker-sync upgrade hands off the WS for a
+# directional file transfer (server-side counterpart to handle_open_sync on
+# the worker)
+const PENDING_SYNC_SESSIONS = Dict{String,Channel{Any}}()
 
 # Send a JSON command to a worker over its control WS. Throws if the worker
 # isn't currently connected.
@@ -82,6 +86,34 @@ function handle_worker_control(ws, worker_secret::String)
             bump_state!()
         end
         @info "Worker disconnected" name=name
+    end
+end
+
+# Handler for /worker-sync — one invocation per directional file transfer.
+# Worker dials this in response to an `open_sync` command on the control WS.
+# Pairs the WS with a Channel that `push_dir_to_worker!` / `pull_dir_from_worker!`
+# is blocked on.
+function handle_worker_sync(ws, worker_secret::String)
+    auth_raw = WebSockets.receive(ws)
+    auth = JSON.parse(String(auth_raw))
+    if get(auth, "secret", "") != worker_secret
+        try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"unauthorized"))) catch end
+        return
+    end
+    sync_id = String(get(auth, "sync_id", ""))
+    if isempty(sync_id) || !haskey(PENDING_SYNC_SESSIONS, sync_id)
+        try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"unknown sync_id"))) catch end
+        return
+    end
+    WebSockets.send(ws, JSON.json(Dict("ok" => true)))
+
+    ch = pop!(PENDING_SYNC_SESSIONS, sync_id)
+    put!(ch, ws)
+
+    # Block here so Bonito holds the WS open while the orchestrator drives
+    # the transfer via the same `ws` reference.
+    while !WebSockets.isclosed(ws)
+        sleep(0.5)
     end
 end
 
@@ -163,6 +195,122 @@ function start_session_on_worker(worker_name::String, cwd::String;
     session_id = result["sessionId"]
 
     return AgentClientProtocol.Client(conn, session_id, cwd)
+end
+
+# ── File transport over WS ────────────────────────────────────────────────────
+
+"""
+    push_dir_to_worker!(worker_name, src, dst) → tree_hash::Vector{UInt8}
+
+Tar `src` on the server, stream it to the worker over a /worker-sync WS, and
+have the worker extract into `dst`. Returns the tree hash of `src` after the
+transfer (so the caller can stash it as the project's base_checksum).
+"""
+function push_dir_to_worker!(worker_name::String, src::String, dst::String)
+    isdir(src) || error("Source path is not a directory: $src")
+    haskey(WORKER_CONTROL_WS, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+
+    sync_id = string(uuid4())
+    ch = Channel{Any}(1)
+    PENDING_SYNC_SESSIONS[sync_id] = ch
+
+    send_command(worker_name, Dict(
+        "type"      => "open_sync",
+        "sync_id"   => sync_id,
+        "direction" => "to_worker",
+        "dst_path"  => dst,
+    ))
+
+    ws = take!(ch)
+    try
+        # Tar src in a tmpfile (gzipped); send size header + binary frame
+        tmp = tempname() * ".tar.gz"
+        try
+            run(Cmd(`tar -czf $tmp .`; dir = src))
+            data = read(tmp)
+            WebSockets.send(ws, JSON.json(Dict("type"=>"tar", "size"=>length(data))))
+            WebSockets.send(ws, data)        # binary frame
+            ack = JSON.parse(String(WebSockets.receive(ws)))
+            get(ack, "ok", false) ||
+                error("worker rejected sync: $(get(ack, "error", "unknown"))")
+        finally
+            rm(tmp; force = true)
+        end
+    finally
+        try close(ws) catch end
+    end
+
+    return tree_hash(src)
+end
+
+"""
+    pull_dir_from_worker!(worker_name, src, dst) → tree_hash
+
+Inverse of `push_dir_to_worker!` — tells the worker to tar `src` (its path)
+and stream it back; we extract into `dst` (server path).
+"""
+function pull_dir_from_worker!(worker_name::String, src::String, dst::String)
+    haskey(WORKER_CONTROL_WS, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+    mkpath(dst)
+
+    sync_id = string(uuid4())
+    ch = Channel{Any}(1)
+    PENDING_SYNC_SESSIONS[sync_id] = ch
+
+    send_command(worker_name, Dict(
+        "type"      => "open_sync",
+        "sync_id"   => sync_id,
+        "direction" => "from_worker",
+        "src_path"  => src,
+    ))
+
+    ws = take!(ch)
+    try
+        header = JSON.parse(String(WebSockets.receive(ws)))
+        get(header, "type", "") == "tar" ||
+            error("worker sent unexpected sync frame: $(get(header, "type", "?"))")
+        data = WebSockets.receive(ws)
+        tmp  = tempname() * ".tar.gz"
+        try
+            write(tmp, data)
+            mkpath(dst)
+            run(Cmd(`tar -xzf $tmp`; dir = dst))
+            WebSockets.send(ws, JSON.json(Dict("ok" => true)))
+        finally
+            rm(tmp; force = true)
+        end
+    finally
+        try close(ws) catch end
+    end
+
+    return tree_hash(dst)
+end
+
+# Tree hash: walk + sha256 over (relpath, size, mtime, content_hash) entries,
+# combined into a final sha256. Skips .git/ + .bonitoTeam/.
+function tree_hash(root::String)
+    h = SHA.SHA256_CTX()
+    paths = String[]
+    if isdir(root)
+        for (dir, dirs, fnames) in walkdir(root; topdown = true)
+            filter!(d -> !(d in (".git", ".bonitoTeam")), dirs)
+            for fname in fnames
+                full = joinpath(dir, fname)
+                isfile(full) && push!(paths, relpath(full, root))
+            end
+        end
+        sort!(paths)
+        for p in paths
+            full = joinpath(root, p)
+            st = stat(full)
+            entry = string(p, "\0", st.size, "\0", st.mtime, "\0",
+                           bytes2hex(open(SHA.sha256, full)))
+            SHA.update!(h, codeunits(entry))
+        end
+    end
+    return SHA.digest!(h)
 end
 
 # Build an AgentClientProtocol.Connection backed by a WebSocket. Each ACP

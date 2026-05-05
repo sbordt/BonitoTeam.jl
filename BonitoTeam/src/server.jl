@@ -105,4 +105,7 @@ function add_worker_ws_routes!(srv::Bonito.Server, worker_secret::String)
     Bonito.HTTPServer.websocket_route!(srv, "/worker-acp" => function(_ctx, ws)
         handle_worker_acp(ws, worker_secret)
     end)
+    Bonito.HTTPServer.websocket_route!(srv, "/worker-sync" => function(_ctx, ws)
+        handle_worker_sync(ws, worker_secret)
+    end)
 end

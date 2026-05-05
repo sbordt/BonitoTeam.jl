@@ -47,7 +47,7 @@ uuid = "4a1c91af-1c90-46a4-8594-a3846516869d"
 version = "0.1.0"
 
 [[deps.BonitoTeam]]
-deps = ["AgentClientProtocol", "Base64", "Bonito", "BonitoMCP", "BonitoWorker", "CommonMark", "Dates", "HTTP", "JSON", "Markdown", "TOML", "UUIDs"]
+deps = ["AgentClientProtocol", "Base64", "Bonito", "BonitoMCP", "BonitoWorker", "CommonMark", "Dates", "HTTP", "JSON", "Markdown", "SHA", "TOML", "UUIDs"]
 path = "BonitoTeam"
 uuid = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
 version = "0.1.0"

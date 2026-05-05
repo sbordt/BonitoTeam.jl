@@ -96,70 +96,6 @@ end
 # dials the server's /worker-ws endpoint. Liveness comes from the WS itself;
 # no periodic probing or heartbeat task.
 
-# ── Rsync orchestration ───────────────────────────────────────────────────────
-
-"""
-Push `src` → `dst` via rsync. If `ssh_target` is `nothing` the destination
-is treated as a local path (server and worker share filesystem); otherwise
-the rsync goes over ssh to `ssh_target:dst`. Source contents (not the dir
-itself) are placed into `dst`.
-"""
-function rsync_to_worker(src::String, ssh_target::Union{String,Nothing}, dst::String)
-    isdir(src) || error("Source path is not a directory: $src")
-    src_with_slash = endswith(src, '/') ? src : src * "/"
-    parent = dirname(rstrip(dst, '/'))
-
-    if ssh_target === nothing
-        @info "rsync (local)" src_with_slash dst
-        mkpath(parent)
-        run(`rsync -az --delete $src_with_slash $(dst)/`)
-    else
-        @info "rsync (ssh)" src_with_slash ssh_target dst
-        run(`ssh $ssh_target mkdir -p $parent`)
-        run(`rsync -az --delete $src_with_slash $ssh_target:$dst/`)
-    end
-    return nothing
-end
-
-# ── Project lifecycle ─────────────────────────────────────────────────────────
-
-# rsync between worker and server for the bidirectional Sync button. --update
-# means "skip files that are newer on the destination" — newest version wins
-# per file.
-function rsync_pull_from_worker!(src_path_on_worker::String,
-                                  ssh_target::Union{String,Nothing},
-                                  dst_path_on_server::String)
-    src = endswith(src_path_on_worker, '/') ? src_path_on_worker : src_path_on_worker * "/"
-    dst = endswith(dst_path_on_server, '/') ? dst_path_on_server : dst_path_on_server * "/"
-    if ssh_target === nothing
-        @info "rsync pull (local)" src dst
-        mkpath(dst_path_on_server)
-        run(`rsync -azu $src $dst`)
-    else
-        @info "rsync pull (ssh)" src dst ssh_target
-        mkpath(dst_path_on_server)
-        run(`rsync -azu $ssh_target:$src $dst`)
-    end
-    return nothing
-end
-
-function rsync_push_to_worker!(src_path_on_server::String,
-                                ssh_target::Union{String,Nothing},
-                                dst_path_on_worker::String)
-    src = endswith(src_path_on_server, '/') ? src_path_on_server : src_path_on_server * "/"
-    dst = endswith(dst_path_on_worker, '/') ? dst_path_on_worker : dst_path_on_worker * "/"
-    parent = dirname(rstrip(dst, '/'))
-    if ssh_target === nothing
-        @info "rsync push (local)" src dst
-        mkpath(parent)
-        run(`rsync -azu $src $dst`)
-    else
-        @info "rsync push (ssh)" src dst ssh_target
-        run(`ssh $ssh_target mkdir -p $parent`)
-        run(`rsync -azu $src $ssh_target:$dst`)
-    end
-    return nothing
-end
 
 """
 Create a new project on the named worker. Steps:
@@ -184,15 +120,17 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
     server_path = joinpath(working_dir(), name)
     worker_path = joinpath(w.projects_root, name)
 
-    # 1. Seed the canonical server-side copy.
+    # 1. Seed the canonical server-side copy from the picked source (local
+    # rsync; this is always on the server box, no SSH).
     if abspath(src_path) != abspath(server_path)
         @info "Seeding server-side mirror" src_path server_path
         mkpath(working_dir())
         run(`rsync -az $(rstrip(src_path, '/'))/ $(rstrip(server_path, '/'))/`)
     end
 
-    # 2. Mirror server → worker.
-    rsync_push_to_worker!(server_path, w.ssh_target, worker_path)
+    # 2. Push server → worker over the worker's WS (no SSH, no inbound port).
+    @info "Pushing project to worker" worker=worker_name dst=worker_path
+    push_dir_to_worker!(worker_name, server_path, worker_path)
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     PROJECTS[id] = p
@@ -205,15 +143,14 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
 end
 
 """
-Bidirectional sync for an existing project. Pulls worker → server first
+Force a full re-sync for an existing project. Pulls worker → server first
 (picks up claude's edits), then pushes server → worker (any user edits).
-Both passes use --update so newer files win on each side per-file.
+Transport is the WS-based file mover; no SSH involved.
 """
 function sync_project!(p::ProjectInfo)
     haskey(WORKERS, p.worker_name) || error("Worker '$(p.worker_name)' not connected")
-    w = WORKERS[p.worker_name]
-    rsync_pull_from_worker!(p.worker_path, w.ssh_target, p.server_path)
-    rsync_push_to_worker!(p.server_path,    w.ssh_target, p.worker_path)
+    pull_dir_from_worker!(p.worker_name, p.worker_path, p.server_path)
+    push_dir_to_worker!(p.worker_name,   p.server_path, p.worker_path)
     return nothing
 end
 
@@ -423,35 +360,8 @@ end
 function dashboard_app(srv_ref::Ref{Bonito.Server})
     error_obs = Observable("")
 
-    # ── Add Worker form ───────────────────────────────────────────────────────
-    add_worker_show = Observable(false)
-    aw_name = Observable("")
-    aw_url = Observable("")
-    aw_secret = Observable("")
-    aw_ssh = Observable("")
-    aw_submit = Bonito.Button("Register"; class = "bt-btn")
-    aw_cancel = Bonito.Button("Cancel"; class = "bt-btn bt-btn-secondary")
-
-    on(aw_submit.value) do clicked
-        clicked || return
-        try
-            ssh = isempty(strip(aw_ssh[])) ? nothing : String(strip(aw_ssh[]))
-            register_worker!(String(strip(aw_name[])),
-                              String(strip(aw_url[])),
-                              String(strip(aw_secret[]));
-                              ssh_target = ssh)
-            error_obs[] = ""
-            add_worker_show[] = false
-            aw_name[] = ""; aw_url[] = ""; aw_secret[] = ""; aw_ssh[] = ""
-        catch e
-            error_obs[] = "Failed to register worker: $e"
-        end
-    end
-    on(aw_cancel.value) do clicked
-        clicked || return
-        add_worker_show[] = false
-        error_obs[] = ""
-    end
+    # Workers self-register over WS when they dial /worker-ws — no manual
+    # "Add worker" form needed. The dashboard just lists them as they connect.
 
     # ── New Project form ──────────────────────────────────────────────────────
     new_proj_show = Observable(false)
@@ -487,13 +397,6 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         error_obs[] = ""
     end
 
-    add_worker_btn = Bonito.Button("+ Add worker"; class = "bt-btn bt-btn-secondary")
-    on(add_worker_btn.value) do clicked
-        clicked || return
-        add_worker_show[] = true
-        error_obs[] = ""
-    end
-
     new_proj_btn = Bonito.Button("+ New project"; class = "bt-btn bt-btn-secondary")
     on(new_proj_btn.value) do clicked
         clicked || return
@@ -510,14 +413,6 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         type = "text", placeholder = ph,
         value = obs,    # Julia → JS: pushed back when obs changes (e.g. auto-fill)
         oninput = js"event => $(obs).notify(event.target.value)")
-
-    add_worker_form() = DOM.div(
-        DOM.label("Name"),     text_input(aw_name, "e.g. desktop-tower"),
-        DOM.label("WS URL"),   text_input(aw_url, "ws://host:8039"),
-        DOM.label("Secret"),   text_input(aw_secret, "shared secret"),
-        DOM.label("SSH target"), text_input(aw_ssh, "user@host (optional, for rsync)"),
-        DOM.div(aw_cancel, aw_submit, class = "bt-form-actions"),
-        class = "bt-form")
 
     new_proj_form() = DOM.div(
         DOM.label("Name"),   text_input(np_name, "e.g. my-project"),
@@ -551,9 +446,6 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
                 DOM.div((project_card(p, error_obs) for p in values(PROJECTS))...)
         end
 
-        worker_form_block = map(add_worker_show) do show
-            show ? add_worker_form() : DOM.div()
-        end
         proj_form_block = map(new_proj_show) do show
             show ? new_proj_form() : DOM.div()
         end
@@ -569,8 +461,6 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
 
             DOM.h2("Workers"),
             worker_list,
-            DOM.div(add_worker_btn, style = "margin-top: 8px"),
-            worker_form_block,
 
             DOM.h2("Projects"),
             project_list,

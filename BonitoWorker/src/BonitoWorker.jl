@@ -68,6 +68,8 @@ function run_control_session(; server_url, secret, name, mcp_path,
             t = get(cmd, "type", "")
             if t == "open_session"
                 @async handle_open_session(server_url, secret, agent_bin, cmd)
+            elseif t == "open_sync"
+                @async handle_open_sync(server_url, secret, cmd)
             elseif t == "ping"
                 WebSockets.send(ws, JSON.json(Dict("type" => "pong")))
             else
@@ -133,6 +135,66 @@ function handle_open_session(server_url::String, secret::String, agent_bin::Stri
         @error "BonitoWorker: ACP session error" sid exception=e
     end
     @info "BonitoWorker: ACP session ended" sid cwd
+end
+
+# ── File transport over /worker-sync ──────────────────────────────────────────
+
+function handle_open_sync(server_url::String, secret::String, cmd::AbstractDict)
+    sync_id   = String(get(cmd, "sync_id", ""))
+    direction = String(get(cmd, "direction", ""))
+    isempty(sync_id) && (@error "open_sync missing sync_id"; return)
+
+    sync_url = ws_url(server_url, "/worker-sync")
+    try
+        WebSockets.open(sync_url) do ws
+            WebSockets.send(ws, JSON.json(Dict("secret" => secret, "sync_id" => sync_id)))
+            ack = JSON.parse(String(WebSockets.receive(ws)))
+            get(ack, "ok", false) ||
+                error("server rejected sync: $(get(ack, "error", "unknown"))")
+
+            if direction == "to_worker"
+                # Server is sending us a tarball; extract into dst_path.
+                dst = String(cmd["dst_path"])
+                header = JSON.parse(String(WebSockets.receive(ws)))
+                get(header, "type", "") == "tar" ||
+                    error("expected tar header, got $(get(header, "type", "?"))")
+                data = WebSockets.receive(ws)
+                tmp = tempname() * ".tar.gz"
+                try
+                    write(tmp, data)
+                    mkpath(dst)
+                    run(Cmd(`tar -xzf $tmp`; dir = dst))
+                    WebSockets.send(ws, JSON.json(Dict("ok" => true)))
+                finally
+                    rm(tmp; force = true)
+                end
+                @info "BonitoWorker: sync to_worker complete" dst bytes=length(data)
+
+            elseif direction == "from_worker"
+                # Server wants us to tar src_path and stream it back.
+                src = String(cmd["src_path"])
+                isdir(src) || error("src_path is not a directory: $src")
+                tmp = tempname() * ".tar.gz"
+                try
+                    run(Cmd(`tar -czf $tmp .`; dir = src))
+                    data = read(tmp)
+                    WebSockets.send(ws, JSON.json(Dict("type"=>"tar", "size"=>length(data))))
+                    WebSockets.send(ws, data)
+                    ack = JSON.parse(String(WebSockets.receive(ws)))
+                    get(ack, "ok", false) ||
+                        error("server rejected tar: $(get(ack, "error", "unknown"))")
+                finally
+                    rm(tmp; force = true)
+                end
+                @info "BonitoWorker: sync from_worker complete" src
+
+            else
+                error("unknown sync direction: $direction")
+            end
+        end
+    catch e
+        @error "BonitoWorker: sync session error" sync_id direction exception=e
+    end
 end
 
 # ── Byte-shuttle between WS frame and subprocess stdio ────────────────────────

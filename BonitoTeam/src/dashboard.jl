@@ -33,18 +33,19 @@ mutable struct ProjectInfo
     server_path::String                # canonical copy on server (= working_dir/name)
     worker_path::String                # mirrored copy on worker (= worker.projects_root/name)
     created::DateTime
-    # Lock model: at most one active ACP session per project. The lock is
-    # acquired when ensure_project_session! brings up the chat_app, released
-    # when the bound worker disconnects.
+    # At most one active ACP session per project. Acquired when
+    # ensure_project_session! brings up the chat_app; released automatically
+    # when the bound worker's control WS drops (the claude process is gone
+    # with it). Worker-only-write model means there's no checksum/divergence
+    # state — anything claude writes on the worker auto-flows back to the
+    # server, the operator never edits server_path.
     locked_by::Union{String,Nothing}      # worker_name when active, else nothing
     locked_at::Union{DateTime,Nothing}
-    base_checksum::Vector{UInt8}          # tree_hash(server_path) at lock time
-    diverged::Bool                        # operator edited server_path while locked?
 end
 
 ProjectInfo(id, name, worker_name, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_name, server_path, worker_path, created,
-                nothing, nothing, UInt8[], false)
+                nothing, nothing)
 
 const WORKERS = Dict{String,WorkerInfo}()
 const PROJECTS = Dict{String,ProjectInfo}()
@@ -86,8 +87,7 @@ function save_projects!()
     mkpath(state_dir())
     data = [Dict("id" => p.id, "name" => p.name, "worker_name" => p.worker_name,
                  "server_path" => p.server_path, "worker_path" => p.worker_path,
-                 "created" => string(p.created),
-                 "base_checksum" => bytes2hex(p.base_checksum))
+                 "created" => string(p.created))
             for p in values(PROJECTS)]
     open(projects_file(), "w") do io
         JSON.print(io, data, 2)
@@ -100,12 +100,6 @@ function load_projects!()
         p = ProjectInfo(d["id"], d["name"], d["worker_name"],
                         d["server_path"], d["worker_path"],
                         DateTime(d["created"]))
-        # Restore base_checksum (locks themselves don't survive restart —
-        # they're tied to the live worker WS).
-        cs = get(d, "base_checksum", "")
-        if !isempty(cs)
-            p.base_checksum = hex2bytes(cs)
-        end
         PROJECTS[p.id] = p
     end
 end
@@ -114,21 +108,18 @@ end
 # dials the server's /worker-ws endpoint. Liveness comes from the WS itself;
 # no periodic probing or heartbeat task.
 
-# ── Project lock + divergence detection ──────────────────────────────────────
+# ── Project lock ──────────────────────────────────────────────────────────────
 
 """
-Mark a project locked by a worker. Captures `tree_hash(server_path)` so that
-later scans can spot operator edits that diverge from this snapshot. Errors
-if the project is already locked by a different worker.
+Mark a project locked by a worker (active ACP session). Errors if the project
+is already locked by a different worker.
 """
 function acquire_lock!(p::ProjectInfo, worker_name::String)
     if p.locked_by !== nothing && p.locked_by != worker_name
         error("Project '$(p.name)' is locked by worker '$(p.locked_by)'")
     end
-    p.locked_by      = worker_name
-    p.locked_at      = now(UTC)
-    p.base_checksum  = tree_hash(p.server_path)
-    p.diverged       = false
+    p.locked_by = worker_name
+    p.locked_at = now(UTC)
     save_projects!()
     bump_state!()
     return p
@@ -137,7 +128,6 @@ end
 function release_lock!(p::ProjectInfo)
     p.locked_by = nothing
     p.locked_at = nothing
-    p.diverged  = false
     save_projects!()
     bump_state!()
     return p
@@ -150,38 +140,6 @@ function release_locks_for_worker!(worker_name::String)
         p.locked_by == worker_name && release_lock!(p)
     end
 end
-
-# Periodic scan: for each locked project, recompute tree_hash(server_path)
-# and compare against `base_checksum`. If they differ, the operator edited
-# the canonical files while a session was active → set p.diverged + bump.
-const DIVERGENCE_SCANNER_RUNNING = Ref(false)
-
-function start_divergence_scanner!(; interval::Real = 5.0)
-    DIVERGENCE_SCANNER_RUNNING[] && return
-    DIVERGENCE_SCANNER_RUNNING[] = true
-    @async while DIVERGENCE_SCANNER_RUNNING[]
-        for p in collect(values(PROJECTS))
-            DIVERGENCE_SCANNER_RUNNING[] || break
-            p.locked_by === nothing && continue
-            try
-                cur = tree_hash(p.server_path)
-                was = p.diverged
-                p.diverged = cur != p.base_checksum
-                p.diverged != was && bump_state!()
-                p.diverged && was == false &&
-                    @warn "Operator edited canonical files while project is locked" project=p.name
-            catch e
-                @warn "divergence scan error" project=p.name exception=e
-            end
-        end
-        for _ in 1:Int(interval * 4)
-            DIVERGENCE_SCANNER_RUNNING[] || break
-            sleep(0.25)
-        end
-    end
-end
-
-stop_divergence_scanner!() = (DIVERGENCE_SCANNER_RUNNING[] = false)
 
 """
 Create a new project on the named worker. Steps:
@@ -226,18 +184,6 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
     ensure_project_session!(p, srv)
     bump_state!()
     return p
-end
-
-"""
-Force a full re-sync for an existing project. Pulls worker → server first
-(picks up claude's edits), then pushes server → worker (any user edits).
-Transport is the WS-based file mover; no SSH involved.
-"""
-function sync_project!(p::ProjectInfo)
-    haskey(WORKERS, p.worker_name) || error("Worker '$(p.worker_name)' not connected")
-    pull_dir_from_worker!(p.worker_name, p.worker_path, p.server_path)
-    push_dir_to_worker!(p.worker_name,   p.server_path, p.worker_path)
-    return nothing
 end
 
 """
@@ -428,34 +374,17 @@ function worker_card(w::WorkerInfo)
 end
 
 function project_card(p::ProjectInfo, error_obs::Observable{String})
-    sync_btn = Bonito.Button("⇅ Sync"; class = "bt-btn bt-btn-secondary")
-    on(sync_btn.value) do clicked
-        clicked || return
-        try
-            sync_project!(p)
-            error_obs[] = ""
-        catch e
-            error_obs[] = "Sync failed for $(p.name): $e"
-        end
-    end
-
-    badges = []
-    p.locked_by !== nothing && push!(badges,
+    badge = p.locked_by === nothing ? DOM.span() :
         DOM.span("🔒 active on $(p.locked_by)";
                  class = "bt-pill bt-pill-online",
-                 style = "margin-left:8px"))
-    p.diverged && push!(badges,
-        DOM.span("⚠ server files diverged";
-                 class = "bt-pill bt-pill-offline",
-                 style = "margin-left:8px"))
+                 style = "margin-left:8px")
 
     DOM.div(
         DOM.div(
-            DOM.div(p.name, badges..., class = "bt-card-title"),
+            DOM.div(p.name, badge, class = "bt-card-title"),
             DOM.div(p.worker_name, " · server: ", p.server_path,
                     " · worker: ", p.worker_path, class = "bt-card-meta")),
-        DOM.div(sync_btn,
-                DOM.a("Open chat →", href = Bonito.Link("/p/$(p.id)"), target = "_blank"),
+        DOM.div(DOM.a("Open chat →", href = Bonito.Link("/p/$(p.id)"), target = "_blank"),
                 style = "display:flex;gap:12px;align-items:center"),
         class = "bt-card")
 end

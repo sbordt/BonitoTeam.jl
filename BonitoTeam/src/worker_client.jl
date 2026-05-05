@@ -316,10 +316,6 @@ function pull_dir_from_worker!(worker_name::String, src::String, dst::String)
     return tree_hash(dst)
 end
 
-# tree_hash is provided by BonitoWorker (shared with the worker-side poller).
-# Re-export for callers in this module.
-const tree_hash = BonitoWorker.tree_hash
-
 """
 Apply a delta sent from a worker to the corresponding project's server_path.
 The delta envelope identifies the project by id; payload (if any) is a tar.gz
@@ -329,11 +325,6 @@ function apply_worker_delta!(cmd::AbstractDict, payload::AbstractVector{UInt8})
     project_id = String(get(cmd, "project_id", ""))
     haskey(PROJECTS, project_id) || (@warn "delta for unknown project" project_id; return)
     p = PROJECTS[project_id]
-
-    deletes = String[]
-    for d in get(cmd, "deletes", [])
-        push!(deletes, String(d))
-    end
 
     if !isempty(payload)
         tmp = tempname() * ".tar.gz"
@@ -346,8 +337,8 @@ function apply_worker_delta!(cmd::AbstractDict, payload::AbstractVector{UInt8})
         end
     end
 
-    for rel in deletes
-        full = joinpath(p.server_path, rel)
+    for rel in get(cmd, "deletes", [])
+        full = joinpath(p.server_path, String(rel))
         try
             isfile(full) && rm(full)
         catch e
@@ -355,11 +346,6 @@ function apply_worker_delta!(cmd::AbstractDict, payload::AbstractVector{UInt8})
         end
     end
 
-    # The worker's pushed state is the new authoritative content for
-    # base_checksum; reset divergence so the scanner doesn't false-positive.
-    p.base_checksum = tree_hash(p.server_path)
-    p.diverged      = false
-    bump_state!()
     return nothing
 end
 

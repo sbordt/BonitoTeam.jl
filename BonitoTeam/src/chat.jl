@@ -133,6 +133,20 @@ function detect_language(path::AbstractString)
     return "plaintext"
 end
 
+# If `text` is exactly a fenced code block (```lang\n...\n```), render it as a
+# read-only Monaco editor with the matching language. Otherwise fall back to
+# Markdown.parse so prose with inline formatting still works.
+function render_text_block(text::AbstractString)
+    m = match(r"^\s*```(\w*)\r?\n(.*?)\r?\n```\s*$"s, text)
+    if m !== nothing
+        lang = isempty(m.captures[1]) ? "plaintext" : String(m.captures[1])
+        code = String(m.captures[2])
+        return BonitoBook.MonacoEditor(code; language = lang,
+                                       options = Dict(:readOnly => true))
+    end
+    return DOM.div(Markdown.parse(text), class = "bt-tool-md")
+end
+
 function render_tool_body(m::ToolMsg)
     if m.kind == "edit"
         # Find a DiffContent block; render Monaco DiffEditor.
@@ -159,12 +173,12 @@ function render_tool_body(m::ToolMsg)
     end
 
     # Default / "think" / "other" / "search" / "fetch" / mixed:
-    # render text blocks as Markdown so agents that emit ```julia ... ``` etc.
-    # get language-aware code blocks. Diff blocks render via DiffEditor inline.
+    # text blocks that ARE a fenced code block become Monaco; mixed prose stays
+    # markdown. Diff blocks render via DiffEditor inline.
     parts = []
     for c in m.content
         if c isa TextContent
-            push!(parts, DOM.div(Markdown.parse(c.text), class = "bt-tool-md"))
+            push!(parts, render_text_block(c.text))
         elseif c isa DiffContent
             lang = detect_language(c.path)
             push!(parts, BonitoBook.DiffEditor(something(c.old_text, ""), c.new_text;

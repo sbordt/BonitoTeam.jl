@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# BonitoTeam server — listens for workers, serves the dashboard.
+#
+# Env:
+#   BONITOTEAM_WORKER_SECRET   shared secret for worker auth (required)
+#   BONITOTEAM_PUBLIC_URL      public base URL, e.g. https://your.domain.com (required)
+#   BONITOTEAM_PORT            internal bind port (default: 8038)
+#   BONITOTEAM_HOST            bind address (default: 127.0.0.1)
+#   BONITOTEAM_STATE_DIR       state dir (default: ~/.local/share/bonitoteam-server)
+#   BONITOTEAM_WORKING_DIR     working dir (default: ~/bonitoteam-server)
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+if [[ -z "${BONITOTEAM_WORKER_SECRET:-}" ]]; then
+    echo "ERROR: BONITOTEAM_WORKER_SECRET must be set" >&2
+    exit 1
+fi
+if [[ -z "${BONITOTEAM_PUBLIC_URL:-}" ]]; then
+    echo "ERROR: BONITOTEAM_PUBLIC_URL must be set" >&2
+    exit 1
+fi
+
+# juliaup installs per-user; add common locations so the system service finds it
+for JULIAUP_BIN in \
+        "${HOME:-}/.juliaup/bin" \
+        /var/lib/bonitoteam/.juliaup/bin \
+        /opt/juliaup/bin; do
+    [[ -d "$JULIAUP_BIN" ]] && export PATH="$JULIAUP_BIN:$PATH"
+done
+
+exec julia \
+    "--project=${PROJECT_DIR}" \
+    --startup-file=no \
+    --threads=auto \
+    "${PROJECT_DIR}/src/server_standalone.jl"

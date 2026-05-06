@@ -668,9 +668,10 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
                             DOM.div(path; class="bt-session-path"),
                             isempty(meta) ? DOM.span() :
                                 DOM.div(meta; class="bt-session-meta")),
-                        DOM.button("Import";
+                        DOM.div("Import";
                             class   = "bt-btn bt-btn-secondary",
-                            onclick = js"() => $(import_path).notify($path)"),
+                            style   = "cursor:pointer;flex-shrink:0",
+                            onclick = js"event => $(import_path).notify($path);"),
                         class = "bt-session-row"))
                 end
                 DOM.div(rows...)

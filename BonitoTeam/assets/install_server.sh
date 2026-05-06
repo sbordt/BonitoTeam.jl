@@ -152,10 +152,13 @@ TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
 
-# Hardening — see systemd.exec(5)
+# Hardening — see systemd.exec(5).
+# ProtectHome is intentionally NOT set: the service runs as the install user
+# and needs to read/write its own juliaup lockfile (~/.julia/juliaup/) and
+# the Julia depot (~/.julia/). Since we run as that user anyway, blocking
+# /home would only stop access to *other* users' homes — irrelevant here.
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=read-only
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true

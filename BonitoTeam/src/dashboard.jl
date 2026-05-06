@@ -468,12 +468,6 @@ const DashboardStyles = Bonito.Styles(
         "gap" => "8px", "margin-bottom" => "8px",
         "flex-wrap" => "wrap",
         "min-width" => "0"),
-    # Bonito wraps reactive map(...) output in <div><bonito-fragment><div>…
-    # which breaks flex layout — the bar isn't a direct flex child of
-    # bt-picker-cur. display:contents makes those wrappers transparent so the
-    # bar becomes an effective direct flex child and `flex: 1 1 0` works.
-    CSS(".bt-picker-cur > div, .bt-picker-cur .bonito-fragment, .bt-picker-cur .bonito-fragment > div",
-        "display" => "contents"),
     # ── Windows-style address bar ────────────────────────────────────────────
     CSS(".bt-addr-bar",
         "flex" => "1 1 0",   "min-width" => "0",

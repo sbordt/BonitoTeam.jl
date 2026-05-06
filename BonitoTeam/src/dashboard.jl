@@ -330,7 +330,15 @@ const DashboardStyles = Bonito.Styles(
         "min-width" => "0", "flex" => "1 1 auto"),
     CSS(".bt-card-title",
         "font-weight" => "600", "font-size" => "14px",
-        "display" => "flex", "align-items" => "center", "gap" => "8px"),
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "min-width" => "0"),
+    # Name spans inside titles: don't break on hyphens, ellipsis when too long
+    CSS(".bt-card-name",
+        "min-width" => "0",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis",
+        "white-space" => "nowrap",
+        "word-break" => "keep-all"),
     CSS(".bt-card-meta",
         "color" => "var(--bt-text-muted)", "font-size" => "12px",
         "margin-top" => "2px",
@@ -569,6 +577,29 @@ const DashboardStyles = Bonito.Styles(
         "transition" => "background 120ms"),
     CSS(".bt-install-copy:hover",
         "background" => "rgba(255,255,255,0.12)"),
+
+    # ── Responsive ───────────────────────────────────────────────────────────
+    # Header stacks below ~560px so the tagline doesn't squish
+    CSS("@media (max-width: 560px)",
+        CSS(".bt-header",
+            "flex-direction" => "column",
+            "align-items" => "flex-start",
+            "gap" => "4px"),
+        CSS(".bt-tagline", "font-size" => "12px"),
+        # form labels above inputs (single column) for touch widths
+        CSS(".bt-form",
+            "grid-template-columns" => "1fr",
+            "gap" => "8px"),
+        CSS(".bt-form label",
+            "padding-top" => "0", "font-size" => "12px"),
+        # cards may need to wrap their action cluster onto a second row
+        CSS(".bt-card", "flex-wrap" => "wrap"),
+        CSS(".bt-card-actions",
+            "margin-left" => "auto", "flex-wrap" => "wrap"),
+        # session row max-path doesn't make sense at narrow widths
+        CSS(".bt-session-path", "max-width" => "100%"),
+        # stats: tighter gap, smaller separators
+        CSS(".bt-stats", "gap" => "12px")),
 )
 
 # Folder picker component
@@ -771,7 +802,9 @@ function worker_card(w::WorkerInfo, srv_ref::Ref{Bonito.Server},
 
     DOM.div(
         DOM.div(
-            DOM.div(status_dot(w.status), w.name; class = "bt-card-title"),
+            DOM.div(status_dot(w.status),
+                    DOM.span(w.name; class = "bt-card-name");
+                    class = "bt-card-title"),
             DOM.div(isempty(w.hostname) ? w.url : w.hostname,
                     class = "bt-card-meta");
             class = "bt-card-body"),
@@ -788,9 +821,10 @@ end
 function project_card(p::ProjectInfo, error_obs::Observable{String},
                        opening_proj::Observable{String})
     badge = p.locked_by === nothing ? DOM.span() :
-        DOM.span("active on $(p.locked_by)";
+        DOM.span("active";
                  class = "bt-pill bt-pill-active",
-                 style = "margin-left:6px")
+                 style = "margin-left:6px",
+                 title = "active session on $(p.locked_by)")
 
     open_indicator = map(opening_proj) do oid
         oid == p.id ?
@@ -808,7 +842,8 @@ function project_card(p::ProjectInfo, error_obs::Observable{String},
 
     DOM.div(
         DOM.div(
-            DOM.div(p.name, badge; class = "bt-card-title"),
+            DOM.div(DOM.span(p.name; class = "bt-card-name"), badge;
+                    class = "bt-card-title"),
             DOM.div(
                 DOM.span(p.worker_name),
                 DOM.span("·"; class = "bt-stat-sep"),

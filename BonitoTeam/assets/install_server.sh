@@ -51,6 +51,18 @@ step "Sanity checks"
 command -v sudo        > /dev/null || { echo "ERROR: sudo not found"; exit 1; }
 ok "julia: $(julia --version)"
 
+# ── Stop service before making any changes ────────────────────────────────────
+# Ensures we never end up in a mixed old/new state: either the old service
+# is running (if we abort before this point), or it's stopped and we own the
+# update fully.
+step "Stop existing service (if running)"
+if sudo systemctl is-active --quiet bonitoteam-server 2>/dev/null; then
+    sudo systemctl stop bonitoteam-server
+    ok "stopped"
+else
+    ok "not running"
+fi
+
 # ── System user ───────────────────────────────────────────────────────────────
 step "System user: bonitoteam"
 if id bonitoteam &>/dev/null; then

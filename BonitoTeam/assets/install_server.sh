@@ -68,6 +68,7 @@ step "Sanity checks"
 [[ -f "$SERVER_BIN" ]] || { echo "ERROR: $SERVER_BIN not found — run from the cloned repo"; exit 1; }
 [[ -n "$JULIA_BIN" ]]  || { echo "ERROR: julia not found in PATH — install Julia first"; exit 1; }
 command -v sudo > /dev/null || { echo "ERROR: sudo not found"; exit 1; }
+chmod +x "$MONOREPO_DIR/BonitoTeam/bin/"*
 ok "julia: $(julia --version)"
 
 # ── Stop service before any changes ───────────────────────────────────────────

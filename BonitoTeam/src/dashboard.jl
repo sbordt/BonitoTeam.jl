@@ -57,48 +57,80 @@ const STATE_VERSION = Observable(0)
 bump_state!() = (STATE_VERSION[] = STATE_VERSION[] + 1)
 
 # Persistence
+# Atomic JSON write: serialise to a sibling .tmp first, then rename into place.
+# `rename(2)` on the same filesystem is atomic, so a crash mid-save can leave
+# only the old file or only the new — never a half-written file.
+function atomic_write_json(path::String, data)
+    mkpath(dirname(path))
+    tmp = path * ".tmp"
+    open(tmp, "w") do io
+        JSON.print(io, data, 2)
+    end
+    mv(tmp, path; force = true)
+end
+
+# Read JSON with corruption tolerance: if the file is truncated/garbled (e.g.
+# from a crash before atomic_write_json existed, or a manual edit gone wrong),
+# log a warning, move it aside as `<file>.bad`, and continue with empty state.
+# We'd rather lose worker/project metadata than refuse to start the server.
+function load_json_tolerant(path::String, label::String)
+    isfile(path) || return nothing
+    try
+        return JSON.parsefile(path)
+    catch e
+        bad = path * ".bad-" * Dates.format(now(UTC), "yyyymmddTHHMMSS")
+        try mv(path, bad; force = true) catch end
+        @warn "$label: failed to parse — moved aside, starting empty" path bad exception=e
+        return nothing
+    end
+end
+
 function save_workers!()
-    mkpath(state_dir())
     data = [Dict("name" => w.name, "url" => w.url, "secret" => w.secret,
                  "ssh_target" => w.ssh_target,
                  "hostname" => w.hostname, "home" => w.home,
                  "mcp_path" => w.mcp_path, "projects_root" => w.projects_root)
             for w in values(WORKERS)]
-    open(workers_file(), "w") do io
-        JSON.print(io, data, 2)
-    end
+    atomic_write_json(workers_file(), data)
 end
 
 function load_workers!()
-    isfile(workers_file()) || return
-    for d in JSON.parsefile(workers_file())
-        w = WorkerInfo(d["name"], d["url"], d["secret"],
-                       get(d, "ssh_target", nothing),
-                       get(d, "hostname", ""), get(d, "home", ""),
-                       get(d, "mcp_path", ""), get(d, "projects_root", ""),
-                       :unknown, now(UTC))
-        WORKERS[w.name] = w
+    raw = load_json_tolerant(workers_file(), "workers.json")
+    raw === nothing && return
+    for d in raw
+        try
+            w = WorkerInfo(d["name"], d["url"], d["secret"],
+                           get(d, "ssh_target", nothing),
+                           get(d, "hostname", ""), get(d, "home", ""),
+                           get(d, "mcp_path", ""), get(d, "projects_root", ""),
+                           :unknown, now(UTC))
+            WORKERS[w.name] = w
+        catch e
+            @warn "skipping malformed worker entry" entry=d exception=e
+        end
     end
 end
 
 function save_projects!()
-    mkpath(state_dir())
     data = [Dict("id" => p.id, "name" => p.name, "worker_name" => p.worker_name,
                  "server_path" => p.server_path, "worker_path" => p.worker_path,
                  "created" => string(p.created))
             for p in values(PROJECTS)]
-    open(projects_file(), "w") do io
-        JSON.print(io, data, 2)
-    end
+    atomic_write_json(projects_file(), data)
 end
 
 function load_projects!()
-    isfile(projects_file()) || return
-    for d in JSON.parsefile(projects_file())
-        p = ProjectInfo(d["id"], d["name"], d["worker_name"],
-                        d["server_path"], d["worker_path"],
-                        DateTime(d["created"]))
-        PROJECTS[p.id] = p
+    raw = load_json_tolerant(projects_file(), "projects.json")
+    raw === nothing && return
+    for d in raw
+        try
+            p = ProjectInfo(d["id"], d["name"], d["worker_name"],
+                            d["server_path"], d["worker_path"],
+                            DateTime(d["created"]))
+            PROJECTS[p.id] = p
+        catch e
+            @warn "skipping malformed project entry" entry=d exception=e
+        end
     end
 end
 
@@ -1340,6 +1372,9 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     App() do session
         DOM.div(
             DashboardStyles,
+            # Live connection indicator (fixed top-right). Tracks WS state:
+            # green=connected, yellow=reconnecting, red=disconnected.
+            Bonito.ConnectionIndicator(),
             DOM.div(
                 DOM.h1("BonitoTeam"),
                 DOM.div("Multi-host orchestrator for agentic coding sessions";

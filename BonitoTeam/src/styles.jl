@@ -79,6 +79,34 @@ const ChatStyles = Bonito.Styles(
         "box-shadow" => "0 0 0 3px rgba(16,185,129,0.18)"),
     CSS(".bt-dot-offline", "background" => "var(--bt-text-faint)"),
 
+    # ── Session-ended banner ─────────────────────────────────────────────────
+    # Shown when the ACP connection drops mid-conversation. Mirrors the
+    # bt-error style but adds a Restart action; sits between header and
+    # message scroll so it's always visible.
+    CSS(".bt-banner-error",
+        "background" => "#fef2f2", "color" => "#b91c1c",
+        "border" => "1px solid #fecaca",
+        "border-radius" => "var(--bt-radius)",
+        "padding" => "10px 14px",
+        "margin" => "12px 16px 0",
+        "display" => "flex", "align-items" => "center", "gap" => "12px",
+        "font-size" => "13px"),
+    CSS(".bt-banner-error .bt-btn",
+        "flex-shrink" => "0"),
+    CSS(".bt-banner-detail",
+        "color" => "#7f1d1d", "font-size" => "12px",
+        "margin-top" => "2px",
+        "font-family" => "ui-monospace, monospace",
+        "white-space" => "nowrap", "overflow" => "hidden",
+        "text-overflow" => "ellipsis"),
+    CSS(".bt-btn-secondary",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text)",
+        "border" => "1px solid var(--bt-border-strong)",
+        "padding" => "6px 12px", "border-radius" => "var(--bt-radius-sm)",
+        "font-size" => "13px", "cursor" => "pointer"),
+    CSS(".bt-btn-secondary:hover",
+        "background" => "var(--bt-surface-2)"),
+
     # ── Messages container ───────────────────────────────────────────────────
     # On wide screens the column self-centers (max-width + align-self), so
     # bubbles don't sprawl across a 1440px+ viewport. Scrollbar stays at the

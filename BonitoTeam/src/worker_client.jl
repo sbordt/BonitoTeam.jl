@@ -36,6 +36,28 @@ function send_command(worker_name::String, payload::AbstractDict)
     return nothing
 end
 
+# Take from a pending-handoff channel with a bounded wait. If `timeout` seconds
+# elapse without the worker dialing back, we evict the entry from `pending`
+# (so the worker gets "unknown id" if it arrives late) and put `nothing` on
+# the channel; callers see that and raise `op_name timed out`.
+#
+# `pending::AbstractDict` and `key::String` are the dict + key that the
+# matching handler `pop!`s when the worker arrives. Both sides race-tolerant
+# via the haskey guard.
+function take_pending!(ch::Channel, pending::AbstractDict, key::String,
+                       timeout::Real, op_name::AbstractString)
+    Base.errormonitor(@async begin
+        sleep(timeout)
+        if haskey(pending, key)
+            delete!(pending, key)
+            try put!(ch, nothing) catch end
+        end
+    end)
+    val = take!(ch)
+    val === nothing && error("$op_name timed out after $(timeout)s — worker may be offline or stuck")
+    return val
+end
+
 # Handler for /worker-ws — runs once per worker, for the worker's lifetime.
 function handle_worker_control(ws, worker_secret::String)
     name = "?"
@@ -139,13 +161,22 @@ function handle_worker_sync(ws, worker_secret::String)
         return
     end
     sync_id = String(get(auth, "sync_id", ""))
-    if isempty(sync_id) || !haskey(PENDING_SYNC_SESSIONS, sync_id)
-        try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"unknown sync_id"))) catch end
+    if isempty(sync_id)
+        try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"missing sync_id"))) catch end
+        return
+    end
+    # Race-tolerant pop: pending entry may have already been evicted by
+    # take_pending!'s timeout. Single pop! both checks + removes atomically.
+    ch = nothing
+    try
+        ch = pop!(PENDING_SYNC_SESSIONS, sync_id)
+    catch e
+        e isa KeyError || rethrow()
+        try WebSockets.send(ws, JSON.json(Dict("ok"=>false,
+                                                "error"=>"unknown or expired sync_id"))) catch end
         return
     end
     WebSockets.send(ws, JSON.json(Dict("ok" => true)))
-
-    ch = pop!(PENDING_SYNC_SESSIONS, sync_id)
     put!(ch, ws)
 
     # Block here so Bonito holds the WS open while the orchestrator drives
@@ -164,13 +195,20 @@ function handle_worker_acp(ws, worker_secret::String)
         return
     end
     sid = String(get(auth, "sid", ""))
-    if isempty(sid) || !haskey(PENDING_ACP_SESSIONS, sid)
-        try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"unknown sid"))) catch end
+    if isempty(sid)
+        try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"missing sid"))) catch end
+        return
+    end
+    ch = nothing
+    try
+        ch = pop!(PENDING_ACP_SESSIONS, sid)
+    catch e
+        e isa KeyError || rethrow()
+        try WebSockets.send(ws, JSON.json(Dict("ok"=>false,
+                                                "error"=>"unknown or expired sid"))) catch end
         return
     end
     WebSockets.send(ws, JSON.json(Dict("ok" => true)))
-
-    ch = pop!(PENDING_ACP_SESSIONS, sid)
     put!(ch, ws)
 
     # Block here so Bonito keeps the WS open for the duration of the session.
@@ -191,7 +229,8 @@ the live ACP `Client`.
 function start_session_on_worker(worker_name::String, cwd::String;
                                   on_update::Function       = identity,
                                   mcp_servers               = [],
-                                  request_handler::Function = AgentClientProtocol.make_request_handler(cwd))
+                                  request_handler::Function = AgentClientProtocol.make_request_handler(cwd),
+                                  timeout::Real             = 30.0)
 
     haskey(WORKER_CONTROL_WS, worker_name) ||
         error("Worker '$worker_name' is not connected")
@@ -223,8 +262,10 @@ function start_session_on_worker(worker_name::String, cwd::String;
         "mcpServers" => mcp_list,
     ))
 
-    # Wait for the worker's /worker-acp upgrade.
-    ws = take!(ch)
+    # Wait for the worker's /worker-acp upgrade — bounded so a dead worker
+    # doesn't hang the dashboard task that triggered the session.
+    ws = take_pending!(ch, PENDING_ACP_SESSIONS, sid, timeout,
+                      "open_session on '$worker_name'")
 
     conn = ws_connection(ws; request_handler, update_handler = on_update)
 
@@ -251,7 +292,8 @@ end
 Tar `src` on the server, stream it to the worker over a /worker-sync WS, and
 have the worker extract into `dst`.
 """
-function push_dir_to_worker!(worker_name::String, src::String, dst::String)
+function push_dir_to_worker!(worker_name::String, src::String, dst::String;
+                              handoff_timeout::Real = 30.0)
     isdir(src) || error("Source path is not a directory: $src")
     haskey(WORKER_CONTROL_WS, worker_name) ||
         error("Worker '$worker_name' is not connected")
@@ -267,7 +309,8 @@ function push_dir_to_worker!(worker_name::String, src::String, dst::String)
         "dst_path"  => dst,
     ))
 
-    ws = take!(ch)
+    ws = take_pending!(ch, PENDING_SYNC_SESSIONS, sync_id, handoff_timeout,
+                      "push to '$worker_name'")
     try
         tmp = tempname() * ".tar.gz"
         try
@@ -293,7 +336,8 @@ end
 Inverse of `push_dir_to_worker!` — tells the worker to tar `src` (its path)
 and stream it back; we extract into `dst` (server path).
 """
-function pull_dir_from_worker!(worker_name::String, src::String, dst::String)
+function pull_dir_from_worker!(worker_name::String, src::String, dst::String;
+                                handoff_timeout::Real = 30.0)
     haskey(WORKER_CONTROL_WS, worker_name) ||
         error("Worker '$worker_name' is not connected")
     mkpath(dst)
@@ -309,7 +353,8 @@ function pull_dir_from_worker!(worker_name::String, src::String, dst::String)
         "src_path"  => src,
     ))
 
-    ws = take!(ch)
+    ws = take_pending!(ch, PENDING_SYNC_SESSIONS, sync_id, handoff_timeout,
+                      "pull from '$worker_name'")
     try
         header = JSON.parse(String(WebSockets.receive(ws)))
         get(header, "type", "") == "tar" ||

@@ -378,6 +378,33 @@ function chat_app(cwd::String;
     end
     update_session_id!(chat_session, client[].session_id)
 
+    # Session-health state surfaced in the UI. Flipped to false when prompt!
+    # raises (worker WS dropped, ACP subprocess died, etc.); the chat banner
+    # uses this to show "session ended — restart?" with a button.
+    session_alive = Observable(true)
+    last_error    = Observable("")
+
+    function restart_session!()
+        try
+            old = client[]
+            if old !== nothing
+                # Best-effort close of the old conn so the worker stops sending.
+                try AgentClientProtocol.send_request(old.conn, "session/cancel",
+                                                      Dict("sessionId" => old.session_id)) catch end
+            end
+            client[] = if client_factory !== nothing
+                client_factory(on_update)
+            else
+                AgentClientProtocol.Client(cwd; on_update, mcp_servers)
+            end
+            update_session_id!(chat_session, client[].session_id)
+            session_alive[] = true
+            last_error[]    = ""
+        catch e
+            last_error[] = "restart failed: $(sprint(showerror, e))"
+        end
+    end
+
     # Bonito App
     App() do bonito_session
         text_val  = Observable("")
@@ -436,10 +463,22 @@ function chat_app(cwd::String;
                     AgentClientProtocol.prompt!(client[], String(text))
                     finalize_streaming!()
                 catch e
-                    id = string(uuid4())
-                    err_msg = AgentMsg(id, "[error: $e]")
-                    push_msg!(err_msg)
-                    finalize_agent(chat_session, err_msg)
+                    # Distinguish transient errors from session death. If the
+                    # underlying ACP connection is gone, the chat banner shows
+                    # the restart affordance; otherwise we still log the error
+                    # inline as a chat bubble so the user has context.
+                    msg = sprint(showerror, e)
+                    if occursin("connection closed", msg) ||
+                       occursin("EOFError",          msg) ||
+                       occursin("BrokenPipe",        msg)
+                        session_alive[] = false
+                        last_error[]    = msg
+                    else
+                        id = string(uuid4())
+                        err_msg = AgentMsg(id, "[error: $msg]")
+                        push_msg!(err_msg)
+                        finalize_agent(chat_session, err_msg)
+                    end
                 finally
                     emit(Dict{String,Any}("type" => "busy_end"))
                 end
@@ -489,21 +528,49 @@ function chat_app(cwd::String;
             });
         """)
 
+        # Status dot reflects ACP session health, not Bonito's WS — the WS
+        # indicator is the floater in the corner, this is "is claude alive".
+        status_dot = map(session_alive) do alive
+            DOM.span(""; class = alive ? "bt-dot bt-dot-online" : "bt-dot bt-dot-offline",
+                         title = alive ? "session live" : "session ended")
+        end
+
+        # Restart banner shown when the agent died. Hidden when alive=true.
+        restart_btn_inner = Bonito.Button("Restart session"; style=nothing,
+                                          class = "bt-btn bt-btn-secondary")
+        on(restart_btn_inner.value) do clicked
+            clicked && @async restart_session!()
+        end
+        banner = map(session_alive, last_error) do alive, err
+            alive && return DOM.div()
+            DOM.div(
+                DOM.div(
+                    DOM.span("⚠ Session ended"; style = "font-weight:600"),
+                    DOM.div(isempty(err) ? "The agent connection was closed." : err;
+                            class = "bt-banner-detail");
+                    style = "flex:1 1 auto; min-width:0"),
+                restart_btn_inner;
+                class = "bt-banner-error")
+        end
+
         DOM.div(
             ChatStyles,
             BonitoTeamJS,
             Bonito.MarkdownCSS,
+            # Live WS-connection indicator (fixed top-right corner).
+            Bonito.ConnectionIndicator(),
             DOM.div(
                 DOM.div(
                     DOM.a("←"; href = Bonito.Link("/"), class = "bt-header-back",
                            title = "Back to dashboard"),
-                    DOM.span(""; class = "bt-dot bt-dot-online", title = "session live"),
+                    status_dot,
                     DOM.div(
                         DOM.span(basename(rstrip(cwd, '/'))),
                         DOM.span(cwd; class = "bt-header-cwd"),
                         class = "bt-header-title");
                     class = "bt-header-row");
                 class = "bt-header"),
+            banner,
             DOM.div(
                 DOM.div(class="bt-spacer-top"),
                 DOM.div(class="bt-spacer-bottom"),

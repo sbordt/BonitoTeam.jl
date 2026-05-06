@@ -70,6 +70,8 @@ function run_control_session(; server_url, secret, name, mcp_path,
                 @async handle_open_sync(server_url, secret, cmd)
             elseif t == "list_dir"
                 @async handle_list_dir(ws, cmd)
+            elseif t == "scan_sessions"
+                @async handle_scan_sessions(ws, cmd)
             elseif t == "ping"
                 WebSockets.send(ws, JSON.json(Dict("type" => "pong")))
             else
@@ -433,6 +435,127 @@ function diff_snapshots(prev::Dict{String,FileEntry},
         haskey(current, rel) || push!(deleted, rel)
     end
     return (created = created, modified = modified, deleted = deleted)
+end
+
+# ── Claude session scanner ─────────────────────────────────────────────────────
+
+"""
+    scan_claude_sessions(; home) → Vector{Dict{String,Any}}
+
+Scan the worker machine for existing Claude Code usage:
+- Running `claude` processes (via /proc/PID/cwd) — exact cwd, marked active
+- Historical projects in ~/.claude/projects/ — decoded via filesystem DFS
+
+Returns sorted: active first, then by last-used time descending.
+Each entry has: `path`, `name`, `active`, and either `pid` (active) or
+`last_used` (Unix timestamp, historical).
+"""
+function scan_claude_sessions(; home::String = get(ENV, "HOME", ""))
+    results  = Dict{String,Any}[]
+    active_paths = Set{String}()
+
+    # Running claude processes via /proc (Linux only)
+    if isdir("/proc")
+        for pid_s in readdir("/proc"; join=false)
+            all(isdigit, pid_s) || continue
+            cmdline_path = "/proc/$pid_s/cmdline"
+            isfile(cmdline_path) || continue
+            cmdline_raw = try read(cmdline_path, String) catch; continue end
+            tokens = split(cmdline_raw, '\0'; keepempty=false)
+            isempty(tokens) && continue
+            basename(tokens[1]) == "claude" || continue
+            any(==(("--mcp")), tokens) && continue   # skip MCP subprocesses
+            cwd = try readlink("/proc/$pid_s/cwd") catch; continue end
+            isdir(cwd) || continue
+            push!(active_paths, cwd)
+            push!(results, Dict{String,Any}(
+                "path"   => cwd,
+                "name"   => basename(cwd),
+                "active" => true,
+                "pid"    => parse(Int, pid_s),
+            ))
+        end
+    end
+
+    # Historical projects from ~/.claude/projects/
+    projects_dir = joinpath(home, ".claude", "projects")
+    if isdir(projects_dir)
+        for encoded in sort!(readdir(projects_dir))
+            proj_dir = joinpath(projects_dir, encoded)
+            isdir(proj_dir) || continue
+            jsonl_files = filter(f -> endswith(f, ".jsonl"),
+                                 readdir(proj_dir; join=true))
+            isempty(jsonl_files) && continue
+            last_used = maximum(stat(f).mtime for f in jsonl_files)
+            decoded = decode_project_path(encoded)
+            decoded === nothing && continue
+            decoded in active_paths && continue
+            push!(results, Dict{String,Any}(
+                "path"      => decoded,
+                "name"      => basename(decoded),
+                "active"    => false,
+                "last_used" => last_used,
+            ))
+        end
+    end
+
+    sort!(results; by = r -> begin
+        is_active = get(r, "active", false) === true
+        last      = get(r, "last_used", 0.0)
+        last_f    = last isa Number ? -Float64(last) : 0.0
+        (is_active ? 0 : 1, last_f)
+    end)
+    return results
+end
+
+# Decode ~/.claude/projects/<encoded> back to an absolute path.
+# Encoding: every '/' in the abs path is replaced by '-' (leading '/' → '-').
+# This is ambiguous when directory names contain '-'; we resolve by DFS against
+# the actual filesystem — only paths whose components physically exist are returned.
+function decode_project_path(encoded::String)
+    startswith(encoded, "-") || return nothing
+    candidates = reconstruct_path("/", encoded[2:end])
+    for c in candidates
+        isdir(c) && return c
+    end
+    return nothing
+end
+
+function reconstruct_path(current::String, remaining::String)
+    isempty(remaining) && return [current]
+    results = String[]
+    parts   = split(remaining, '-'; keepempty=false)
+    for i in 1:length(parts)
+        segment   = join(parts[1:i], '-')
+        candidate = joinpath(current, segment)
+        isdir(candidate) || continue
+        rest = i < length(parts) ? join(parts[i+1:end], '-') : ""
+        if isempty(rest)
+            push!(results, candidate)
+        else
+            append!(results, reconstruct_path(candidate, rest))
+        end
+    end
+    return results
+end
+
+function handle_scan_sessions(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    sessions = try
+        scan_claude_sessions()
+    catch e
+        @warn "BonitoWorker: scan_claude_sessions failed" exception=e
+        Dict{String,Any}[]
+    end
+    try
+        WebSockets.send(ws, JSON.json(Dict(
+            "type"       => "scan_sessions_result",
+            "request_id" => request_id,
+            "sessions"   => sessions,
+        )))
+    catch e
+        @warn "BonitoWorker: scan_sessions response failed" exception=e
+    end
 end
 
 function find_agent_bin()

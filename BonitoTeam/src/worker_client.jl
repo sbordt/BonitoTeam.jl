@@ -24,6 +24,8 @@ const PENDING_SYNC_SESSIONS = Dict{String,Channel{Any}}()
 # request_id → Channel{Dict} where worker's list_dir_response is handed back
 # to the dashboard task that issued the RPC
 const PENDING_LIST_DIR = Dict{String,Channel{Dict}}()
+# request_id → Channel where worker's scan_sessions_result is handed back
+const PENDING_SCAN_SESSIONS = Dict{String,Channel{Vector{Dict{String,Any}}}}()
 
 # Send a JSON command to a worker over its control WS. Throws if the worker
 # isn't currently connected.
@@ -91,6 +93,14 @@ function handle_worker_control(ws, worker_secret::String)
                     if haskey(PENDING_LIST_DIR, rid)
                         ch = pop!(PENDING_LIST_DIR, rid)
                         put!(ch, Dict{String,Any}(cmd))
+                    end
+                elseif t == "scan_sessions_result"
+                    rid = String(get(cmd, "request_id", ""))
+                    if haskey(PENDING_SCAN_SESSIONS, rid)
+                        ch = pop!(PENDING_SCAN_SESSIONS, rid)
+                        sessions = [Dict{String,Any}(s)
+                                    for s in get(cmd, "sessions", Any[])]
+                        put!(ch, sessions)
                     end
                 end
             catch e
@@ -348,6 +358,29 @@ function list_worker_dir(worker_name::String, path::AbstractString;
     return (path = String(resp["path"]),
             entries = [(name = String(e["name"]), dir = Bool(e["dir"]))
                        for e in resp["entries"]])
+end
+
+"""
+    scan_worker_sessions(worker_name; timeout=15.0) → Vector{Dict{String,Any}}
+
+Ask the named worker to scan for existing Claude Code sessions (running processes
++ ~/.claude/projects/ history) and return the results. Blocks until the worker
+replies or `timeout` seconds elapse.
+"""
+function scan_worker_sessions(worker_name::String; timeout::Real = 15.0)
+    haskey(WORKER_CONTROL_WS, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+    rid = string(uuid4())
+    ch  = Channel{Vector{Dict{String,Any}}}(1)
+    PENDING_SCAN_SESSIONS[rid] = ch
+    send_command(worker_name, Dict("type" => "scan_sessions", "request_id" => rid))
+    @async begin
+        sleep(timeout)
+        if isopen(ch)
+            put!(ch, [Dict{String,Any}("error" => "scan_sessions timed out")])
+        end
+    end
+    return take!(ch)
 end
 
 """

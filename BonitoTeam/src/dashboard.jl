@@ -318,6 +318,25 @@ const DashboardStyles = Bonito.Styles(
         "margin-bottom" => "6px",
         "display" => "flex", "justify-content" => "space-between",
         "align-items" => "center", "gap" => "8px"),
+    # Discover panel (per-worker Claude session scanner)
+    CSS(".bt-discover-panel",
+        "background" => "#f9fafb", "border" => "1px solid #e5e7eb",
+        "border-radius" => "6px", "padding" => "12px 16px",
+        "margin-top" => "-4px", "margin-bottom" => "8px"),
+    CSS(".bt-discover-header",
+        "display" => "flex", "justify-content" => "space-between",
+        "align-items" => "center", "margin-bottom" => "10px",
+        "font-weight" => "600", "font-size" => "13px"),
+    CSS(".bt-session-row",
+        "display" => "flex", "justify-content" => "space-between",
+        "align-items" => "center", "padding" => "8px 10px",
+        "border" => "1px solid #e5e7eb", "border-radius" => "4px",
+        "margin-bottom" => "6px", "background" => "#fff"),
+    CSS(".bt-session-path",
+        "font-family" => "ui-monospace,monospace", "font-size" => "11px",
+        "color" => "#6b7280", "margin-top" => "2px"),
+    CSS(".bt-session-meta",
+        "font-size" => "11px", "color" => "#9ca3af", "margin-top" => "2px"),
     # Spinner shown while a create operation is in progress
     CSS(".bt-spinner-row",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
@@ -459,21 +478,27 @@ status_pill(s::Symbol) = DOM.span(string(s);
     class = "bt-pill bt-pill-$s")
 
 function worker_card(w::WorkerInfo, srv_ref::Ref{Bonito.Server},
-                     error_obs::Observable{String}, picker_state::Observable{String})
-    new_proj_btn = Bonito.Button("+ Project"; style=nothing, class = "bt-btn bt-btn-secondary")
+                     error_obs::Observable{String}, picker_state::Observable{String},
+                     discover_state::Observable{String})
+    new_proj_btn  = Bonito.Button("+ Project"; style=nothing, class = "bt-btn bt-btn-secondary")
+    discover_btn  = Bonito.Button("Discover"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(new_proj_btn.value) do clicked
         clicked || return
-        # Toggle the per-worker picker; only one worker's picker open at a time.
-        picker_state[] = picker_state[] == w.name ? "" : w.name
-        error_obs[] = ""
+        picker_state[]   = picker_state[]   == w.name ? "" : w.name
+        discover_state[] = ""
+        error_obs[]      = ""
+    end
+    on(discover_btn.value) do clicked
+        clicked || return
+        discover_state[] = discover_state[] == w.name ? "" : w.name
+        picker_state[]   = ""
+        error_obs[]      = ""
     end
     DOM.div(
         DOM.div(
             DOM.div(w.name, " ", status_pill(w.status), class = "bt-card-title"),
-            DOM.div(w.url, " · ",
-                isempty(w.hostname) ? "?" : w.hostname,
-                class = "bt-card-meta")),
-        DOM.div(new_proj_btn, style = "display:flex;gap:8px"),
+            DOM.div(isempty(w.hostname) ? w.url : w.hostname, class = "bt-card-meta")),
+        DOM.div(discover_btn, new_proj_btn, style = "display:flex;gap:8px"),
         class = "bt-card")
 end
 
@@ -560,6 +585,105 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     # form is currently visible (""  → none).
     picker_state = Observable("")
     remote_pickers = Dict{String,RemoteFolderPicker}()
+
+    # Discover panel — scan a worker for existing Claude Code sessions
+    discover_state   = Observable("")                       # worker name whose panel is open
+    discover_results = Observable(Dict{String,Any}[])
+    discover_busy    = Observable(false)
+    import_path      = Observable("")                       # JS onclick notifies this
+
+    on(discover_state) do w_name
+        isempty(w_name) && return
+        discover_busy[]    = true
+        discover_results[] = Dict{String,Any}[]
+        @async begin
+            try
+                discover_results[] = scan_worker_sessions(w_name)
+            catch e
+                discover_results[] = [Dict{String,Any}("error" => sprint(showerror, e))]
+            finally
+                discover_busy[] = false
+            end
+        end
+    end
+
+    on(import_path) do path
+        isempty(path) && return
+        import_path[] = ""          # reset so the same path can be re-imported
+        isempty(busy_msg[]) || return
+        w_name = discover_state[]
+        isempty(w_name) && return
+        proj_name = replace(basename(rstrip(path, '/')), r"[^a-zA-Z0-9_\-]" => "_")
+        isempty(proj_name) && (proj_name = "project")
+        busy_msg[] = "Pulling from worker…"
+        @async begin
+            try
+                create_project_from_worker!(srv_ref[], w_name, path; name=proj_name)
+                error_obs[]      = ""
+                discover_state[] = ""
+            catch e
+                error_obs[] = "Failed to import: $(sprint(showerror, e))"
+            finally
+                busy_msg[] = ""
+            end
+        end
+    end
+
+    function discover_panel(w_name::String)
+        close_btn = Bonito.Button("✕"; style=nothing, class = "bt-btn bt-btn-secondary")
+        on(close_btn.value) do clicked
+            clicked && (discover_state[] = "")
+        end
+        panel_content = map(discover_busy, discover_results) do busy, results
+            if busy
+                spinner_row("Scanning for Claude Code sessions…")
+            elseif isempty(results)
+                DOM.div("No Claude Code sessions found on $w_name.", class = "bt-empty")
+            else
+                rows = DOM.Node[]
+                for r in results
+                    if haskey(r, "error")
+                        push!(rows, DOM.div("Error: $(r["error"])", class = "bt-error"))
+                        continue
+                    end
+                    path      = String(get(r, "path", ""))
+                    isempty(path) && continue
+                    name      = String(get(r, "name", basename(path)))
+                    is_active = get(r, "active", false) === true
+                    badge     = is_active ?
+                        DOM.span("running"; class="bt-pill bt-pill-online",
+                                 style="margin-left:6px") : DOM.span()
+                    meta = if is_active
+                        "PID $(get(r, "pid", "?"))"
+                    elseif haskey(r, "last_used")
+                        ts = get(r, "last_used", 0.0)
+                        dt = Dates.unix2datetime(ts isa Number ? Float64(ts) : 0.0)
+                        "Last used: $(Dates.format(dt, "yyyy-mm-dd HH:MM")) UTC"
+                    else
+                        ""
+                    end
+                    push!(rows, DOM.div(
+                        DOM.div(
+                            DOM.span(name, badge; style="font-weight:600"),
+                            DOM.div(path; class="bt-session-path"),
+                            isempty(meta) ? DOM.span() :
+                                DOM.div(meta; class="bt-session-meta")),
+                        DOM.button("Import";
+                            class   = "bt-btn bt-btn-secondary",
+                            onclick = js"() => $(import_path).notify($path)"),
+                        class = "bt-session-row"))
+                end
+                DOM.div(rows...)
+            end
+        end
+        DOM.div(
+            DOM.div(
+                DOM.span("Claude Code sessions on $w_name"),
+                close_btn,
+                class = "bt-discover-header"),
+            panel_content,
+            class = "bt-discover-panel")
+    end
 
     function get_remote_picker(name)
         haskey(remote_pickers, name) || (remote_pickers[name] = RemoteFolderPicker(name))
@@ -650,14 +774,15 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     # Layout
     App() do session
         # Re-render lists whenever STATE_VERSION bumps OR picker_state changes
-        worker_list = map(STATE_VERSION, picker_state) do _, picked_worker
+        worker_list = map(STATE_VERSION, picker_state, discover_state) do _, picked_worker, discovered_worker
             isempty(WORKERS) && return DOM.div(
                 "No workers registered yet. Run the install script on a worker.",
                 class = "bt-empty")
             rows = []
             for w in values(WORKERS)
-                push!(rows, worker_card(w, srv_ref, error_obs, picker_state))
-                picked_worker == w.name && push!(rows, remote_picker_form(w.name))
+                push!(rows, worker_card(w, srv_ref, error_obs, picker_state, discover_state))
+                picked_worker    == w.name && push!(rows, remote_picker_form(w.name))
+                discovered_worker == w.name && push!(rows, discover_panel(w.name))
             end
             DOM.div(rows...)
         end

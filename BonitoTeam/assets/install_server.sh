@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # BonitoTeam server installer — idempotent.
+# Run as a regular user (sudo is invoked internally for privileged steps):
 #
-# Clone the repo, then run as root:
-#   sudo bash BonitoTeam/assets/install_server.sh [options]
+#   bash BonitoTeam/assets/install_server.sh [options]
 #
 # Options:
 #   --public-url URL   URL workers use to reach this server
@@ -32,8 +32,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ "$(id -u)" -eq 0 ]] || { echo "ERROR: run as root (sudo bash $0 ...)"; exit 1; }
-
 step() { echo ""; echo "==> $*"; }
 ok()   { echo "    ok   : $*"; }
 info() { echo "    info : $*"; }
@@ -41,14 +39,16 @@ info() { echo "    info : $*"; }
 DATA_DIR="/var/lib/bonitoteam"
 CONFIG_DIR="/etc/bonitoteam"
 SERVER_BIN="$MONOREPO_DIR/BonitoTeam/bin/bonitoteam-server"
+JULIA_BIN="$(command -v julia || true)"
 
 echo "==> BonitoTeam server installer"
 echo "    Monorepo: $MONOREPO_DIR"
 
 # ── Sanity checks ─────────────────────────────────────────────────────────────
 step "Sanity checks"
-[[ -f "$SERVER_BIN" ]] || { echo "ERROR: $SERVER_BIN not found — is MONOREPO_DIR correct?"; exit 1; }
-command -v julia > /dev/null || { echo "ERROR: julia not found in PATH — install Julia first"; exit 1; }
+[[ -f "$SERVER_BIN" ]] || { echo "ERROR: $SERVER_BIN not found — run from the cloned repo"; exit 1; }
+[[ -n "$JULIA_BIN" ]]  || { echo "ERROR: julia not found in PATH — install Julia first"; exit 1; }
+command -v sudo        > /dev/null || { echo "ERROR: sudo not found"; exit 1; }
 ok "julia: $(julia --version)"
 
 # ── System user ───────────────────────────────────────────────────────────────
@@ -56,30 +56,30 @@ step "System user: bonitoteam"
 if id bonitoteam &>/dev/null; then
     ok "exists"
 else
-    useradd --system \
-            --home-dir "$DATA_DIR" \
-            --create-home \
-            --shell /usr/sbin/nologin \
-            --comment "BonitoTeam server" \
-            bonitoteam
+    sudo useradd --system \
+                 --home-dir "$DATA_DIR" \
+                 --create-home \
+                 --shell /usr/sbin/nologin \
+                 --comment "BonitoTeam server" \
+                 bonitoteam
     ok "created"
 fi
-mkdir -p "$DATA_DIR/state" "$DATA_DIR/projects"
-chown -R bonitoteam:bonitoteam "$DATA_DIR"
-chmod 750 "$DATA_DIR"
+sudo mkdir -p "$DATA_DIR/state" "$DATA_DIR/projects"
+sudo chown -R bonitoteam:bonitoteam "$DATA_DIR"
+sudo chmod 750 "$DATA_DIR"
 
 # ── Julia env ─────────────────────────────────────────────────────────────────
 step "Julia env (BonitoTeam)"
-sudo -u bonitoteam julia \
+julia \
     "--project=$MONOREPO_DIR/BonitoTeam" \
     --startup-file=no \
-    -e 'import Pkg; Pkg.instantiate(); Pkg.precompile()'
-ok "instantiated + precompiled"
+    -e 'import Pkg; Pkg.instantiate()'
+ok "instantiated"
 
 # ── Worker secret ─────────────────────────────────────────────────────────────
 step "Worker secret"
-if [[ -z "$SECRET" && -f "$CONFIG_DIR/server.env" ]]; then
-    SECRET=$(grep '^BONITOTEAM_WORKER_SECRET=' "$CONFIG_DIR/server.env" 2>/dev/null \
+if [[ -z "$SECRET" ]] && sudo test -f "$CONFIG_DIR/server.env" 2>/dev/null; then
+    SECRET=$(sudo grep '^BONITOTEAM_WORKER_SECRET=' "$CONFIG_DIR/server.env" \
              | cut -d= -f2- || true)
     [[ -n "$SECRET" ]] && info "reusing existing secret from $CONFIG_DIR/server.env"
 fi
@@ -100,8 +100,8 @@ ok "$PUBLIC_URL"
 
 # ── Config file ───────────────────────────────────────────────────────────────
 step "Config: $CONFIG_DIR/server.env"
-mkdir -p "$CONFIG_DIR"
-cat > "$CONFIG_DIR/server.env" << EOF
+sudo mkdir -p "$CONFIG_DIR"
+sudo tee "$CONFIG_DIR/server.env" > /dev/null << EOF
 BONITOTEAM_WORKER_SECRET=$SECRET
 BONITOTEAM_PUBLIC_URL=$PUBLIC_URL
 BONITOTEAM_PORT=$PORT
@@ -109,14 +109,13 @@ BONITOTEAM_HOST=0.0.0.0
 BONITOTEAM_STATE_DIR=$DATA_DIR/state
 BONITOTEAM_WORKING_DIR=$DATA_DIR/projects
 EOF
-chown root:bonitoteam "$CONFIG_DIR/server.env"
-chmod 640 "$CONFIG_DIR/server.env"
+sudo chown root:bonitoteam "$CONFIG_DIR/server.env"
+sudo chmod 640 "$CONFIG_DIR/server.env"
 ok "written (mode 640, group bonitoteam)"
 
 # ── systemd service ───────────────────────────────────────────────────────────
 step "systemd service: bonitoteam-server"
-JULIA_BIN="$(command -v julia)"
-cat > /etc/systemd/system/bonitoteam-server.service << EOF
+sudo tee /etc/systemd/system/bonitoteam-server.service > /dev/null << EOF
 [Unit]
 Description=BonitoTeam dashboard server
 After=network-online.target
@@ -148,20 +147,21 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictRealtime=true
 LockPersonality=true
 # Julia JIT requires writable+executable pages — MemoryDenyWriteExecute must stay off
-ReadWritePaths=$DATA_DIR $MONOREPO_DIR
+ReadOnlyPaths=$MONOREPO_DIR
+ReadWritePaths=$DATA_DIR
 
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable bonitoteam-server > /dev/null 2>&1 || true
+sudo systemctl daemon-reload
+sudo systemctl enable bonitoteam-server > /dev/null 2>&1 || true
 ok "installed + enabled"
 
 # ── Start ─────────────────────────────────────────────────────────────────────
 step "Start bonitoteam-server"
-systemctl restart bonitoteam-server
+sudo systemctl restart bonitoteam-server
 sleep 2
-if systemctl is-active --quiet bonitoteam-server; then
+if sudo systemctl is-active --quiet bonitoteam-server; then
     ok "active"
 else
     echo "ERROR: service failed to start." >&2

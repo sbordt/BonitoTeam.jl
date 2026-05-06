@@ -45,19 +45,58 @@ const TOOL_ICONS = Dict(
 tool_icon(kind) = get(TOOL_ICONS, kind, "⚙")
 
 # Short summary shown on the collapsed tool header (before expand).
+# Per-kind summaries are tuned for at-a-glance comprehension:
+#   edit:   one file → "name · ±N lines";  many → "K files · ±N lines"
+#   search: count of result rows that look like grep hits
+#   move:   "src → dst" extracted from the content text
+#   fetch:  domain of the URL extracted from the content
+#   else:   line / byte count of the first text block
 function content_summary(kind::AbstractString, content::AbstractVector)
     isempty(content) && return ""
+
     if kind == "edit"
-        for c in content
-            if c isa DiffContent
-                old_n = length(split(something(c.old_text, ""), '\n'))
-                new_n = length(split(c.new_text, '\n'))
-                d     = new_n - old_n
-                noun  = abs(d) == 1 ? "line" : "lines"
-                return "$(basename(c.path)) · $(d > 0 ? "+$d" : d) $noun"
+        diffs = [c for c in content if c isa DiffContent]
+        if !isempty(diffs)
+            total_delta = 0
+            for d in diffs
+                total_delta += length(split(d.new_text, '\n')) -
+                               length(split(something(d.old_text, ""), '\n'))
+            end
+            sign_str  = total_delta > 0 ? "+$total_delta" : string(total_delta)
+            line_word = abs(total_delta) == 1 ? "line" : "lines"
+            return length(diffs) == 1 ?
+                "$(basename(diffs[1].path)) · $sign_str $line_word" :
+                "$(length(diffs)) files · $sign_str $line_word"
+        end
+    end
+
+    if kind == "search"
+        text = join((c.text for c in content if c isa TextContent), "\n")
+        if !isempty(text)
+            hits = count(line -> match(r"^[^\s:]+:\d+[:\-]", line) !== nothing,
+                         split(text, '\n'))
+            if hits > 0
+                return "$hits $(hits == 1 ? "match" : "matches")"
             end
         end
     end
+
+    if kind == "move"
+        text = join((c.text for c in content if c isa TextContent), "\n")
+        m = match(r"([\S]+)\s*(?:->|→|to)\s*([\S]+)", text)
+        if m !== nothing
+            return "$(basename(m.captures[1])) → $(basename(m.captures[2]))"
+        end
+    end
+
+    if kind == "fetch"
+        text = join((c.text for c in content if c isa TextContent), "\n")
+        m = match(r"https?://([^/\s]+)", text)
+        if m !== nothing
+            return String(m.captures[1])
+        end
+    end
+
     for c in content
         if c isa TextContent
             n = count('\n', c.text) + 1
@@ -185,6 +224,42 @@ function load_tool_content(cwd::AbstractString, tool_id::AbstractString)
     return Any[parse_tool_content_item(c) for c in raw if c isa AbstractDict]
 end
 
+# A single DiffContent rendered as path-header + inline DiffEditor. Used by
+# both the dedicated 'edit' path (where multiple diffs are stacked) and the
+# default fallback (where a diff appears in a mixed content array).
+function render_diff_block(d::DiffContent)
+    DOM.div(
+        DOM.div(d.path; class = "bt-diff-header"),
+        BonitoBook.DiffEditor(something(d.old_text, ""), d.new_text;
+                               language = detect_language(d.path),
+                               renderSideBySide = false);
+        class = "bt-diff-block")
+end
+
+# Render search-tool output as one row per match. Recognises both `path:line:`
+# (grep / rg default) and `path-line-` (grep -A/-B context). Lines that don't
+# match either format are rendered as muted raw lines so we don't lose them.
+function render_search_results(text::AbstractString)
+    rows = []
+    for line in split(text, '\n')
+        isempty(strip(line)) && continue
+        m = match(r"^([^:]+):(\d+):(.*)$", line)
+        if m === nothing
+            m = match(r"^([^-]+)-(\d+)-(.*)$", line)
+        end
+        if m !== nothing
+            push!(rows, DOM.div(
+                DOM.span(String(m.captures[1]); class = "bt-search-path"),
+                DOM.span(":" * String(m.captures[2]); class = "bt-search-line"),
+                DOM.code(strip(String(m.captures[3])); class = "bt-search-snippet");
+                class = "bt-search-row"))
+        else
+            push!(rows, DOM.div(line; class = "bt-search-raw"))
+        end
+    end
+    DOM.div(rows...; class = "bt-search-results")
+end
+
 function render_tool_body(m::ToolMsg, cwd::AbstractString)
     content = load_tool_content(cwd, m.id)
     isempty(content) &&
@@ -192,16 +267,19 @@ function render_tool_body(m::ToolMsg, cwd::AbstractString)
                        class = "bt-tool-empty")
 
     if m.kind == "edit"
-        for c in content
-            if c isa DiffContent
-                lang = detect_language(c.path)
-                return BonitoBook.DiffEditor(
-                    something(c.old_text, ""),
-                    c.new_text;
-                    language = lang,
-                    renderSideBySide = false,
-                )
-            end
+        # Render every diff (multi-edit calls used to silently drop all but
+        # the first). Stack with file-path headers between each.
+        diffs = [c for c in content if c isa DiffContent]
+        if !isempty(diffs)
+            return DOM.div((render_diff_block(d) for d in diffs)...;
+                            class = length(diffs) > 1 ? "bt-multi-diff" : "")
+        end
+    end
+
+    if m.kind == "search"
+        text = join((c.text for c in content if c isa TextContent), "\n")
+        if !isempty(text)
+            return render_search_results(text)
         end
     end
 
@@ -213,18 +291,15 @@ function render_tool_body(m::ToolMsg, cwd::AbstractString)
         end
     end
 
-    # Default / "think" / "other" / "search" / "fetch" / mixed:
-    # text blocks that ARE a fenced code block become Monaco; mixed prose stays
-    # markdown. Diff blocks render via DiffEditor inline.
+    # Default / "think" / "other" / "fetch" / "move" / "delete" / mixed:
+    # text blocks that ARE a fenced code block become Monaco; prose stays
+    # markdown. Diff blocks (uncommon outside `edit`) render inline.
     parts = []
     for c in content
         if c isa TextContent
             push!(parts, render_text_block(c.text))
         elseif c isa DiffContent
-            lang = detect_language(c.path)
-            push!(parts, BonitoBook.DiffEditor(something(c.old_text, ""), c.new_text;
-                                                language = lang,
-                                                renderSideBySide = false))
+            push!(parts, render_diff_block(c))
         elseif c isa ImageContent
             push!(parts, DOM.img(src = "data:$(c.mime_type);base64,$(c.data)",
                                   style = "max-width:100%"))

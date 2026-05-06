@@ -381,12 +381,28 @@ function chat_app(cwd::String;
     # Bonito App
     App() do bonito_session
         text_val  = Observable("")
-        send_btn  = Bonito.Button("▶"; style=nothing, class="bt-send-btn")
-        stop_btn  = Bonito.Button("■"; style=nothing, class="bt-stop-btn")
+        # Inline SVG icons render crisply at any size, independent of installed
+        # fonts (Arial's ▶ glyph is tiny on Linux).
+        send_icon = Bonito.HTML(
+            """<svg viewBox="0 0 24 24" width="20" height="20" fill="none"
+                    stroke="currentColor" stroke-width="2.2"
+                    stroke-linecap="round" stroke-linejoin="round">
+                 <line x1="12" y1="19" x2="12" y2="5"></line>
+                 <polyline points="5 12 12 5 19 12"></polyline>
+               </svg>""")
+        stop_icon = Bonito.HTML(
+            """<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                 <rect x="5" y="5" width="14" height="14" rx="2.5"></rect>
+               </svg>""")
+        send_btn  = Bonito.Button(send_icon; style=nothing, class="bt-send-btn",
+                                  title="Send (Enter)")
+        stop_btn  = Bonito.Button(stop_icon; style=nothing, class="bt-stop-btn",
+                                  title="Stop generation")
 
         text_input = DOM.textarea(
             "";
-            placeholder="Message (Shift+Enter for newline)",
+            placeholder="Message…",
+            title="Enter to send  ·  Shift+Enter for newline",
             class="bt-text-input",
             rows=1,
             oninput=js"""event => {
@@ -477,7 +493,17 @@ function chat_app(cwd::String;
             ChatStyles,
             BonitoTeamJS,
             Bonito.MarkdownCSS,
-            DOM.div("BonitoTeam — ", DOM.code(cwd), class="bt-header"),
+            DOM.div(
+                DOM.div(
+                    DOM.a("←"; href = Bonito.Link("/"), class = "bt-header-back",
+                           title = "Back to dashboard"),
+                    DOM.span(""; class = "bt-dot bt-dot-online", title = "session live"),
+                    DOM.div(
+                        DOM.span(basename(rstrip(cwd, '/'))),
+                        DOM.span(cwd; class = "bt-header-cwd"),
+                        class = "bt-header-title");
+                    class = "bt-header-row");
+                class = "bt-header"),
             DOM.div(
                 DOM.div(class="bt-spacer-top"),
                 DOM.div(class="bt-spacer-bottom"),
@@ -487,7 +513,9 @@ function chat_app(cwd::String;
                 DOM.div(class="bt-busy-dot"),
                 DOM.div(class="bt-busy-dot"),
                 class="bt-busy"),
-            DOM.div(text_input, send_btn, stop_btn, class="bt-input-area"),
+            DOM.div(
+                DOM.div(text_input, send_btn, stop_btn, class = "bt-input-row");
+                class = "bt-input-area"),
             class="bt-app")
     end
 end

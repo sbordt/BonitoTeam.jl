@@ -137,7 +137,7 @@ StandardError=journal
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=read-only
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true

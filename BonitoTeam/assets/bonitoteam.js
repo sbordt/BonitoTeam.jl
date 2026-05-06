@@ -148,10 +148,31 @@ class BonitoChat {
         }
 
         if (msg.type === 'thought_final') {
+            // Streaming finished. The body holds the live <span class="bt-stream-text">
+            // accumulator; if msg.html is present (legacy path), use it. Otherwise
+            // mark the node as ready for lazy fetch — body will be re-fetched when
+            // the user expands the <details>.
+            const node = this.nodeById.get(msg.id);
+            if (node) {
+                if (msg.html) {
+                    const body = node.querySelector('.bt-thought-body');
+                    if (body) body.innerHTML = msg.html;
+                }
+                const details = node.querySelector('.bt-thought-details');
+                if (details) details.dataset.streamed = 'true';
+            }
+            return;
+        }
+
+        if (msg.type === 'thought_body') {
+            // Response from requestThoughtRender — fill the lazy body.
             const node = this.nodeById.get(msg.id);
             if (node) {
                 const body = node.querySelector('.bt-thought-body');
-                if (body) body.innerHTML = msg.html;
+                if (body) {
+                    body.innerHTML = msg.html;
+                    body.dataset.loaded = 'true';
+                }
             }
             return;
         }
@@ -227,6 +248,7 @@ class BonitoChat {
             case 'thought':
                 div.className = 'bt-thought-msg';
                 div.innerHTML = this.thoughtHTML(msg);
+                this.wireThoughtToggle(div, msg.id);
                 break;
             case 'tool':
                 div.className = 'bt-tool-msg';
@@ -242,10 +264,31 @@ class BonitoChat {
     }
 
     thoughtHTML(msg) {
-        return `<details class="bt-thought-details">
-            <summary class="bt-thought-summary">💭 Thinking…</summary>
-            <div class="bt-thought-body">${msg.streaming ? '<span class="bt-stream-text"></span>' : (msg.html || '')}</div>
+        // Streaming: live accumulator via bt-stream-text.
+        // Historical: empty body, lazy-loaded on expand by wireThoughtToggle.
+        // Legacy (msg.html present): just render it.
+        const body = msg.streaming ? '<span class="bt-stream-text"></span>' :
+                     msg.html      ? msg.html : '';
+        const summary = msg.streaming ? 'Thinking…' :
+                        (msg.summary || 'Show thinking');
+        return `<details class="bt-thought-details" data-thought-id="${escapeAttr(msg.id || '')}">
+            <summary class="bt-thought-summary">💭 ${escapeHTML(summary)}</summary>
+            <div class="bt-thought-body" data-loaded="${msg.streaming || msg.html ? 'true' : 'false'}">${body}</div>
         </details>`;
+    }
+
+    // On first expand of a non-streaming thought, ask Julia for the body.
+    // Subsequent expands reuse the cached HTML in the body div.
+    wireThoughtToggle(node, thoughtId) {
+        const details = node.querySelector('.bt-thought-details');
+        const body    = node.querySelector('.bt-thought-body');
+        if (!details || !body) return;
+        details.addEventListener('toggle', () => {
+            if (!details.open) return;                // collapsing
+            if (body.dataset.loaded === 'true') return;   // already have HTML
+            body.innerHTML = '<span class="bt-thought-loading">loading…</span>';
+            this.obs.requestThoughtRender?.notify(thoughtId);
+        });
     }
 
     // Tool block: header + empty placeholder. Body is fetched lazily on expand.

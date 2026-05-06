@@ -34,7 +34,14 @@ function format_for_mcp(value;
         end
     end
 
-    # 3. Large container: summarize instead of dumping
+    # 3. `nothing` return is the common case for statements with side effects
+    # (println, push!, etc.). Skip emitting "result:\nnothing" — it's noise
+    # that the chat doesn't benefit from and that costs claude tokens.
+    if value === nothing
+        return blocks
+    end
+
+    # 4. Large container: summarize instead of dumping
     if !full_output && _is_large_container(value)
         repr = _summarize_container(value)
     else

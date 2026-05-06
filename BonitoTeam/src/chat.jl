@@ -97,6 +97,21 @@ function content_summary(kind::AbstractString, content::AbstractVector)
         end
     end
 
+    # MCP tools (kind=="other") whose first text block is a fenced ```julia
+    # code block — show the first code line as the summary so calls like
+    # bt_julia_eval show "x = 1 + 2" instead of "5 lines · 124 bytes".
+    if !isempty(content) && content[1] isa TextContent
+        m = match(r"^\s*```julia\r?\n(.*?)\r?\n```"s, content[1].text)
+        if m !== nothing
+            first_line = strip(split(String(m.captures[1]), '\n')[1])
+            if !isempty(first_line)
+                return length(first_line) > 50 ?
+                    SubString(first_line, 1, prevind(first_line, 50)) * "…" :
+                    first_line
+            end
+        end
+    end
+
     for c in content
         if c isa TextContent
             n = count('\n', c.text) + 1
@@ -137,9 +152,13 @@ end
 
 msg_to_dict(m::ToolMsg) = tool_header_dict(m)
 
+# Thoughts are lazy-loaded: header carries only id + a size hint. JS asks for
+# the body via requestThoughtRender(id) when the user expands the <details>.
+# Avoids shipping potentially huge thinking transcripts on every range fetch.
 function msg_to_dict(m::ThoughtMsg)
-    html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
-    Dict{String,Any}("type" => "thought", "id" => m.id, "html" => html)
+    n = count('\n', m.text) + 1
+    Dict{String,Any}("type" => "thought", "id" => m.id,
+                     "summary" => "$n $(n == 1 ? "line" : "lines")")
 end
 
 function msg_to_dict(m::PlanMsg)
@@ -199,15 +218,32 @@ function monaco_readonly(text::AbstractString, lang::AbstractString)
     )
 end
 
-# If `text` is exactly a fenced code block (```lang\n...\n```), render it as a
-# read-only Monaco editor with the matching language. Otherwise fall back to
-# Markdown.parse so prose with inline formatting still works.
+# Render a single tool-content text block. Three recognised shapes:
+#  1. Fenced code (```lang\n...\n```)   → Monaco read-only with that language
+#  2. Eval section (label:\n<body>)      → labeled card + Monaco; emitted by
+#     BonitoMCP's bt_julia_eval which prefixes blocks with "stdout", "result",
+#     "error" so the chat can show them as distinct sections instead of one
+#     concatenated text dump.
+#  3. Mixed prose                        → Markdown.parse fallback.
+const EVAL_SECTION_LABELS = ("stdout", "stderr", "result", "error")
+
 function render_text_block(text::AbstractString)
     m = match(r"^\s*```(\w*)\r?\n(.*?)\r?\n```\s*$"s, text)
     if m !== nothing
         lang = isempty(m.captures[1]) ? "plaintext" : String(m.captures[1])
-        code = String(m.captures[2])
-        return monaco_readonly(code, lang)
+        return monaco_readonly(String(m.captures[2]), lang)
+    end
+    m = match(Regex("^(" * join(EVAL_SECTION_LABELS, "|") * "):\n(.*)\$", "s"), text)
+    if m !== nothing
+        label = String(m.captures[1])
+        body  = String(m.captures[2])
+        # Result is a Julia value's repr → julia highlighting; everything else
+        # is unstructured text (stack traces, captured stdout, etc).
+        lang = label == "result" ? "julia" : "plaintext"
+        return DOM.div(
+            DOM.div(uppercase(label); class = "bt-section-label"),
+            monaco_readonly(body, lang);
+            class = "bt-eval-section")
     end
     return DOM.div(Markdown.parse(text), class = "bt-tool-md")
 end
@@ -326,8 +362,9 @@ function chat_app(cwd::String;
     range_response = Observable("")           # JSON: {start, messages}
 
     # JS → Julia
-    request_range        = Observable(Any[])  # [start_idx, end_idx]
-    request_tool_render  = Observable("")     # tool_id
+    request_range          = Observable(Any[])  # [start_idx, end_idx]
+    request_tool_render    = Observable("")     # tool_id
+    request_thought_render = Observable("")     # thought_id
 
     function push_msg!(msg::ChatMsg)
         push!(msgs_store, msg)
@@ -591,15 +628,29 @@ function chat_app(cwd::String;
             end
         end
 
+        # Lazy thought body rendering: msg_to_dict ships a header only; when
+        # the user expands the <details>, JS notifies request_thought_render
+        # with the thought id and we ship the rendered HTML back via emit.
+        on(request_thought_render) do thought_id
+            isempty(thought_id) && return
+            idx = findfirst(m -> m isa ThoughtMsg && m.id == thought_id, msgs_store)
+            idx === nothing && return
+            html = sprint(show, MIME("text/html"), Markdown.parse(msgs_store[idx].text))
+            emit(Dict{String,Any}("type" => "thought_body",
+                                  "id"   => thought_id,
+                                  "html" => html))
+        end
+
         n = length(msgs_store)
         evaljs(bonito_session, js"""
             window.initBonitoChat({
-                totalCount:        $(total_count),
-                requestRange:      $(request_range),
-                rangeResponse:     $(range_response),
-                newMsg:            $(new_msg_obs),
-                requestToolRender: $(request_tool_render),
-                initialCount:      $n,
+                totalCount:           $(total_count),
+                requestRange:         $(request_range),
+                rangeResponse:        $(range_response),
+                newMsg:               $(new_msg_obs),
+                requestToolRender:    $(request_tool_render),
+                requestThoughtRender: $(request_thought_render),
+                initialCount:         $n,
             });
         """)
 

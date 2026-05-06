@@ -52,6 +52,27 @@ function _eval_with_capture(sess::Module, code::AbstractString)
     return (val, err_text, captured)
 end
 
+# Trim noisy frames from a Julia backtrace string. We keep the showerror line
+# (which has the actual error) and drop everything past the first stdlib /
+# REPL boundary — claude doesn't need to wade through 30 frames of `eval`,
+# `include_string`, `client.jl`, etc., that's just our MCP plumbing.
+const BACKTRACE_NOISE_FRAMES = (
+    r"\bBase\.eval\b", r"\binclude_string\b", r"\beval_user_input\b",
+    r"\bclient\.jl\b", r"\brun_main_repl\b", r"\brun_fallback_repl\b",
+    r"\brepl_main\b",  r"\b_start\b",
+)
+
+function _trim_backtrace(text::AbstractString)
+    lines = split(text, '\n')
+    cut = something(findfirst(line -> any(p -> occursin(p, line), BACKTRACE_NOISE_FRAMES),
+                              lines), length(lines) + 1)
+    cut > length(lines) && return String(strip(text))
+    kept = lines[1:cut-1]
+    suppressed = length(lines) - length(kept)
+    suppressed > 1 && push!(kept, "  [+ $suppressed internal frames]")
+    return strip(join(kept, "\n"))
+end
+
 """
 Evaluate `code` in the per-env_path persistent session. Captures stdout, return
 value, and errors. Output is formatted via output_discipline.jl rules.
@@ -74,7 +95,8 @@ function julia_eval_handler(args::AbstractDict)
         if !isempty(stdout_str)
             push!(out_blocks, Dict("type" => "text", "text" => "stdout:\n$stdout_str"))
         end
-        push!(out_blocks, Dict("type" => "text", "text" => "error:\n$err_text"))
+        push!(out_blocks, Dict("type" => "text",
+                                "text" => "error:\n$(_trim_backtrace(err_text))"))
         out_blocks
     else
         result_blocks = format_for_mcp(val;
@@ -127,12 +149,24 @@ end
 register!(
     "bt_julia_eval",
     """
-    Evaluate Julia code in a per-env_path persistent session. State (variables,
-    `using`-loaded modules) carries over between calls.
+    Evaluate Julia code in a persistent per-`env_path` session. ALWAYS prefer
+    this over `julia -e` via Bash for Julia work — running through Bash spawns
+    a fresh process every time, so `using Foo` / loaded variables / compiled
+    methods don't carry over and you pay full startup cost on each call.
 
-    Output is auto-truncated at max_response_bytes (default 10000). Large arrays /
-    dicts are summarized. 2-D arrays of color types are rendered as images. Pass
-    full_output=true to disable all of this.
+    State (top-level bindings, loaded modules, function defs) carries over
+    across calls with the same `env_path`. Use `bt_julia_restart` to drop the
+    session if it's gotten into a bad state. `bt_julia_list_sessions` shows
+    what's currently live.
+
+    Output rules:
+      - stdout, return value, and errors are returned as separate blocks.
+      - Output is auto-truncated at `max_response_bytes` (default 10000).
+        Large arrays / dicts are summarised; pass `full_output=true` to disable.
+      - 2-D arrays of color types are rendered as images.
+      - A return value of `nothing` is suppressed to keep responses tight —
+        if you need to inspect a value, return it explicitly (last expression
+        in the block).
     """,
     Dict{String,Any}(
         "type" => "object",

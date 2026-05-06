@@ -189,6 +189,10 @@ const ChatStyles = Bonito.Styles(
         "white-space" => "pre-wrap", "word-break" => "break-word",
         "font-size" => "12.5px", "line-height" => "1.5",
         "color" => "var(--bt-text-muted)"),
+    CSS(".bt-thought-loading, .bt-tool-loading",
+        "color" => "var(--bt-text-faint)",
+        "font-style" => "italic", "font-size" => "12px",
+        "padding" => "4px 0"),
 
     # ── Tool call card ───────────────────────────────────────────────────────
     CSS(".bt-tool-msg",
@@ -254,6 +258,20 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-tool-md",
         "font-size" => "13px", "line-height" => "1.5",
         "padding-top" => "8px"),
+
+    # Eval-section blocks (BonitoMCP bt_julia_eval output): a tiny uppercase
+    # label (STDOUT / RESULT / ERROR) above the Monaco-rendered body of each
+    # section, so the input code, captured output, and return value are
+    # visually distinct in the tool body.
+    CSS(".bt-section-label",
+        "font-size" => "10.5px", "font-weight" => "600",
+        "letter-spacing" => "0.08em", "text-transform" => "uppercase",
+        "color" => "var(--bt-text-faint)",
+        "margin" => "12px 0 4px"),
+    CSS(".bt-eval-section + .bt-eval-section",
+        "margin-top" => "4px"),
+    CSS(".bt-eval-section:first-child .bt-section-label",
+        "margin-top" => "8px"),
 
     # ── Diff blocks (multi-edit) ─────────────────────────────────────────────
     # Single-diff body just shows the editor; multi-edit bodies stack diffs

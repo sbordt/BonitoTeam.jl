@@ -640,7 +640,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
             elseif isempty(results)
                 DOM.div("No Claude Code sessions found on $w_name.", class = "bt-empty")
             else
-                rows = DOM.Node[]
+                rows = []
                 for r in results
                     if haskey(r, "error")
                         push!(rows, DOM.div("Error: $(r["error"])", class = "bt-error"))

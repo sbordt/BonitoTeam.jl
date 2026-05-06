@@ -247,105 +247,328 @@ end
 # control handler (which reconnects asynchronously) can register routes.
 const SERVER_REF = Ref{Union{Bonito.Server,Nothing}}(nothing)
 
-# Dashboard styles
+# Dashboard styles — modern surface + spacing system, status dots, smooth transitions
 const DashboardStyles = Bonito.Styles(
+    # ── Tokens ───────────────────────────────────────────────────────────────
+    CSS(":root",
+        "--bt-bg"            => "#fafaf9",
+        "--bt-surface"       => "#ffffff",
+        "--bt-surface-2"     => "#f8fafc",
+        "--bt-border"        => "rgba(15,23,42,0.08)",
+        "--bt-border-strong" => "rgba(15,23,42,0.14)",
+        "--bt-text"          => "#0f172a",
+        "--bt-text-muted"    => "#64748b",
+        "--bt-text-faint"    => "#94a3b8",
+        "--bt-accent"        => "#3b82f6",
+        "--bt-accent-hover"  => "#2563eb",
+        "--bt-success"       => "#10b981",
+        "--bt-error"         => "#ef4444",
+        "--bt-shadow-sm"     => "0 1px 2px rgba(15,23,42,0.05)",
+        "--bt-shadow-md"     => "0 4px 12px rgba(15,23,42,0.08)",
+        "--bt-radius"        => "8px",
+        "--bt-radius-sm"     => "6px"),
+
+    # ── Shell ────────────────────────────────────────────────────────────────
     CSS(".bt-dash",
-        "font-family"  => "system-ui, -apple-system, sans-serif",
-        "max-width"    => "920px", "margin" => "0 auto", "padding" => "32px 24px",
-        "color"        => "#1f2937"),
-    CSS(".bt-dash h1", "font-size" => "24px", "margin-bottom" => "8px"),
-    CSS(".bt-dash h2", "font-size" => "16px", "margin-top" => "32px",
-        "margin-bottom" => "12px", "color" => "#374151",
-        "border-bottom" => "1px solid #e5e7eb", "padding-bottom" => "6px"),
-    CSS(".bt-dash .bt-sub", "color" => "#6b7280", "font-size" => "13px",
-        "margin-bottom" => "24px"),
-    CSS(".bt-card",
-        "border" => "1px solid #e5e7eb", "border-radius" => "6px",
-        "padding" => "12px 16px", "margin-bottom" => "8px",
-        "display" => "flex", "justify-content" => "space-between",
-        "align-items" => "center", "background" => "#fff"),
-    CSS(".bt-card .bt-card-title", "font-weight" => "600"),
-    CSS(".bt-card .bt-card-meta", "color" => "#6b7280", "font-size" => "12px"),
-    CSS(".bt-card a", "color" => "#2563eb", "text-decoration" => "none",
+        "font-family"  => "'Inter', system-ui, -apple-system, sans-serif",
+        "font-size"    => "14px", "line-height" => "1.5",
+        "color"        => "var(--bt-text)", "background" => "var(--bt-bg)",
+        "min-height"   => "100vh",
+        "padding"      => "32px 24px",
+        "max-width"    => "960px", "margin" => "0 auto",
+        "-webkit-font-smoothing" => "antialiased"),
+
+    # ── Header + tagline ─────────────────────────────────────────────────────
+    CSS(".bt-header",
+        "display" => "flex", "align-items" => "baseline",
+        "justify-content" => "space-between", "gap" => "16px",
+        "margin-bottom" => "4px"),
+    CSS(".bt-header h1",
+        "font-size" => "22px", "font-weight" => "600",
+        "letter-spacing" => "-0.01em", "margin" => "0"),
+    CSS(".bt-tagline",
+        "color" => "var(--bt-text-muted)", "font-size" => "13px"),
+
+    # ── Stats strip ──────────────────────────────────────────────────────────
+    CSS(".bt-stats",
+        "display" => "flex", "gap" => "20px", "flex-wrap" => "wrap",
+        "padding" => "12px 16px", "margin-top" => "16px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius)",
         "font-size" => "13px"),
+    CSS(".bt-stat",
+        "display" => "flex", "align-items" => "center", "gap" => "6px"),
+    CSS(".bt-stat-value", "font-weight" => "600"),
+    CSS(".bt-stat-label", "color" => "var(--bt-text-muted)"),
+    CSS(".bt-stat-sep",   "color" => "var(--bt-text-faint)", "user-select" => "none"),
+
+    # ── Section headings ─────────────────────────────────────────────────────
+    CSS(".bt-section",
+        "display" => "flex", "align-items" => "baseline",
+        "justify-content" => "space-between",
+        "margin" => "32px 0 12px"),
+    CSS(".bt-section h2",
+        "font-size" => "11px", "font-weight" => "600",
+        "letter-spacing" => "0.08em", "text-transform" => "uppercase",
+        "color" => "var(--bt-text-muted)", "margin" => "0"),
+
+    # ── Card ─────────────────────────────────────────────────────────────────
+    CSS(".bt-card",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius)",
+        "padding" => "14px 16px",
+        "margin-bottom" => "8px",
+        "display" => "flex", "align-items" => "center",
+        "justify-content" => "space-between", "gap" => "16px",
+        "transition" => "border-color 120ms ease, box-shadow 120ms ease"),
+    CSS(".bt-card:hover",
+        "border-color" => "var(--bt-border-strong)",
+        "box-shadow" => "var(--bt-shadow-sm)"),
+    CSS(".bt-card-body",
+        "min-width" => "0", "flex" => "1 1 auto"),
+    CSS(".bt-card-title",
+        "font-weight" => "600", "font-size" => "14px",
+        "display" => "flex", "align-items" => "center", "gap" => "8px"),
+    CSS(".bt-card-meta",
+        "color" => "var(--bt-text-muted)", "font-size" => "12px",
+        "margin-top" => "2px",
+        "display" => "flex", "align-items" => "center", "gap" => "6px",
+        "white-space" => "nowrap", "overflow" => "hidden",
+        "text-overflow" => "ellipsis"),
+    CSS(".bt-card-actions",
+        "display" => "flex", "gap" => "6px", "flex-shrink" => "0",
+        "align-items" => "center"),
+    CSS(".bt-mono",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "11.5px",
+        "color" => "var(--bt-text-faint)"),
+
+    # ── Status dot ───────────────────────────────────────────────────────────
+    CSS(".bt-dot",
+        "display" => "inline-block",
+        "width" => "8px", "height" => "8px",
+        "border-radius" => "50%", "flex-shrink" => "0"),
+    CSS(".bt-dot-online",
+        "background" => "var(--bt-success)",
+        "box-shadow" => "0 0 0 3px rgba(16,185,129,0.18)"),
+    CSS(".bt-dot-offline", "background" => "var(--bt-error)"),
+    CSS(".bt-dot-unknown", "background" => "var(--bt-text-faint)"),
+
+    # ── Pill (small text-bearing badge) ──────────────────────────────────────
     CSS(".bt-pill",
-        "display" => "inline-block", "padding" => "2px 8px",
-        "border-radius" => "999px", "font-size" => "11px", "font-weight" => "500"),
-    CSS(".bt-pill-online",  "background" => "#d1fae5", "color" => "#065f46"),
-    CSS(".bt-pill-offline", "background" => "#fee2e2", "color" => "#991b1b"),
-    CSS(".bt-pill-unknown", "background" => "#f3f4f6", "color" => "#6b7280"),
-    CSS(".bt-form",
-        "background" => "#f9fafb", "border" => "1px solid #e5e7eb",
-        "border-radius" => "6px", "padding" => "16px", "margin-top" => "12px",
-        "display" => "grid", "grid-template-columns" => "120px 1fr",
-        "gap" => "8px 12px", "align-items" => "center"),
-    CSS(".bt-form input",
-        "padding" => "6px 10px", "border" => "1px solid #d1d5db",
-        "border-radius" => "4px", "font-size" => "13px", "width" => "100%",
-        "box-sizing" => "border-box"),
-    CSS(".bt-form select",
-        "padding" => "6px 10px", "border" => "1px solid #d1d5db",
-        "border-radius" => "4px", "font-size" => "13px"),
-    CSS(".bt-form .bt-form-actions",
-        "grid-column" => "1 / -1", "display" => "flex", "gap" => "8px",
-        "justify-content" => "flex-end", "margin-top" => "8px"),
+        "display" => "inline-flex", "align-items" => "center",
+        "padding" => "1px 8px",
+        "border-radius" => "999px",
+        "font-size" => "11px", "font-weight" => "500",
+        "letter-spacing" => "0.02em"),
+    CSS(".bt-pill-active",
+        "background" => "rgba(16,185,129,0.12)", "color" => "#047857"),
+    CSS(".bt-pill-muted",
+        "background" => "var(--bt-surface-2)", "color" => "var(--bt-text-muted)"),
+
+    # ── Buttons ──────────────────────────────────────────────────────────────
     CSS(".bt-btn",
-        "padding" => "6px 16px", "border" => "none", "border-radius" => "4px",
-        "background" => "#2563eb", "color" => "#fff", "font-weight" => "500",
-        "cursor" => "pointer", "font-size" => "13px"),
+        "appearance" => "none", "border" => "none",
+        "padding" => "7px 12px",
+        "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-accent)", "color" => "#fff",
+        "font-size" => "13px", "font-weight" => "500",
+        "cursor" => "pointer",
+        "display" => "inline-flex", "align-items" => "center", "gap" => "6px",
+        "transition" => "background 120ms ease, transform 80ms ease, opacity 120ms ease, color 120ms"),
+    CSS(".bt-btn:hover",  "background" => "var(--bt-accent-hover)"),
+    CSS(".bt-btn:active", "transform" => "translateY(1px)"),
     CSS(".bt-btn-secondary",
-        "background" => "#e5e7eb", "color" => "#374151"),
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text)",
+        "border" => "1px solid var(--bt-border-strong)"),
+    CSS(".bt-btn-secondary:hover",
+        "background" => "var(--bt-surface-2)"),
+    CSS(".bt-btn-ghost",
+        "background" => "transparent", "color" => "var(--bt-text-muted)",
+        "padding" => "6px 8px"),
+    CSS(".bt-btn-ghost:hover",
+        "background" => "var(--bt-surface-2)", "color" => "var(--bt-text)"),
+    CSS(".bt-btn-loading",
+        "opacity" => "0.7", "cursor" => "wait"),
+
+    # ── Forms ────────────────────────────────────────────────────────────────
+    CSS(".bt-form",
+        "background" => "var(--bt-surface-2)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius)",
+        "padding" => "16px", "margin-top" => "12px",
+        "display" => "grid",
+        "grid-template-columns" => "120px 1fr",
+        "gap" => "12px 16px", "align-items" => "start"),
+    CSS(".bt-form label",
+        "color" => "var(--bt-text-muted)", "font-size" => "13px",
+        "padding-top" => "8px"),
+    CSS(".bt-form input, .bt-form select",
+        "padding" => "8px 10px",
+        "border" => "1px solid var(--bt-border-strong)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "font-size" => "14px",
+        "background" => "var(--bt-surface)",
+        "width" => "100%", "box-sizing" => "border-box",
+        "outline" => "none",
+        "transition" => "border-color 120ms, box-shadow 120ms"),
+    CSS(".bt-form input:focus, .bt-form select:focus",
+        "border-color" => "var(--bt-accent)",
+        "box-shadow" => "0 0 0 3px rgba(59,130,246,0.18)"),
+    CSS(".bt-form-actions",
+        "grid-column" => "1 / -1",
+        "display" => "flex", "gap" => "8px",
+        "justify-content" => "flex-end",
+        "padding-top" => "4px"),
+    CSS(".bt-form-hint",
+        "color" => "#047857", "font-size" => "12px", "margin-top" => "4px"),
+
+    # ── Notices ──────────────────────────────────────────────────────────────
     CSS(".bt-error",
-        "background" => "#fee2e2", "color" => "#991b1b",
-        "padding" => "8px 12px", "border-radius" => "4px", "font-size" => "13px",
-        "margin-top" => "8px"),
+        "background" => "#fef2f2", "color" => "#b91c1c",
+        "border" => "1px solid #fee2e2",
+        "padding" => "10px 12px",
+        "border-radius" => "var(--bt-radius-sm)",
+        "font-size" => "13px", "margin-top" => "12px"),
     CSS(".bt-empty",
-        "color" => "#9ca3af", "font-style" => "italic", "padding" => "8px 0"),
-    # Folder picker
+        "color" => "var(--bt-text-faint)", "font-size" => "13px",
+        "padding" => "20px",
+        "text-align" => "center",
+        "border" => "1px dashed var(--bt-border)",
+        "border-radius" => "var(--bt-radius)"),
+
+    # ── Folder picker ────────────────────────────────────────────────────────
     CSS(".bt-picker",
-        "border" => "1px solid #d1d5db", "border-radius" => "4px",
-        "padding" => "8px", "background" => "#fff",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "padding" => "6px",
+        "background" => "var(--bt-surface)",
         "max-height" => "260px", "overflow-y" => "auto",
         "font-family" => "ui-monospace, monospace", "font-size" => "12px"),
     CSS(".bt-picker-row",
-        "padding" => "4px 6px", "cursor" => "pointer",
-        "border-radius" => "3px"),
-    CSS(".bt-picker-row:hover", "background" => "#eef2ff"),
+        "padding" => "5px 8px",
+        "border-radius" => "4px", "cursor" => "pointer",
+        "transition" => "background 80ms"),
+    CSS(".bt-picker-row:hover",
+        "background" => "var(--bt-surface-2)"),
     CSS(".bt-picker-cur",
-        "padding" => "6px 10px", "background" => "#f9fafb",
-        "border" => "1px solid #e5e7eb", "border-radius" => "4px",
+        "padding" => "8px 10px",
+        "background" => "var(--bt-surface-2)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)",
         "font-family" => "ui-monospace, monospace", "font-size" => "12px",
-        "margin-bottom" => "6px",
-        "display" => "flex", "justify-content" => "space-between",
-        "align-items" => "center", "gap" => "8px"),
-    # Discover panel (per-worker Claude session scanner)
+        "margin-bottom" => "8px",
+        "display" => "flex", "align-items" => "center",
+        "justify-content" => "space-between", "gap" => "8px"),
+    CSS(".bt-picker-loading",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "color" => "var(--bt-text-muted)",
+        "padding" => "12px", "font-size" => "12px"),
+
+    # ── Discover panel ───────────────────────────────────────────────────────
     CSS(".bt-discover-panel",
-        "background" => "#f9fafb", "border" => "1px solid #e5e7eb",
-        "border-radius" => "6px", "padding" => "12px 16px",
+        "background" => "var(--bt-surface-2)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius)",
+        "padding" => "14px 16px",
         "margin-top" => "-4px", "margin-bottom" => "8px"),
     CSS(".bt-discover-header",
-        "display" => "flex", "justify-content" => "space-between",
-        "align-items" => "center", "margin-bottom" => "10px",
+        "display" => "flex", "align-items" => "center",
+        "justify-content" => "space-between",
+        "margin-bottom" => "10px"),
+    CSS(".bt-discover-title",
         "font-weight" => "600", "font-size" => "13px"),
+    CSS(".bt-discover-actions",
+        "display" => "flex", "gap" => "6px", "align-items" => "center"),
+
+    CSS(".bt-section-label",
+        "font-size" => "10.5px", "font-weight" => "600",
+        "letter-spacing" => "0.08em", "text-transform" => "uppercase",
+        "color" => "var(--bt-text-faint)",
+        "margin" => "12px 4px 6px"),
     CSS(".bt-session-row",
-        "display" => "flex", "justify-content" => "space-between",
-        "align-items" => "center", "padding" => "8px 10px",
-        "border" => "1px solid #e5e7eb", "border-radius" => "4px",
-        "margin-bottom" => "6px", "background" => "#fff"),
+        "display" => "flex", "align-items" => "center",
+        "justify-content" => "space-between",
+        "padding" => "10px 12px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "margin-bottom" => "6px",
+        "transition" => "border-color 120ms"),
+    CSS(".bt-session-row:hover",
+        "border-color" => "var(--bt-border-strong)"),
+    CSS(".bt-session-active",
+        "border-left" => "3px solid var(--bt-success)"),
+    CSS(".bt-session-name",
+        "font-weight" => "600", "font-size" => "13px",
+        "display" => "flex", "align-items" => "center", "gap" => "6px"),
     CSS(".bt-session-path",
-        "font-family" => "ui-monospace,monospace", "font-size" => "11px",
-        "color" => "#6b7280", "margin-top" => "2px"),
+        "font-family" => "ui-monospace, monospace", "font-size" => "11px",
+        "color" => "var(--bt-text-muted)", "margin-top" => "2px",
+        "max-width" => "440px", "overflow" => "hidden",
+        "text-overflow" => "ellipsis", "white-space" => "nowrap"),
     CSS(".bt-session-meta",
-        "font-size" => "11px", "color" => "#9ca3af", "margin-top" => "2px"),
-    # Spinner shown while a create operation is in progress
+        "font-size" => "11px",
+        "color" => "var(--bt-text-faint)", "margin-top" => "2px"),
+
+    # ── Spinner ──────────────────────────────────────────────────────────────
     CSS(".bt-spinner-row",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
-        "color" => "#6b7280", "font-size" => "13px"),
+        "color" => "var(--bt-text-muted)", "font-size" => "13px"),
     CSS(".bt-spinner",
-        "width" => "14px", "height" => "14px", "border-radius" => "50%",
-        "border" => "2px solid #e5e7eb", "border-top-color" => "#2563eb",
-        "animation" => "bt-spin 0.8s linear infinite", "flex-shrink" => "0"),
+        "width" => "14px", "height" => "14px",
+        "border-radius" => "50%",
+        "border" => "2px solid var(--bt-border)",
+        "border-top-color" => "var(--bt-accent)",
+        "animation" => "bt-spin 0.7s linear infinite",
+        "flex-shrink" => "0"),
+    CSS(".bt-spinner-sm",
+        "width" => "11px", "height" => "11px", "border-width" => "1.5px"),
     CSS("@keyframes bt-spin", CSS("to", "transform" => "rotate(360deg)")),
+
+    # ── Open chat link ───────────────────────────────────────────────────────
+    CSS(".bt-link",
+        "color" => "var(--bt-accent)", "text-decoration" => "none",
+        "font-size" => "13px", "font-weight" => "500",
+        "padding" => "6px 10px",
+        "border-radius" => "var(--bt-radius-sm)",
+        "display" => "inline-flex", "align-items" => "center", "gap" => "6px",
+        "transition" => "background 120ms"),
+    CSS(".bt-link:hover",
+        "background" => "rgba(59,130,246,0.08)"),
+    CSS(".bt-link-loading",
+        "color" => "var(--bt-text-muted)", "pointer-events" => "none"),
+
+    # ── Slide-in for forms / panels ──────────────────────────────────────────
+    CSS(".bt-slide-in", "animation" => "bt-slide 160ms ease-out"),
+    CSS("@keyframes bt-slide",
+        CSS("from", "opacity" => "0", "transform" => "translateY(-4px)"),
+        CSS("to",   "opacity" => "1", "transform" => "translateY(0)")),
+
+    # ── Install hint (empty-state with copy button) ──────────────────────────
+    CSS(".bt-install-block",
+        "background" => "var(--bt-surface-2)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius)",
+        "padding" => "16px 18px"),
+    CSS(".bt-install-cmd",
+        "display" => "flex", "align-items" => "center",
+        "justify-content" => "space-between", "gap" => "8px",
+        "background" => "#0f172a", "color" => "#e2e8f0",
+        "font-family" => "ui-monospace, monospace", "font-size" => "12.5px",
+        "padding" => "10px 12px", "border-radius" => "var(--bt-radius-sm)",
+        "margin-top" => "8px"),
+    CSS(".bt-install-copy",
+        "background" => "rgba(255,255,255,0.06)",
+        "color" => "#e2e8f0",
+        "border" => "1px solid rgba(255,255,255,0.12)",
+        "padding" => "4px 10px", "border-radius" => "4px",
+        "font-size" => "12px", "cursor" => "pointer",
+        "transition" => "background 120ms"),
+    CSS(".bt-install-copy:hover",
+        "background" => "rgba(255,255,255,0.12)"),
 )
 
 # Folder picker component
@@ -408,25 +631,73 @@ function folder_picker_render(p::FolderPicker)
         list)
 end
 
-# Remote folder picker — same shape as FolderPicker but reads the worker's
-# filesystem over its control WS via `list_worker_dir`. Used by the per-worker
-# "new project" flow.
+# Remote folder picker — reads the worker's filesystem over its control WS via
+# `list_worker_dir`. Async: the WS round-trip would otherwise block Bonito's map
+# during render and freeze the UI for hundreds of ms per browse click.
+const PickerEntry = NamedTuple{(:name, :dir), Tuple{String, Bool}}
+
 mutable struct RemoteFolderPicker
     worker_name::String
     cur::Observable{String}
     selected::Observable{String}
     expanded::Observable{Bool}
+    entries::Observable{Vector{PickerEntry}}
+    loading::Observable{Bool}
+    err::Observable{String}
+    fetch_id::Ref{Int}                 # increments per request; older replies bail
+    listeners_set_up::Ref{Bool}        # idempotency for setup_listeners!
 end
 
 RemoteFolderPicker(worker_name::String, start::String = "") = RemoteFolderPicker(
-    worker_name, Observable(start), Observable(""), Observable(false))
+    worker_name, Observable(start), Observable(""), Observable(false),
+    Observable(PickerEntry[]), Observable(false), Observable(""),
+    Ref(0), Ref(false))
+
+# Kick off a WS list_worker_dir for `p.cur[]` and update entries/loading/err.
+# Older in-flight responses are discarded via fetch_id.
+function fetch_remote_entries!(p::RemoteFolderPicker)
+    p.fetch_id[] += 1
+    my_id  = p.fetch_id[]
+    target = p.cur[]
+    p.loading[] = true
+    p.err[]     = ""
+    @async begin
+        try
+            resp = list_worker_dir(p.worker_name, target)
+            my_id == p.fetch_id[] || return        # stale response, abandon
+            if resp.path != target
+                # Worker resolved cur="" → its $HOME. Cascading on(cur) will
+                # trigger a fresh fetch — leave loading=true so the spinner
+                # bridges the gap.
+                p.cur[] = resp.path
+                return
+            end
+            p.entries[] = PickerEntry[(name = String(e.name), dir = Bool(e.dir))
+                                      for e in resp.entries if e.dir]
+            p.loading[] = false
+        catch e
+            my_id == p.fetch_id[] || return
+            p.err[]     = sprint(showerror, e)
+            p.loading[] = false
+        end
+    end
+end
+
+function setup_remote_picker_listeners!(p::RemoteFolderPicker)
+    p.listeners_set_up[] && return
+    p.listeners_set_up[] = true
+    on(p.cur)      do _;   p.expanded[] && fetch_remote_entries!(p); end
+    on(p.expanded) do exp; exp && fetch_remote_entries!(p); end
+    return
+end
 
 function remote_folder_picker_render(p::RemoteFolderPicker)
+    setup_remote_picker_listeners!(p)
+
     browse_btn = Bonito.Button("Browse"; style=nothing, class = "bt-btn bt-btn-secondary")
-    up_btn     = Bonito.Button("↑ Up"; style=nothing, class = "bt-btn bt-btn-secondary")
+    up_btn     = Bonito.Button("↑ Up";   style=nothing, class = "bt-btn bt-btn-secondary")
     choose_btn = Bonito.Button("Choose"; style=nothing, class = "bt-btn")
 
-    # On first browse, request the worker's $HOME (cur="" means "default").
     on(browse_btn.value) do clicked
         clicked && (p.expanded[] = !p.expanded[])
     end
@@ -443,25 +714,26 @@ function remote_folder_picker_render(p::RemoteFolderPicker)
         p.expanded[] = false
     end
 
-    # Resolves cur="" → worker's $HOME on first expand by querying the worker.
-    list = map(p.cur, p.expanded) do path, show
-        show || return DOM.div()
-        local resp
-        try
-            resp = list_worker_dir(p.worker_name, path)
-        catch e
-            return DOM.div("error: $e", class = "bt-picker", style = "color:#991b1b")
+    list = map(p.expanded, p.loading, p.entries, p.err, p.cur) do exp, loading, entries, err, cur
+        exp || return DOM.div()
+        if loading
+            return DOM.div(
+                DOM.div(class = "bt-spinner"),
+                DOM.span("Listing folder…"),
+                class = "bt-picker bt-picker-loading bt-slide-in")
         end
-        # Update the path display once we know it (e.g. resolved $HOME)
-        resp.path != path && (p.cur[] = resp.path)
-        dirs = filter(e -> e.dir, resp.entries)
-        rows = isempty(dirs) ?
-            [DOM.div("(no subfolders)", class = "bt-picker-row", style = "color:#9ca3af")] :
+        if !isempty(err)
+            return DOM.div("error: $err",
+                           class = "bt-picker", style = "color:#b91c1c")
+        end
+        rows = isempty(entries) ?
+            [DOM.div("(no subfolders)",
+                class = "bt-picker-row", style = "color:var(--bt-text-faint)")] :
             [DOM.div("📁 $(e.name)",
-                class = "bt-picker-row",
-                onclick = js"event => $(p.cur).notify($(joinpath(resp.path, e.name)));")
-             for e in dirs]
-        DOM.div(rows...; class = "bt-picker")
+                class   = "bt-picker-row",
+                onclick = js"event => $(p.cur).notify($(joinpath(cur, e.name)));")
+             for e in entries]
+        DOM.div(rows...; class = "bt-picker bt-slide-in")
     end
 
     DOM.div(
@@ -473,15 +745,17 @@ function remote_folder_picker_render(p::RemoteFolderPicker)
         list)
 end
 
-# Dashboard app
-status_pill(s::Symbol) = DOM.span(string(s);
-    class = "bt-pill bt-pill-$s")
+# Status indicator helpers
+status_dot(s::Symbol) = DOM.span(""; class = "bt-dot bt-dot-$s",
+    title = string(s))   # native tooltip
 
 function worker_card(w::WorkerInfo, srv_ref::Ref{Bonito.Server},
                      error_obs::Observable{String}, picker_state::Observable{String},
                      discover_state::Observable{String})
     new_proj_btn  = Bonito.Button("+ Project"; style=nothing, class = "bt-btn bt-btn-secondary")
-    discover_btn  = Bonito.Button("Discover"; style=nothing, class = "bt-btn bt-btn-secondary")
+    discover_btn  = Bonito.Button("Discover";  style=nothing, class = "bt-btn bt-btn-secondary")
+    is_online     = w.status == :online
+
     on(new_proj_btn.value) do clicked
         clicked || return
         picker_state[]   = picker_state[]   == w.name ? "" : w.name
@@ -494,42 +768,68 @@ function worker_card(w::WorkerInfo, srv_ref::Ref{Bonito.Server},
         picker_state[]   = ""
         error_obs[]      = ""
     end
+
     DOM.div(
         DOM.div(
-            DOM.div(w.name, " ", status_pill(w.status), class = "bt-card-title"),
-            DOM.div(isempty(w.hostname) ? w.url : w.hostname, class = "bt-card-meta")),
-        DOM.div(discover_btn, new_proj_btn, style = "display:flex;gap:8px"),
+            DOM.div(status_dot(w.status), w.name; class = "bt-card-title"),
+            DOM.div(isempty(w.hostname) ? w.url : w.hostname,
+                    class = "bt-card-meta");
+            class = "bt-card-body"),
+        DOM.div(
+            is_online ? discover_btn   : DOM.span(),
+            is_online ? new_proj_btn   : DOM.span("offline"; class = "bt-pill bt-pill-muted"),
+            class = "bt-card-actions"),
         class = "bt-card")
 end
 
-function project_card(p::ProjectInfo, error_obs::Observable{String})
+# Build a project card. `opening_proj` lets the card show an inline "Opening…"
+# spinner when the user clicks "Open chat" — gives feedback that the click
+# registered, since the chat page itself can take a few seconds to come up.
+function project_card(p::ProjectInfo, error_obs::Observable{String},
+                       opening_proj::Observable{String})
     badge = p.locked_by === nothing ? DOM.span() :
-        DOM.span("🔒 active on $(p.locked_by)";
-                 class = "bt-pill bt-pill-online",
-                 style = "margin-left:8px")
+        DOM.span("active on $(p.locked_by)";
+                 class = "bt-pill bt-pill-active",
+                 style = "margin-left:6px")
+
+    open_indicator = map(opening_proj) do oid
+        oid == p.id ?
+            DOM.span(DOM.div(class = "bt-spinner bt-spinner-sm"), "Opening…";
+                     class = "bt-spinner-row",
+                     style = "padding-right:8px") :
+            DOM.span()
+    end
+
+    open_link = DOM.a("Open chat →";
+        href    = Bonito.Link("/p/$(p.id)"),
+        target  = "_blank",
+        class   = "bt-link",
+        onclick = js"event => $(opening_proj).notify($(p.id))")
 
     DOM.div(
         DOM.div(
-            DOM.div(p.name, badge, class = "bt-card-title"),
-            DOM.div(p.worker_name, " · server: ", p.server_path,
-                    " · worker: ", p.worker_path, class = "bt-card-meta")),
-        DOM.div(DOM.a("Open chat →", href = Bonito.Link("/p/$(p.id)"), target = "_blank"),
-                style = "display:flex;gap:12px;align-items:center"),
+            DOM.div(p.name, badge; class = "bt-card-title"),
+            DOM.div(
+                DOM.span(p.worker_name),
+                DOM.span("·"; class = "bt-stat-sep"),
+                DOM.span(p.worker_path; class = "bt-mono",
+                         title = "server: $(p.server_path)\nworker: $(p.worker_path)");
+                class = "bt-card-meta");
+            class = "bt-card-body"),
+        DOM.div(open_indicator, open_link;
+                class = "bt-card-actions"),
         class = "bt-card")
 end
 
 function dashboard_app(srv_ref::Ref{Bonito.Server})
     error_obs = Observable("")
 
-    # Workers self-register over WS when they dial /worker-ws — no manual
-    # "Add worker" form needed. The dashboard just lists them as they connect.
+    # Workers self-register over WS — no manual "Add worker" form.
 
-    # New Project form
+    # ── New Project form ─────────────────────────────────────────────────────
     new_proj_show = Observable(false)
     np_name = Observable("")
-    np_picker = FolderPicker(working_dir())   # default to server's project working dir
-    # Auto-fill the project name from the picked folder's basename when the
-    # user hasn't typed anything yet. Their typing always wins.
+    np_picker = FolderPicker(working_dir())
     on(np_picker.selected) do sel
         isempty(strip(np_name[])) || return
         isempty(sel) && return
@@ -537,6 +837,19 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     end
     np_worker = Observable("")
     busy_msg  = Observable("")   # "" = idle; non-empty = operation in progress
+
+    # ── Open-chat click feedback ─────────────────────────────────────────────
+    # When the user clicks "Open chat →" on a project card, a new tab opens
+    # but the chat app can take a few seconds to come up. We flash an
+    # "Opening…" spinner on that card so the click visibly registers.
+    opening_proj = Observable("")
+    on(opening_proj) do pid
+        isempty(pid) && return
+        @async begin
+            sleep(3)
+            opening_proj[] == pid && (opening_proj[] = "")
+        end
+    end
 
     np_submit = Bonito.Button("Create"; style=nothing, class = "bt-btn")
     np_cancel = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
@@ -592,8 +905,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     discover_busy    = Observable(false)
     import_path      = Observable("")                       # JS onclick notifies this
 
-    on(discover_state) do w_name
-        isempty(w_name) && return
+    function trigger_scan!(w_name::String)
         discover_busy[]    = true
         discover_results[] = Dict{String,Any}[]
         @async begin
@@ -605,6 +917,10 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
                 discover_busy[] = false
             end
         end
+    end
+
+    on(discover_state) do w_name
+        isempty(w_name) || trigger_scan!(w_name)
     end
 
     on(import_path) do path
@@ -629,61 +945,73 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         end
     end
 
-    function discover_panel(w_name::String)
-        close_btn = Bonito.Button("✕"; style=nothing, class = "bt-btn bt-btn-secondary")
-        on(close_btn.value) do clicked
-            clicked && (discover_state[] = "")
+    function session_row(r::AbstractDict)
+        path      = String(get(r, "path", ""))
+        isempty(path) && return DOM.div()
+        name      = String(get(r, "name", basename(path)))
+        is_active = get(r, "active", false) === true
+        meta = if is_active
+            "PID $(get(r, "pid", "?"))"
+        elseif haskey(r, "last_used")
+            ts = get(r, "last_used", 0.0)
+            dt = Dates.unix2datetime(ts isa Number ? Float64(ts) : 0.0)
+            "Last used $(Dates.format(dt, "yyyy-mm-dd HH:MM"))"
+        else
+            ""
         end
-        panel_content = map(discover_busy, discover_results) do busy, results
-            if busy
-                spinner_row("Scanning for Claude Code sessions…")
-            elseif isempty(results)
-                DOM.div("No Claude Code sessions found on $w_name.", class = "bt-empty")
-            else
-                rows = []
-                for r in results
-                    if haskey(r, "error")
-                        push!(rows, DOM.div("Error: $(r["error"])", class = "bt-error"))
-                        continue
-                    end
-                    path      = String(get(r, "path", ""))
-                    isempty(path) && continue
-                    name      = String(get(r, "name", basename(path)))
-                    is_active = get(r, "active", false) === true
-                    badge     = is_active ?
-                        DOM.span("running"; class="bt-pill bt-pill-online",
-                                 style="margin-left:6px") : DOM.span()
-                    meta = if is_active
-                        "PID $(get(r, "pid", "?"))"
-                    elseif haskey(r, "last_used")
-                        ts = get(r, "last_used", 0.0)
-                        dt = Dates.unix2datetime(ts isa Number ? Float64(ts) : 0.0)
-                        "Last used: $(Dates.format(dt, "yyyy-mm-dd HH:MM")) UTC"
-                    else
-                        ""
-                    end
-                    push!(rows, DOM.div(
-                        DOM.div(
-                            DOM.span(name, badge; style="font-weight:600"),
-                            DOM.div(path; class="bt-session-path"),
-                            isempty(meta) ? DOM.span() :
-                                DOM.div(meta; class="bt-session-meta")),
-                        DOM.div("Import";
-                            class   = "bt-btn bt-btn-secondary",
-                            style   = "cursor:pointer;flex-shrink:0",
-                            onclick = js"event => $(import_path).notify($path);"),
-                        class = "bt-session-row"))
-                end
-                DOM.div(rows...)
-            end
-        end
+        badge = is_active ?
+            DOM.span("active"; class = "bt-pill bt-pill-active") : DOM.span()
         DOM.div(
             DOM.div(
-                DOM.span("Claude Code sessions on $w_name"),
-                close_btn,
+                DOM.div(name, badge; class = "bt-session-name"),
+                DOM.div(path; class = "bt-session-path"),
+                isempty(meta) ? DOM.span() : DOM.div(meta; class = "bt-session-meta")),
+            DOM.div("Import";
+                class   = "bt-btn bt-btn-secondary",
+                style   = "cursor:pointer;flex-shrink:0",
+                onclick = js"event => $(import_path).notify($path);"),
+            class = is_active ? "bt-session-row bt-session-active" : "bt-session-row")
+    end
+
+    function discover_panel(w_name::String)
+        close_btn  = Bonito.Button("✕"; style=nothing, class = "bt-btn bt-btn-ghost")
+        rescan_btn = Bonito.Button("↻ Rescan"; style=nothing, class = "bt-btn bt-btn-secondary")
+        on(close_btn.value)  do clicked; clicked && (discover_state[] = ""); end
+        on(rescan_btn.value) do clicked; clicked && trigger_scan!(w_name); end
+
+        panel_content = map(discover_busy, discover_results) do busy, results
+            if busy
+                spinner_row("Scanning $w_name for Claude Code sessions…")
+            elseif isempty(results)
+                DOM.div("No Claude Code sessions found on $w_name."; class = "bt-empty")
+            else
+                # Surface errors first, then split active vs historical.
+                errors = [DOM.div("Error: $(r["error"])"; class = "bt-error")
+                          for r in results if haskey(r, "error")]
+                clean       = filter(r -> !haskey(r, "error"), results)
+                active      = filter(r -> get(r, "active", false) === true, clean)
+                historical  = filter(r -> get(r, "active", false) !== true, clean)
+                blocks = []
+                append!(blocks, errors)
+                if !isempty(active)
+                    push!(blocks, DOM.div("Active"; class = "bt-section-label"))
+                    append!(blocks, [session_row(r) for r in active])
+                end
+                if !isempty(historical)
+                    push!(blocks, DOM.div("Historical"; class = "bt-section-label"))
+                    append!(blocks, [session_row(r) for r in historical])
+                end
+                DOM.div(blocks...; class = "bt-slide-in")
+            end
+        end
+
+        DOM.div(
+            DOM.div(
+                DOM.span("Claude Code sessions on $w_name"; class = "bt-discover-title"),
+                DOM.div(rescan_btn, close_btn; class = "bt-discover-actions");
                 class = "bt-discover-header"),
-            panel_content,
-            class = "bt-discover-panel")
+            panel_content;
+            class = "bt-discover-panel bt-slide-in")
     end
 
     function get_remote_picker(name)
@@ -772,49 +1100,106 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
             class = "bt-form")
     end
 
+    # ── Stats strip ──────────────────────────────────────────────────────────
+    stats_strip = map(STATE_VERSION) do _
+        online   = count(w -> w.status == :online, values(WORKERS))
+        total    = length(WORKERS)
+        n_proj   = length(PROJECTS)
+        n_active = count(p -> p.locked_by !== nothing, values(PROJECTS))
+        sep()    = DOM.span("·"; class = "bt-stat-sep")
+        DOM.div(
+            DOM.div(
+                status_dot(online > 0 ? :online : (total == 0 ? :unknown : :offline)),
+                DOM.span("$online"; class = "bt-stat-value"),
+                DOM.span("/$total workers online"; class = "bt-stat-label"),
+                class = "bt-stat"),
+            sep(),
+            DOM.div(
+                DOM.span("$n_proj"; class = "bt-stat-value"),
+                DOM.span(n_proj == 1 ? "project" : "projects"; class = "bt-stat-label"),
+                class = "bt-stat"),
+            sep(),
+            DOM.div(
+                DOM.span("$n_active"; class = "bt-stat-value"),
+                DOM.span("active"; class = "bt-stat-label"),
+                class = "bt-stat"),
+            class = "bt-stats")
+    end
+
+    # ── Worker / project lists ───────────────────────────────────────────────
+    worker_list = map(STATE_VERSION, picker_state, discover_state) do _, picked, discovered
+        if isempty(WORKERS)
+            install_url = "$(public_url_or_default())/install.sh"
+            install_cmd = "curl -fsSL $install_url | sh"
+            return DOM.div(
+                DOM.div("No workers connected yet.";
+                        style = "color:var(--bt-text-muted);font-size:13px"),
+                DOM.div("Run on each agent machine:";
+                        style = "color:var(--bt-text-faint);font-size:12px;margin-top:8px"),
+                DOM.div(
+                    DOM.span(install_cmd),
+                    DOM.span("Copy";
+                        class   = "bt-install-copy",
+                        onclick = js"""event => {
+                            navigator.clipboard.writeText($install_cmd);
+                            event.target.textContent = 'Copied';
+                            setTimeout(() => event.target.textContent = 'Copy', 1200);
+                        }"""),
+                    class = "bt-install-cmd");
+                class = "bt-install-block")
+        end
+        rows = []
+        for w in values(WORKERS)
+            push!(rows, worker_card(w, srv_ref, error_obs, picker_state, discover_state))
+            picked     == w.name && push!(rows, remote_picker_form(w.name))
+            discovered == w.name && push!(rows, discover_panel(w.name))
+        end
+        DOM.div(rows...)
+    end
+
+    project_list = map(STATE_VERSION) do _
+        isempty(PROJECTS) ?
+            DOM.div("No projects yet — pick a worker above and click + Project, or import an existing Claude session via Discover.";
+                    class = "bt-empty") :
+            DOM.div((project_card(p, error_obs, opening_proj) for p in values(PROJECTS))...)
+    end
+
+    proj_form_block = map(new_proj_show) do show
+        show ? DOM.div(new_proj_form(); class = "bt-slide-in") : DOM.div()
+    end
+    error_block = map(error_obs) do msg
+        isempty(msg) ? DOM.div() : DOM.div(msg; class = "bt-error")
+    end
+
     # Layout
     App() do session
-        # Re-render lists whenever STATE_VERSION bumps OR picker_state changes
-        worker_list = map(STATE_VERSION, picker_state, discover_state) do _, picked_worker, discovered_worker
-            isempty(WORKERS) && return DOM.div(
-                "No workers registered yet. Run the install script on a worker.",
-                class = "bt-empty")
-            rows = []
-            for w in values(WORKERS)
-                push!(rows, worker_card(w, srv_ref, error_obs, picker_state, discover_state))
-                picked_worker    == w.name && push!(rows, remote_picker_form(w.name))
-                discovered_worker == w.name && push!(rows, discover_panel(w.name))
-            end
-            DOM.div(rows...)
-        end
-
-        project_list = map(STATE_VERSION) do _
-            isempty(PROJECTS) ?
-                DOM.div("No projects yet.", class = "bt-empty") :
-                DOM.div((project_card(p, error_obs) for p in values(PROJECTS))...)
-        end
-
-        proj_form_block = map(new_proj_show) do show
-            show ? new_proj_form() : DOM.div()
-        end
-        error_block = map(error_obs) do msg
-            isempty(msg) ? DOM.div() : DOM.div(msg, class = "bt-error")
-        end
-
         DOM.div(
             DashboardStyles,
-            DOM.h1("BonitoTeam"),
-            DOM.div("Multi-host orchestrator for agentic coding sessions.", class = "bt-sub"),
+            DOM.div(
+                DOM.h1("BonitoTeam"),
+                DOM.div("Multi-host orchestrator for agentic coding sessions";
+                        class = "bt-tagline");
+                class = "bt-header"),
+            stats_strip,
             error_block,
 
-            DOM.h2("Workers"),
+            DOM.div(DOM.h2("Workers"); class = "bt-section"),
             worker_list,
 
-            DOM.h2("Projects"),
+            DOM.div(
+                DOM.h2("Projects"),
+                new_proj_btn;
+                class = "bt-section"),
             project_list,
-            DOM.div(new_proj_btn, style = "margin-top: 8px"),
-            proj_form_block,
+            proj_form_block;
 
             class = "bt-dash")
     end
+end
+
+# Best-effort lookup of the public URL for the install one-liner shown in the
+# empty state. Reads the same env BONITOTEAM_PUBLIC_URL that the service uses.
+function public_url_or_default()
+    url = get(ENV, "BONITOTEAM_PUBLIC_URL", "")
+    isempty(url) ? "http://<your-server>:8038" : rstrip(url, '/')
 end

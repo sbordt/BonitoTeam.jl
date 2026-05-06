@@ -4,6 +4,11 @@
 #
 #   bash BonitoTeam/assets/install_server.sh [options]
 #
+# The systemd service runs as the user invoking sudo (so it can access
+# their juliaup install + the monorepo without permission gymnastics).
+# Re-run the script to update — service is stopped first, so we never
+# leave half-applied state behind.
+#
 # Options:
 #   --public-url URL   URL workers use to reach this server
 #                      (default: http://<auto-detected-ip>:PORT)
@@ -36,25 +41,38 @@ step() { echo ""; echo "==> $*"; }
 ok()   { echo "    ok   : $*"; }
 info() { echo "    info : $*"; }
 
+# ── Service user ──────────────────────────────────────────────────────────────
+# Service runs as the human who invoked the installer — they own the monorepo
+# and the juliaup install, so no /home traversal permission issues.
+SERVICE_USER="${SUDO_USER:-$USER}"
+if [[ -z "$SERVICE_USER" || "$SERVICE_USER" == "root" ]]; then
+    echo "ERROR: cannot determine non-root user for the service." >&2
+    echo "       Run as a regular user; the script will sudo when needed:" >&2
+    echo "         bash $0 ..." >&2
+    exit 1
+fi
+SERVICE_HOME="$(getent passwd "$SERVICE_USER" | cut -d: -f6)"
+[[ -d "$SERVICE_HOME" ]] || { echo "ERROR: $SERVICE_USER's home not found"; exit 1; }
+
 DATA_DIR="/var/lib/bonitoteam"
 CONFIG_DIR="/etc/bonitoteam"
 SERVER_BIN="$MONOREPO_DIR/BonitoTeam/bin/bonitoteam-server"
 JULIA_BIN="$(command -v julia || true)"
 
 echo "==> BonitoTeam server installer"
-echo "    Monorepo: $MONOREPO_DIR"
+echo "    Monorepo     : $MONOREPO_DIR"
+echo "    Service user : $SERVICE_USER"
 
 # ── Sanity checks ─────────────────────────────────────────────────────────────
 step "Sanity checks"
 [[ -f "$SERVER_BIN" ]] || { echo "ERROR: $SERVER_BIN not found — run from the cloned repo"; exit 1; }
 [[ -n "$JULIA_BIN" ]]  || { echo "ERROR: julia not found in PATH — install Julia first"; exit 1; }
-command -v sudo        > /dev/null || { echo "ERROR: sudo not found"; exit 1; }
+command -v sudo > /dev/null || { echo "ERROR: sudo not found"; exit 1; }
 ok "julia: $(julia --version)"
 
-# ── Stop service before making any changes ────────────────────────────────────
-# Ensures we never end up in a mixed old/new state: either the old service
-# is running (if we abort before this point), or it's stopped and we own the
-# update fully.
+# ── Stop service before any changes ───────────────────────────────────────────
+# Either the old service is running (if we abort before this point) or it's
+# stopped and we own the update fully — never half-and-half.
 step "Stop existing service (if running)"
 if sudo systemctl is-active --quiet bonitoteam-server 2>/dev/null; then
     sudo systemctl stop bonitoteam-server
@@ -63,28 +81,16 @@ else
     ok "not running"
 fi
 
-# ── System user ───────────────────────────────────────────────────────────────
-step "System user: bonitoteam"
-if id bonitoteam &>/dev/null; then
-    ok "exists"
-else
-    sudo useradd --system \
-                 --home-dir "$DATA_DIR" \
-                 --create-home \
-                 --shell /usr/sbin/nologin \
-                 --comment "BonitoTeam server" \
-                 bonitoteam
-    ok "created"
-fi
+# ── Data dir ──────────────────────────────────────────────────────────────────
+step "Data dir: $DATA_DIR"
 sudo mkdir -p "$DATA_DIR/state" "$DATA_DIR/projects"
-sudo chown -R bonitoteam:bonitoteam "$DATA_DIR"
+sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
 sudo chmod 750 "$DATA_DIR"
+ok "owned by $SERVICE_USER"
 
 # ── Julia env ─────────────────────────────────────────────────────────────────
 step "Julia env (BonitoTeam)"
-julia \
-    "--project=$MONOREPO_DIR/BonitoTeam" \
-    --startup-file=no \
+julia "--project=$MONOREPO_DIR/BonitoTeam" --startup-file=no \
     -e 'import Pkg; Pkg.instantiate()'
 ok "instantiated"
 
@@ -121,9 +127,9 @@ BONITOTEAM_HOST=0.0.0.0
 BONITOTEAM_STATE_DIR=$DATA_DIR/state
 BONITOTEAM_WORKING_DIR=$DATA_DIR/projects
 EOF
-sudo chown root:bonitoteam "$CONFIG_DIR/server.env"
+sudo chown "root:$SERVICE_USER" "$CONFIG_DIR/server.env"
 sudo chmod 640 "$CONFIG_DIR/server.env"
-ok "written (mode 640, group bonitoteam)"
+ok "written (mode 640, group $SERVICE_USER)"
 
 # ── systemd service ───────────────────────────────────────────────────────────
 step "systemd service: bonitoteam-server"
@@ -135,8 +141,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=bonitoteam
-Group=bonitoteam
+User=$SERVICE_USER
 EnvironmentFile=$CONFIG_DIR/server.env
 Environment=PATH=$(dirname "$JULIA_BIN"):/usr/local/bin:/usr/bin:/bin
 ExecStart=$SERVER_BIN
@@ -146,7 +151,7 @@ TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
 
-# Hardening
+# Hardening — see systemd.exec(5)
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
@@ -158,8 +163,7 @@ ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictRealtime=true
 LockPersonality=true
-# Julia JIT requires writable+executable pages — MemoryDenyWriteExecute must stay off
-ReadOnlyPaths=$MONOREPO_DIR
+# Julia JIT requires writable+executable pages — MemoryDenyWriteExecute stays off
 ReadWritePaths=$DATA_DIR
 
 [Install]
@@ -171,7 +175,7 @@ ok "installed + enabled"
 
 # ── Start ─────────────────────────────────────────────────────────────────────
 step "Start bonitoteam-server"
-sudo systemctl restart bonitoteam-server
+sudo systemctl start bonitoteam-server
 sleep 2
 if sudo systemctl is-active --quiet bonitoteam-server; then
     ok "active"
@@ -192,3 +196,4 @@ echo "    curl -fsSL $PUBLIC_URL/install.sh | sh"
 echo ""
 echo "  Logs:    journalctl -u bonitoteam-server -f"
 echo "  Config:  $CONFIG_DIR/server.env"
+echo "  State:   $DATA_DIR"

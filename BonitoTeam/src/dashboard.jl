@@ -408,7 +408,9 @@ const DashboardStyles = Bonito.Styles(
         "border-radius" => "var(--bt-radius)",
         "padding" => "16px", "margin-top" => "12px",
         "display" => "grid",
-        "grid-template-columns" => "120px 1fr",
+        # minmax(0, 1fr) lets the column shrink below content min-width so the
+        # picker's address bar can scroll horizontally without expanding the form
+        "grid-template-columns" => "120px minmax(0, 1fr)",
         "gap" => "12px 16px", "align-items" => "start"),
     CSS(".bt-form label",
         "color" => "var(--bt-text-muted)", "font-size" => "13px",
@@ -462,14 +464,78 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-picker-row:hover",
         "background" => "var(--bt-surface-2)"),
     CSS(".bt-picker-cur",
-        "padding" => "8px 10px",
-        "background" => "var(--bt-surface-2)",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius-sm)",
-        "font-family" => "ui-monospace, monospace", "font-size" => "12px",
-        "margin-bottom" => "8px",
         "display" => "flex", "align-items" => "center",
-        "justify-content" => "space-between", "gap" => "8px"),
+        "gap" => "8px", "margin-bottom" => "8px",
+        "flex-wrap" => "wrap",
+        "min-width" => "0"),
+    # Bonito wraps reactive map(...) output in <div><bonito-fragment><div>…
+    # which breaks flex layout — the bar isn't a direct flex child of
+    # bt-picker-cur. display:contents makes those wrappers transparent so the
+    # bar becomes an effective direct flex child and `flex: 1 1 0` works.
+    CSS(".bt-picker-cur > div, .bt-picker-cur .bonito-fragment, .bt-picker-cur .bonito-fragment > div",
+        "display" => "contents"),
+    # ── Windows-style address bar ────────────────────────────────────────────
+    CSS(".bt-addr-bar",
+        "flex" => "1 1 0",   "min-width" => "0",
+        "display" => "flex", "align-items" => "center",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border-strong)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "padding" => "2px 4px",
+        "min-height" => "32px",
+        "cursor" => "text",
+        "overflow-x" => "auto",
+        "transition" => "border-color 120ms, box-shadow 120ms"),
+    CSS(".bt-addr-bar:hover",
+        "border-color" => "var(--bt-accent)"),
+    CSS(".bt-addr-seg",
+        "padding" => "4px 6px",
+        "border-radius" => "4px",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "12px",
+        "color" => "var(--bt-text)",
+        "white-space" => "nowrap",
+        "cursor" => "pointer",
+        "transition" => "background 80ms, color 80ms"),
+    CSS(".bt-addr-seg:hover",
+        "background" => "var(--bt-surface-2)",
+        "color" => "var(--bt-accent)"),
+    CSS(".bt-addr-seg-root",
+        "padding" => "4px 4px"),
+    CSS(".bt-addr-chevron",
+        "color" => "var(--bt-text-faint)",
+        "user-select" => "none",
+        "padding" => "0 1px",
+        "font-size" => "11px",
+        "flex-shrink" => "0"),
+    # Empty area to the right of the segments — clicking it enters edit mode
+    CSS(".bt-addr-filler",
+        "flex" => "1 1 auto", "min-width" => "8px",
+        "align-self" => "stretch",
+        "cursor" => "text"),
+    CSS(".bt-addr-input",
+        "flex" => "1 1 auto", "min-width" => "0",
+        "padding" => "6px 10px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-accent)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "min-height" => "32px",
+        "box-sizing" => "border-box",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "12px",
+        "color" => "var(--bt-text)",
+        "outline" => "none",
+        "box-shadow" => "0 0 0 3px rgba(59,130,246,0.18)"),
+    CSS(".bt-addr-icon-btn",
+        "background" => "transparent", "border" => "none",
+        "color" => "var(--bt-text-faint)", "cursor" => "pointer",
+        "padding" => "4px 6px", "border-radius" => "4px",
+        "font-size" => "13px",
+        "transition" => "background 80ms, color 80ms",
+        "flex-shrink" => "0"),
+    CSS(".bt-addr-icon-btn:hover",
+        "background" => "var(--bt-surface-2)",
+        "color" => "var(--bt-accent)"),
     CSS(".bt-picker-loading",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "color" => "var(--bt-text-muted)",
@@ -588,7 +654,7 @@ const DashboardStyles = Bonito.Styles(
         CSS(".bt-tagline", "font-size" => "12px"),
         # form labels above inputs (single column) for touch widths
         CSS(".bt-form",
-            "grid-template-columns" => "1fr",
+            "grid-template-columns" => "minmax(0, 1fr)",
             "gap" => "8px"),
         CSS(".bt-form label",
             "padding-top" => "0", "font-size" => "12px"),
@@ -602,29 +668,99 @@ const DashboardStyles = Bonito.Styles(
         CSS(".bt-stats", "gap" => "12px")),
 )
 
+# Windows-style address bar: clickable breadcrumb segments by default;
+# clicking the empty area or the ✎ button switches to a text input where the
+# user can type/paste a path. Enter commits, Esc cancels.
+"""
+    address_bar(cur, editing) → Bonito DOM node
+
+`cur::Observable{String}` is the path being browsed; `editing::Observable{Bool}`
+toggles between breadcrumb mode and text-input mode. Both are mutated in
+response to user clicks/keystrokes.
+"""
+function address_bar(cur::Observable{String}, editing::Observable{Bool})
+    map(cur, editing) do path, edit
+        if edit
+            DOM.input(
+                type    = "text",
+                value   = path,
+                class   = "bt-addr-input",
+                autofocus = true,
+                onfocus = js"event => event.target.select()",
+                onkeydown = js"""event => {
+                    if (event.key === 'Enter') {
+                        $(cur).notify(event.target.value);
+                        $(editing).notify(false);
+                    } else if (event.key === 'Escape') {
+                        $(editing).notify(false);
+                    }
+                }""")
+        else
+            paths = breadcrumb_paths(String(path))
+            nodes = []
+            for (i, full) in enumerate(paths)
+                label = i == 1 ? "/" : basename(full)
+                push!(nodes, DOM.span(label;
+                    class   = i == 1 ? "bt-addr-seg bt-addr-seg-root" : "bt-addr-seg",
+                    onclick = js"event => { event.stopPropagation(); $(cur).notify($full); }",
+                    title   = full))
+                if i < length(paths)
+                    push!(nodes, DOM.span("›"; class = "bt-addr-chevron"))
+                end
+            end
+            # Filler at the end takes remaining width — clicking it enters edit mode.
+            push!(nodes, DOM.div("";
+                class = "bt-addr-filler",
+                onclick = js"event => $(editing).notify(true)"))
+            push!(nodes, DOM.button("✎";
+                class    = "bt-addr-icon-btn",
+                title    = "Edit path",
+                onclick  = js"event => $(editing).notify(true)"))
+            DOM.div(nodes...;
+                class   = "bt-addr-bar",
+                onclick = js"""event => {
+                    if (event.target === event.currentTarget) $(editing).notify(true);
+                }""")
+        end
+    end
+end
+
+# Build cumulative paths for breadcrumb rendering:
+# "/home/server/BonitoTeam" → ["/", "/home", "/home/server", "/home/server/BonitoTeam"]
+function breadcrumb_paths(cur::String)::Vector{String}
+    isempty(cur) && return ["/"]
+    cur = startswith(cur, "/") ? cur : "/" * cur
+    parts = split(cur, '/'; keepempty = false)
+    paths = String["/"]
+    acc = ""
+    for p in parts
+        acc *= "/" * String(p)
+        push!(paths, acc)
+    end
+    return paths
+end
+
 # Folder picker component
 """
 Slim server-side folder picker. `selected` is an Observable{String} the caller
-listens to. Renders as: current path + Browse / Up / Choose buttons + (when
-expanded) a flat list of subdirectories.
+listens to. Renders as: address bar + Up / Choose buttons + a flat list of
+subdirectories below the bar.
 """
 mutable struct FolderPicker
     cur::Observable{String}        # current directory being browsed
     selected::Observable{String}   # final chosen directory
     expanded::Observable{Bool}
+    editing::Observable{Bool}      # address bar in text-edit mode
 end
 
 FolderPicker(start::String = pwd()) = FolderPicker(
-    Observable(abspath(start)), Observable(""), Observable(false))
+    Observable(abspath(start)), Observable(""), Observable(false), Observable(false))
 
 function folder_picker_render(p::FolderPicker)
-    browse_btn = Bonito.Button("Browse"; style=nothing, class = "bt-btn bt-btn-secondary")
-    up_btn     = Bonito.Button("↑ Up"; style=nothing, class = "bt-btn bt-btn-secondary")
+    up_btn     = Bonito.Button("↑"; style=nothing, class = "bt-btn bt-btn-secondary",
+                               title = "Up one level")
     choose_btn = Bonito.Button("Choose"; style=nothing, class = "bt-btn")
 
-    on(browse_btn.value) do clicked
-        clicked && (p.expanded[] = !p.expanded[])
-    end
     on(up_btn.value) do clicked
         clicked || return
         parent = dirname(rstrip(p.cur[], '/'))
@@ -633,31 +769,32 @@ function folder_picker_render(p::FolderPicker)
     on(choose_btn.value) do clicked
         clicked || return
         p.selected[] = p.cur[]
-        p.expanded[] = false
     end
 
-    list = map(p.cur, p.expanded) do path, show
-        show || return DOM.div()
+    # Always show the listing — drop the explicit Browse-to-expand mode.
+    p.expanded[] = true
+
+    list = map(p.cur) do path
         entries = try
             sort!(filter(n -> isdir(joinpath(path, n)) && !startswith(n, "."),
                          readdir(path)))
         catch e
-            return DOM.div("error: $e", class = "bt-picker", style = "color:#991b1b")
+            return DOM.div("error: $e", class = "bt-picker", style = "color:#b91c1c")
         end
         rows = isempty(entries) ?
-            [DOM.div("(no subfolders)", class = "bt-picker-row", style = "color:#9ca3af")] :
-            [DOM.div("📁 $name",
-                class = "bt-picker-row",
-                onclick = js"event => $(p.cur).notify($(joinpath(path, name))); ")
+            [DOM.div("(no subfolders)";
+                class = "bt-picker-row", style = "color:var(--bt-text-faint)")] :
+            [DOM.div("📁 $name";
+                class   = "bt-picker-row",
+                onclick = js"event => $(p.cur).notify($(joinpath(path, name)));")
              for name in entries]
         DOM.div(rows...; class = "bt-picker")
     end
 
     DOM.div(
         DOM.div(
-            DOM.span(p.cur, style = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap"),
-            DOM.div(up_btn, browse_btn, choose_btn,
-                    style = "display:flex;gap:6px;flex-shrink:0"),
+            address_bar(p.cur, p.editing),
+            up_btn, choose_btn;
             class = "bt-picker-cur"),
         list)
 end
@@ -672,6 +809,7 @@ mutable struct RemoteFolderPicker
     cur::Observable{String}
     selected::Observable{String}
     expanded::Observable{Bool}
+    editing::Observable{Bool}          # address bar in text-edit mode
     entries::Observable{Vector{PickerEntry}}
     loading::Observable{Bool}
     err::Observable{String}
@@ -681,6 +819,7 @@ end
 
 RemoteFolderPicker(worker_name::String, start::String = "") = RemoteFolderPicker(
     worker_name, Observable(start), Observable(""), Observable(false),
+    Observable(false),
     Observable(PickerEntry[]), Observable(false), Observable(""),
     Ref(0), Ref(false))
 
@@ -725,13 +864,10 @@ end
 function remote_folder_picker_render(p::RemoteFolderPicker)
     setup_remote_picker_listeners!(p)
 
-    browse_btn = Bonito.Button("Browse"; style=nothing, class = "bt-btn bt-btn-secondary")
-    up_btn     = Bonito.Button("↑ Up";   style=nothing, class = "bt-btn bt-btn-secondary")
+    up_btn     = Bonito.Button("↑"; style=nothing, class = "bt-btn bt-btn-secondary",
+                               title = "Up one level")
     choose_btn = Bonito.Button("Choose"; style=nothing, class = "bt-btn")
 
-    on(browse_btn.value) do clicked
-        clicked && (p.expanded[] = !p.expanded[])
-    end
     on(up_btn.value) do clicked
         clicked || return
         cur = p.cur[]
@@ -742,25 +878,26 @@ function remote_folder_picker_render(p::RemoteFolderPicker)
     on(choose_btn.value) do clicked
         clicked || return
         p.selected[] = p.cur[]
-        p.expanded[] = false
     end
 
-    list = map(p.expanded, p.loading, p.entries, p.err, p.cur) do exp, loading, entries, err, cur
-        exp || return DOM.div()
+    # Picker is always visible — kick off the initial fetch on first render.
+    p.expanded[] = true
+
+    list = map(p.loading, p.entries, p.err, p.cur) do loading, entries, err, cur
         if loading
             return DOM.div(
                 DOM.div(class = "bt-spinner"),
-                DOM.span("Listing folder…"),
+                DOM.span("Listing folder…");
                 class = "bt-picker bt-picker-loading bt-slide-in")
         end
         if !isempty(err)
-            return DOM.div("error: $err",
+            return DOM.div("error: $err";
                            class = "bt-picker", style = "color:#b91c1c")
         end
         rows = isempty(entries) ?
-            [DOM.div("(no subfolders)",
+            [DOM.div("(no subfolders)";
                 class = "bt-picker-row", style = "color:var(--bt-text-faint)")] :
-            [DOM.div("📁 $(e.name)",
+            [DOM.div("📁 $(e.name)";
                 class   = "bt-picker-row",
                 onclick = js"event => $(p.cur).notify($(joinpath(cur, e.name)));")
              for e in entries]
@@ -769,9 +906,8 @@ function remote_folder_picker_render(p::RemoteFolderPicker)
 
     DOM.div(
         DOM.div(
-            DOM.span(p.cur, style = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap"),
-            DOM.div(up_btn, browse_btn, choose_btn,
-                    style = "display:flex;gap:6px;flex-shrink:0"),
+            address_bar(p.cur, p.editing),
+            up_btn, choose_btn;
             class = "bt-picker-cur"),
         list)
 end

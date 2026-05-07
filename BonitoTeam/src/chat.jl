@@ -384,52 +384,22 @@ function chat_app(cwd::String;
 
     # ACP update handlers
     #
-    # `user_message_chunk` only arrives during session/load replay (live user
-    # input bypasses on_update — we push UserMsg directly when the user hits
-    # send). Consecutive chunks for one historical user message merge into a
-    # single bubble; finalize_streaming! flips the flag when something
-    # else arrives (agent message, tool call, etc).
-    function on_update(upd::UserMessageChunk)
-        upd.content isa TextContent || return
-        text = upd.content.text
-        if !user_streaming[]
-            user_streaming[] = true
-            msg = UserMsg(text)
-            push!(msgs_store, msg)
-            append_user(chat_session, msg)
-            total_count[] = length(msgs_store)
-            emit(Dict{String,Any}("type" => "user", "text" => text))
-        else
-            msgs_store[end].text *= text
-            emit(Dict{String,Any}("type" => "user_chunk", "text" => text))
-        end
-    end
-
-    function on_update(upd::AgentMessageChunk)
-        upd.content isa TextContent || return
-        text = upd.content.text
-        if isempty(agent_id[])
-            id = string(uuid4())
-            agent_id[] = id
-            msg = AgentMsg(id, text)
-            push!(msgs_store, msg)
-            total_count[] = length(msgs_store)
-            emit(Dict{String,Any}("type" => "agent", "id" => id,
-                                  "html" => "", "streaming" => true))
-        else
-            msgs_store[end].text *= text
-            emit(Dict{String,Any}("type" => "chunk", "id" => agent_id[], "text" => text))
-        end
-    end
-
+    # All three streaming handlers (user/agent/thought) follow the same shape:
+    #   1. If we're already streaming the same type → accumulate by ID lookup
+    #      (NOT msgs_store[end] — interleaved events from session/load replay
+    #      can put a different message there).
+    #   2. Otherwise → finalize_streaming! to close any other in-flight stream,
+    #      then push a fresh message and remember its ID.
     function finalize_streaming!()
-        # Close any in-flight replayed user message — once an agent/thought/
-        # tool event arrives, the user-message stream is complete.
+        # User messages are persisted at creation (append_user runs in
+        # on_update(::UserMessageChunk) the moment the first chunk arrives),
+        # so closing the stream just clears the in-flight flag.
         user_streaming[] = false
         if !isempty(thought_id[])
             idx = findfirst(m -> m isa ThoughtMsg && m.id == thought_id[], msgs_store)
             if idx !== nothing
                 m = msgs_store[idx]
+                append_thought(chat_session, m)
                 html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
                 emit(Dict{String,Any}("type" => "thought_final", "id" => m.id, "html" => html))
             end
@@ -447,10 +417,57 @@ function chat_app(cwd::String;
         end
     end
 
+    function on_update(upd::UserMessageChunk)
+        upd.content isa TextContent || return
+        text = upd.content.text
+        if !user_streaming[]
+            finalize_streaming!()
+            user_streaming[] = true
+            msg = UserMsg(text)
+            push!(msgs_store, msg)
+            append_user(chat_session, msg)
+            total_count[] = length(msgs_store)
+            emit(Dict{String,Any}("type" => "user", "text" => text))
+        else
+            # Accumulate into the most-recent UserMsg (the in-flight one).
+            idx = findlast(m -> m isa UserMsg, msgs_store)
+            idx === nothing && return
+            msgs_store[idx].text *= text
+            emit(Dict{String,Any}("type" => "user_chunk", "text" => text))
+        end
+    end
+
+    function on_update(upd::AgentMessageChunk)
+        upd.content isa TextContent || return
+        text = upd.content.text
+        if isempty(agent_id[])
+            finalize_streaming!()
+            id = string(uuid4())
+            agent_id[] = id
+            msg = AgentMsg(id, text)
+            push!(msgs_store, msg)
+            total_count[] = length(msgs_store)
+            emit(Dict{String,Any}("type" => "agent", "id" => id,
+                                  "html" => "", "streaming" => true))
+        else
+            idx = findfirst(m -> m isa AgentMsg && m.id == agent_id[], msgs_store)
+            idx === nothing && return
+            msgs_store[idx].text *= text
+            emit(Dict{String,Any}("type" => "chunk", "id" => agent_id[], "text" => text))
+        end
+    end
+
     function on_update(upd::AgentThoughtChunk)
         upd.content isa TextContent || return
         text = upd.content.text
+        # claude-agent-acp's session/load replay emits placeholder thought
+        # chunks with empty content — the underlying jsonl doesn't persist
+        # thought text, so the agent fakes "there was thinking here" markers.
+        # Live sessions deliver real text; this filters the placeholders out
+        # so we don't spawn empty bubbles after a resume.
+        isempty(text) && return
         if isempty(thought_id[])
+            finalize_streaming!()
             id = string(uuid4())
             thought_id[] = id
             msg = ThoughtMsg(id, text)
@@ -459,7 +476,9 @@ function chat_app(cwd::String;
             emit(Dict{String,Any}("type" => "thought", "id" => id,
                                   "html" => "", "streaming" => true))
         else
-            msgs_store[end].text *= text
+            idx = findfirst(m -> m isa ThoughtMsg && m.id == thought_id[], msgs_store)
+            idx === nothing && return
+            msgs_store[idx].text *= text
             emit(Dict{String,Any}("type" => "thought_chunk", "id" => thought_id[], "text" => text))
         end
     end

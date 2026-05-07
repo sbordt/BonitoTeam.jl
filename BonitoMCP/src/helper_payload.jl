@@ -57,6 +57,140 @@ function format_value(val, max_bytes::Int, full_output::Bool)
 end
 
 """
+    format_show(val, max_bytes_image, max_bytes_text) → Vector{Dict{String,Any}}
+
+Like `format_value` but for `bt_show`: walk the MIME chain (PNG → SVG → HTML
+→ text/plain) to find the richest representation the value supports, and tag
+heavy blocks with `annotations.audience = ["user"]` per the MCP spec so they
+render in the chat UI WITHOUT being forwarded to the model. A small
+"shown: <type> (<size>)" text block (audience = both) keeps the agent
+informed without bloating its context.
+
+Returns one or two content blocks:
+  • a description text block (audience = user + assistant)
+  • the rich content (audience = user only) — image, svg, html, or fallback text
+"""
+function format_show(val, max_bytes_image::Int, max_bytes_text::Int)
+    val === nothing && return [Dict{String,Any}(
+        "type" => "text",
+        "text" => "shown: nothing",
+        "annotations" => Dict("audience" => ["user", "assistant"]),
+    )]
+
+    # Image PNG — preferred for plots + Makie scenes via showable.
+    if showable_safe(MIME"image/png"(), val)
+        png = sprint_mime(val, MIME"image/png"())
+        if !isempty(png) && length(png) <= max_bytes_image
+            return [
+                describe(val, "image/png", length(png)),
+                Dict{String,Any}(
+                    "type" => "image",
+                    "data" => base64encode(png),
+                    "mimeType" => "image/png",
+                    "annotations" => Dict("audience" => ["user"]),
+                ),
+            ]
+        end
+    end
+
+    # Direct PNG render for 2-D colorant arrays (no MIME hook needed).
+    if looks_like_image(val)
+        try
+            png = value_to_png(val)
+            if length(png) <= max_bytes_image
+                return [
+                    describe(val, "image/png", length(png)),
+                    Dict{String,Any}(
+                        "type" => "image",
+                        "data" => base64encode(png),
+                        "mimeType" => "image/png",
+                        "annotations" => Dict("audience" => ["user"]),
+                    ),
+                ]
+            end
+        catch
+        end
+    end
+
+    # SVG — vector, often smaller than PNG.
+    if showable_safe(MIME"image/svg+xml"(), val)
+        svg = sprint_mime(val, MIME"image/svg+xml"())
+        if !isempty(svg) && length(svg) <= max_bytes_image
+            return [
+                describe(val, "image/svg+xml", length(svg)),
+                Dict{String,Any}(
+                    "type" => "image",
+                    "data" => base64encode(svg),
+                    "mimeType" => "image/svg+xml",
+                    "annotations" => Dict("audience" => ["user"]),
+                ),
+            ]
+        end
+    end
+
+    # NOTE: HTML support is intentionally deferred. The chat-side ACP parser
+    # drops `resource` content blocks to the literal string "[tool content:
+    # resource]", so we'd render garbage. A follow-up can add an HTML branch
+    # by extending parse_tool_content_item + render_tool_body to honour a
+    # `__bt_show_html__:` text-prefix marker (or by adding an HTMLContent
+    # type to ContentBlock).
+    #
+    # Plain-text fallback. No audience filter — small enough that claude
+    # seeing it costs ~nothing and is useful when bt_show is called on a
+    # struct/array (no PNG/SVG/HTML).
+    repr = sprint(show, "text/plain", val)
+    return [Dict{String,Any}(
+        "type" => "text",
+        "text" => "shown: $(typeof_short(val))\n```\n$(truncate_text(repr, max_bytes_text, false, "result"))\n```",
+        "annotations" => Dict("audience" => ["user", "assistant"]),
+    )]
+end
+
+# Short type description for the audience=both summary, e.g. "Matrix{RGB}".
+typeof_short(val) = string(typeof(val).name.name)
+
+# Audience-both header that names the type + size so claude can reason
+# about what got shown without seeing the bytes.
+function describe(val, mime::AbstractString, nbytes::Integer)
+    Dict{String,Any}(
+        "type" => "text",
+        "text" => "shown: $(typeof_short(val)) as $mime ($(format_bytes_short(nbytes)))",
+        "annotations" => Dict("audience" => ["user", "assistant"]),
+    )
+end
+
+# `showable` can throw for some types (e.g. Makie pre-display lifecycle bugs);
+# we don't want a failed probe to abort the whole render path, just to fall
+# through to the next MIME.
+function showable_safe(mime::MIME, val)
+    try
+        return showable(mime, val)
+    catch
+        return false
+    end
+end
+
+function sprint_mime(val, mime::MIME)
+    try
+        # Some types' MIME shows write binary, others write text — reading
+        # back as Vector{UInt8} via take! handles both, and base64encode +
+        # codeunits work on either path uniformly.
+        io = IOBuffer()
+        show(io, mime, val)
+        return take!(io)
+    catch
+        return UInt8[]
+    end
+end
+
+function format_bytes_short(n::Integer)
+    n < 1024     && return "$(n)B"
+    n < 1024^2   && return string(round(n / 1024; digits=1), "KB")
+    n < 1024^3   && return string(round(n / 1024^2; digits=1), "MB")
+                    return string(round(n / 1024^3; digits=2), "GB")
+end
+
+"""
     format_error(err, bt, max_bytes, full_output) → Vector{Dict{String,Any}}
 
 Render an exception + trimmed backtrace as a single error block.

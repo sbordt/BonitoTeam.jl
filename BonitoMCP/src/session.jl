@@ -136,6 +136,27 @@ function execute(s::JuliaSession, code::AbstractString;
                   timeout::Union{Real,Nothing} = DEFAULT_TIMEOUT,
                   max_bytes::Int               = 10_000,
                   full_output::Bool            = false)
+    return execute_with(s, code, :format_value, timeout,
+                         (max_bytes, full_output))
+end
+
+# bt_show counterpart: uses the BonitoMCPHelper.format_show formatter, which
+# walks the MIME chain (PNG → SVG → HTML → text) and tags rich content with
+# annotations.audience=["user"] so heavy bytes don't reach the model.
+function execute_show(s::JuliaSession, code::AbstractString;
+                       timeout::Union{Real,Nothing} = DEFAULT_TIMEOUT,
+                       max_image_bytes::Int         = 4_000_000,
+                       max_text_bytes::Int          = 4_000)
+    return execute_with(s, code, :format_show, timeout,
+                         (max_image_bytes, max_text_bytes))
+end
+
+# Shared body — the formatter symbol picks which BonitoMCPHelper function the
+# worker calls; `args_tuple` is splatted into that call.
+function execute_with(s::JuliaSession, code::AbstractString,
+                       formatter::Symbol,
+                       timeout::Union{Real,Nothing},
+                       args_tuple::Tuple)
     @lock s.lock begin
         s.in_flight === nothing ||
             error("An eval is already in flight on this session — call " *
@@ -160,13 +181,15 @@ function execute(s::JuliaSession, code::AbstractString;
         s.in_flight_started = time()
         # Wrap in the helper so the worker returns pre-formatted block dicts
         # (base types only, never user-defined types Malt's serialiser
-        # wouldn't recognise on the parent side).
+        # wouldn't recognise on the parent side). The error path always uses
+        # format_error regardless of which value-formatter is picked.
+        max_err_bytes = formatter === :format_value ? args_tuple[1] : args_tuple[2]
         wrapped = quote
             try
-                Main.BonitoMCPHelper.format_value($(expr), $max_bytes, $full_output)
+                Main.BonitoMCPHelper.$(formatter)($(expr), $(args_tuple...))
             catch __mcp_err__
                 Main.BonitoMCPHelper.format_error(__mcp_err__, catch_backtrace(),
-                                                   $max_bytes, $full_output)
+                                                   $max_err_bytes, false)
             end
         end
         s.in_flight = Malt.remote_eval(s.worker, wrapped)

@@ -126,6 +126,21 @@ function finalize_agent(session::ChatSession, msg::AgentMsg)
     end
 end
 
+# Appended on stream-finalize (a tool call / next message arrives after
+# thought chunks). Persisted so a chat reload or agent restart keeps the
+# thinking trail visible. Empty thoughts (zero-byte chunks observed during
+# replay edge cases) are skipped to keep chat.md clean.
+function append_thought(session::ChatSession, msg::ThoughtMsg)
+    isempty(strip(msg.text)) && return
+    open(session.path, "a") do io
+        println(io, "!!! thought \"$(msg.id)\"")
+        for line in split(msg.text, '\n')
+            println(io, "    ", line)
+        end
+        println(io)
+    end
+end
+
 function append_tool(session::ChatSession, msg::ToolMsg)
     open(session.path, "a") do io
         meta = "$(msg.kind) · $(msg.status) · $(msg.id)"

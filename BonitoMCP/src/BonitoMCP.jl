@@ -36,5 +36,6 @@ end
 include("server.jl")
 include("session.jl")          # JuliaSession + SessionManager (subprocess-per-env)
 include("tools/eval.jl")
+include("tools/show.jl")       # bt_show — rich MIME render, audience-tagged
 
 end # module BonitoMCP

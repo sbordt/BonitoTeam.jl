@@ -61,7 +61,13 @@ ProjectInfo(id, name, worker_name, server_path, worker_path, created) =
                 nothing, nothing, :unsynced, nothing, nothing)
 
 const WORKERS = Dict{String,WorkerInfo}()
-const PROJECTS = Dict{String,ProjectInfo}()
+# Value type intentionally `Any` — Julia 1.12's stricter world-age binds
+# parametric types to the world they were constructed in. With `Dict{...,
+# ProjectInfo}` a Revise-driven hot-reload of the struct makes future
+# inserts fail with a world-age MethodError on convert. The dict only ever
+# holds ProjectInfo (verified at every callsite), so the looser annotation
+# is a dev-ergonomics fix with no production cost.
+const PROJECTS = Dict{String,Any}()
 
 # Per-project runtime — kept out of the persisted state
 const PROJECT_APPS = Dict{String,Bonito.App}()

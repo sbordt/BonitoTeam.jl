@@ -20,8 +20,8 @@ include("websocketio.jl")
 
 export compute_signature, compute_delta, apply_patch, full_signature_bytes,
        send_directory, receive_directory, walk_directory,
-       WebSocketIO, register_http_websockets!,
-       LibrsyncError
+       send_file, receive_file,
+       WebSocketIO, LibrsyncError
 # `ManifestEntry` and `PlanEntry` are accessed as `RemoteSync.ManifestEntry`
 # etc. — kept unexported to avoid clashing with AgentClientProtocol.PlanEntry.
 

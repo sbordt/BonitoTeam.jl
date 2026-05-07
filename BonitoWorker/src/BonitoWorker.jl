@@ -9,15 +9,6 @@ module BonitoWorker
 
 using HTTP, HTTP.WebSockets, JSON, RemoteSync
 
-# Lazy: register HTTP.WebSockets with RemoteSync's WebSocketIO on first use.
-const REMOTESYNC_HTTP_REGISTERED = Ref(false)
-function ensure_remotesync_http!()
-    REMOTESYNC_HTTP_REGISTERED[] && return
-    RemoteSync.register_http_websockets!(HTTP.WebSockets)
-    REMOTESYNC_HTTP_REGISTERED[] = true
-    return
-end
-
 # Public entry
 """
     BonitoWorker.connect_and_serve(; server_url, secret, name, mcp_path,
@@ -81,8 +72,6 @@ function run_control_session(; server_url, secret, name, mcp_path,
                 @async handle_list_dir(ws, cmd)
             elseif t == "scan_sessions"
                 @async handle_scan_sessions(ws, cmd)
-            elseif t == "fetch_blob"
-                @async handle_fetch_blob(ws, cmd)
             elseif t == "ping"
                 WebSockets.send(ws, JSON.json(Dict("type" => "pong")))
             else
@@ -189,54 +178,6 @@ function handle_list_dir(ws, cmd::AbstractDict)
     end
 end
 
-# Single-file blob fetch over the control WS. Used by the chat UI's bt_show
-# preview renderer to pull `<cwd>/.bonitoTeam/show/<id>.<ext>` from the
-# worker on demand. The server requests:
-#
-#     {"type":"fetch_blob", "request_id", "path": "<abs-or-cwd-relative>"}
-#
-# Reply over the same WS:
-#   Frame 1 (text):   {"type":"fetch_blob_response", "request_id", "size":N}
-#                  OR {"type":"fetch_blob_response", "request_id", "error":"..."}
-#   Frame 2 (binary): the file's bytes (only if no error)
-#
-# Cap at 16 MB to keep a runaway request from filling memory.
-const FETCH_BLOB_MAX_BYTES = 16 * 1024 * 1024
-
-function handle_fetch_blob(ws, cmd::AbstractDict)
-    request_id = String(get(cmd, "request_id", ""))
-    path       = String(get(cmd, "path", ""))
-    err = if isempty(path)
-        "missing path"
-    elseif !isfile(path)
-        "not a file: $path"
-    elseif filesize(path) > FETCH_BLOB_MAX_BYTES
-        "file too large ($(filesize(path)) > $FETCH_BLOB_MAX_BYTES)"
-    else
-        nothing
-    end
-    if err !== nothing
-        try
-            WebSockets.send(ws, JSON.json(Dict(
-                "type" => "fetch_blob_response",
-                "request_id" => request_id,
-                "error" => err)))
-        catch e
-            @warn "fetch_blob error reply failed" exception=e
-        end
-        return
-    end
-    bytes = read(path)
-    try
-        WebSockets.send(ws, JSON.json(Dict(
-            "type" => "fetch_blob_response",
-            "request_id" => request_id,
-            "size" => length(bytes))))
-        WebSockets.send(ws, bytes)
-    catch e
-        @warn "fetch_blob send failed" exception=e
-    end
-end
 
 # RemoteSync (librsync) transfer over /transfer-ws.
 #
@@ -251,8 +192,6 @@ function handle_open_transfer(server_url::String, secret::String,
     direction = String(get(cmd, "direction", ""))
     isempty(sync_id) && (@error "open_transfer missing sync_id"; return)
 
-    ensure_remotesync_http!()
-
     transfer_url = ws_url(server_url, "/transfer-ws")
     try
         WebSockets.open(transfer_url) do ws
@@ -263,16 +202,24 @@ function handle_open_transfer(server_url::String, secret::String,
 
             wsio = RemoteSync.WebSocketIO(ws)
             if direction == "to_worker"
-                # Server is sending; we're the receiver.
+                # Server is sending; we're the receiver. Directory transfer.
                 dst = String(cmd["dst_path"])
                 mkpath(dst)
                 RemoteSync.receive_directory(dst, wsio)
                 @info "BonitoWorker: transfer to_worker complete" dst
             elseif direction == "from_worker"
+                # Worker is sending; server is the receiver. Directory transfer.
                 src = String(cmd["src_path"])
                 isdir(src) || error("src_path is not a directory: $src")
                 RemoteSync.send_directory(src, wsio)
                 @info "BonitoWorker: transfer from_worker complete" src
+            elseif direction == "file_from_worker"
+                # Single-file streaming. Worker reads the file and ships chunks
+                # to the server. No size cap — receiver writes straight to disk.
+                src = String(cmd["src_path"])
+                isfile(src) || error("src_path is not a file: $src")
+                RemoteSync.send_file(src, wsio)
+                @info "BonitoWorker: file transfer complete" src
             else
                 error("unknown transfer direction: $direction")
             end

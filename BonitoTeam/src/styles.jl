@@ -25,9 +25,12 @@ const ChatStyles = Bonito.Styles(
         "overflow" => "hidden"),
 
     # ── App shell — full-viewport flex column ────────────────────────────────
+    # `position: fixed; inset: 0` decouples the chat from any Bonito wrapper
+    # element above us; without it a slightly-too-tall ancestor produces a
+    # spurious page-level scrollbar even though `body` is overflow:hidden.
     CSS(".bt-app",
+        "position" => "fixed", "inset" => "0",
         "display" => "flex", "flex-direction" => "column",
-        "height" => "100svh",
         "font-family" => "'Inter', system-ui, -apple-system, sans-serif",
         "font-size" => "14px",
         "background" => "var(--bt-bg)",
@@ -51,23 +54,36 @@ const ChatStyles = Bonito.Styles(
         "display" => "flex", "align-items" => "center", "gap" => "10px",
         "width" => "100%", "max-width" => "880px"),
     CSS(".bt-header-back",
-        "color" => "var(--bt-text-muted)", "text-decoration" => "none",
-        "font-size" => "16px",
-        "padding" => "4px 8px", "border-radius" => "4px",
+        "color" => "var(--bt-text)", "text-decoration" => "none",
+        "font-size" => "20px", "line-height" => "1",
+        "padding" => "4px 10px", "border-radius" => "6px",
         "transition" => "background 80ms, color 80ms",
         "flex-shrink" => "0"),
     CSS(".bt-header-back:hover",
         "background" => "var(--bt-surface-2)",
-        "color" => "var(--bt-text)"),
+        "color" => "var(--bt-accent)"),
+    # Title shrinks to fit but doesn't grow — keeps the Sync button right next
+    # to the title rather than pushed to the far edge.
     CSS(".bt-header-title",
         "font-weight" => "600", "font-size" => "14px",
         "min-width" => "0", "overflow" => "hidden",
         "text-overflow" => "ellipsis", "white-space" => "nowrap",
-        "flex" => "1 1 auto"),
+        "flex" => "0 1 auto"),
     CSS(".bt-header-cwd",
         "font-family" => "ui-monospace, monospace", "font-size" => "12px",
         "color" => "var(--bt-text-muted)", "font-weight" => "400",
         "margin-left" => "6px"),
+    CSS(".bt-header-sync",
+        "appearance" => "none",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
+        "font-size" => "12px", "padding" => "4px 10px",
+        "border-radius" => "6px",
+        "cursor" => "pointer",
+        "transition" => "background 80ms"),
+    CSS(".bt-header-sync:hover",
+        "background" => "var(--bt-surface-2)"),
 
     # ── Status dot (online/offline/streaming) ────────────────────────────────
     CSS(".bt-dot",
@@ -468,6 +484,17 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-stop-btn:hover",
         "background" => "rgba(239,68,68,0.08)",
         "border-color" => "var(--bt-error)"),
+
+    # ── Spinner (used by bt_show preview while streaming from worker) ────────
+    CSS(".bt-spinner",
+        "width" => "14px", "height" => "14px",
+        "border-radius" => "50%",
+        "border" => "2px solid var(--bt-border)",
+        "border-top-color" => "var(--bt-accent)",
+        "animation" => "bt-spin 0.7s linear infinite",
+        "flex-shrink" => "0",
+        "display" => "inline-block"),
+    CSS("@keyframes bt-spin", CSS("to", "transform" => "rotate(360deg)")),
 
     # ── Responsive ───────────────────────────────────────────────────────────
     CSS("@media (max-width: 480px)",

@@ -234,6 +234,98 @@ function receive_directory(root::AbstractString, transport::IO;
     return (written = written, deleted = deleted, skipped = skipped)
 end
 
+# ── Single-file streaming ──────────────────────────────────────────────────
+# Independent of the manifest-based directory protocol: useful when the caller
+# already knows the exact file it wants. Memory-bounded by FILE_CHUNK_BYTES
+# regardless of file size, so the only ceiling is disk space.
+const FILE_CHUNK_BYTES = 1 * 1024 * 1024      # 1 MiB per WS frame
+
+"""
+    send_file(path, transport::IO; on_progress = nothing) → bytes_sent
+
+Stream the contents of `path` over `transport` in `FILE_CHUNK_BYTES` chunks.
+The receiver on the other end must be running `receive_file`.
+
+`on_progress` callback stages: `:file_header` `(size, mtime)`,
+`:file_chunk` `(sent, total)`, `:file_done` `(size,)`.
+"""
+function send_file(path::AbstractString, transport::IO;
+                    on_progress = nothing)
+    isfile(path) || error("send_file: not a file: $path")
+    st   = stat(path)
+    size = UInt64(st.size)
+    hdr  = IOBuffer()
+    write(hdr, htol(size))
+    write(hdr, htol(reinterpret(UInt64, Float64(st.mtime))))
+    write_frame(transport, TAG_FILE_HEADER, take!(hdr))
+    notify_progress(on_progress, :file_header, (size = size, mtime = Float64(st.mtime)))
+
+    sent = UInt64(0)
+    buf  = Vector{UInt8}(undef, FILE_CHUNK_BYTES)
+    open(path, "r") do io
+        while !eof(io)
+            n = readbytes!(io, buf, FILE_CHUNK_BYTES)
+            n > 0 && write_frame(transport, TAG_FILE_CHUNK, view(buf, 1:n))
+            sent += UInt64(n)
+            notify_progress(on_progress, :file_chunk, (sent = sent, total = size))
+        end
+    end
+    write_frame(transport, TAG_FILE_END)
+    notify_progress(on_progress, :file_done, (size = sent,))
+    return sent
+end
+
+"""
+    receive_file(dst, transport::IO; on_progress = nothing)
+        → (size::UInt64, mtime::Float64)
+
+Receive a streamed file into `dst`. Atomic write: streamed into `<dst>.partial`
+then renamed, so a transport crash mid-file leaves any prior version intact.
+"""
+function receive_file(dst::AbstractString, transport::IO;
+                       on_progress = nothing)
+    tag, payload = read_frame(transport)
+    tag == TAG_FILE_HEADER ||
+        error("receive_file: expected FILE_HEADER, got tag $(tag)")
+    io_hdr = IOBuffer(payload)
+    total  = ltoh(read(io_hdr, UInt64))
+    mtime  = reinterpret(Float64, ltoh(read(io_hdr, UInt64)))
+    notify_progress(on_progress, :file_header, (size = total, mtime = mtime))
+
+    mkpath(dirname(dst))
+    partial  = dst * ".partial"
+    received = UInt64(0)
+    try
+        open(partial, "w") do out
+            while true
+                tag2, pl = read_frame(transport)
+                if tag2 == TAG_FILE_END
+                    break
+                elseif tag2 == TAG_FILE_CHUNK
+                    write(out, pl)
+                    received += UInt64(length(pl))
+                    notify_progress(on_progress, :file_chunk,
+                                    (received = received, total = total))
+                else
+                    error("receive_file: unexpected tag $(tag2)")
+                end
+            end
+        end
+        mv(partial, dst; force = true)
+    catch
+        isfile(partial) && rm(partial; force = true)
+        rethrow()
+    end
+
+    try
+        touch_mtime(dst, mtime)
+    catch
+        # best-effort; mtime mismatch only costs a directory-resync round-trip.
+    end
+    notify_progress(on_progress, :file_done, (size = received,))
+    return (size = received, mtime = mtime)
+end
+
 # Set the mtime of `path` to `mtime_secs` (Unix epoch seconds, fractional OK).
 # Direct utimes(2) ccall — sets both atime + mtime to the same value. Linux/
 # macOS only; on Windows the next-run shortcut (size+mtime ⇒ skip) just won't

@@ -317,33 +317,59 @@ function render_show_reference(text::AbstractString, cwd::AbstractString,
     header = nl === nothing ? text : text[1:prevind(text, nl)]
     m = match(r"^shown: (\S+)\s+\(([^,]+),\s*([^)]+)\)\s*$", header)
     m === nothing && return nothing
-    relpath_str, mime, size_str = m.captures[1], strip(m.captures[2]), strip(m.captures[3])
+    relpath_str, mime, size_str = String(m.captures[1]),
+                                    String(strip(m.captures[2])),
+                                    String(strip(m.captures[3]))
 
     server_local_path = joinpath(cwd, relpath_str)
 
-    # Best-effort fetch: prefer the server-local file; if missing, ask the
-    # worker for the bytes directly. Cache to server-local path for next
-    # render so we don't re-fetch on collapse/expand cycles.
-    bytes = if isfile(server_local_path)
-        read(server_local_path)
-    elseif isempty(project_id) || !haskey(PROJECTS, project_id)
+    # Already on the server (RemoteSync mirror or a previous fetch). Render
+    # synchronously — no spinner needed.
+    if isfile(server_local_path)
+        return render_show_preview(read(server_local_path), mime, size_str, relpath_str)
+    end
+
+    # No project context → no worker to ask.
+    if isempty(project_id) || !haskey(PROJECTS, project_id)
         return DOM.div("(file not on server: $relpath_str)";
                        class = "bt-tool-empty")
-    else
-        p = PROJECTS[project_id]
-        worker_path = joinpath(p.worker_path, relpath_str)
-        try
-            bts = fetch_blob_from_worker(p.worker_name, worker_path; timeout = 30.0)
-            mkpath(dirname(server_local_path))
-            write(server_local_path, bts)
-            bts
-        catch e
-            return DOM.div("(failed to fetch $relpath_str from worker: $(sprint(showerror, e)))";
-                           class = "bt-tool-empty")
+    end
+
+    # Stream from the worker via /transfer-ws + RemoteSync.send_file. Show a
+    # spinner immediately and swap in the preview when the file lands on disk.
+    p = PROJECTS[project_id]
+    worker_path = joinpath(p.worker_path, relpath_str)
+
+    state = Observable{Any}(:loading)
+    body  = map(state) do s
+        if s === :loading
+            DOM.div(
+                DOM.span(""; class = "bt-spinner"),
+                DOM.span("Fetching $relpath_str from worker… ($size_str)";
+                         style = "margin-left:8px"),
+                style = "display:flex; align-items:center; padding:8px; color:var(--bt-text-muted)")
+        elseif s isa Tuple && s[1] === :ready
+            render_show_preview(s[2], mime, size_str, relpath_str)
+        elseif s isa Tuple && s[1] === :error
+            DOM.div("(failed to fetch $relpath_str from worker: $(s[2]))";
+                    class = "bt-tool-empty")
+        else
+            DOM.div("(unexpected state)"; class = "bt-tool-empty")
         end
     end
 
-    return render_show_preview(bytes, String(mime), String(size_str), relpath_str)
+    Base.errormonitor(@async begin
+        try
+            mkpath(dirname(server_local_path))
+            fetch_file_from_worker(p.worker_name, worker_path, server_local_path;
+                                    handoff_timeout = 30.0)
+            state[] = (:ready, read(server_local_path))
+        catch e
+            state[] = (:error, sprint(showerror, e))
+        end
+    end)
+
+    return DOM.div(body)
 end
 
 # Render the actual preview based on MIME. Images / SVG → <img>, video/*
@@ -865,17 +891,6 @@ function chat_app(cwd::String;
             ChatStyles,
             BonitoTeamJS,
             Bonito.MarkdownCSS,
-            DOM.style("""
-                .bt-header-sync {
-                    appearance: none; border: 1px solid var(--bt-border, #e5e7eb);
-                    background: var(--bt-surface, #fff);
-                    color: var(--bt-text, #111827);
-                    font-size: 12px; padding: 4px 10px; border-radius: 6px;
-                    cursor: pointer; margin-left: auto;
-                    transition: background 80ms;
-                }
-                .bt-header-sync:hover { background: var(--bt-surface-2, #f3f4f6); }
-            """),
             # Live WS-connection indicator (fixed top-right corner).
             Bonito.ConnectionIndicator(),
             DOM.div(

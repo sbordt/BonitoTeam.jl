@@ -1,14 +1,14 @@
-# IO-like adapter that turns an HTTP.WebSocket into a stream the librsync
-# drive loop and our wire protocol can use directly. WebSocket framing is
-# message-oriented (each `send` ↔ `receive` is one frame); we present a
-# byte-stream view by buffering the latest received frame and serving
-# `read`/`readbytes!` requests out of it.
+# IO-like adapter that turns a frame-oriented transport (e.g. an
+# HTTP.WebSocket) into a byte stream the librsync drive loop and our wire
+# protocol can use directly. We present a byte-stream view by buffering the
+# latest received frame and serving `read`/`readbytes!` requests out of it.
 #
 # We deliberately use the *parametric* type signature `WebSocketIO{WS}` so this
 # module compiles without a hard dep on HTTP.jl. Callers construct via
 # `WebSocketIO(ws)` where `ws` is anything implementing the small surface
 # `send_frame!(ws, bytes)` / `recv_frame(ws)::Vector{UInt8}` / `is_closed(ws)`.
-# The HTTP.WebSockets adapters are a few lines below.
+# The HTTP.WebSockets adapters live in ext/RemoteSyncHTTPExt.jl and are loaded
+# automatically by Julia's package-extension mechanism when HTTP is present.
 
 mutable struct WebSocketIO{WS} <: IO
     ws        :: WS
@@ -22,42 +22,10 @@ end
 WebSocketIO(ws) = WebSocketIO{typeof(ws)}(ws, UInt8[], 1, IOBuffer(), false, false)
 
 # Receive the next frame. Returns `nothing` on close. Implementations
-# specialise on `WS`.
+# specialise on `WS` — see ext/RemoteSyncHTTPExt.jl for HTTP.WebSocket.
 function recv_frame end
 function send_frame! end
 function is_closed end
-
-# ── HTTP.WebSockets specialisation (loaded lazily) ─────────────────────────
-# Set up via `register_http_websockets!()` (called from RemoteSync's __init__
-# when HTTP is loaded) so this file doesn't pull HTTP at import time.
-function register_http_websockets!(WSModule::Module)
-    @eval begin
-        function $(@__MODULE__).recv_frame(ws::$(WSModule).WebSocket)
-            try
-                $(WSModule).isclosed(ws) && return nothing
-                frame = $(WSModule).receive(ws)
-                return frame isa AbstractVector{UInt8} ?
-                    Vector{UInt8}(frame) :
-                    Vector{UInt8}(codeunits(String(frame)))
-            catch e
-                e isa $(WSModule).WebSocketError && return nothing
-                e isa Base.IOError              && return nothing
-                e isa EOFError                  && return nothing
-                rethrow()
-            end
-        end
-
-        function $(@__MODULE__).send_frame!(ws::$(WSModule).WebSocket,
-                                             bytes::AbstractVector{UInt8})
-            $(WSModule).send(ws, bytes)
-            return nothing
-        end
-
-        $(@__MODULE__).is_closed(ws::$(WSModule).WebSocket) =
-            $(WSModule).isclosed(ws)
-    end
-    return nothing
-end
 
 # ── IO interface ───────────────────────────────────────────────────────────
 function _refill!(io::WebSocketIO)

@@ -6,12 +6,18 @@
 # Frame layout: [tag::UInt8] [length::UInt32 LE] [payload::length bytes]
 #
 # Tags (one byte, free room to grow):
-const TAG_MANIFEST = 0x01    # sender → receiver: list of source files
-const TAG_PLAN     = 0x02    # receiver → sender: per-file action + signature
-const TAG_DELTA    = 0x03    # sender → receiver: delta payload for one file
-const TAG_DONE     = 0x04    # sender → receiver: end-of-stream
-const TAG_OK       = 0x05    # receiver → sender: file applied OK
-const TAG_PROGRESS = 0x06    # either direction: human-readable status string
+const TAG_MANIFEST    = 0x01    # sender → receiver: list of source files
+const TAG_PLAN        = 0x02    # receiver → sender: per-file action + signature
+const TAG_DELTA       = 0x03    # sender → receiver: delta payload for one file
+const TAG_DONE        = 0x04    # sender → receiver: end-of-stream
+const TAG_OK          = 0x05    # receiver → sender: file applied OK
+const TAG_PROGRESS    = 0x06    # either direction: human-readable status string
+# Single-file streaming protocol (used by send_file/receive_file). Independent
+# of the manifest/delta protocol so a transport carries either one transfer or
+# the other, never mixed.
+const TAG_FILE_HEADER = 0x10    # payload: [size::UInt64][mtime::Float64]
+const TAG_FILE_CHUNK  = 0x11    # payload: chunk bytes
+const TAG_FILE_END    = 0x12    # payload: empty
 
 # Action codes inside a Plan entry:
 const ACTION_SKIP   = 0x00   # file matches, do nothing

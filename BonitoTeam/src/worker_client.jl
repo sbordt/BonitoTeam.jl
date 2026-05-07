@@ -16,17 +16,6 @@
 
 using HTTP, HTTP.WebSockets, JSON, AgentClientProtocol, RemoteSync
 
-# Lazily register HTTP.WebSockets with RemoteSync's WebSocketIO so it knows
-# how to recv_frame/send_frame!/is_closed on a live HTTP.WebSocket. Done on
-# first transfer rather than at module load to avoid a circular init.
-const REMOTESYNC_HTTP_REGISTERED = Ref(false)
-function ensure_remotesync_http!()
-    REMOTESYNC_HTTP_REGISTERED[] && return
-    RemoteSync.register_http_websockets!(HTTP.WebSockets)
-    REMOTESYNC_HTTP_REGISTERED[] = true
-    return
-end
-
 # name → live control WS (used by the server to push commands to the worker)
 const WORKER_CONTROL_WS = Dict{String,Any}()
 # sid → Channel{Any} where the matching /worker-acp upgrade hands off the WS
@@ -39,10 +28,6 @@ const PENDING_TRANSFERS = Dict{String,Channel{Any}}()
 const PENDING_LIST_DIR = Dict{String,Channel{Dict}}()
 # request_id → Channel where worker's scan_sessions_result is handed back
 const PENDING_SCAN_SESSIONS = Dict{String,Channel{Vector{Dict{String,Any}}}}()
-# request_id → Channel{(header_dict, payload_bytes)} where the worker's
-# fetch_blob reply (one JSON header frame + one binary frame) is handed
-# back to the chat-side bt_show renderer.
-const PENDING_FETCH_BLOB = Dict{String,Channel{Tuple{Dict{String,Any},Vector{UInt8}}}}()
 
 # Send a JSON command to a worker over its control WS. Throws if the worker
 # isn't currently connected.
@@ -137,17 +122,6 @@ function handle_worker_control(ws, worker_secret::String)
                                     for s in get(cmd, "sessions", Any[])]
                         put!(ch, sessions)
                     end
-                elseif t == "fetch_blob_response"
-                    rid = String(get(cmd, "request_id", ""))
-                    haskey(PENDING_FETCH_BLOB, rid) || continue
-                    ch = pop!(PENDING_FETCH_BLOB, rid)
-                    bytes = if haskey(cmd, "error")
-                        UInt8[]
-                    else
-                        # The next frame on the WS is the binary payload.
-                        Vector{UInt8}(WebSockets.receive(ws))
-                    end
-                    put!(ch, (Dict{String,Any}(cmd), bytes))
                 end
             catch e
                 @warn "Worker control frame error" exception=e
@@ -353,7 +327,6 @@ function sync_dir_to_worker!(worker_name::String, src::String, dst::String;
     isdir(src) || error("Source path is not a directory: $src")
     haskey(WORKER_CONTROL_WS, worker_name) ||
         error("Worker '$worker_name' is not connected")
-    ensure_remotesync_http!()
 
     sync_id = string(uuid4())
     ch = Channel{Any}(1)
@@ -392,7 +365,6 @@ function sync_dir_from_worker!(worker_name::String, src::String, dst::String;
                                 on_progress = nothing)
     haskey(WORKER_CONTROL_WS, worker_name) ||
         error("Worker '$worker_name' is not connected")
-    ensure_remotesync_http!()
     mkpath(dst)
 
     sync_id = string(uuid4())
@@ -512,35 +484,46 @@ function scan_worker_sessions(worker_name::String; timeout::Real = 15.0)
 end
 
 """
-    fetch_blob_from_worker(worker_name, path; timeout=15) → Vector{UInt8}
+    fetch_file_from_worker(worker_name, src_path, dst_path;
+                            handoff_timeout = 15.0, on_progress = nothing)
 
-Pull a single file's bytes from the named worker. Used by the chat UI's
-bt_show preview renderer when the file isn't in `<server_path>/<relpath>`
-yet (e.g. unsynced project, or fresh tool result before the file gets
-RemoteSync'd as part of a project sync). Throws on timeout / worker errors.
+Stream a single file from the named worker into `dst_path` on the server.
+Reuses the `/transfer-ws` handoff already used by directory sync, but with
+direction `"file_from_worker"` and `RemoteSync.send_file`/`receive_file` for
+chunked, memory-bounded transfer. No size cap.
+
+Used by the chat UI's bt_show preview renderer when the file isn't in
+`<server_path>/<relpath>` yet (e.g. unsynced project, or a fresh tool
+result before the file gets RemoteSync'd as part of a project sync).
 """
-function fetch_blob_from_worker(worker_name::String, path::AbstractString;
-                                  timeout::Real = 15.0)
+function fetch_file_from_worker(worker_name::String,
+                                  src_path::AbstractString,
+                                  dst_path::AbstractString;
+                                  handoff_timeout::Real = 15.0,
+                                  on_progress = nothing)
     haskey(WORKER_CONTROL_WS, worker_name) ||
         error("Worker '$worker_name' is not connected")
-    rid = string(uuid4())
-    ch  = Channel{Tuple{Dict{String,Any},Vector{UInt8}}}(1)
-    PENDING_FETCH_BLOB[rid] = ch
+
+    sync_id = string(uuid4())
+    ch = Channel{Any}(1)
+    PENDING_TRANSFERS[sync_id] = ch
+
     send_command(worker_name, Dict(
-        "type"       => "fetch_blob",
-        "request_id" => rid,
-        "path"       => String(path),
+        "type"      => "open_transfer",
+        "sync_id"   => sync_id,
+        "direction" => "file_from_worker",
+        "src_path"  => String(src_path),
     ))
-    Base.errormonitor(@async begin
-        sleep(timeout)
-        if haskey(PENDING_FETCH_BLOB, rid)
-            delete!(PENDING_FETCH_BLOB, rid)
-            try put!(ch, (Dict{String,Any}("error" => "fetch_blob timed out"), UInt8[])) catch end
-        end
-    end)
-    header, bytes = take!(ch)
-    haskey(header, "error") && error("fetch_blob '$path' on '$worker_name': $(header["error"])")
-    return bytes
+
+    ws = take_pending!(ch, PENDING_TRANSFERS, sync_id, handoff_timeout,
+                      "fetch_file from '$worker_name'")
+    try
+        wsio = RemoteSync.WebSocketIO(ws)
+        RemoteSync.receive_file(String(dst_path), wsio; on_progress)
+    finally
+        try close(ws) catch end
+    end
+    return String(dst_path)
 end
 
 # Build an AgentClientProtocol.Connection backed by a WebSocket. Each ACP

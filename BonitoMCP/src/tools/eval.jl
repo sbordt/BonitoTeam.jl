@@ -1,9 +1,40 @@
-# MCP tool registrations: bt_julia_eval, bt_julia_restart, bt_julia_list_sessions.
-# Architecture: each env_path gets a `julia -i` subprocess managed by
-# SessionManager (see session.jl). Output discipline (truncation, structured
-# blocks, container summarisation, image detection, backtrace trim,
-# nothing-suppression) lives in helper_payload.jl which is `include`d into
-# every subprocess on startup.
+# MCP tool registrations.
+#
+# Soft-timeout streaming model:
+#   bt_julia_eval starts execution and returns within `timeout` seconds (or
+#   when execution finishes, whichever is first). If still running, the
+#   response carries the partial stdout captured so far + an explicit
+#   `status: "running"` and `elapsed_s`. The agent then chooses:
+#     - bt_julia_continue        wait another `timeout` seconds
+#     - bt_julia_interrupt       SIGINT, capture output + InterruptException
+#     - bt_julia_restart         SIGKILL the whole session (loses state)
+#
+# Default `timeout` is 30s. There is NO hard kill at timeout — that's the
+# whole point. Lower `timeout` = tighter feedback on long jobs at the cost
+# of more round-trips; higher = less polling overhead.
+
+# ── Status helpers ──────────────────────────────────────────────────────────
+running_response(env_path::Union{String,Nothing}, partial::AbstractString,
+                  elapsed::Real) = Dict{String,Any}(
+    "content" => [Dict("type" => "text",
+                        "text" => string(
+            "status: running\n",
+            "elapsed: $(elapsed)s\n",
+            "env_path: ", env_path === nothing ? "<temp>" : env_path, "\n",
+            isempty(partial) ? "(no output captured yet)" :
+                "stdout so far:\n$partial",
+            "\n\n",
+            "Decide: bt_julia_continue (wait more), bt_julia_interrupt ",
+            "(SIGINT, keep state), or bt_julia_restart (lose state)."))],
+    "isError"   => false,
+    "_meta"     => Dict("status" => "running", "elapsed_s" => elapsed),
+)
+
+completed_response(blocks, is_error::Bool, elapsed::Real) = Dict{String,Any}(
+    "content" => blocks,
+    "isError" => is_error,
+    "_meta"   => Dict("status" => "completed", "elapsed_s" => elapsed),
+)
 
 # ── Handlers ────────────────────────────────────────────────────────────────
 function julia_eval_handler(args::AbstractDict)
@@ -15,40 +46,91 @@ function julia_eval_handler(args::AbstractDict)
     max_bytes   = Int(get(args, "max_response_bytes", 10_000))
 
     isempty(strip(code)) && return Dict{String,Any}(
-        "content" => [Dict("type"=>"text", "text"=>"error: empty code")],
+        "content" => [Dict("type" => "text", "text" => "error: empty code")],
         "isError" => true,
     )
 
-    # Tear down a stale dead session before creating a new one. SessionManager
-    # already does this in get_or_create!, but doing it explicitly here lets
-    # the next call after a hard-timeout-kill recover transparently.
     s = try
         get_or_create!(manager(), env_path; julia_cmd)
     catch e
         return Dict{String,Any}(
-            "content" => [Dict("type"=>"text", "text"=>"error starting session: $(sprint(showerror, e))")],
+            "content" => [Dict("type" => "text",
+                                "text" => "error starting session: $(sprint(showerror, e))")],
             "isError" => true,
         )
     end
 
     timeout = effective_timeout(code, user_to)
 
-    blocks, is_error = try
+    res = try
         execute(s, code; timeout, max_bytes, full_output)
     catch e
-        # On timeout / subprocess death, clean the dict so the next call
-        # builds a fresh subprocess.
-        msg = sprint(showerror, e)
         return Dict{String,Any}(
-            "content" => [Dict("type"=>"text", "text"=>msg)],
+            "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
             "isError" => true,
         )
     end
 
-    return Dict{String,Any}(
-        "content" => blocks,
-        "isError" => is_error,
-    )
+    return res.status === :completed ?
+        completed_response(res.blocks, res.is_error, res.elapsed_s) :
+        running_response(env_path, res.partial, res.elapsed_s)
+end
+
+function julia_continue_handler(args::AbstractDict)
+    env_path  = get(args, "env_path", nothing)
+    user_to   = get(args, "timeout",  nothing)
+    julia_cmd = get(args, "julia_cmd", nothing)
+
+    s = try
+        get_or_create!(manager(), env_path; julia_cmd)
+    catch e
+        return Dict{String,Any}(
+            "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
+            "isError" => true,
+        )
+    end
+
+    # Use the in-flight code's Pkg-aware behaviour
+    timeout = user_to === nothing ? DEFAULT_TIMEOUT :
+              user_to > 0 ? user_to : nothing
+
+    res = try
+        continue_eval!(s; timeout)
+    catch e
+        return Dict{String,Any}(
+            "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
+            "isError" => true,
+        )
+    end
+    return res.status === :completed ?
+        completed_response(res.blocks, res.is_error, res.elapsed_s) :
+        running_response(env_path, res.partial, res.elapsed_s)
+end
+
+function julia_interrupt_handler(args::AbstractDict)
+    env_path  = get(args, "env_path", nothing)
+    julia_cmd = get(args, "julia_cmd", nothing)
+
+    s = try
+        get_or_create!(manager(), env_path; julia_cmd)
+    catch e
+        return Dict{String,Any}(
+            "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
+            "isError" => true,
+        )
+    end
+
+    res = try
+        interrupt!(s)
+    catch e
+        return Dict{String,Any}(
+            "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
+            "isError" => true,
+        )
+    end
+    return res.status === :completed ?
+        completed_response(res.blocks, res.is_error, res.elapsed_s) :
+        running_response(env_path, res.partial, res.elapsed_s)
 end
 
 function julia_restart_handler(args::AbstractDict)
@@ -73,8 +155,10 @@ function julia_list_sessions_handler(::AbstractDict)
             s.julia_cmd === nothing || push!(extras, "julia_cmd=$(s.julia_cmd)")
             s.temp                  && push!(extras, "temp")
             s.alive                 || push!(extras, "DEAD")
+            s.in_flight             && push!(extras, "EVAL IN FLIGHT")
             tail = isempty(extras) ? "" : "  [" * join(extras, ", ") * "]"
-            push!(lines, "  - $(s.env_path)$tail")
+            label = s.env_path === nothing ? "<temp>" : s.env_path
+            push!(lines, "  - $label$tail")
             s.log_path === nothing  || push!(lines, "      log: $(s.log_path)")
         end
         join(lines, "\n")
@@ -86,54 +170,57 @@ function julia_list_sessions_handler(::AbstractDict)
 end
 
 # ── Registration ────────────────────────────────────────────────────────────
+const EVAL_DESCRIPTION = """
+Evaluate Julia code in a persistent per-`env_path` session. ALWAYS prefer this
+over `julia -e` via Bash for Julia work — Bash spawns a fresh process every
+time so `using Foo`, loaded variables, and compiled methods don't carry over,
+and you pay full startup cost on each call.
+
+Each `env_path` runs in its own Julia subprocess (managed via Malt.jl);
+state (top-level bindings, modules, function defs) carries over across
+calls. Revise.jl is auto-loaded so source edits to packages are picked up
+without restart. If the env path ends in `/test`, TestEnv is auto-activated
+so the parent project's test deps are visible.
+
+Streaming model — IMPORTANT:
+  - `timeout` is a **soft** checkpoint, not a hard kill. The call returns
+    within `timeout` seconds with either:
+      • status="completed" — full result blocks; OR
+      • status="running"   — the eval is still in flight; the response
+        contains the stdout captured so far so you can decide what to do.
+  - When you see status="running", choose one:
+      • bt_julia_continue (wait another `timeout` seconds)
+      • bt_julia_interrupt (SIGINT — captures output + InterruptException;
+        session state preserved)
+      • bt_julia_restart (SIGKILL — loses all session state)
+  - Lower `timeout` = more frequent feedback on long jobs but more round
+    trips. Higher = less overhead but coarser progress signal.
+  - Default 30s; auto-disabled (no checkpointing) when the code uses
+    `Pkg.*` since installs are routinely multi-minute. Pass `timeout=0`
+    to disable the checkpoint entirely.
+
+Output:
+  - Echoed code, captured stdout, return value, and errors are returned
+    as separate blocks.
+  - `nothing` returns are suppressed (don't waste tokens on it; if you
+    need a value, return it explicitly as the last expression).
+  - Output is auto-truncated at `max_response_bytes` (default 10000).
+    Large arrays / dicts are summarised.
+  - 2-D color arrays render as PNG when PNGFiles is loaded in the env.
+  - Backtraces are trimmed to user-relevant frames.
+"""
+
 register!(
-    "bt_julia_eval",
-    """
-    Evaluate Julia code in a persistent per-`env_path` session. ALWAYS prefer
-    this over `julia -e` via Bash for Julia work — running through Bash spawns
-    a fresh process every time, so `using Foo` / loaded variables / compiled
-    methods don't carry over and you pay full startup cost on each call.
-
-    Each `env_path` runs in its own `julia -i` subprocess; state (top-level
-    bindings, loaded modules, function defs) carries over across calls with
-    the same env. Use `bt_julia_restart` to drop the session if it's gotten
-    into a bad state. `bt_julia_list_sessions` shows what's currently live.
-    Revise.jl is auto-loaded so source edits to packages are picked up
-    without restart. If the env path ends in `/test`, TestEnv is activated
-    automatically so the parent project's test deps are visible.
-
-    Output:
-      - Echoed code, captured stdout, return value, and errors are returned
-        as separate blocks.
-      - Output is auto-truncated at `max_response_bytes` (default 10000).
-        Large arrays / dicts are summarised; pass `full_output=true` to disable.
-      - 2-D arrays of color types are rendered as PNG images when PNGFiles is
-        available in the env.
-      - A return value of `nothing` is suppressed to keep responses tight —
-        if you need to inspect a value, return it explicitly (last expression
-        in the block).
-      - Backtraces are trimmed to user-relevant frames.
-
-    Timeout (`timeout` seconds) defaults to 60s but is auto-disabled when the
-    code matches `Pkg.*` so installs / precompiles aren't killed mid-flight.
-    A hard timeout `kill`s the subprocess; the session is restarted on the
-    next call.
-    """,
+    "bt_julia_eval", EVAL_DESCRIPTION,
     Dict{String,Any}(
         "type" => "object",
         "properties" => Dict{String,Any}(
-            "code" => Dict("type" => "string",
-                           "description" => "Julia code to evaluate"),
-            "env_path" => Dict("type" => "string",
-                               "description" => "Optional Julia project directory; omit for a temp env"),
-            "timeout" => Dict("type" => "number",
-                              "description" => "Hard timeout in seconds. Default 60s; auto-disabled for `Pkg.*`. Pass 0 to disable."),
-            "julia_cmd" => Dict("type" => "string",
-                                "description" => "Custom Julia invocation, e.g. `julia +1.11` (juliaup channel) or `/path/to/julia --check-bounds=yes`. Use rarely."),
-            "full_output" => Dict("type" => "boolean", "default" => false,
-                                  "description" => "Disable output truncation/summarisation"),
-            "max_response_bytes" => Dict("type" => "integer", "default" => 10_000,
-                                          "description" => "Per-block byte cap"),
+            "code"               => Dict("type"=>"string", "description"=>"Julia code to evaluate"),
+            "env_path"           => Dict("type"=>"string", "description"=>"Optional Julia project directory; omit for a temp env"),
+            "timeout"            => Dict("type"=>"number", "description"=>"Soft checkpoint cadence in seconds. Default 30; auto-disabled for Pkg.*; pass 0 to disable."),
+            "julia_cmd"          => Dict("type"=>"string", "description"=>"Custom Julia invocation, e.g. `julia +1.11` or `julia --check-bounds=yes`. Use rarely."),
+            "full_output"        => Dict("type"=>"boolean", "default"=>false, "description"=>"Disable output truncation/summarisation"),
+            "max_response_bytes" => Dict("type"=>"integer", "default"=>10_000, "description"=>"Per-block byte cap"),
         ),
         "required" => ["code"],
     ),
@@ -141,19 +228,51 @@ register!(
 )
 
 register!(
-    "bt_julia_restart",
+    "bt_julia_continue",
     """
-    Restart a Julia session, clearing all state. IMPORTANT: restarting is slow
-    and loses everything. Revise.jl is loaded automatically so code changes to
-    loaded packages are picked up without restarting — only restart as a last
-    resort when the session is truly broken or for changes Revise can't fix
-    (e.g. struct field changes).
+    Continue waiting for an in-flight bt_julia_eval call. Returns the same
+    shape as bt_julia_eval — completed or still-running. Pass `timeout` to
+    set how long this checkpoint waits before returning again.
     """,
     Dict{String,Any}(
         "type" => "object",
         "properties" => Dict{String,Any}(
-            "env_path" => Dict("type" => "string",
-                               "description" => "Project to restart; omit for the temp session"),
+            "env_path" => Dict("type"=>"string", "description"=>"Session to continue; omit for temp"),
+            "timeout"  => Dict("type"=>"number", "description"=>"Checkpoint timeout in seconds. Default 30; pass 0 to disable."),
+        ),
+    ),
+    julia_continue_handler,
+)
+
+register!(
+    "bt_julia_interrupt",
+    """
+    SIGINT the in-flight bt_julia_eval. The user code raises InterruptException;
+    the session subprocess and all state survive. Returns the captured stdout
+    so far + the interrupt error block. Use this when you want to stop a
+    runaway computation but keep the loaded packages/variables.
+    """,
+    Dict{String,Any}(
+        "type" => "object",
+        "properties" => Dict{String,Any}(
+            "env_path" => Dict("type"=>"string", "description"=>"Session to interrupt; omit for temp"),
+        ),
+    ),
+    julia_interrupt_handler,
+)
+
+register!(
+    "bt_julia_restart",
+    """
+    Restart a Julia session, clearing all state. SIGKILL — lose everything in
+    the session. Slow (subprocess restart + reloading packages). Revise.jl is
+    auto-loaded so source edits to packages are picked up without restart;
+    only restart for state corruption or struct field changes Revise can't fix.
+    """,
+    Dict{String,Any}(
+        "type" => "object",
+        "properties" => Dict{String,Any}(
+            "env_path" => Dict("type"=>"string", "description"=>"Project to restart; omit for the temp session"),
         ),
     ),
     julia_restart_handler,
@@ -161,7 +280,7 @@ register!(
 
 register!(
     "bt_julia_list_sessions",
-    "List currently active per-`env_path` Julia sessions and their log files.",
+    "List currently active per-`env_path` Julia sessions. Marks any session that has an in-flight eval.",
     Dict{String,Any}("type" => "object", "properties" => Dict{String,Any}()),
     julia_list_sessions_handler,
 )

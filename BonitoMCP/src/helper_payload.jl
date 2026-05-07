@@ -1,121 +1,80 @@
-# Helper payload — `include`d into every BonitoMCP Julia subprocess on startup.
-# Provides BonitoMCPHelper.eval_and_emit, which runs user code, captures
-# stdout/stderr/return value, applies output discipline (truncation, container
-# summarisation, image detection, backtrace trim, suppress `nothing`), and
-# writes the resulting structured-block stream back to stdout where the
-# parent BonitoMCP process can parse it.
-#
-# Wire format (one line per block, between BEGIN/END markers):
-#
-#   __MCP_BLOCKS_BEGIN__
-#   <kind>:<base64-of-utf8-text>
-#   ...
-#   __MCP_BLOCKS_END__
-#
-# `kind` is one of: code, stdout, stderr, result, error, image.
-# Image blocks emit a third field for the mime type:
-#   image:<base64-of-bytes>:<mime>
+# Loaded into every Malt-managed Julia subprocess on startup. Provides two
+# pure formatting functions called from the wrapper expression in
+# session.jl::execute. Returns Vector{Dict{String,Any}} of MCP content
+# blocks — base types only, so Malt's serialiser never sees user-defined
+# types it can't reconstruct on the parent side.
 
 module BonitoMCPHelper
 
 using Base64
 
-const BLOCKS_BEGIN = "__MCP_BLOCKS_BEGIN__"
-const BLOCKS_END   = "__MCP_BLOCKS_END__"
-
 const DEFAULT_MAX_RESPONSE_BYTES = 10_000
 const LARGE_CONTAINER_THRESHOLD  = 100      # array / dict elements
 
-# Stack frames we strip from error backtraces — REPL / include_string / our
-# own eval plumbing — so the user-visible trace is the actual call site.
+# Stack frames we strip from error backtraces so the user-visible trace ends
+# at the actual call site (not REPL / include_string / Malt internals).
 const BACKTRACE_NOISE_FRAMES = (
     r"\bBase\.eval\b", r"\binclude_string\b", r"\beval_user_input\b",
     r"\bclient\.jl\b", r"\brun_main_repl\b", r"\brun_fallback_repl\b",
     r"\brepl_main\b",  r"\b_start\b",
-    r"\beval_and_emit\b",                   # our own frame
+    r"\bMalt\b",                            # Malt's own remote_eval frames
 )
 
-# ── Public entry ─────────────────────────────────────────────────────────────
+# ── Public entries ──────────────────────────────────────────────────────────
 """
-    eval_and_emit(code; max_bytes, full_output)
+    format_value(val, max_bytes, full_output) → Vector{Dict{String,Any}}
 
-Evaluate `code` in `Main`, capture all output, and write a sentinel-bracketed
-structured-block stream to the (real, pre-redirect) stdout. Returns `nothing`.
+Turn a Julia value into MCP content blocks. `nothing` returns are suppressed.
+2-D color arrays render to PNG when PNGFiles is loaded in the env. Large
+containers are summarised. Always-text blocks use the `result:\\n<body>` shape
+so the chat-side renderer picks them up as labeled Monaco sections.
 """
-function eval_and_emit(code::AbstractString;
-                       max_bytes::Int   = DEFAULT_MAX_RESPONSE_BYTES,
-                       full_output::Bool = false)
-    pipe = Pipe()
-    Base.link_pipe!(pipe; reader_supports_async = true, writer_supports_async = true)
-    real_stdout = stdout
-    real_stderr = stderr
+function format_value(val, max_bytes::Int, full_output::Bool)
+    val === nothing && return Dict{String,Any}[]   # suppress nothing-result
 
-    val      = nothing
-    err_text = nothing
-
-    reader = @async read(pipe, String)
-    redirect_stdout(pipe.in)
-    redirect_stderr(pipe.in)
-    try
-        val = include_string(Main, code, "mcp_eval")
-    catch e
-        err_text = sprint() do io
-            showerror(io, e)
-            println(io)
-            Base.show_backtrace(io, catch_backtrace())
-        end
-        err_text = trim_backtrace(err_text)
-    finally
-        redirect_stdout(real_stdout)
-        redirect_stderr(real_stderr)
-        close(pipe.in)
-    end
-    captured = fetch(reader)
-
-    println(real_stdout, BLOCKS_BEGIN)
-    emit_text(real_stdout, "code", "```julia\n$(rstrip(code, '\n'))\n```")
-    if !isempty(captured)
-        emit_text(real_stdout, "stdout",
-                   "stdout:\n$(truncate_text(captured, max_bytes, full_output, "stdout"))")
-    end
-    if err_text !== nothing
-        emit_text(real_stdout, "error",
-                   "error:\n$(truncate_text(err_text, max_bytes, full_output, "error"))")
-    elseif val !== nothing
-        emit_value(real_stdout, val, max_bytes, full_output)
-    end
-    println(real_stdout, BLOCKS_END)
-    flush(real_stdout)
-    return nothing
-end
-
-# ── Block emitters ───────────────────────────────────────────────────────────
-emit_text(io, kind, text::AbstractString) =
-    println(io, kind, ":", base64encode(text))
-
-emit_image(io, bytes::AbstractVector{UInt8}, mime::AbstractString) =
-    println(io, "image:", base64encode(bytes), ":", mime)
-
-# Result branch: image vs container vs plain repr
-function emit_value(io, val, max_bytes::Int, full_output::Bool)
-    # Image-detection: 2-D array of colorants → try to render as PNG
+    # Image-detection: 2-D array of colorants → render as PNG (size-capped).
     if !full_output && looks_like_image(val)
         try
             png = value_to_png(val)
             if length(png) <= 4 * max_bytes
-                emit_image(io, png, "image/png")
-                return
+                return [Dict{String,Any}(
+                    "type" => "image",
+                    "data" => base64encode(png),
+                    "mimeType" => "image/png",
+                )]
             end
         catch
-            # fall through to text
+            # fall through to text repr
         end
     end
+
     repr = !full_output && is_large_container(val) ?
         summarize_container(val) : sprint(show, "text/plain", val)
-    emit_text(io, "result", "result:\n$(truncate_text(repr, max_bytes, full_output, "result"))")
+    return [Dict{String,Any}(
+        "type" => "text",
+        "text" => "result:\n$(truncate_text(repr, max_bytes, full_output, "result"))",
+    )]
 end
 
-# ── Truncation ──────────────────────────────────────────────────────────────
+"""
+    format_error(err, bt, max_bytes, full_output) → Vector{Dict{String,Any}}
+
+Render an exception + trimmed backtrace as a single error block.
+"""
+function format_error(err, bt, max_bytes::Int, full_output::Bool)
+    text = sprint() do io
+        showerror(io, err)
+        println(io)
+        Base.show_backtrace(io, bt)
+    end
+    text = trim_backtrace(text)
+    return [Dict{String,Any}(
+        "type" => "text",
+        "text" => "error:\n$(truncate_text(text, max_bytes, full_output, "error"))",
+    )]
+end
+
+# ── Output discipline ──────────────────────────────────────────────────────
 function truncate_text(text::AbstractString, max_bytes::Int, full_output::Bool,
                        label::AbstractString)
     full_output && return text
@@ -127,7 +86,6 @@ function truncate_text(text::AbstractString, max_bytes::Int, full_output::Bool,
                   "call with full_output=true to see all]"
 end
 
-# ── Backtrace cleanup ───────────────────────────────────────────────────────
 function trim_backtrace(text::AbstractString)
     lines = split(text, '\n')
     cut = something(findfirst(line -> any(p -> occursin(p, line), BACKTRACE_NOISE_FRAMES),
@@ -139,7 +97,6 @@ function trim_backtrace(text::AbstractString)
     return strip(join(kept, "\n"))
 end
 
-# ── Large-container summary ─────────────────────────────────────────────────
 function is_large_container(value)
     value isa AbstractArray && return length(value) > LARGE_CONTAINER_THRESHOLD
     value isa AbstractDict  && return length(value) > LARGE_CONTAINER_THRESHOLD
@@ -156,7 +113,6 @@ function summarize_container(value)
                   sprint(show, "text/plain", head))
 end
 
-# ── Image detection ─────────────────────────────────────────────────────────
 function looks_like_image(value)
     value isa AbstractArray || return false
     ndims(value) == 2       || return false
@@ -165,16 +121,14 @@ function looks_like_image(value)
            occursin("Gray", name) || occursin("Colorant", name)
 end
 
-# Stub: real PNG encoding requires FileIO+PNGFiles or similar in the user's
-# env. The wrapping `try` in emit_value falls through to text repr when this
-# raises, so absence of those packages just disables image rendering.
+# Best-effort: only renders if the user has PNGFiles loaded in the env.
 function value_to_png(value)
     if Base.isbindingresolved(Main, :PNGFiles) && isdefined(Main, :PNGFiles)
         io = IOBuffer()
         Base.invokelatest(Main.PNGFiles.save, io, value)
         return take!(io)
     end
-    error("PNG encoding requires PNGFiles in the env; falling back to text repr")
+    error("PNG encoding requires PNGFiles in the env")
 end
 
 end # module BonitoMCPHelper

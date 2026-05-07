@@ -6,12 +6,11 @@
 # with annotations.audience = ["user"] per the MCP spec.
 
 function julia_show_handler(args::AbstractDict)
-    code             = String(get(args, "code", ""))
-    env_path         = get(args, "env_path", nothing)
-    julia_cmd        = get(args, "julia_cmd", nothing)
-    user_to          = get(args, "timeout", nothing)
-    max_image_bytes  = Int(get(args, "max_image_bytes", 4_000_000))
-    max_text_bytes   = Int(get(args, "max_text_bytes", 4_000))
+    code      = String(get(args, "code", ""))
+    env_path  = get(args, "env_path", nothing)
+    julia_cmd = get(args, "julia_cmd", nothing)
+    user_to   = get(args, "timeout", nothing)
+    max_bytes = Int(get(args, "max_bytes", 4_000_000))
 
     isempty(strip(code)) && return Dict{String,Any}(
         "content" => [Dict("type" => "text", "text" => "error: empty code")],
@@ -31,7 +30,7 @@ function julia_show_handler(args::AbstractDict)
     timeout = effective_timeout(code, user_to)
 
     res = try
-        execute_show(s, code; timeout, max_image_bytes, max_text_bytes)
+        execute_show(s, code; timeout, max_bytes)
     catch e
         return Dict{String,Any}(
             "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
@@ -49,29 +48,29 @@ const SHOW_DESCRIPTION = """
 Evaluate Julia code and present its return value RICHLY to the user (image,
 SVG, HTML, or formatted text) WITHOUT putting the bytes into your context.
 
-Use this when you want the user to see something — a Makie plot, a DataFrame,
-an HTML widget, an image — but don't need to read the content yourself. The
-heavy bytes are tagged with `annotations.audience = ["user"]` per the MCP
-spec, so MCP-aware clients route them to the chat UI without forwarding to
-the model. You'll see only a short "shown: <type> as <mime> (<size>)"
-acknowledgement.
+How it works: the result is rendered to a file under
+`<env_path>/.bonitoTeam/show/<id>.<ext>` (PNG / SVG / HTML / TXT depending
+on what the value supports). The MCP response is JUST the file reference —
+"shown: .bonitoTeam/show/<id>.<ext> (<mime>, <size>)". The chat UI on the
+server fetches the file lazily and renders a collapsible preview. The
+actual bytes never enter your conversation context.
 
 Use bt_julia_eval (not bt_show) if you actually need to inspect the value
 yourself.
 
-The eval runs in the same per-`env_path` session as bt_julia_eval — bindings,
-loaded packages, and Revise state carry over between calls.
+The eval runs in the same per-`env_path` session as bt_julia_eval —
+bindings, loaded packages, and Revise state carry over between calls.
 
-MIME chain (richest match wins):
+MIME chain (richest match wins, written to disk in that format):
   • image/png         — Makie scenes, Plots.jl figures, Colorant matrices
+                        (where `showable(MIME"image/png", value)` is true)
   • image/svg+xml     — vector graphics
   • text/html         — HTML widgets, DataFrames with HTML show methods
   • text/plain        — fallback for anything else
 
-Limits:
-  • `max_image_bytes` (default 4 MB) caps PNG/SVG/HTML payloads. Above the
+Limit:
+  • `max_bytes` (default 4 MB) caps the rendered file size. Above the
     limit we fall through to the next MIME (or eventually plain text).
-  • `max_text_bytes`  (default 4 KB) is the text-fallback cap.
 """
 
 register!(
@@ -79,12 +78,12 @@ register!(
     Dict{String,Any}(
         "type" => "object",
         "properties" => Dict{String,Any}(
-            "code"             => Dict("type"=>"string", "description"=>"Julia code to evaluate; the LAST expression's value is what gets shown"),
-            "env_path"         => Dict("type"=>"string", "description"=>"Optional Julia project directory; omit for a temp env"),
-            "timeout"          => Dict("type"=>"number", "description"=>"Soft checkpoint cadence in seconds (same semantics as bt_julia_eval)"),
-            "julia_cmd"        => Dict("type"=>"string", "description"=>"Custom Julia invocation, e.g. `julia +1.11`. Use rarely."),
-            "max_image_bytes"  => Dict("type"=>"integer", "default"=>4_000_000, "description"=>"PNG/SVG/HTML payload cap"),
-            "max_text_bytes"   => Dict("type"=>"integer", "default"=>4_000,     "description"=>"text-fallback truncation cap"),
+            "code"      => Dict("type"=>"string", "description"=>"Julia code to evaluate; the LAST expression's value is what gets shown"),
+            "env_path"  => Dict("type"=>"string", "description"=>"Optional Julia project directory; omit for a temp env"),
+            "timeout"   => Dict("type"=>"number", "description"=>"Soft checkpoint cadence in seconds (same semantics as bt_julia_eval)"),
+            "julia_cmd" => Dict("type"=>"string", "description"=>"Custom Julia invocation, e.g. `julia +1.11`. Use rarely."),
+            "max_bytes" => Dict("type"=>"integer", "default"=>4_000_000,
+                                "description"=>"Rendered file size cap; falls to the next MIME above this"),
         ),
         "required" => ["code"],
     ),

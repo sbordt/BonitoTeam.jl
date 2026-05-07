@@ -39,6 +39,10 @@ const PENDING_TRANSFERS = Dict{String,Channel{Any}}()
 const PENDING_LIST_DIR = Dict{String,Channel{Dict}}()
 # request_id → Channel where worker's scan_sessions_result is handed back
 const PENDING_SCAN_SESSIONS = Dict{String,Channel{Vector{Dict{String,Any}}}}()
+# request_id → Channel{(header_dict, payload_bytes)} where the worker's
+# fetch_blob reply (one JSON header frame + one binary frame) is handed
+# back to the chat-side bt_show renderer.
+const PENDING_FETCH_BLOB = Dict{String,Channel{Tuple{Dict{String,Any},Vector{UInt8}}}}()
 
 # Send a JSON command to a worker over its control WS. Throws if the worker
 # isn't currently connected.
@@ -133,6 +137,17 @@ function handle_worker_control(ws, worker_secret::String)
                                     for s in get(cmd, "sessions", Any[])]
                         put!(ch, sessions)
                     end
+                elseif t == "fetch_blob_response"
+                    rid = String(get(cmd, "request_id", ""))
+                    haskey(PENDING_FETCH_BLOB, rid) || continue
+                    ch = pop!(PENDING_FETCH_BLOB, rid)
+                    bytes = if haskey(cmd, "error")
+                        UInt8[]
+                    else
+                        # The next frame on the WS is the binary payload.
+                        Vector{UInt8}(WebSockets.receive(ws))
+                    end
+                    put!(ch, (Dict{String,Any}(cmd), bytes))
                 end
             catch e
                 @warn "Worker control frame error" exception=e
@@ -494,6 +509,38 @@ function scan_worker_sessions(worker_name::String; timeout::Real = 15.0)
         end
     end
     return take!(ch)
+end
+
+"""
+    fetch_blob_from_worker(worker_name, path; timeout=15) → Vector{UInt8}
+
+Pull a single file's bytes from the named worker. Used by the chat UI's
+bt_show preview renderer when the file isn't in `<server_path>/<relpath>`
+yet (e.g. unsynced project, or fresh tool result before the file gets
+RemoteSync'd as part of a project sync). Throws on timeout / worker errors.
+"""
+function fetch_blob_from_worker(worker_name::String, path::AbstractString;
+                                  timeout::Real = 15.0)
+    haskey(WORKER_CONTROL_WS, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+    rid = string(uuid4())
+    ch  = Channel{Tuple{Dict{String,Any},Vector{UInt8}}}(1)
+    PENDING_FETCH_BLOB[rid] = ch
+    send_command(worker_name, Dict(
+        "type"       => "fetch_blob",
+        "request_id" => rid,
+        "path"       => String(path),
+    ))
+    Base.errormonitor(@async begin
+        sleep(timeout)
+        if haskey(PENDING_FETCH_BLOB, rid)
+            delete!(PENDING_FETCH_BLOB, rid)
+            try put!(ch, (Dict{String,Any}("error" => "fetch_blob timed out"), UInt8[])) catch end
+        end
+    end)
+    header, bytes = take!(ch)
+    haskey(header, "error") && error("fetch_blob '$path' on '$worker_name': $(header["error"])")
+    return bytes
 end
 
 # Build an AgentClientProtocol.Connection backed by a WebSocket. Each ACP

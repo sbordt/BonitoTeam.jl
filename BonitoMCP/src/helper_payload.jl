@@ -57,100 +57,97 @@ function format_value(val, max_bytes::Int, full_output::Bool)
 end
 
 """
-    format_show(val, max_bytes_image, max_bytes_text) → Vector{Dict{String,Any}}
+    format_show(val, out_dir, max_bytes) → Vector{Dict{String,Any}}
 
-Like `format_value` but for `bt_show`: walk the MIME chain (PNG → SVG → HTML
-→ text/plain) to find the richest representation the value supports, and tag
-heavy blocks with `annotations.audience = ["user"]` per the MCP spec so they
-render in the chat UI WITHOUT being forwarded to the model. A small
-"shown: <type> (<size>)" text block (audience = both) keeps the agent
-informed without bloating its context.
+`bt_show` formatter. Writes the value to a file under `out_dir` (typically
+`<cwd>/.bonitoTeam/show/`) and returns ONLY a small text reference. The
+file's bytes never enter the MCP tool result, so claude-agent-acp can't
+forward them to the model — the agent only sees a path + size + mime.
 
-Returns one or two content blocks:
-  • a description text block (audience = user + assistant)
-  • the rich content (audience = user only) — image, svg, html, or fallback text
+The chat-side renderer parses the reference, fetches the file from the
+worker if needed, and shows a collapsible preview (image / video / html /
+text) inline in the chat.
+
+MIME chain (richest match wins, all rasterised to file extensions
+claude.ai's Messages API doesn't even need to handle since the bytes
+never reach it):
+  • image/png         — Makie/Plots figures, Colorant matrices via
+                        `showable` or PNGFiles
+  • image/svg+xml     — vector graphics (saved as `.svg`)
+  • text/html         — HTML widgets (`.html`)
+  • text/plain        — fallback
 """
-function format_show(val, max_bytes_image::Int, max_bytes_text::Int)
-    val === nothing && return [Dict{String,Any}(
-        "type" => "text",
-        "text" => "shown: nothing",
-        "annotations" => Dict("audience" => ["user", "assistant"]),
-    )]
+function format_show(val, out_dir::AbstractString, max_bytes::Int)
+    val === nothing && return [text_block("shown: nothing")]
 
-    # Image PNG — preferred for plots + Makie scenes via showable.
+    mkpath(out_dir)
+    base = string(time_ns(), base = 16) * "-" * string(rand(UInt32), base = 16)
+
+    # Image PNG via showable hook (preferred for plots + Makie scenes).
     if showable_safe(MIME"image/png"(), val)
         png = sprint_mime(val, MIME"image/png"())
-        if !isempty(png) && length(png) <= max_bytes_image
-            return [
-                describe(val, "image/png", length(png)),
-                Dict{String,Any}(
-                    "type" => "image",
-                    "data" => base64encode(png),
-                    "mimeType" => "image/png",
-                    "annotations" => Dict("audience" => ["user"]),
-                ),
-            ]
+        if !isempty(png) && length(png) <= max_bytes
+            return write_show_file(out_dir, base, ".png", "image/png", png, val)
         end
     end
 
-    # Direct PNG render for 2-D colorant arrays (no MIME hook needed).
+    # Direct PNG render for 2-D colorant arrays (when PNGFiles is available).
     if looks_like_image(val)
         try
             png = value_to_png(val)
-            if length(png) <= max_bytes_image
-                return [
-                    describe(val, "image/png", length(png)),
-                    Dict{String,Any}(
-                        "type" => "image",
-                        "data" => base64encode(png),
-                        "mimeType" => "image/png",
-                        "annotations" => Dict("audience" => ["user"]),
-                    ),
-                ]
+            if length(png) <= max_bytes
+                return write_show_file(out_dir, base, ".png", "image/png", png, val)
             end
         catch
         end
     end
 
-    # NOTE: SVG is NOT used here. Even though many Julia values implement
-    # `showable(MIME"image/svg+xml")` (Colorant matrices, plots), claude's
-    # Messages API does not accept image/svg+xml — it only takes png / jpeg
-    # / gif / webp. Returning SVG would propagate as a tool result that
-    # claude-agent-acp forwards to the model, and the next request would
-    # fail with `400 Could not process image` (verified end-to-end). For
-    # vector content prefer rasterising upstream of bt_show, e.g. via Makie
-    # `colorbuffer` + PNGFiles.save, or via a Plots backend that emits PNG.
-    #
-    # NOTE: HTML support is intentionally deferred. The chat-side ACP parser
-    # drops `resource` content blocks to the literal string "[tool content:
-    # resource]", so we'd render garbage. A follow-up can add an HTML branch
-    # by extending parse_tool_content_item + render_tool_body to honour a
-    # `__bt_show_html__:` text-prefix marker (or by adding an HTMLContent
-    # type to ContentBlock).
-    #
-    # Plain-text fallback. No audience filter — small enough that claude
-    # seeing it costs ~nothing and is useful when bt_show is called on a
-    # struct/array (no PNG/SVG/HTML).
+    # SVG (vector graphics — fine here because the bytes go to a file, not
+    # to claude). Browsers render image/svg+xml in <img> tags.
+    if showable_safe(MIME"image/svg+xml"(), val)
+        svg = sprint_mime(val, MIME"image/svg+xml"())
+        if !isempty(svg) && length(svg) <= max_bytes
+            return write_show_file(out_dir, base, ".svg", "image/svg+xml", svg, val)
+        end
+    end
+
+    # HTML widgets / DataFrames. Same thing — chat will iframe-render.
+    if showable_safe(MIME"text/html"(), val)
+        html = sprint_mime(val, MIME"text/html"())
+        if !isempty(html) && length(html) <= max_bytes
+            return write_show_file(out_dir, base, ".html", "text/html", html, val)
+        end
+    end
+
+    # Plain text fallback — write to file too so the chat can render it
+    # in Monaco like other tool outputs.
     repr = sprint(show, "text/plain", val)
-    return [Dict{String,Any}(
-        "type" => "text",
-        "text" => "shown: $(typeof_short(val))\n```\n$(truncate_text(repr, max_bytes_text, false, "result"))\n```",
-        "annotations" => Dict("audience" => ["user", "assistant"]),
-    )]
+    bytes = codeunits(repr)
+    return write_show_file(out_dir, base, ".txt", "text/plain", bytes, val)
 end
 
-# Short type description for the audience=both summary, e.g. "Matrix{RGB}".
+# Write the rendered bytes to disk and produce the reference content block.
+function write_show_file(out_dir::AbstractString, base::AbstractString,
+                          ext::AbstractString, mime::AbstractString,
+                          bytes, val)
+    fname = base * ext
+    path  = joinpath(out_dir, fname)
+    open(io -> write(io, bytes), path, "w")
+    # Relative path so the chat side can resolve under either cwd. Path is
+    # stable across server restarts because it lives on disk.
+    relpath_str = joinpath(".bonitoTeam", "show", fname)
+    text = string("shown: ", relpath_str,
+                  " (", mime, ", ", format_bytes_short(length(bytes)), ")",
+                  "\ntype: ", typeof_short(val))
+    return [text_block(text)]
+end
+
+text_block(text::AbstractString) = Dict{String,Any}(
+    "type" => "text",
+    "text" => text,
+)
+
 typeof_short(val) = string(typeof(val).name.name)
-
-# Audience-both header that names the type + size so claude can reason
-# about what got shown without seeing the bytes.
-function describe(val, mime::AbstractString, nbytes::Integer)
-    Dict{String,Any}(
-        "type" => "text",
-        "text" => "shown: $(typeof_short(val)) as $mime ($(format_bytes_short(nbytes)))",
-        "annotations" => Dict("audience" => ["user", "assistant"]),
-    )
-end
 
 # `showable` can throw for some types (e.g. Makie pre-display lifecycle bugs);
 # we don't want a failed probe to abort the whole render path, just to fall

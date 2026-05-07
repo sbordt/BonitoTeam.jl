@@ -81,6 +81,8 @@ function run_control_session(; server_url, secret, name, mcp_path,
                 @async handle_list_dir(ws, cmd)
             elseif t == "scan_sessions"
                 @async handle_scan_sessions(ws, cmd)
+            elseif t == "fetch_blob"
+                @async handle_fetch_blob(ws, cmd)
             elseif t == "ping"
                 WebSockets.send(ws, JSON.json(Dict("type" => "pong")))
             else
@@ -184,6 +186,55 @@ function handle_list_dir(ws, cmd::AbstractDict)
         WebSockets.send(ws, JSON.json(response))
     catch e
         @warn "list_dir response failed" exception=e
+    end
+end
+
+# Single-file blob fetch over the control WS. Used by the chat UI's bt_show
+# preview renderer to pull `<cwd>/.bonitoTeam/show/<id>.<ext>` from the
+# worker on demand. The server requests:
+#
+#     {"type":"fetch_blob", "request_id", "path": "<abs-or-cwd-relative>"}
+#
+# Reply over the same WS:
+#   Frame 1 (text):   {"type":"fetch_blob_response", "request_id", "size":N}
+#                  OR {"type":"fetch_blob_response", "request_id", "error":"..."}
+#   Frame 2 (binary): the file's bytes (only if no error)
+#
+# Cap at 16 MB to keep a runaway request from filling memory.
+const FETCH_BLOB_MAX_BYTES = 16 * 1024 * 1024
+
+function handle_fetch_blob(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    path       = String(get(cmd, "path", ""))
+    err = if isempty(path)
+        "missing path"
+    elseif !isfile(path)
+        "not a file: $path"
+    elseif filesize(path) > FETCH_BLOB_MAX_BYTES
+        "file too large ($(filesize(path)) > $FETCH_BLOB_MAX_BYTES)"
+    else
+        nothing
+    end
+    if err !== nothing
+        try
+            WebSockets.send(ws, JSON.json(Dict(
+                "type" => "fetch_blob_response",
+                "request_id" => request_id,
+                "error" => err)))
+        catch e
+            @warn "fetch_blob error reply failed" exception=e
+        end
+        return
+    end
+    bytes = read(path)
+    try
+        WebSockets.send(ws, JSON.json(Dict(
+            "type" => "fetch_blob_response",
+            "request_id" => request_id,
+            "size" => length(bytes))))
+        WebSockets.send(ws, bytes)
+    catch e
+        @warn "fetch_blob send failed" exception=e
     end
 end
 

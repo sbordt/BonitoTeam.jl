@@ -296,11 +296,112 @@ function render_search_results(text::AbstractString)
     DOM.div(rows...; class = "bt-search-results")
 end
 
-function render_tool_body(m::ToolMsg, cwd::AbstractString)
+function find_show_reference(content)
+    for c in content
+        c isa TextContent || continue
+        startswith(c.text, "shown: ") && return c.text
+    end
+    return nothing
+end
+
+# Parse a `shown: <relpath> (<mime>, <size>)` reference and render a preview
+# of the file. The file lives at <worker_path>/<relpath> on the worker. We
+# try the server-side mirror first (RemoteSync may have already pulled it)
+# and fall back to a single-file fetch over the worker control WS. Returns
+# `nothing` if the reference can't be parsed (caller falls back to the
+# default rendering).
+function render_show_reference(text::AbstractString, cwd::AbstractString,
+                                project_id::AbstractString)
+    # Header line is the first line; "type: ..." may follow.
+    nl = findfirst('\n', text)
+    header = nl === nothing ? text : text[1:prevind(text, nl)]
+    m = match(r"^shown: (\S+)\s+\(([^,]+),\s*([^)]+)\)\s*$", header)
+    m === nothing && return nothing
+    relpath_str, mime, size_str = m.captures[1], strip(m.captures[2]), strip(m.captures[3])
+
+    server_local_path = joinpath(cwd, relpath_str)
+
+    # Best-effort fetch: prefer the server-local file; if missing, ask the
+    # worker for the bytes directly. Cache to server-local path for next
+    # render so we don't re-fetch on collapse/expand cycles.
+    bytes = if isfile(server_local_path)
+        read(server_local_path)
+    elseif isempty(project_id) || !haskey(PROJECTS, project_id)
+        return DOM.div("(file not on server: $relpath_str)";
+                       class = "bt-tool-empty")
+    else
+        p = PROJECTS[project_id]
+        worker_path = joinpath(p.worker_path, relpath_str)
+        try
+            bts = fetch_blob_from_worker(p.worker_name, worker_path; timeout = 30.0)
+            mkpath(dirname(server_local_path))
+            write(server_local_path, bts)
+            bts
+        catch e
+            return DOM.div("(failed to fetch $relpath_str from worker: $(sprint(showerror, e)))";
+                           class = "bt-tool-empty")
+        end
+    end
+
+    return render_show_preview(bytes, String(mime), String(size_str), relpath_str)
+end
+
+# Render the actual preview based on MIME. Images / SVG → <img>, video/*
+# → <video>, text/html → <iframe sandbox>, text/* → Monaco; everything else
+# → a generic "binary" message + size.
+function render_show_preview(bytes::AbstractVector{UInt8}, mime::AbstractString,
+                              size_str::AbstractString, relpath_str::AbstractString)
+    if startswith(mime, "image/")
+        b64 = Base64.base64encode(bytes)
+        return DOM.div(
+            DOM.img(src = "data:$mime;base64,$b64",
+                    style = "max-width:100%; display:block"),
+            DOM.div("$relpath_str · $size_str";
+                    style = "font-size:11px;color:var(--bt-text-faint);margin-top:4px"))
+    elseif startswith(mime, "video/")
+        b64 = Base64.base64encode(bytes)
+        return DOM.div(
+            DOM.video(controls = "", style = "max-width:100%; display:block",
+                       DOM.source(src = "data:$mime;base64,$b64", type = mime)),
+            DOM.div("$relpath_str · $size_str";
+                    style = "font-size:11px;color:var(--bt-text-faint);margin-top:4px"))
+    elseif mime == "text/html"
+        # Sandbox the iframe so embedded scripts can't reach the chat
+        # session. Same-origin disabled; allow scripts so HTML widgets
+        # (DataFrames, Plots HTML output, simple SPAs) still render.
+        b64 = Base64.base64encode(bytes)
+        return DOM.div(
+            DOM.iframe(src = "data:text/html;base64,$b64",
+                        sandbox = "allow-scripts",
+                        style = "width:100%; min-height:400px; border:1px solid var(--bt-border); border-radius:6px"),
+            DOM.div("$relpath_str · $size_str";
+                    style = "font-size:11px;color:var(--bt-text-faint);margin-top:4px"))
+    elseif startswith(mime, "text/")
+        text = String(bytes)
+        return monaco_readonly(text, mime == "text/julia" ? "julia" : "plaintext")
+    else
+        return DOM.div("$relpath_str · $size_str ($mime)";
+                       class = "bt-tool-empty")
+    end
+end
+
+function render_tool_body(m::ToolMsg, cwd::AbstractString;
+                           project_id::AbstractString = "")
     content = load_tool_content(cwd, m.id)
     isempty(content) &&
         return DOM.div("(no body — tool details not persisted for this entry)",
                        class = "bt-tool-empty")
+
+    # bt_show output: ANY text block starts with "shown: " (the bt_julia_eval
+    # wrapper prepends a `\`\`\`julia` code-echo block before the formatter's
+    # output, so we have to scan, not just look at the first block). The
+    # rendered file lives on the worker; the chat fetches it lazily and
+    # renders a collapsible preview without putting the bytes through claude.
+    show_text = find_show_reference(content)
+    if show_text !== nothing
+        body = render_show_reference(show_text, cwd, project_id)
+        body === nothing || return body
+    end
 
     if m.kind == "edit"
         # Render every diff (multi-edit calls used to silently drop all but
@@ -672,7 +773,7 @@ function chat_app(cwd::String;
             isempty(tool_id) && return
             idx = findfirst(m -> m isa ToolMsg && m.id == tool_id, msgs_store)
             idx === nothing && return
-            body = render_tool_body(msgs_store[idx], cwd)
+            body = render_tool_body(msgs_store[idx], cwd; project_id = project_id)
             try
                 Bonito.dom_in_js(bonito_session, body, js"""(elem) => {
                     const slot = document.querySelector(

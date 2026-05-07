@@ -141,14 +141,23 @@ function execute(s::JuliaSession, code::AbstractString;
 end
 
 # bt_show counterpart: uses the BonitoMCPHelper.format_show formatter, which
-# walks the MIME chain (PNG → SVG → HTML → text) and tags rich content with
-# annotations.audience=["user"] so heavy bytes don't reach the model.
+# RENDERS the result to a file under <env>/.bonitoTeam/show/ on the worker
+# side and returns a small text reference. The chat UI on the server side
+# fetches the file (lazily) and renders a collapsible preview — bytes never
+# enter the MCP tool result, so claude-agent-acp can't forward them to the
+# model. Keeps the agent's context small while still showing the user
+# images / SVGs / HTML / text inline.
 function execute_show(s::JuliaSession, code::AbstractString;
                        timeout::Union{Real,Nothing} = DEFAULT_TIMEOUT,
-                       max_image_bytes::Int         = 4_000_000,
-                       max_text_bytes::Int          = 4_000)
+                       max_bytes::Int               = 4_000_000)
+    # Anchor the show/ dir in the env_path so it travels with the project
+    # (RemoteSync covers .bonitoTeam/ already; show files persist alongside
+    # the chat history).
+    out_dir = s.env_path === nothing ?
+        mktempdir(prefix = "bt-show-") :
+        joinpath(s.env_path, ".bonitoTeam", "show")
     return execute_with(s, code, :format_show, timeout,
-                         (max_image_bytes, max_text_bytes))
+                         (out_dir, max_bytes))
 end
 
 # Shared body — the formatter symbol picks which BonitoMCPHelper function the
@@ -183,7 +192,7 @@ function execute_with(s::JuliaSession, code::AbstractString,
         # (base types only, never user-defined types Malt's serialiser
         # wouldn't recognise on the parent side). The error path always uses
         # format_error regardless of which value-formatter is picked.
-        max_err_bytes = formatter === :format_value ? args_tuple[1] : args_tuple[2]
+        max_err_bytes = formatter === :format_value ? args_tuple[1] : 4_000
         wrapped = quote
             try
                 Main.BonitoMCPHelper.$(formatter)($(expr), $(args_tuple...))

@@ -288,13 +288,36 @@ Scan the worker machine for existing Claude Code usage:
 - Running `claude` processes (via /proc/PID/cwd) — exact cwd, marked active
 - Historical projects in ~/.claude/projects/ — decoded via filesystem DFS
 
-Returns sorted: active first, then by last-used time descending.
-Each entry has: `path`, `name`, `active`, and either `pid` (active) or
-`last_used` (Unix timestamp, historical).
+Returns sorted: active first, then by last-used time descending. Each entry has:
+- `path`, `name`, `active` (always)
+- `pid` (active only)
+- `last_used` (Unix timestamp, historical only)
+- `session_id` (jsonl basename, used by the import flow's `session/load` —
+  most-recently-modified jsonl wins for projects with multiple sessions; for
+  active sessions we look up the in-flight jsonl by its mtime too)
 """
 function scan_claude_sessions(; home::String = get(ENV, "HOME", ""))
     results  = Dict{String,Any}[]
     active_paths = Set{String}()
+
+    # Pre-build cwd → latest_session_id map by walking ~/.claude/projects/
+    # once, so both active and historical entries can pick up an ID.
+    sid_by_cwd = Dict{String,String}()
+    projects_dir = joinpath(home, ".claude", "projects")
+    if isdir(projects_dir)
+        for encoded in readdir(projects_dir)
+            proj_dir = joinpath(projects_dir, encoded)
+            isdir(proj_dir) || continue
+            jsonl_files = filter(f -> endswith(f, ".jsonl"),
+                                 readdir(proj_dir; join=true))
+            isempty(jsonl_files) && continue
+            decoded = decode_project_path(encoded)
+            decoded === nothing && continue
+            # Latest jsonl by mtime.
+            latest = jsonl_files[argmax(stat(f).mtime for f in jsonl_files)]
+            sid_by_cwd[decoded] = first(splitext(basename(latest)))
+        end
+    end
 
     # Running claude processes via /proc (Linux only)
     if isdir("/proc")
@@ -310,17 +333,18 @@ function scan_claude_sessions(; home::String = get(ENV, "HOME", ""))
             cwd = try readlink("/proc/$pid_s/cwd") catch; continue end
             isdir(cwd) || continue
             push!(active_paths, cwd)
-            push!(results, Dict{String,Any}(
+            entry = Dict{String,Any}(
                 "path"   => cwd,
                 "name"   => basename(cwd),
                 "active" => true,
                 "pid"    => parse(Int, pid_s),
-            ))
+            )
+            haskey(sid_by_cwd, cwd) && (entry["session_id"] = sid_by_cwd[cwd])
+            push!(results, entry)
         end
     end
 
     # Historical projects from ~/.claude/projects/
-    projects_dir = joinpath(home, ".claude", "projects")
     if isdir(projects_dir)
         for encoded in sort!(readdir(projects_dir))
             proj_dir = joinpath(projects_dir, encoded)
@@ -332,12 +356,14 @@ function scan_claude_sessions(; home::String = get(ENV, "HOME", ""))
             decoded = decode_project_path(encoded)
             decoded === nothing && continue
             decoded in active_paths && continue
-            push!(results, Dict{String,Any}(
+            entry = Dict{String,Any}(
                 "path"      => decoded,
                 "name"      => basename(decoded),
                 "active"    => false,
                 "last_used" => last_used,
-            ))
+            )
+            haskey(sid_by_cwd, decoded) && (entry["session_id"] = sid_by_cwd[decoded])
+            push!(results, entry)
         end
     end
 

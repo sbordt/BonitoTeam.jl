@@ -48,11 +48,17 @@ mutable struct ProjectInfo
     # to :stale on restart so a crash mid-sync doesn't leave a wrong "synced".
     backup_status::Symbol
     last_sync_at::Union{DateTime,Nothing}
+    # Set when the project was imported from an existing claude-agent-acp
+    # session — the .jsonl basename in ~/.claude/projects/<encoded>/ on the
+    # worker. start_session_on_worker uses session/load with this ID to bring
+    # the conversation history back to where claude left off; nothing → fresh
+    # session/new. Persisted so server restarts still resume.
+    resume_session_id::Union{String,Nothing}
 end
 
 ProjectInfo(id, name, worker_name, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_name, server_path, worker_path, created,
-                nothing, nothing, :unsynced, nothing)
+                nothing, nothing, :unsynced, nothing, nothing)
 
 const WORKERS = Dict{String,WorkerInfo}()
 const PROJECTS = Dict{String,ProjectInfo}()
@@ -127,7 +133,8 @@ function save_projects!()
                  # crash mid-sync doesn't leave the next start-up reporting
                  # "synced" for a half-transferred mirror.
                  "backup_status" => string(p.backup_status === :syncing ? :stale : p.backup_status),
-                 "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at))
+                 "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at),
+                 "resume_session_id" => p.resume_session_id)
             for p in values(PROJECTS)]
     atomic_write_json(projects_file(), data)
 end
@@ -144,6 +151,9 @@ function load_projects!()
             p.backup_status = Symbol(status_str)
             last = get(d, "last_sync_at", nothing)
             p.last_sync_at = last === nothing ? nothing : DateTime(String(last))
+            sid = get(d, "resume_session_id", nothing)
+            p.resume_session_id = (sid === nothing || isempty(String(sid))) ?
+                                       nothing : String(sid)
             PROJECTS[p.id] = p
         catch e
             @warn "skipping malformed project entry" entry=d exception=e
@@ -236,7 +246,8 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
 end
 
 """
-    create_project_from_worker!(srv, worker_name, worker_path; name, sync=false, progress)
+    create_project_from_worker!(srv, worker_name, worker_path;
+                                 name, sync=false, resume_session_id=nothing, progress)
 
 Register a project rooted at an existing folder ON THE WORKER. By default
 NO bytes are pulled to the server — the project is immediately usable for
@@ -244,11 +255,18 @@ chat (which only needs `worker_path`), and the operator can later trigger an
 async sync via `sync_project_to_server!` (e.g. the "Sync to server" button on
 the project card or in the chat header menu). Pass `sync=true` to force a
 synchronous pull at create time.
+
+If `resume_session_id` is set to a claude-agent-acp session ID (the .jsonl
+basename in `~/.claude/projects/<encoded>/`), the chat will use ACP's
+`session/load` to resume that conversation — its history replays into the
+chat UI and the agent regains full context. The ID persists across server
+restarts.
 """
 function create_project_from_worker!(srv::Bonito.Server, worker_name::String,
                                       worker_path::String;
                                       name::String = basename(rstrip(worker_path, '/')),
                                       sync::Bool = false,
+                                      resume_session_id::Union{String,Nothing} = nothing,
                                       progress = nothing)
     haskey(WORKERS, worker_name) || error("Unknown worker: $worker_name")
     isempty(name) && error("Project name must not be empty (folder has no basename?)")
@@ -260,6 +278,7 @@ function create_project_from_worker!(srv::Bonito.Server, worker_name::String,
     server_path = joinpath(working_dir(), name)
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
+    p.resume_session_id = resume_session_id
     PROJECTS[id] = p
 
     if sync
@@ -356,8 +375,12 @@ function ensure_project_session!(p::ProjectInfo, srv::Union{Bonito.Server,Nothin
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
         [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path)]
 
+    # If the project was imported with a claude session ID, the factory
+    # asks the worker to do session/load (resume) instead of session/new.
     client_factory = on_update -> start_session_on_worker(w.name, p.worker_path;
-                                                           on_update, mcp_servers = mcp)
+                                                           on_update,
+                                                           mcp_servers = mcp,
+                                                           resume_session_id = p.resume_session_id)
     # Ensure server_path exists so BonitoBook (which reads files from cwd to
     # render the chat notebook + tools) doesn't crash on a never-synced
     # project. Empty dir is fine; the actual project files live on the worker
@@ -1335,7 +1358,9 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     discover_state   = Observable("")                       # worker name whose panel is open
     discover_results = Observable(Dict{String,Any}[])
     discover_busy    = Observable(false)
-    import_path      = Observable("")                       # JS onclick notifies this
+    # JS onclick notifies a {path, session_id} dict so the import handler can
+    # tell the worker to claude-agent-acp's session/load instead of /new.
+    import_path      = Observable(Dict{String,Any}())
 
     function trigger_scan!(w_name::String)
         discover_busy[]    = true
@@ -1355,19 +1380,27 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         isempty(w_name) || trigger_scan!(w_name)
     end
 
-    on(import_path) do path
+    on(import_path) do payload
+        isempty(payload) && return
+        path = String(get(payload, "path", ""))
         isempty(path) && return
-        import_path[] = ""          # reset so the same path can be re-imported
+        sid_raw = get(payload, "session_id", nothing)
+        resume_session_id = (sid_raw === nothing || isempty(String(sid_raw))) ?
+                                nothing : String(sid_raw)
+        import_path[] = Dict{String,Any}()    # reset so the same path can re-fire
         isempty(busy_msg[]) || return
         w_name = discover_state[]
         isempty(w_name) && return
         proj_name = replace(basename(rstrip(path, '/')), r"[^a-zA-Z0-9_\-]" => "_")
         isempty(proj_name) && (proj_name = "project")
-        busy_msg[] = "Importing $(proj_name)…"
+        busy_msg[] = resume_session_id === nothing ?
+            "Importing $(proj_name)…" :
+            "Resuming $(proj_name) (session $(resume_session_id[1:8])…)"
         @async begin
             try
                 create_project_from_worker!(srv_ref[], w_name, path;
                                              name = proj_name,
+                                             resume_session_id = resume_session_id,
                                              progress = msg -> (busy_msg[] = "Importing $(proj_name): $(msg)"))
                 error_obs[]      = ""
                 discover_state[] = ""
@@ -1384,6 +1417,11 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         isempty(path) && return DOM.div()
         name      = String(get(r, "name", basename(path)))
         is_active = get(r, "active", false) === true
+        # session_id is the .jsonl basename of the most-recent claude session
+        # at this cwd. When set, the import flow uses ACP's session/load to
+        # resume that conversation instead of starting fresh.
+        sid_raw   = get(r, "session_id", nothing)
+        session_id = sid_raw === nothing ? "" : String(sid_raw)
         meta = if is_active
             "PID $(get(r, "pid", "?"))"
         elseif haskey(r, "last_used")
@@ -1395,12 +1433,16 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         end
         badge = is_active ?
             DOM.span("active"; class = "bt-pill bt-pill-active") : DOM.span()
+        # Show whether resume is available, so the user knows what they're
+        # getting. Plain "Import" looks the same as before for sessions we
+        # didn't find a jsonl for.
+        btn_label = isempty(session_id) ? "Import" : "Resume"
         DOM.div(
             DOM.div(
                 DOM.div(name, badge; class = "bt-session-name"),
                 DOM.div(path; class = "bt-session-path"),
                 isempty(meta) ? DOM.span() : DOM.div(meta; class = "bt-session-meta")),
-            DOM.div("Import";
+            DOM.div(btn_label;
                 class   = "bt-btn bt-btn-secondary",
                 style   = "cursor:pointer;flex-shrink:0",
                 # Instant visual feedback: flip the button to a loading
@@ -1409,8 +1451,8 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
                 onclick = js"""event => {
                     const btn = event.currentTarget;
                     btn.classList.add('bt-clicked');
-                    btn.textContent = 'Importing…';
-                    $(import_path).notify($path);
+                    btn.textContent = $(btn_label) === 'Resume' ? 'Resuming…' : 'Importing…';
+                    $(import_path).notify({path: $path, session_id: $session_id});
                 }"""),
             class = is_active ? "bt-session-row bt-session-active" : "bt-session-row")
     end

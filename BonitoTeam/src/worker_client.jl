@@ -228,16 +228,23 @@ end
 # Server-side ACP client over an accepted WS
 """
     start_session_on_worker(worker_name, cwd; on_update, mcp_servers,
-                             request_handler) → AgentClientProtocol.Client
+                             request_handler, resume_session_id=nothing)
+        → AgentClientProtocol.Client
 
 Tell the worker to spawn claude-agent-acp for `cwd` and dial back an ACP WS.
-Block until the WS arrives, then drive `initialize` + `session/new`. Returns
+Block until the WS arrives, then drive `initialize`, then either
+`session/load` (when `resume_session_id` is set) or `session/new`. Returns
 the live ACP `Client`.
+
+When resuming, claude-agent-acp replays the prior conversation as a stream
+of `session/update` notifications — our `update_handler` receives them just
+like live events, so the chat UI fills in automatically.
 """
 function start_session_on_worker(worker_name::String, cwd::String;
                                   on_update::Function       = identity,
                                   mcp_servers               = [],
                                   request_handler::Function = AgentClientProtocol.make_request_handler(cwd),
+                                  resume_session_id::Union{String,Nothing} = nothing,
                                   timeout::Real             = 30.0)
 
     haskey(WORKER_CONTROL_WS, worker_name) ||
@@ -253,9 +260,8 @@ function start_session_on_worker(worker_name::String, cwd::String;
                      "env"     => [Dict("name" => k, "value" => v) for (k,v) in s.env])
                 for s in mcp_servers]
 
-    # Find the project this session belongs to so the worker can tag its
-    # delta frames with project_id (server uses it to apply diffs to the
-    # right server_path).
+    # Find the project this session belongs to (purely for the worker-side
+    # log line; we don't ship project_id over the wire anymore).
     project_id = ""
     for p in values(PROJECTS)
         p.worker_name == worker_name && p.worker_path == cwd && (project_id = p.id; break)
@@ -285,9 +291,23 @@ function start_session_on_worker(worker_name::String, cwd::String;
         "clientInfo" => Dict("name" => "BonitoTeam", "version" => "0.1.0"),
     ))
 
-    result     = AgentClientProtocol.send_request(conn, "session/new",
+    session_id = if resume_session_id !== nothing
+        @info "ACP: resuming session" cwd resume_session_id
+        # `session/load` returns no useful body — the agent's reply is the
+        # stream of session/update notifications that our update_handler
+        # picks up. The session ID we use afterwards is the one we asked
+        # for (claude-agent-acp keeps it stable across load).
+        AgentClientProtocol.send_request(conn, "session/load", Dict(
+            "sessionId"  => resume_session_id,
+            "cwd"        => cwd,
+            "mcpServers" => mcp_list,
+        ))
+        resume_session_id
+    else
+        result = AgentClientProtocol.send_request(conn, "session/new",
                      Dict("cwd" => cwd, "mcpServers" => mcp_list))
-    session_id = result["sessionId"]
+        result["sessionId"]
+    end
 
     return AgentClientProtocol.Client(conn, session_id, cwd)
 end

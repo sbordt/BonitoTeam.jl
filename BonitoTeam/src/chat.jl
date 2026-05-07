@@ -3,7 +3,7 @@ const BonitoTeamJS = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "bonitoteam
 # Message types
 abstract type ChatMsg end
 
-struct UserMsg <: ChatMsg
+mutable struct UserMsg <: ChatMsg
     text::String
 end
 
@@ -354,6 +354,11 @@ function chat_app(cwd::String;
     msgs_store   = load_history(chat_session)
     agent_id     = Ref("")
     thought_id   = Ref("")
+    # Tracks whether a user_message_chunk replay is currently in flight,
+    # so consecutive chunks accumulate into one UserMsg bubble. Live user
+    # input never goes through on_update, so this only matters during
+    # session/load replay.
+    user_streaming = Ref(false)
     client       = Ref{Union{AgentClientProtocol.Client,Nothing}}(nothing)
 
     # Observables
@@ -378,6 +383,28 @@ function chat_app(cwd::String;
     end
 
     # ACP update handlers
+    #
+    # `user_message_chunk` only arrives during session/load replay (live user
+    # input bypasses on_update — we push UserMsg directly when the user hits
+    # send). Consecutive chunks for one historical user message merge into a
+    # single bubble; finalize_streaming! flips the flag when something
+    # else arrives (agent message, tool call, etc).
+    function on_update(upd::UserMessageChunk)
+        upd.content isa TextContent || return
+        text = upd.content.text
+        if !user_streaming[]
+            user_streaming[] = true
+            msg = UserMsg(text)
+            push!(msgs_store, msg)
+            append_user(chat_session, msg)
+            total_count[] = length(msgs_store)
+            emit(Dict{String,Any}("type" => "user", "text" => text))
+        else
+            msgs_store[end].text *= text
+            emit(Dict{String,Any}("type" => "user_chunk", "text" => text))
+        end
+    end
+
     function on_update(upd::AgentMessageChunk)
         upd.content isa TextContent || return
         text = upd.content.text
@@ -396,6 +423,9 @@ function chat_app(cwd::String;
     end
 
     function finalize_streaming!()
+        # Close any in-flight replayed user message — once an agent/thought/
+        # tool event arrives, the user-message stream is complete.
+        user_streaming[] = false
         if !isempty(thought_id[])
             idx = findfirst(m -> m isa ThoughtMsg && m.id == thought_id[], msgs_store)
             if idx !== nothing

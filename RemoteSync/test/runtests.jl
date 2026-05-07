@@ -1,0 +1,347 @@
+using RemoteSync
+using Test
+using Random
+using SHA
+
+# ── Bidirectional in-process IO for tests ──────────────────────────────────
+# Two BufferStreams glued together: side A's reads come from side B's writes
+# and vice versa. Lets us run send_directory/receive_directory in two tasks
+# without spinning up sockets or subprocesses.
+mutable struct BidirIO <: IO
+    in_io  :: IO
+    out_io :: IO
+end
+
+function pipe_pair()
+    a_to_b = Base.BufferStream()
+    b_to_a = Base.BufferStream()
+    return BidirIO(b_to_a, a_to_b), BidirIO(a_to_b, b_to_a)
+end
+
+Base.read(io::BidirIO, ::Type{UInt8}) = read(io.in_io, UInt8)
+Base.read(io::BidirIO, n::Integer) = read(io.in_io, n)
+Base.readbytes!(io::BidirIO, dst, n = length(dst)) = readbytes!(io.in_io, dst, n)
+Base.eof(io::BidirIO) = eof(io.in_io)
+Base.bytesavailable(io::BidirIO) = bytesavailable(io.in_io)
+Base.write(io::BidirIO, b::UInt8) = write(io.out_io, b)
+Base.unsafe_write(io::BidirIO, p::Ptr{UInt8}, n::UInt) = unsafe_write(io.out_io, p, n)
+Base.flush(io::BidirIO) = flush(io.out_io)
+Base.close(io::BidirIO) = (close(io.in_io); close(io.out_io))
+Base.isopen(io::BidirIO) = isopen(io.in_io) || isopen(io.out_io)
+
+# Helper: build a deterministic pseudo-binary file of `n` bytes seeded by
+# `seed`. Same input → same output, so we can compare sha256 between runs.
+function make_blob(n::Int; seed::UInt64 = UInt64(0xCAFEBABEDEADBEEF))
+    rng = Random.Xoshiro(seed)
+    return rand(rng, UInt8, n)
+end
+
+# ── Layer 1: librsync primitives ───────────────────────────────────────────
+@testset "primitives" begin
+    @testset "signature is reproducible" begin
+        basis = make_blob(50_000)
+        s1 = IOBuffer(); s2 = IOBuffer()
+        compute_signature(IOBuffer(basis), s1)
+        compute_signature(IOBuffer(basis), s2)
+        b1 = take!(s1); b2 = take!(s2)
+        @test b1 == b2
+        @test !isempty(b1)
+    end
+
+    @testset "patch reconstructs original (identity case)" begin
+        # When new == basis, the delta should rebuild basis byte-for-byte.
+        basis = make_blob(20_000)
+        sig = IOBuffer(); compute_signature(IOBuffer(basis), sig)
+        seekstart(sig)
+        delta = IOBuffer()
+        compute_delta(sig, IOBuffer(basis), delta)
+        seekstart(delta)
+        out = IOBuffer()
+        apply_patch(IOBuffer(basis), delta, out)
+        @test take!(out) == basis
+    end
+
+    @testset "patch reconstructs new (with edits)" begin
+        basis = make_blob(40_000; seed = UInt64(1))
+        new   = copy(basis)
+        # Insert + change a chunk in the middle so delta has both copy + literal cmds.
+        splice!(new, 10_000:11_000, make_blob(2_000; seed = UInt64(2)))
+
+        sig = IOBuffer(); compute_signature(IOBuffer(basis), sig); seekstart(sig)
+        delta = IOBuffer(); compute_delta(sig, IOBuffer(new), delta); seekstart(delta)
+        out = IOBuffer(); apply_patch(IOBuffer(basis), delta, out)
+        @test take!(out) == new
+    end
+
+    @testset "patch reconstructs new (no basis)" begin
+        new = make_blob(5_000; seed = UInt64(3))
+        # Empty basis → "all literal" delta — the path send_directory uses
+        # for files the receiver doesn't have.
+        sig = IOBuffer(); compute_signature(IOBuffer(UInt8[]), sig); seekstart(sig)
+        delta = IOBuffer(); compute_delta(sig, IOBuffer(new), delta); seekstart(delta)
+        out = IOBuffer(); apply_patch(IOBuffer(UInt8[]), delta, out)
+        @test take!(out) == new
+    end
+
+    @testset "delta is much smaller than full file when basis is close" begin
+        basis = make_blob(100_000; seed = UInt64(4))
+        new   = copy(basis); new[50_001] ⊻= 0xFF   # one-byte edit
+        sig = IOBuffer(); compute_signature(IOBuffer(basis), sig); seekstart(sig)
+        delta = IOBuffer(); compute_delta(sig, IOBuffer(new), delta)
+        @test position(delta) < length(new) ÷ 4  # generous bound
+    end
+end
+
+# ── Layer 2: wire format round-trips ───────────────────────────────────────
+@testset "wire format" begin
+    using RemoteSync: ManifestEntry, PlanEntry,
+                      encode_manifest, decode_manifest,
+                      encode_plan,     decode_plan,
+                      encode_delta_frame, decode_delta_frame,
+                      ACTION_FULL, ACTION_PATCH, ACTION_SKIP, ACTION_DELETE,
+                      write_frame, read_frame, TAG_MANIFEST
+    # Tests reach into the internals; that's fine — they're qualified above.
+
+    @testset "manifest round-trip" begin
+        entries = [ManifestEntry("a.txt", UInt64(10), 1.5),
+                   ManifestEntry("nested/dir/b.bin", UInt64(99999), 1234567.89)]
+        decoded = decode_manifest(encode_manifest(entries))
+        @test length(decoded) == 2
+        @test decoded[1].rel == "a.txt" && decoded[1].size == 10 && decoded[1].mtime == 1.5
+        @test decoded[2].rel == "nested/dir/b.bin"
+    end
+
+    @testset "plan round-trip" begin
+        plan = [PlanEntry("a", ACTION_FULL,   UInt8[]),
+                PlanEntry("b", ACTION_PATCH,  UInt8[1, 2, 3, 4, 5]),
+                PlanEntry("c", ACTION_SKIP,   UInt8[]),
+                PlanEntry("d", ACTION_DELETE, UInt8[])]
+        decoded = decode_plan(encode_plan(plan))
+        @test length(decoded) == 4
+        @test decoded[2].action == ACTION_PATCH && decoded[2].sig == UInt8[1, 2, 3, 4, 5]
+    end
+
+    @testset "delta frame round-trip" begin
+        rel = "deeply/nested/file.bin"; bytes = make_blob(1_500)
+        rel2, b2 = decode_delta_frame(encode_delta_frame(rel, bytes))
+        @test rel == rel2 && b2 == bytes
+    end
+
+    @testset "framed write/read survives mixed payloads" begin
+        a, b = pipe_pair()
+        @async begin
+            write_frame(a, TAG_MANIFEST, UInt8[1, 2, 3])
+            write_frame(a, UInt8(0x77), UInt8[])
+            write_frame(a, UInt8(0x99), make_blob(10_000))
+            close(a)
+        end
+        t1, p1 = read_frame(b); @test t1 == TAG_MANIFEST && p1 == UInt8[1, 2, 3]
+        t2, p2 = read_frame(b); @test t2 == 0x77         && isempty(p2)
+        t3, p3 = read_frame(b); @test t3 == 0x99         && length(p3) == 10_000
+    end
+end
+
+# ── Layer 3: directory sync end-to-end ─────────────────────────────────────
+function dir_hash(root)
+    h = SHA.SHA256_CTX()
+    files = String[]
+    for (dir, _, fs) in walkdir(root)
+        for f in fs
+            push!(files, relpath(joinpath(dir, f), root))
+        end
+    end
+    sort!(files)
+    for rel in files
+        SHA.update!(h, codeunits(rel * "\0"))
+        SHA.update!(h, read(joinpath(root, rel)))
+        SHA.update!(h, UInt8[0])
+    end
+    return SHA.digest!(h)
+end
+
+# Run sender + receiver in two tasks bridged by a pipe pair. Returns the
+# (written, deleted, skipped) Stats from the receiver.
+function run_sync(src, dst)
+    a, b = pipe_pair()
+    sender_done = Channel{Any}(1)
+    receiver_done = Channel{Any}(1)
+    @async try
+        send_directory(src, a)
+        put!(sender_done, :ok)
+    catch e
+        put!(sender_done, e)
+    finally
+        close(a)
+    end
+    @async try
+        result = receive_directory(dst, b)
+        put!(receiver_done, result)
+    catch e
+        put!(receiver_done, e)
+    finally
+        close(b)
+    end
+    s = take!(sender_done); r = take!(receiver_done)
+    s isa Symbol || throw(s)
+    r isa Exception && throw(r)
+    return r
+end
+
+# ── Layer 4: WebSocketIO over a real loopback HTTP.WebSocket ──────────────
+# Exercises the WS adapter's framed write/flush + buffered read across a real
+# socket — guards against IOBuffer-vs-bytesavailable footguns and similar
+# adapter regressions.
+@testset "WebSocketIO over loopback HTTP.WebSocket" begin
+    using HTTP, HTTP.WebSockets
+    RemoteSync.register_http_websockets!(HTTP.WebSockets)
+
+    server_done = Channel{Any}(1)
+    # Pick a likely-free high port; HTTP.WebSockets.listen! returns a Server
+    # whose `listener` we can poke for the actual bound port if needed.
+    port = rand(40000:60000)
+    server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
+        try
+            wsio = WebSocketIO(ws)
+            stats = receive_directory(mktempdir(), wsio)
+            put!(server_done, stats)
+        catch e
+            put!(server_done, e)
+        end
+    end
+    sleep(0.2)
+
+    # Sender side: do a fresh sync of a tiny dir.
+    src = mktempdir()
+    write(joinpath(src, "alpha.txt"), "ws-io smoke test")
+    write(joinpath(src, "blob.bin"), make_blob(10_000; seed = UInt64(99)))
+    try
+        client_done = Channel{Any}(1)
+        @async try
+            HTTP.WebSockets.open("ws://127.0.0.1:$port") do ws
+                wsio = WebSocketIO(ws)
+                send_directory(src, wsio)
+            end
+            put!(client_done, :ok)
+        catch e
+            put!(client_done, e)
+        end
+
+        # Both sides should finish well within a few seconds.
+        s = nothing
+        for _ in 1:30
+            isready(server_done) && (s = take!(server_done); break)
+            sleep(0.1)
+        end
+        c = isready(client_done) ? take!(client_done) : :TIMEOUT
+
+        @test s isa NamedTuple
+        @test s.written == 2
+        @test c === :ok
+    finally
+        rm(src; recursive=true, force=true)
+        close(server)
+    end
+end
+
+@testset "directory sync" begin
+    @testset "fresh sync (empty dst)" begin
+        src = mktempdir(); dst = mktempdir()
+        try
+            mkpath(joinpath(src, "sub"))
+            write(joinpath(src, "a.txt"), "hello world")
+            write(joinpath(src, "sub", "b.bin"), make_blob(40_000))
+            stats = run_sync(src, dst)
+            @test stats.written == 2 && stats.deleted == 0 && stats.skipped == 0
+            @test dir_hash(src) == dir_hash(dst)
+        finally
+            rm(src; recursive=true, force=true)
+            rm(dst; recursive=true, force=true)
+        end
+    end
+
+    @testset "incremental sync (some files match, one edited, one deleted)" begin
+        src = mktempdir(); dst = mktempdir()
+        try
+            # Both sides start with identical contents.
+            mkpath(joinpath(src, "x"))
+            write(joinpath(src, "match.txt"), "stable")
+            write(joinpath(src, "x", "edit.bin"), make_blob(20_000; seed = UInt64(10)))
+            write(joinpath(src, "gone.txt"), "to-be-deleted")
+            cp(src, dst; force = true)
+            # Sleep past mtime resolution so the rewrite below is detectable
+            # by the size+mtime shortcut. Without this, on fast machines + low-
+            # resolution FSs the rewrite can land in the same mtime tick as cp,
+            # causing the receiver to skip the file (correct per rsync's quick-
+            # check heuristic, but defeats this test's intent).
+            sleep(1.1)
+            # Now diverge: edit one file, remove "gone".
+            write(joinpath(src, "x", "edit.bin"), make_blob(20_000; seed = UInt64(11)))
+            rm(joinpath(src, "gone.txt"))
+            # And add a new file post-clone.
+            write(joinpath(src, "fresh.dat"), make_blob(1_000; seed = UInt64(12)))
+
+            stats = run_sync(src, dst)
+            @test dir_hash(src) == dir_hash(dst)
+            @test stats.deleted == 1
+            # The matched file should have skipped; the new + edited counted.
+            @test stats.written >= 1
+        finally
+            rm(src; recursive=true, force=true)
+            rm(dst; recursive=true, force=true)
+        end
+    end
+
+    @testset "ignores .git/" begin
+        src = mktempdir(); dst = mktempdir()
+        try
+            mkpath(joinpath(src, ".git"))
+            write(joinpath(src, ".git", "HEAD"), "ref: refs/heads/main")
+            write(joinpath(src, "real.txt"), "kept")
+            run_sync(src, dst)
+            @test isfile(joinpath(dst, "real.txt"))
+            @test !isdir(joinpath(dst, ".git"))
+        finally
+            rm(src; recursive=true, force=true)
+            rm(dst; recursive=true, force=true)
+        end
+    end
+
+    @testset "progress callback fires expected stages" begin
+        src = mktempdir(); dst = mktempdir()
+        try
+            write(joinpath(src, "a.bin"), make_blob(5_000))
+            write(joinpath(src, "b.bin"), make_blob(7_000))
+            stages_sender = Symbol[]
+            stages_receiver = Symbol[]
+
+            a, b = pipe_pair()
+            @async (try
+                send_directory(src, a; on_progress = (s, _) -> push!(stages_sender, s))
+            finally
+                close(a)
+            end)
+            receive_directory(dst, b; on_progress = (s, _) -> push!(stages_receiver, s))
+            close(b)
+
+            @test :walk_done       in stages_sender
+            @test :transfer_done   in stages_sender
+            @test :manifest_received in stages_receiver
+            @test :transfer_done    in stages_receiver
+        finally
+            rm(src; recursive=true, force=true)
+            rm(dst; recursive=true, force=true)
+        end
+    end
+
+    @testset "large file (multi-MB) round-trips correctly" begin
+        src = mktempdir(); dst = mktempdir()
+        try
+            write(joinpath(src, "big.bin"), make_blob(2_000_000; seed = UInt64(99)))
+            run_sync(src, dst)
+            @test dir_hash(src) == dir_hash(dst)
+        finally
+            rm(src; recursive=true, force=true)
+            rm(dst; recursive=true, force=true)
+        end
+    end
+end

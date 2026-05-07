@@ -7,7 +7,16 @@ module BonitoWorker
 # Worker has NO inbound listener — no firewall hole on the worker side.
 # Single port to open is on the server (8038), already needed for browsers.
 
-using HTTP, HTTP.WebSockets, JSON, SHA
+using HTTP, HTTP.WebSockets, JSON, RemoteSync
+
+# Lazy: register HTTP.WebSockets with RemoteSync's WebSocketIO on first use.
+const REMOTESYNC_HTTP_REGISTERED = Ref(false)
+function ensure_remotesync_http!()
+    REMOTESYNC_HTTP_REGISTERED[] && return
+    RemoteSync.register_http_websockets!(HTTP.WebSockets)
+    REMOTESYNC_HTTP_REGISTERED[] = true
+    return
+end
 
 # Public entry
 """
@@ -65,9 +74,9 @@ function run_control_session(; server_url, secret, name, mcp_path,
             cmd = JSON.parse(String(frame))
             t = get(cmd, "type", "")
             if t == "open_session"
-                @async handle_open_session(server_url, secret, agent_bin, cmd, ws)
-            elseif t == "open_sync"
-                @async handle_open_sync(server_url, secret, cmd)
+                @async handle_open_session(server_url, secret, agent_bin, cmd)
+            elseif t == "open_transfer"
+                @async handle_open_transfer(server_url, secret, cmd)
             elseif t == "list_dir"
                 @async handle_list_dir(ws, cmd)
             elseif t == "scan_sessions"
@@ -84,10 +93,9 @@ end
 
 # Per-session WS handler
 function handle_open_session(server_url::String, secret::String, agent_bin::String,
-                              cmd::AbstractDict, control_ws)
-    sid        = String(get(cmd, "sid", ""))
-    project_id = String(get(cmd, "project_id", ""))
-    cwd        = String(get(cmd, "cwd", pwd()))
+                              cmd::AbstractDict)
+    sid           = String(get(cmd, "sid", ""))
+    cwd           = String(get(cmd, "cwd", pwd()))
     env_overrides = Dict{String,String}(get(cmd, "env", Dict{String,String}()))
     isempty(sid) && (@error "open_session missing sid"; return)
 
@@ -115,20 +123,11 @@ function handle_open_session(server_url::String, secret::String, agent_bin::Stri
             get(ack, "ok", false) ||
                 error("server rejected ACP session: $(get(ack, "error", "unknown"))")
 
-            # Live worker→server file sync. Each tick computes a snapshot of
-            # `cwd`, diffs against the previous one, and pushes any changes
-            # over the control WS as a {type: "delta"} envelope + tarball.
-            stop_polling = Ref(false)
-            polling_task = isempty(project_id) ? nothing :
-                @async poll_and_push(control_ws, project_id, cwd, stop_polling)
-
             ws_to_proc = @async relay_ws_to_proc(ws, proc)
             proc_to_ws = @async relay_proc_to_ws(proc, ws)
             try
                 wait(ws_to_proc)
             finally
-                stop_polling[] = true
-                polling_task !== nothing && (try wait(polling_task) catch end)
                 try
                     isopen(proc) && kill(proc)
                 catch e
@@ -188,122 +187,47 @@ function handle_list_dir(ws, cmd::AbstractDict)
     end
 end
 
-# Live polling task
-"""
-    poll_and_push(control_ws, project_id, cwd, stop_ref; interval=0.5)
-
-Tick every `interval` seconds. Compute a snapshot of `cwd`, diff against the
-last one, and if anything changed, send a delta envelope over `control_ws`:
-
-    Frame 1 (text):   {"type":"delta","project_id":...,"deletes":[...],"has_payload":bool}
-    Frame 2 (binary): tar.gz of created+modified files (only if has_payload=true)
-"""
-function poll_and_push(control_ws, project_id::String, cwd::String,
-                       stop_ref::Ref{Bool}; interval::Real = 0.5)
-    prev = compute_snapshot(cwd)   # baseline; don't ship the initial state
-    while !stop_ref[]
-        sleep(interval)
-        stop_ref[] && break
-        local cur
-        try
-            cur = compute_snapshot(cwd; prev = prev)
-        catch e
-            @warn "BonitoWorker: snapshot scan failed" cwd exception=e
-            continue
-        end
-        d = diff_snapshots(prev, cur)
-        if isempty(d.created) && isempty(d.modified) && isempty(d.deleted)
-            prev = cur
-            continue
-        end
-        try
-            send_delta(control_ws, project_id, cwd, d)
-        catch e
-            @warn "BonitoWorker: failed to push delta" exception=e
-            # Don't bail — try again next tick.
-        end
-        prev = cur
-    end
-end
-
-function send_delta(control_ws, project_id::String, cwd::String,
-                    d::NamedTuple)
-    changed = vcat(d.created, d.modified)
-    has_payload = !isempty(changed)
-    header = Dict(
-        "type"        => "delta",
-        "project_id"  => project_id,
-        "deletes"     => d.deleted,
-        "has_payload" => has_payload,
-    )
-    WebSockets.send(control_ws, JSON.json(header))
-    if has_payload
-        tmp = tempname() * ".tar.gz"
-        try
-            run(Cmd(`tar -czf $tmp $changed`; dir = cwd))
-            WebSockets.send(control_ws, read(tmp))
-        finally
-            rm(tmp; force = true)
-        end
-    end
-end
-
-# File transport over /worker-sync
-function handle_open_sync(server_url::String, secret::String, cmd::AbstractDict)
+# RemoteSync (librsync) transfer over /transfer-ws.
+#
+# Server sends `{type:"open_transfer", sync_id, direction, src_path or dst_path}`.
+# We dial /transfer-ws on the server, authenticate, and run the matching
+# RemoteSync side. The transfer happens in the @async task spawned by the
+# control loop, so the control WS read-loop continues servicing pings while
+# librsync chews through bytes.
+function handle_open_transfer(server_url::String, secret::String,
+                                cmd::AbstractDict)
     sync_id   = String(get(cmd, "sync_id", ""))
     direction = String(get(cmd, "direction", ""))
-    isempty(sync_id) && (@error "open_sync missing sync_id"; return)
+    isempty(sync_id) && (@error "open_transfer missing sync_id"; return)
 
-    sync_url = ws_url(server_url, "/worker-sync")
+    ensure_remotesync_http!()
+
+    transfer_url = ws_url(server_url, "/transfer-ws")
     try
-        WebSockets.open(sync_url) do ws
+        WebSockets.open(transfer_url) do ws
             WebSockets.send(ws, JSON.json(Dict("secret" => secret, "sync_id" => sync_id)))
             ack = JSON.parse(String(WebSockets.receive(ws)))
             get(ack, "ok", false) ||
-                error("server rejected sync: $(get(ack, "error", "unknown"))")
+                error("server rejected transfer: $(get(ack, "error", "unknown"))")
 
+            wsio = RemoteSync.WebSocketIO(ws)
             if direction == "to_worker"
-                # Server is sending us a tarball; extract into dst_path.
+                # Server is sending; we're the receiver.
                 dst = String(cmd["dst_path"])
-                header = JSON.parse(String(WebSockets.receive(ws)))
-                get(header, "type", "") == "tar" ||
-                    error("expected tar header, got $(get(header, "type", "?"))")
-                data = WebSockets.receive(ws)
-                tmp = tempname() * ".tar.gz"
-                try
-                    write(tmp, data)
-                    mkpath(dst)
-                    run(Cmd(`tar -xzf $tmp`; dir = dst))
-                    WebSockets.send(ws, JSON.json(Dict("ok" => true)))
-                finally
-                    rm(tmp; force = true)
-                end
-                @info "BonitoWorker: sync to_worker complete" dst bytes=length(data)
-
+                mkpath(dst)
+                RemoteSync.receive_directory(dst, wsio)
+                @info "BonitoWorker: transfer to_worker complete" dst
             elseif direction == "from_worker"
-                # Server wants us to tar src_path and stream it back.
                 src = String(cmd["src_path"])
                 isdir(src) || error("src_path is not a directory: $src")
-                tmp = tempname() * ".tar.gz"
-                try
-                    run(Cmd(`tar -czf $tmp .`; dir = src))
-                    data = read(tmp)
-                    WebSockets.send(ws, JSON.json(Dict("type"=>"tar", "size"=>length(data))))
-                    WebSockets.send(ws, data)
-                    ack = JSON.parse(String(WebSockets.receive(ws)))
-                    get(ack, "ok", false) ||
-                        error("server rejected tar: $(get(ack, "error", "unknown"))")
-                finally
-                    rm(tmp; force = true)
-                end
-                @info "BonitoWorker: sync from_worker complete" src
-
+                RemoteSync.send_directory(src, wsio)
+                @info "BonitoWorker: transfer from_worker complete" src
             else
-                error("unknown sync direction: $direction")
+                error("unknown transfer direction: $direction")
             end
         end
     catch e
-        @error "BonitoWorker: sync session error" sync_id direction exception=e
+        @error "BonitoWorker: transfer error" sync_id direction exception=e
     end
 end
 
@@ -353,88 +277,6 @@ function ws_url(http_url::AbstractString, path::AbstractString)
     else
         return http_url * path
     end
-end
-
-# Snapshot + diff (used by both worker poller and server divergence scanner)
-# Snapshot entry: (size, mtime_ns, content_hash). Used as the value of the
-# Dict returned by `compute_snapshot`.
-const FileEntry = Tuple{Int,Float64,Vector{UInt8}}
-
-const SNAPSHOT_IGNORE_DIRS = (".git", ".bonitoTeam")
-
-"""
-    compute_snapshot(root; prev=nothing) → Dict{String,FileEntry}
-
-Walk `root` (skipping .git/ + .bonitoTeam/) and produce {relpath → (size, mtime, sha256)}.
-
-If `prev` is given, files whose `(size, mtime)` are unchanged inherit the old
-content_hash without re-reading the file — keeps the cost of a no-change scan
-to ~one stat() per file.
-"""
-function compute_snapshot(root::AbstractString;
-                          prev::Union{Nothing,Dict{String,FileEntry}} = nothing)
-    files = Dict{String,FileEntry}()
-    isdir(root) || return files
-    for (dir, dirs, fnames) in walkdir(root; topdown = true)
-        filter!(d -> !(d in SNAPSHOT_IGNORE_DIRS), dirs)
-        for fname in fnames
-            full = joinpath(dir, fname)
-            isfile(full) || continue
-            rel = relpath(full, root)
-            st = stat(full)
-            size = Int(st.size)
-            mtime = st.mtime
-            if prev !== nothing && haskey(prev, rel)
-                old_size, old_mtime, old_hash = prev[rel]
-                if old_size == size && old_mtime == mtime
-                    files[rel] = (size, mtime, old_hash)
-                    continue
-                end
-            end
-            files[rel] = (size, mtime, open(SHA.sha256, full))
-        end
-    end
-    return files
-end
-
-"""
-    tree_hash(root) → Vector{UInt8}
-
-Single sha256 over the snapshot — used by the divergence scanner.
-"""
-function tree_hash(root::AbstractString)
-    snap = compute_snapshot(root)
-    h = SHA.SHA256_CTX()
-    for rel in sort!(collect(keys(snap)))
-        size, mtime, content_hash = snap[rel]
-        SHA.update!(h, codeunits(string(rel, "\0", size, "\0", mtime, "\0",
-                                        bytes2hex(content_hash))))
-    end
-    return SHA.digest!(h)
-end
-
-"""
-    diff_snapshots(prev, current) → (created, modified, deleted)
-
-Each return field is a `Vector{String}` of relpaths.
-"""
-function diff_snapshots(prev::Dict{String,FileEntry},
-                        current::Dict{String,FileEntry})
-    created  = String[]
-    modified = String[]
-    deleted  = String[]
-    for (rel, (sz, mt, h)) in current
-        if haskey(prev, rel)
-            _, _, prev_h = prev[rel]
-            prev_h != h && push!(modified, rel)
-        else
-            push!(created, rel)
-        end
-    end
-    for rel in keys(prev)
-        haskey(current, rel) || push!(deleted, rel)
-    end
-    return (created = created, modified = modified, deleted = deleted)
 end
 
 # ── Claude session scanner ─────────────────────────────────────────────────────

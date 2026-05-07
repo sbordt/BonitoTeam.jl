@@ -40,11 +40,19 @@ mutable struct ProjectInfo
     # server, the operator never edits server_path.
     locked_by::Union{String,Nothing}      # worker_name when active, else nothing
     locked_at::Union{DateTime,Nothing}
+    # :unsynced (default for worker-imported projects) — server has no copy.
+    # :syncing — a librsync transfer is in progress.
+    # :synced — last librsync transfer completed successfully; server has a copy.
+    # :stale — was synced once but content has likely diverged since.
+    # Persistence: only :unsynced vs :synced is durable; :syncing always resets
+    # to :stale on restart so a crash mid-sync doesn't leave a wrong "synced".
+    backup_status::Symbol
+    last_sync_at::Union{DateTime,Nothing}
 end
 
 ProjectInfo(id, name, worker_name, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_name, server_path, worker_path, created,
-                nothing, nothing)
+                nothing, nothing, :unsynced, nothing)
 
 const WORKERS = Dict{String,WorkerInfo}()
 const PROJECTS = Dict{String,ProjectInfo}()
@@ -114,7 +122,12 @@ end
 function save_projects!()
     data = [Dict("id" => p.id, "name" => p.name, "worker_name" => p.worker_name,
                  "server_path" => p.server_path, "worker_path" => p.worker_path,
-                 "created" => string(p.created))
+                 "created" => string(p.created),
+                 # `:syncing` is a runtime state — persist as `:stale` so a
+                 # crash mid-sync doesn't leave the next start-up reporting
+                 # "synced" for a half-transferred mirror.
+                 "backup_status" => string(p.backup_status === :syncing ? :stale : p.backup_status),
+                 "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at))
             for p in values(PROJECTS)]
     atomic_write_json(projects_file(), data)
 end
@@ -127,6 +140,10 @@ function load_projects!()
             p = ProjectInfo(d["id"], d["name"], d["worker_name"],
                             d["server_path"], d["worker_path"],
                             DateTime(d["created"]))
+            status_str = String(get(d, "backup_status", "unsynced"))
+            p.backup_status = Symbol(status_str)
+            last = get(d, "last_sync_at", nothing)
+            p.last_sync_at = last === nothing ? nothing : DateTime(String(last))
             PROJECTS[p.id] = p
         catch e
             @warn "skipping malformed project entry" entry=d exception=e
@@ -205,7 +222,7 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
 
     # 2. Push server → worker over the worker's WS (no SSH, no inbound port).
     @info "Pushing project to worker" worker=worker_name dst=worker_path
-    push_dir_to_worker!(worker_name, server_path, worker_path; progress)
+    sync_dir_to_worker!(worker_name, server_path, worker_path; on_progress = progress)
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     PROJECTS[id] = p
@@ -219,13 +236,19 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
 end
 
 """
-Create a project rooted at an existing folder ON THE WORKER. The worker's
-folder stays in place (becomes `worker_path`); we pull a copy to the server
-as the canonical mirror, then start the session like any other project.
+    create_project_from_worker!(srv, worker_name, worker_path; name, sync=false, progress)
+
+Register a project rooted at an existing folder ON THE WORKER. By default
+NO bytes are pulled to the server — the project is immediately usable for
+chat (which only needs `worker_path`), and the operator can later trigger an
+async sync via `sync_project_to_server!` (e.g. the "Sync to server" button on
+the project card or in the chat header menu). Pass `sync=true` to force a
+synchronous pull at create time.
 """
 function create_project_from_worker!(srv::Bonito.Server, worker_name::String,
                                       worker_path::String;
                                       name::String = basename(rstrip(worker_path, '/')),
+                                      sync::Bool = false,
                                       progress = nothing)
     haskey(WORKERS, worker_name) || error("Unknown worker: $worker_name")
     isempty(name) && error("Project name must not be empty (folder has no basename?)")
@@ -235,16 +258,82 @@ function create_project_from_worker!(srv::Bonito.Server, worker_name::String,
 
     id = string(uuid4())[1:8]
     server_path = joinpath(working_dir(), name)
-    @info "Pulling project from worker" worker=worker_name worker_path server_path
-    pull_dir_from_worker!(worker_name, worker_path, server_path; progress)
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     PROJECTS[id] = p
+
+    if sync
+        @info "Pulling project from worker" worker=worker_name worker_path server_path
+        p.backup_status = :syncing
+        try
+            sync_dir_from_worker!(worker_name, worker_path, server_path; on_progress = progress)
+            p.backup_status = :synced
+            p.last_sync_at  = now(UTC)
+        catch e
+            p.backup_status = :unsynced
+            rethrow(e)
+        end
+    else
+        @info "Registering project from worker (no sync)" worker=worker_name worker_path
+    end
+
     save_projects!()
 
     progress === nothing || progress("Starting chat session…")
     ensure_project_session!(p, srv)
     bump_state!()
+    return p
+end
+
+# Triggered by the chat header's "Sync to server" menu item. Looks up the
+# project, runs sync_project_to_server! in a Task, pushes status updates
+# back to the chat's sync_status observable so the menu shows progress
+# without redirecting to the dashboard.
+function handle_chat_sync_click(project_id::AbstractString,
+                                 sync_status::Observable{String})
+    haskey(PROJECTS, project_id) || (sync_status[] = "unknown project"; return)
+    p = PROJECTS[project_id]
+    p.backup_status === :syncing && (sync_status[] = "already syncing…"; return)
+    sync_status[] = "starting…"
+    @async begin
+        try
+            sync_project_to_server!(p;
+                on_progress = msg -> (sync_status[] = msg))
+            sync_status[] = "✓ synced $(Dates.format(p.last_sync_at, "HH:MM:SS")) UTC"
+        catch e
+            sync_status[] = "failed: $(sprint(showerror, e))"
+        end
+    end
+    return
+end
+
+"""
+    sync_project_to_server!(p::ProjectInfo; on_progress=nothing)
+
+Pull the worker's current `worker_path` into the project's server-side
+mirror via librsync. Resumable — only changed bytes go over the wire.
+Updates `p.backup_status` to `:syncing` for the duration, then `:synced`
+on success or `:stale` on failure.
+"""
+function sync_project_to_server!(p::ProjectInfo; on_progress = nothing)
+    haskey(WORKERS, p.worker_name) ||
+        error("Worker '$(p.worker_name)' is not connected")
+    p.backup_status === :syncing &&
+        error("Project '$(p.name)' is already syncing")
+    p.backup_status = :syncing
+    bump_state!()
+    try
+        sync_dir_from_worker!(p.worker_name, p.worker_path, p.server_path;
+                              on_progress = on_progress)
+        p.backup_status = :synced
+        p.last_sync_at  = now(UTC)
+        save_projects!()
+        bump_state!()
+    catch e
+        p.backup_status = :stale
+        bump_state!()
+        rethrow(e)
+    end
     return p
 end
 
@@ -269,7 +358,13 @@ function ensure_project_session!(p::ProjectInfo, srv::Union{Bonito.Server,Nothin
 
     client_factory = on_update -> start_session_on_worker(w.name, p.worker_path;
                                                            on_update, mcp_servers = mcp)
-    app = chat_app(p.server_path; mcp_servers = mcp, client_factory = client_factory)
+    # Ensure server_path exists so BonitoBook (which reads files from cwd to
+    # render the chat notebook + tools) doesn't crash on a never-synced
+    # project. Empty dir is fine; the actual project files live on the worker
+    # and only get pulled here if the user clicks "Sync to server".
+    mkpath(p.server_path)
+    app = chat_app(p.server_path; project_id = p.id,
+                    mcp_servers = mcp, client_factory = client_factory)
 
     PROJECT_APPS[p.id] = app
     if srv !== nothing
@@ -410,8 +505,15 @@ const DashboardStyles = Bonito.Styles(
         "letter-spacing" => "0.02em"),
     CSS(".bt-pill-active",
         "background" => "rgba(16,185,129,0.12)", "color" => "#047857"),
+    CSS(".bt-pill-online",
+        "background" => "rgba(16,185,129,0.12)", "color" => "#047857"),
     CSS(".bt-pill-muted",
         "background" => "var(--bt-surface-2)", "color" => "var(--bt-text-muted)"),
+    CSS(".bt-pill-warn",
+        "background" => "rgba(234,179,8,0.15)", "color" => "#a16207"),
+    CSS(".bt-pill-syncing",
+        "background" => "rgba(59,130,246,0.12)", "color" => "#1d4ed8",
+        "gap" => "6px"),
 
     # ── Buttons ──────────────────────────────────────────────────────────────
     CSS(".bt-btn",
@@ -437,6 +539,8 @@ const DashboardStyles = Bonito.Styles(
         "background" => "var(--bt-surface-2)", "color" => "var(--bt-text)"),
     CSS(".bt-btn-loading",
         "opacity" => "0.7", "cursor" => "wait"),
+    CSS(".bt-btn-sm",
+        "padding" => "3px 9px", "font-size" => "12px"),
 
     # ── Forms ────────────────────────────────────────────────────────────────
     CSS(".bt-form",
@@ -1035,11 +1139,41 @@ function worker_card(w::WorkerInfo, srv_ref::Ref{Bonito.Server},
         class = "bt-card")
 end
 
+# Render a small pill describing the project's backup status. Read at card-
+# render time; the dashboard re-renders on bump_state! whenever sync state
+# changes.
+function backup_pill(p::ProjectInfo)
+    if p.backup_status === :syncing
+        DOM.span(DOM.div(class = "bt-spinner bt-spinner-sm"),
+                 DOM.span("Backing up…");
+                 class = "bt-pill bt-pill-syncing bt-spinner-row",
+                 style = "margin-left:6px",
+                 title = "Project is syncing to server")
+    elseif p.backup_status === :synced
+        last = p.last_sync_at === nothing ? "" :
+               " (last: $(Dates.format(p.last_sync_at, "yyyy-mm-dd HH:MM")) UTC)"
+        DOM.span("backed up"; class = "bt-pill bt-pill-online",
+                 style = "margin-left:6px",
+                 title = "Server has a copy of this project's files$(last)")
+    elseif p.backup_status === :stale
+        DOM.span("stale backup"; class = "bt-pill bt-pill-warn",
+                 style = "margin-left:6px",
+                 title = "Server copy may be out of date — re-sync to refresh")
+    else
+        DOM.span("not backed up"; class = "bt-pill bt-pill-muted",
+                 style = "margin-left:6px",
+                 title = "Server has no copy — chat works directly against the worker")
+    end
+end
+
 # Build a project card. `opening_proj` lets the card show an inline "Opening…"
 # spinner when the user clicks "Open chat" — gives feedback that the click
 # registered, since the chat page itself can take a few seconds to come up.
+# `sync_request` is notified with the project id when the user clicks
+# "Sync to server"; the dashboard handler runs the actual transfer.
 function project_card(p::ProjectInfo, error_obs::Observable{String},
-                       opening_proj::Observable{String})
+                       opening_proj::Observable{String},
+                       sync_request::Observable{String})
     badge = p.locked_by === nothing ? DOM.span() :
         DOM.span("active";
                  class = "bt-pill bt-pill-active",
@@ -1060,9 +1194,26 @@ function project_card(p::ProjectInfo, error_obs::Observable{String},
         class   = "bt-link",
         onclick = js"event => $(opening_proj).notify($(p.id))")
 
+    sync_btn = if p.backup_status === :syncing
+        DOM.span()   # already syncing — pill shows the spinner
+    else
+        label = p.backup_status === :synced ? "Re-sync" : "Sync to server"
+        DOM.span(label;
+            class   = "bt-btn bt-btn-secondary bt-btn-sm",
+            style   = "cursor:pointer;margin-right:8px",
+            # Instant feedback before the WS round-trip lands.
+            onclick = js"""event => {
+                const btn = event.currentTarget;
+                btn.classList.add('bt-clicked');
+                btn.textContent = 'Syncing…';
+                $(sync_request).notify($(p.id));
+            }""")
+    end
+
     DOM.div(
         DOM.div(
-            DOM.div(DOM.span(p.name; class = "bt-card-name"), badge;
+            DOM.div(DOM.span(p.name; class = "bt-card-name"),
+                    badge, backup_pill(p);
                     class = "bt-card-title"),
             DOM.div(
                 DOM.span(p.worker_name),
@@ -1071,7 +1222,7 @@ function project_card(p::ProjectInfo, error_obs::Observable{String},
                          title = "server: $(p.server_path)\nworker: $(p.worker_path)");
                 class = "bt-card-meta");
             class = "bt-card-body"),
-        DOM.div(open_indicator, open_link;
+        DOM.div(sync_btn, open_indicator, open_link;
                 class = "bt-card-actions"),
         class = "bt-card")
 end
@@ -1103,6 +1254,30 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         @async begin
             sleep(3)
             opening_proj[] == pid && (opening_proj[] = "")
+        end
+    end
+
+    # ── Sync-to-server click handler ─────────────────────────────────────────
+    # Fired by the project card's "Sync to server" / "Re-sync" button. The
+    # actual transfer runs in the background; we update busy_msg + bump_state!
+    # so the UI shows the syncing state on the card.
+    sync_request = Observable("")
+    on(sync_request) do pid
+        isempty(pid) && return
+        sync_request[] = ""           # reset so the same card can re-fire
+        haskey(PROJECTS, pid) || return
+        p = PROJECTS[pid]
+        p.backup_status === :syncing && return    # already in flight
+        @async begin
+            try
+                sync_project_to_server!(p;
+                    on_progress = msg -> (busy_msg[] = "Syncing $(p.name): $(msg)"))
+                error_obs[] = ""
+            catch e
+                error_obs[] = "Failed to sync $(p.name): $(sprint(showerror, e))"
+            finally
+                busy_msg[] = ""
+            end
         end
     end
 
@@ -1430,7 +1605,8 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         isempty(PROJECTS) ?
             DOM.div("No projects yet — pick a worker above and click + Project, or import an existing Claude session via Discover.";
                     class = "bt-empty") :
-            DOM.div((project_card(p, error_obs, opening_proj) for p in values(PROJECTS))...)
+            DOM.div((project_card(p, error_obs, opening_proj, sync_request)
+                     for p in values(PROJECTS))...)
     end
 
     proj_form_block = map(new_proj_show) do show

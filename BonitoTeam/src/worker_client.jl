@@ -5,22 +5,35 @@
 # Endpoints (registered as Bonito websocket_route!s):
 #   /worker-ws    → control channel. Worker sends a hello frame; we register
 #                   it in WORKERS, mark online, and keep the WS for sending
-#                   commands like "open_session" back to the worker.
+#                   commands like "open_session" / "open_transfer" back.
 #   /worker-acp   → per-session WS. Worker dials this in response to an
 #                   "open_session" command and identifies the WS by sid; we
 #                   pair it with a Channel that `start_session_on_worker` is
 #                   blocked on.
+#   /transfer-ws  → directional librsync transfer; worker dials this in
+#                   response to an "open_transfer" command; pairs the WS
+#                   with whichever sync_dir_*_worker! call is waiting.
 
-using HTTP, HTTP.WebSockets, JSON, AgentClientProtocol
+using HTTP, HTTP.WebSockets, JSON, AgentClientProtocol, RemoteSync
+
+# Lazily register HTTP.WebSockets with RemoteSync's WebSocketIO so it knows
+# how to recv_frame/send_frame!/is_closed on a live HTTP.WebSocket. Done on
+# first transfer rather than at module load to avoid a circular init.
+const REMOTESYNC_HTTP_REGISTERED = Ref(false)
+function ensure_remotesync_http!()
+    REMOTESYNC_HTTP_REGISTERED[] && return
+    RemoteSync.register_http_websockets!(HTTP.WebSockets)
+    REMOTESYNC_HTTP_REGISTERED[] = true
+    return
+end
 
 # name → live control WS (used by the server to push commands to the worker)
 const WORKER_CONTROL_WS = Dict{String,Any}()
 # sid → Channel{Any} where the matching /worker-acp upgrade hands off the WS
 const PENDING_ACP_SESSIONS = Dict{String,Channel{Any}}()
-# sync_id → Channel{Any} where /worker-sync upgrade hands off the WS for a
-# directional file transfer (server-side counterpart to handle_open_sync on
-# the worker)
-const PENDING_SYNC_SESSIONS = Dict{String,Channel{Any}}()
+# sync_id → Channel{Any} where the /transfer-ws upgrade hands off the WS for
+# a RemoteSync (librsync) directional transfer.
+const PENDING_TRANSFERS = Dict{String,Channel{Any}}()
 # request_id → Channel{Dict} where worker's list_dir_response is handed back
 # to the dashboard task that issued the RPC
 const PENDING_LIST_DIR = Dict{String,Channel{Dict}}()
@@ -106,11 +119,7 @@ function handle_worker_control(ws, worker_secret::String)
             try
                 cmd = JSON.parse(String(frame))
                 t = get(cmd, "type", "")
-                if t == "delta"
-                    payload = get(cmd, "has_payload", false) ?
-                                  WebSockets.receive(ws) : UInt8[]
-                    apply_worker_delta!(cmd, payload)
-                elseif t == "list_dir_response"
+                if t == "list_dir_response"
                     rid = String(get(cmd, "request_id", ""))
                     if haskey(PENDING_LIST_DIR, rid)
                         ch = pop!(PENDING_LIST_DIR, rid)
@@ -149,11 +158,11 @@ function handle_worker_control(ws, worker_secret::String)
     end
 end
 
-# Handler for /worker-sync — one invocation per directional file transfer.
-# Worker dials this in response to an `open_sync` command on the control WS.
-# Pairs the WS with a Channel that `push_dir_to_worker!` / `pull_dir_from_worker!`
-# is blocked on.
-function handle_worker_sync(ws, worker_secret::String)
+# Handler for /transfer-ws — one invocation per directional RemoteSync transfer.
+# Worker (from inside its Malt subprocess) dials this in response to an
+# `open_transfer` command on the control WS. We hand the live WS to the
+# orchestrator task that called sync_dir_to_worker!/sync_dir_from_worker!.
+function handle_transfer_ws(ws, worker_secret::String)
     auth_raw = WebSockets.receive(ws)
     auth = JSON.parse(String(auth_raw))
     if get(auth, "secret", "") != worker_secret
@@ -165,11 +174,9 @@ function handle_worker_sync(ws, worker_secret::String)
         try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"missing sync_id"))) catch end
         return
     end
-    # Race-tolerant pop: pending entry may have already been evicted by
-    # take_pending!'s timeout. Single pop! both checks + removes atomically.
     ch = nothing
     try
-        ch = pop!(PENDING_SYNC_SESSIONS, sync_id)
+        ch = pop!(PENDING_TRANSFERS, sync_id)
     catch e
         e isa KeyError || rethrow()
         try WebSockets.send(ws, JSON.json(Dict("ok"=>false,
@@ -179,10 +186,11 @@ function handle_worker_sync(ws, worker_secret::String)
     WebSockets.send(ws, JSON.json(Dict("ok" => true)))
     put!(ch, ws)
 
-    # Block here so Bonito holds the WS open while the orchestrator drives
-    # the transfer via the same `ws` reference.
+    # Hold the WS open for the duration of the transfer. The orchestrator
+    # task is reading/writing through it on the same process; we just need
+    # to keep Bonito from tearing down the underlying connection.
     while !WebSockets.isclosed(ws)
-        sleep(0.5)
+        sleep(1)
     end
 end
 
@@ -286,50 +294,52 @@ end
 
 # File transport over WS
 
-"""
-    push_dir_to_worker!(worker_name, src, dst)
+# RemoteSync transfer (librsync-based, IO-streamed over /transfer-ws).
+# Both directions share the same orchestration: we generate a sync_id, tell
+# the worker to dial in (the worker side spawns its own Malt subprocess so
+# the librsync work doesn't pin the worker's ACP relay loop), wait for the
+# WS handoff, then run the matching RemoteSync side here in a Task.
+#
+# The server side runs in-process (Task) rather than its own subprocess: the
+# work is interleaved with WS reads/writes (which yield) and per-file IO
+# (which yields), so the main task's heartbeat loop stays responsive even on
+# multi-GB transfers.
 
-Tar `src` on the server, stream it to the worker over a /worker-sync WS, and
-have the worker extract into `dst`.
 """
-function push_dir_to_worker!(worker_name::String, src::String, dst::String;
+    sync_dir_to_worker!(worker_name, src, dst; on_progress=nothing)
+
+Send the contents of server-side `src` to worker-side `dst` via librsync.
+Resumable: subsequent calls compute deltas against the worker's existing
+files, so unchanged content isn't retransmitted.
+"""
+function sync_dir_to_worker!(worker_name::String, src::String, dst::String;
                               handoff_timeout::Real = 30.0,
-                              progress = nothing)
+                              on_progress = nothing)
     isdir(src) || error("Source path is not a directory: $src")
     haskey(WORKER_CONTROL_WS, worker_name) ||
         error("Worker '$worker_name' is not connected")
+    ensure_remotesync_http!()
 
     sync_id = string(uuid4())
     ch = Channel{Any}(1)
-    PENDING_SYNC_SESSIONS[sync_id] = ch
+    PENDING_TRANSFERS[sync_id] = ch
 
-    progress === nothing || progress("Connecting to worker…")
+    notify_str(on_progress, "Connecting to worker…")
     send_command(worker_name, Dict(
-        "type"      => "open_sync",
+        "type"      => "open_transfer",
         "sync_id"   => sync_id,
         "direction" => "to_worker",
         "dst_path"  => dst,
     ))
 
-    ws = take_pending!(ch, PENDING_SYNC_SESSIONS, sync_id, handoff_timeout,
-                      "push to '$worker_name'")
+    ws = take_pending!(ch, PENDING_TRANSFERS, sync_id, handoff_timeout,
+                      "sync to '$worker_name'")
     try
-        tmp = tempname() * ".tar.gz"
-        try
-            progress === nothing || progress("Tarring source…")
-            run(Cmd(`tar -czf $tmp .`; dir = src))
-            data = read(tmp)
-            progress === nothing || progress("Sending $(format_bytes(length(data))) to worker…")
-            WebSockets.send(ws, JSON.json(Dict("type"=>"tar", "size"=>length(data))))
-            WebSockets.send(ws, data)
-            progress === nothing || progress("Worker extracting…")
-            ack = JSON.parse(String(WebSockets.receive(ws)))
-            get(ack, "ok", false) ||
-                error("worker rejected sync: $(get(ack, "error", "unknown"))")
-            progress === nothing || progress("Done")
-        finally
-            rm(tmp; force = true)
-        end
+        notify_str(on_progress, "Streaming via librsync…")
+        wsio = RemoteSync.WebSocketIO(ws)
+        RemoteSync.send_directory(src, wsio;
+            on_progress = (stage, info) -> remotesync_progress(on_progress, stage, info))
+        notify_str(on_progress, "Done")
     finally
         try close(ws) catch end
     end
@@ -337,55 +347,72 @@ function push_dir_to_worker!(worker_name::String, src::String, dst::String;
 end
 
 """
-    pull_dir_from_worker!(worker_name, src, dst)
+    sync_dir_from_worker!(worker_name, src, dst; on_progress=nothing)
 
-Inverse of `push_dir_to_worker!` — tells the worker to tar `src` (its path)
-and stream it back; we extract into `dst` (server path).
+Inverse: receive worker-side `src` into server-side `dst` via librsync.
+Resumable in the same way as `sync_dir_to_worker!`.
 """
-function pull_dir_from_worker!(worker_name::String, src::String, dst::String;
+function sync_dir_from_worker!(worker_name::String, src::String, dst::String;
                                 handoff_timeout::Real = 30.0,
-                                progress = nothing)
+                                on_progress = nothing)
     haskey(WORKER_CONTROL_WS, worker_name) ||
         error("Worker '$worker_name' is not connected")
+    ensure_remotesync_http!()
     mkpath(dst)
 
     sync_id = string(uuid4())
     ch = Channel{Any}(1)
-    PENDING_SYNC_SESSIONS[sync_id] = ch
+    PENDING_TRANSFERS[sync_id] = ch
 
-    progress === nothing || progress("Connecting to worker…")
+    notify_str(on_progress, "Connecting to worker…")
     send_command(worker_name, Dict(
-        "type"      => "open_sync",
+        "type"      => "open_transfer",
         "sync_id"   => sync_id,
         "direction" => "from_worker",
         "src_path"  => src,
     ))
 
-    ws = take_pending!(ch, PENDING_SYNC_SESSIONS, sync_id, handoff_timeout,
-                      "pull from '$worker_name'")
+    ws = take_pending!(ch, PENDING_TRANSFERS, sync_id, handoff_timeout,
+                      "sync from '$worker_name'")
     try
-        progress === nothing || progress("Worker tarring source…")
-        header = JSON.parse(String(WebSockets.receive(ws)))
-        get(header, "type", "") == "tar" ||
-            error("worker sent unexpected sync frame: $(get(header, "type", "?"))")
-        progress === nothing || progress("Receiving $(format_bytes(get(header, "size", 0)))…")
-        data = WebSockets.receive(ws)
-        tmp  = tempname() * ".tar.gz"
-        try
-            progress === nothing || progress("Extracting on server…")
-            write(tmp, data)
-            mkpath(dst)
-            run(Cmd(`tar -xzf $tmp`; dir = dst))
-            WebSockets.send(ws, JSON.json(Dict("ok" => true)))
-            progress === nothing || progress("Done")
-        finally
-            rm(tmp; force = true)
-        end
+        notify_str(on_progress, "Streaming via librsync…")
+        wsio = RemoteSync.WebSocketIO(ws)
+        RemoteSync.receive_directory(dst, wsio;
+            on_progress = (stage, info) -> remotesync_progress(on_progress, stage, info))
+        notify_str(on_progress, "Done")
     finally
         try close(ws) catch end
     end
     return nothing
 end
+
+# Translate RemoteSync's structured progress events into the human-readable
+# strings the dashboard busy_msg observable shows.
+function remotesync_progress(cb, stage::Symbol, info)
+    cb === nothing && return
+    msg = if stage === :walk_done
+        "Scanning files: $(info.count) found"
+    elseif stage === :manifest_received
+        "Receiving manifest: $(info.count) files"
+    elseif stage === :plan_received
+        "Planning: $(info.work) of $(info.planned) need transfer"
+    elseif stage === :file_start
+        "Sending $(info.idx)/$(info.total): $(info.rel)"
+    elseif stage === :apply_start
+        "Receiving $(info.idx)/$(info.total): $(info.rel)"
+    elseif stage === :transfer_done
+        haskey(info, :written) ?
+            "Transfer complete: $(info.written) wrote, $(info.deleted) deleted, $(info.skipped) skipped" :
+            "Transfer complete: $(info.files) files"
+    else
+        nothing
+    end
+    msg === nothing || notify_str(cb, msg)
+    return
+end
+
+notify_str(::Nothing, _msg::AbstractString) = nothing
+notify_str(cb, msg::AbstractString) = (try cb(msg) catch end; nothing)
 
 # Human-readable byte counts used by the progress callbacks above.
 function format_bytes(n::Integer)
@@ -447,39 +474,6 @@ function scan_worker_sessions(worker_name::String; timeout::Real = 15.0)
         end
     end
     return take!(ch)
-end
-
-"""
-Apply a delta sent from a worker to the corresponding project's server_path.
-The delta envelope identifies the project by id; payload (if any) is a tar.gz
-of created+modified files.
-"""
-function apply_worker_delta!(cmd::AbstractDict, payload::AbstractVector{UInt8})
-    project_id = String(get(cmd, "project_id", ""))
-    haskey(PROJECTS, project_id) || (@warn "delta for unknown project" project_id; return)
-    p = PROJECTS[project_id]
-
-    if !isempty(payload)
-        tmp = tempname() * ".tar.gz"
-        try
-            write(tmp, payload)
-            mkpath(p.server_path)
-            run(Cmd(`tar -xzf $tmp`; dir = p.server_path))
-        finally
-            rm(tmp; force = true)
-        end
-    end
-
-    for rel in get(cmd, "deletes", [])
-        full = joinpath(p.server_path, String(rel))
-        try
-            isfile(full) && rm(full)
-        catch e
-            @warn "delta delete failed" path=full exception=e
-        end
-    end
-
-    return nothing
 end
 
 # Build an AgentClientProtocol.Connection backed by a WebSocket. Each ACP

@@ -29,8 +29,10 @@ Routes:
   /p/<project_id>         — chat UI for one project
   /install.sh             — worker installer (curl-pipeable)
   /worker/bundle.tar.gz   — package files the installer downloads
-  /worker-ws  (WS)        — control channel each worker holds open after install
-  /worker-acp (WS)        — per-session ACP relay; one connection per project session
+  /worker-ws    (WS)      — control channel each worker holds open after install
+  /worker-acp   (WS)      — per-session ACP relay; one connection per project session
+  /transfer-ws  (WS)      — librsync directional transfer; dialed on demand by a
+                            worker in response to an `open_transfer` command
 
 `worker_secret` is the shared secret used by every worker. `public_url` is the
 base URL workers see (and what the install script tells them to dial back).
@@ -103,7 +105,7 @@ function add_worker_ws_routes!(srv::Bonito.Server, worker_secret::String)
     Bonito.HTTPServer.websocket_route!(srv, "/worker-acp" => function(_ctx, ws)
         handle_worker_acp(ws, worker_secret)
     end)
-    Bonito.HTTPServer.websocket_route!(srv, "/worker-sync" => function(_ctx, ws)
-        handle_worker_sync(ws, worker_secret)
+    Bonito.HTTPServer.websocket_route!(srv, "/transfer-ws" => function(_ctx, ws)
+        handle_transfer_ws(ws, worker_secret)
     end)
 end

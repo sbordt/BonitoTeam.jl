@@ -347,6 +347,7 @@ end
 
 # Chat app
 function chat_app(cwd::String;
+                  project_id::String = "",
                   mcp_servers    = AgentClientProtocol.MCPServer[],
                   client_factory = nothing)
     chat_session = load_session(cwd)
@@ -679,16 +680,89 @@ function chat_app(cwd::String;
                 class = "bt-banner-error")
         end
 
+        # Top-left chat menu. JS-only popover so we don't burn an extra
+        # observable trip just to toggle visibility. Items use observables
+        # (sync_click, etc.) for the actual actions.
+        sync_click  = Observable("")
+        sync_status = Observable("")    # human-readable status line for the menu
+        on(sync_click) do tag
+            isempty(tag) && return
+            sync_click[] = ""
+            isempty(project_id) && (sync_status[] = "no project bound"; return)
+            handle_chat_sync_click(project_id, sync_status)
+        end
+
+        menu_block = DOM.div(
+            DOM.button("☰";
+                class = "bt-header-back",
+                title = "Project menu",
+                onclick = js"""event => {
+                    const m = event.currentTarget.nextElementSibling;
+                    m.classList.toggle('bt-menu-open');
+                    event.stopPropagation();
+                }"""),
+            DOM.div(
+                DOM.div("Sync to server";
+                    class = "bt-menu-item",
+                    onclick = js"""event => {
+                        event.currentTarget.closest('.bt-menu')
+                                            .classList.remove('bt-menu-open');
+                        $(sync_click).notify('sync');
+                    }"""),
+                DOM.a("Open dashboard"; href = Bonito.Link("/"),
+                       class = "bt-menu-item",
+                       target = "_blank"),
+                map(sync_status) do msg
+                    isempty(msg) ? DOM.div() :
+                        DOM.div(msg;
+                                class = "bt-menu-status",
+                                style = "padding:6px 12px;font-size:12px;color:var(--bt-text-muted)")
+                end;
+                class = "bt-menu");
+            class = "bt-header-menu",
+            # Click-outside-to-close: a single document-level listener that
+            # closes any open .bt-menu when the click isn't inside one.
+            onclick = js"event => event.stopPropagation()")
+
         DOM.div(
             ChatStyles,
             BonitoTeamJS,
             Bonito.MarkdownCSS,
+            DOM.style("""
+                .bt-header-menu { position: relative; display: inline-block; }
+                .bt-menu {
+                    position: absolute; left: 0; top: calc(100% + 4px);
+                    min-width: 200px;
+                    background: var(--bt-surface, #fff);
+                    border: 1px solid var(--bt-border, #e5e7eb);
+                    border-radius: 8px;
+                    box-shadow: 0 4px 16px rgba(0,0,0,0.08);
+                    padding: 4px 0;
+                    display: none;
+                    z-index: 100;
+                }
+                .bt-menu.bt-menu-open { display: block; }
+                .bt-menu-item {
+                    display: block; padding: 8px 12px;
+                    cursor: pointer; color: var(--bt-text, #111827);
+                    text-decoration: none; font-size: 13px;
+                }
+                .bt-menu-item:hover { background: var(--bt-surface-2, #f3f4f6); }
+            """),
+            DOM.script(js"""
+                // Click anywhere outside the menu closes it.
+                document.addEventListener('click', () => {
+                    document.querySelectorAll('.bt-menu.bt-menu-open')
+                            .forEach(m => m.classList.remove('bt-menu-open'));
+                });
+            """),
             # Live WS-connection indicator (fixed top-right corner).
             Bonito.ConnectionIndicator(),
             DOM.div(
                 DOM.div(
                     DOM.a("←"; href = Bonito.Link("/"), class = "bt-header-back",
                            title = "Back to dashboard"),
+                    menu_block,
                     status_dot,
                     DOM.div(
                         DOM.span(basename(rstrip(cwd, '/'))),

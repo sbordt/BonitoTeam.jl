@@ -1,0 +1,265 @@
+# Directory-level sync orchestrating the wire protocol from wire.jl with the
+# librsync primitives from primitives.jl. One side calls `send_directory`,
+# the other calls `receive_directory`. Both sides share the same `transport`
+# (a single bidirectional IO; can be a Pipe, a WebSocketIO, an IOBuffer pair
+# bridged with a background task, anything).
+
+const SNAPSHOT_IGNORE_DIRS = Set([".git", ".bonitoTeam"])
+
+"""
+    walk_directory(root) → Vector{ManifestEntry}
+
+Walk `root` and produce a stable, sorted manifest. Skips `.git/` and
+`.bonitoTeam/`. Paths in the manifest use forward slashes regardless of the
+host OS so the wire protocol is portable.
+"""
+function walk_directory(root::AbstractString)
+    out = ManifestEntry[]
+    isdir(root) || return out
+    for (dir, dirs, files) in walkdir(root; topdown = true)
+        filter!(d -> !(d in SNAPSHOT_IGNORE_DIRS), dirs)
+        for f in files
+            full = joinpath(dir, f)
+            isfile(full) || continue
+            rel = relpath(full, root)
+            Sys.iswindows() && (rel = replace(rel, '\\' => '/'))
+            st  = stat(full)
+            push!(out, ManifestEntry(String(rel), UInt64(st.size), Float64(st.mtime)))
+        end
+    end
+    sort!(out; by = e -> e.rel)
+    return out
+end
+
+# ── Receiver helpers ───────────────────────────────────────────────────────
+# Decide what to do with each entry the sender announced + which local files
+# should be deleted. The plan is what we ask the sender to send back to us.
+function build_plan(local_root::AbstractString,
+                    remote_manifest::Vector{ManifestEntry})
+    plan = PlanEntry[]
+    remote_set = Set(e.rel for e in remote_manifest)
+
+    for e in remote_manifest
+        local_path = joinpath(local_root, e.rel)
+        if !isfile(local_path)
+            push!(plan, PlanEntry(e.rel, ACTION_FULL, UInt8[]))
+            continue
+        end
+        st = stat(local_path)
+        # Same heuristic as rsync's --size-only-with-1s-modify-window: matching
+        # size + mtime (within ~1ms) is treated as identical. The 1ms tolerance
+        # absorbs Float64 precision loss in the stat→wire→utimes→stat round-trip
+        # (ns precision can't survive Float64 at modern Unix epoch values).
+        if UInt64(st.size) == e.size && abs(Float64(st.mtime) - e.mtime) < 0.001
+            push!(plan, PlanEntry(e.rel, ACTION_SKIP, UInt8[]))
+            continue
+        end
+        sig = full_signature_bytes(local_path)
+        push!(plan, PlanEntry(e.rel, ACTION_PATCH, sig))
+    end
+
+    # Anything local but not in remote → delete.
+    for (dir, dirs, files) in walkdir(local_root; topdown = true)
+        filter!(d -> !(d in SNAPSHOT_IGNORE_DIRS), dirs)
+        for f in files
+            full = joinpath(dir, f)
+            rel = relpath(full, local_root)
+            Sys.iswindows() && (rel = replace(rel, '\\' => '/'))
+            in(String(rel), remote_set) || push!(plan,
+                PlanEntry(String(rel), ACTION_DELETE, UInt8[]))
+        end
+    end
+    return plan
+end
+
+# ── Public: sender side ────────────────────────────────────────────────────
+"""
+    send_directory(root, transport::IO; on_progress = nothing)
+
+Send `root` over `transport`. The receiver on the other end of `transport`
+must be running `receive_directory`. Returns when the transfer completes.
+
+`on_progress` is an optional callback `(stage::Symbol, info::NamedTuple) -> Any`
+invoked at: `:walk_done`, `:plan_received`, `:file_start`, `:file_done`,
+`:transfer_done`. Useful for driving a UI progress bar without polling.
+"""
+function send_directory(root::AbstractString, transport::IO;
+                        on_progress = nothing)
+    notify_progress(on_progress, :walk_start, (root = root,))
+    manifest = walk_directory(root)
+    notify_progress(on_progress, :walk_done, (count = length(manifest),))
+
+    write_frame(transport, TAG_MANIFEST, encode_manifest(manifest))
+
+    tag, payload = read_frame(transport)
+    tag == TAG_PLAN || error("RemoteSync sender: expected PLAN, got tag $(tag)")
+    plan = decode_plan(payload)
+    work = filter(p -> p.action == ACTION_FULL || p.action == ACTION_PATCH, plan)
+    notify_progress(on_progress, :plan_received,
+                    (planned = length(plan), work = length(work)))
+
+    for (i, p) in pairs(work)
+        local_path = joinpath(root, p.rel)
+        notify_progress(on_progress, :file_start,
+                        (rel = p.rel, idx = i, total = length(work),
+                         action = p.action == ACTION_FULL ? :full : :patch))
+
+        delta_buf = IOBuffer()
+        if p.action == ACTION_FULL
+            # No basis on receiver — emit a delta against an empty signature
+            # so the receiver can use the same apply_patch path uniformly.
+            empty_sig = IOBuffer()
+            empty_basis = IOBuffer(UInt8[])
+            compute_signature(empty_basis, empty_sig)
+            seekstart(empty_sig)
+            open(local_path, "r") do io
+                compute_delta(empty_sig, io, delta_buf)
+            end
+        else
+            sig_in = IOBuffer(p.sig)
+            open(local_path, "r") do io
+                compute_delta(sig_in, io, delta_buf)
+            end
+        end
+
+        write_frame(transport, TAG_DELTA, encode_delta_frame(p.rel, take!(delta_buf)))
+
+        # Wait for the receiver's OK so we keep things synchronous + bound the
+        # in-flight queue (otherwise a slow receiver would balloon memory).
+        ack_tag, _ = read_frame(transport)
+        ack_tag == TAG_OK || error("RemoteSync sender: expected OK after $(p.rel), got $(ack_tag)")
+        notify_progress(on_progress, :file_done, (rel = p.rel, idx = i, total = length(work)))
+    end
+
+    write_frame(transport, TAG_DONE)
+    notify_progress(on_progress, :transfer_done, (files = length(manifest),))
+    return nothing
+end
+
+# ── Public: receiver side ──────────────────────────────────────────────────
+"""
+    receive_directory(root, transport::IO; on_progress = nothing) → Stats
+
+Receive into `root` over `transport`. Atomic per-file writes (`<rel>.partial`
+then `mv`) so a transport crash mid-file leaves the prior version intact.
+
+Returns a NamedTuple `(written, deleted, skipped)` with file counts.
+"""
+function receive_directory(root::AbstractString, transport::IO;
+                           on_progress = nothing)
+    mkpath(root)
+    notify_progress(on_progress, :wait_manifest, NamedTuple())
+
+    tag, payload = read_frame(transport)
+    tag == TAG_MANIFEST ||
+        error("RemoteSync receiver: expected MANIFEST, got tag $(tag)")
+    manifest = decode_manifest(payload)
+    notify_progress(on_progress, :manifest_received, (count = length(manifest),))
+
+    plan = build_plan(root, manifest)
+    write_frame(transport, TAG_PLAN, encode_plan(plan))
+
+    skipped = count(p -> p.action == ACTION_SKIP, plan)
+    written = 0
+    deleted = 0
+
+    expected = filter(p -> p.action == ACTION_FULL || p.action == ACTION_PATCH, plan)
+    by_rel   = Dict(e.rel => e for e in manifest)
+    for (i, p) in pairs(expected)
+        tag2, pl = read_frame(transport)
+        tag2 == TAG_DELTA ||
+            error("RemoteSync receiver: expected DELTA, got tag $(tag2)")
+        rel, delta = decode_delta_frame(pl)
+        rel == p.rel || error("RemoteSync receiver: delta order mismatch ($(rel) vs $(p.rel))")
+
+        notify_progress(on_progress, :apply_start,
+                        (rel = rel, idx = i, total = length(expected)))
+
+        dst = joinpath(root, rel)
+        mkpath(dirname(dst))
+        partial = dst * ".partial"
+        try
+            open(partial, "w") do out_io
+                if p.action == ACTION_FULL
+                    # Need a seekable basis even though it's empty.
+                    apply_patch(IOBuffer(UInt8[]), IOBuffer(delta), out_io)
+                else
+                    open(dst, "r") do basis_io
+                        apply_patch(basis_io, IOBuffer(delta), out_io)
+                    end
+                end
+            end
+            mv(partial, dst; force = true)
+        catch
+            isfile(partial) && rm(partial; force = true)
+            rethrow()
+        end
+
+        # Set mtime to the source's so the next-run shortcut (size+mtime ⇒ skip)
+        # actually fires.
+        if haskey(by_rel, rel)
+            try
+                touch_mtime(dst, by_rel[rel].mtime)
+            catch
+                # touch_mtime is a best-effort optimisation; failing it
+                # only costs us an extra rsync round-trip next time.
+            end
+        end
+
+        written += 1
+        write_frame(transport, TAG_OK)
+        notify_progress(on_progress, :apply_done,
+                        (rel = rel, idx = i, total = length(expected)))
+    end
+
+    # Wait for sender's DONE before applying deletes so a sender crash mid-stream
+    # doesn't leave us with a destructive delete pass executed against a partial
+    # transfer.
+    tag3, _ = read_frame(transport)
+    tag3 == TAG_DONE ||
+        error("RemoteSync receiver: expected DONE, got tag $(tag3)")
+
+    for p in plan
+        p.action == ACTION_DELETE || continue
+        full = joinpath(root, p.rel)
+        try
+            isfile(full) && (rm(full); deleted += 1)
+        catch e
+            @warn "RemoteSync receiver: failed to delete" path=full exception=e
+        end
+    end
+
+    notify_progress(on_progress, :transfer_done,
+                    (written = written, deleted = deleted, skipped = skipped))
+    return (written = written, deleted = deleted, skipped = skipped)
+end
+
+# Set the mtime of `path` to `mtime_secs` (Unix epoch seconds, fractional OK).
+# Direct utimes(2) ccall — sets both atime + mtime to the same value. Linux/
+# macOS only; on Windows the next-run shortcut (size+mtime ⇒ skip) just won't
+# fire and we'll re-compute deltas (correct, slightly slower).
+function touch_mtime(path::AbstractString, mtime_secs::Float64)
+    Sys.iswindows() && return nothing
+    sec  = floor(Int64, mtime_secs)
+    usec = floor(Int64, (mtime_secs - sec) * 1e6)
+    times = Int64[sec, usec, sec, usec]
+    GC.@preserve times begin
+        r = ccall(:utimes, Cint, (Cstring, Ptr{Int64}), path, pointer(times))
+    end
+    r == 0 || Base.systemerror("utimes")
+    return nothing
+end
+
+# ── Progress callback dispatch ─────────────────────────────────────────────
+# `nothing` is used as the no-op callback; anything else is invoked. Argument
+# types are fully constrained so dispatch is unambiguous regardless of the
+# concrete NamedTuple type passed for `info`.
+notify_progress(::Nothing, ::Symbol, ::Any) = nothing
+function notify_progress(cb, stage::Symbol, info)
+    try
+        cb(stage, info)
+    catch e
+        @warn "RemoteSync: progress callback threw" stage exception=e
+    end
+    return nothing
+end

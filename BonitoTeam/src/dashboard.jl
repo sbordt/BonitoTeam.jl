@@ -68,7 +68,30 @@ const PROJECT_APPS = Dict{String,Bonito.App}()
 
 # Observable; bumped whenever WORKERS or PROJECTS changes so the dashboard re-renders.
 const STATE_VERSION = Observable(0)
-bump_state!() = (STATE_VERSION[] = STATE_VERSION[] + 1)
+# Setting an Observable propagates to the browser via Bonito's WebSocket;
+# if a session is broken (e.g. a stale tab whose hashed asset URLs went 404
+# after a redeploy), Bonito surfaces that as a JSException from the
+# observable update. We don't want a stale UI tab to break server-side
+# operations, so this swallows + logs the error rather than propagating it.
+function bump_state!()
+    try
+        STATE_VERSION[] = STATE_VERSION[] + 1
+    catch e
+        @debug "bump_state!: observable propagation failed (likely stale browser session)" exception=e
+    end
+    return nothing
+end
+
+# Same shape, for any observable update we want to be best-effort. Use this
+# wherever a UI tick should never block server-side work.
+function safe_set!(obs::Observable, val)
+    try
+        obs[] = val
+    catch e
+        @debug "safe_set!: observable propagation failed (likely stale browser session)" exception=e
+    end
+    return nothing
+end
 
 # Persistence
 # Atomic JSON write: serialise to a sibling .tmp first, then rename into place.
@@ -310,17 +333,20 @@ end
 # without redirecting to the dashboard.
 function handle_chat_sync_click(project_id::AbstractString,
                                  sync_status::Observable{String})
-    haskey(PROJECTS, project_id) || (sync_status[] = "unknown project"; return)
+    haskey(PROJECTS, project_id) || (safe_set!(sync_status, "unknown project"); return)
     p = PROJECTS[project_id]
-    p.backup_status === :syncing && (sync_status[] = "already syncing…"; return)
-    sync_status[] = "starting…"
+    p.backup_status === :syncing && (safe_set!(sync_status, "already syncing…"); return)
+    safe_set!(sync_status, "starting…")
     @async begin
         try
             sync_project_to_server!(p;
-                on_progress = msg -> (sync_status[] = msg))
-            sync_status[] = "✓ synced $(Dates.format(p.last_sync_at, "HH:MM:SS")) UTC"
+                on_progress = msg -> safe_set!(sync_status, msg))
+            safe_set!(sync_status,
+                "✓ synced $(Dates.format(p.last_sync_at, "HH:MM:SS")) UTC")
         catch e
-            sync_status[] = "failed: $(sprint(showerror, e))"
+            bt = catch_backtrace()
+            @warn "handle_chat_sync_click failed" project=p.name exception=(e, bt)
+            safe_set!(sync_status, "failed: $(sprint(showerror, e))")
         end
     end
     return
@@ -1293,13 +1319,21 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         p.backup_status === :syncing && return    # already in flight
         @async begin
             try
+                # safe_set! on busy_msg: a JS hiccup updating the toast must
+                # not abort the in-flight transfer.
                 sync_project_to_server!(p;
-                    on_progress = msg -> (busy_msg[] = "Syncing $(p.name): $(msg)"))
-                error_obs[] = ""
+                    on_progress = msg -> safe_set!(busy_msg, "Syncing $(p.name): $(msg)"))
+                safe_set!(error_obs, "")
             catch e
-                error_obs[] = "Failed to sync $(p.name): $(sprint(showerror, e))"
+                # Log the full backtrace server-side so the next time we
+                # diagnose a failure, we know which call raised. The toast
+                # itself only shows the short message.
+                bt = catch_backtrace()
+                @warn "sync_project_to_server! failed" project=p.name exception=(e, bt)
+                safe_set!(error_obs,
+                    "Failed to sync $(p.name): $(sprint(showerror, e))")
             finally
-                busy_msg[] = ""
+                safe_set!(busy_msg, "")
             end
         end
     end

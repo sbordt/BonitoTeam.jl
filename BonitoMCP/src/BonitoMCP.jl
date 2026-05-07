@@ -34,7 +34,7 @@ function register!(name::AbstractString, description::AbstractString,
 end
 
 include("server.jl")
-include("output_discipline.jl")
+include("session.jl")          # JuliaSession + SessionManager (subprocess-per-env)
 include("tools/eval.jl")
 
 end # module BonitoMCP

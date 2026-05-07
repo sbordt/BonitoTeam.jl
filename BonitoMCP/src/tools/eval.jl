@@ -1,129 +1,83 @@
-# Persistent-session Julia eval tool with output discipline.
-# Multiple sessions keyed by env_path, lazily started.
+# MCP tool registrations: bt_julia_eval, bt_julia_restart, bt_julia_list_sessions.
+# Architecture: each env_path gets a `julia -i` subprocess managed by
+# SessionManager (see session.jl). Output discipline (truncation, structured
+# blocks, container summarisation, image detection, backtrace trim,
+# nothing-suppression) lives in helper_payload.jl which is `include`d into
+# every subprocess on startup.
 
-import Pkg
-
-# Per-session anonymous module + (optional) Pkg env
-const SESSIONS = Dict{String,Module}()
-
-function _session_for(env_path::Union{Nothing,AbstractString})
-    key = something(env_path, "<temp>")
-    if !haskey(SESSIONS, key)
-        m = Module(Symbol("MCPSession_", replace(string(hash(key)), "-" => "_")))
-        # Make Base + Core available in the session
-        Core.eval(m, :(using Base))
-        if env_path !== nothing && isdir(env_path)
-            Pkg.activate(env_path; io = devnull)
-        end
-        SESSIONS[key] = m
-    end
-    return SESSIONS[key]
-end
-
-# redirect_stdout requires a Pipe / IOStream / DevNull (NOT IOBuffer). Capture
-# both stdout and stderr from `f()` and return (val, error_text, captured_text).
-function _eval_with_capture(sess::Module, code::AbstractString)
-    pipe = Pipe()
-    Base.link_pipe!(pipe; reader_supports_async = true, writer_supports_async = true)
-    old_stdout = stdout
-    old_stderr = stderr
-    val = nothing
-    err_text = nothing
-
-    # Reader runs concurrently so the pipe never fills up
-    reader = @async read(pipe, String)
-
-    redirect_stdout(pipe.in)
-    redirect_stderr(pipe.in)
-    try
-        val = include_string(sess, code, "mcp_eval")
-    catch e
-        err_text = sprint() do io
-            showerror(io, e)
-            println(io)
-            Base.show_backtrace(io, catch_backtrace())
-        end
-    finally
-        redirect_stdout(old_stdout)
-        redirect_stderr(old_stderr)
-        close(pipe.in)
-    end
-    captured = fetch(reader)
-    return (val, err_text, captured)
-end
-
-# Trim noisy frames from a Julia backtrace string. We keep the showerror line
-# (which has the actual error) and drop everything past the first stdlib /
-# REPL boundary — claude doesn't need to wade through 30 frames of `eval`,
-# `include_string`, `client.jl`, etc., that's just our MCP plumbing.
-const BACKTRACE_NOISE_FRAMES = (
-    r"\bBase\.eval\b", r"\binclude_string\b", r"\beval_user_input\b",
-    r"\bclient\.jl\b", r"\brun_main_repl\b", r"\brun_fallback_repl\b",
-    r"\brepl_main\b",  r"\b_start\b",
-)
-
-function _trim_backtrace(text::AbstractString)
-    lines = split(text, '\n')
-    cut = something(findfirst(line -> any(p -> occursin(p, line), BACKTRACE_NOISE_FRAMES),
-                              lines), length(lines) + 1)
-    cut > length(lines) && return String(strip(text))
-    kept = lines[1:cut-1]
-    suppressed = length(lines) - length(kept)
-    suppressed > 1 && push!(kept, "  [+ $suppressed internal frames]")
-    return strip(join(kept, "\n"))
-end
-
-"""
-Evaluate `code` in the per-env_path persistent session. Captures stdout, return
-value, and errors. Output is formatted via output_discipline.jl rules.
-"""
+# ── Handlers ────────────────────────────────────────────────────────────────
 function julia_eval_handler(args::AbstractDict)
-    code = String(get(args, "code", ""))
-    env_path = get(args, "env_path", nothing)
+    code        = String(get(args, "code", ""))
+    env_path    = get(args, "env_path", nothing)
+    julia_cmd   = get(args, "julia_cmd", nothing)
+    user_to     = get(args, "timeout", nothing)
     full_output = Bool(get(args, "full_output", false))
-    max_bytes = Int(get(args, "max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES))
+    max_bytes   = Int(get(args, "max_response_bytes", 10_000))
 
-    sess = _session_for(env_path)
-    val, err_text, stdout_str = _eval_with_capture(sess, code)
+    isempty(strip(code)) && return Dict{String,Any}(
+        "content" => [Dict("type"=>"text", "text"=>"error: empty code")],
+        "isError" => true,
+    )
 
-    # Always include the executed code as the first content block — ACP doesn't
-    # surface tool args, so this is how the chat UI shows what was run.
-    code_block = Dict("type" => "text", "text" => "```julia\n$code\n```")
+    # Tear down a stale dead session before creating a new one. SessionManager
+    # already does this in get_or_create!, but doing it explicitly here lets
+    # the next call after a hard-timeout-kill recover transparently.
+    s = try
+        get_or_create!(manager(), env_path; julia_cmd)
+    catch e
+        return Dict{String,Any}(
+            "content" => [Dict("type"=>"text", "text"=>"error starting session: $(sprint(showerror, e))")],
+            "isError" => true,
+        )
+    end
 
-    blocks = if err_text !== nothing
-        out_blocks = Dict{String,Any}[code_block]
-        if !isempty(stdout_str)
-            push!(out_blocks, Dict("type" => "text", "text" => "stdout:\n$stdout_str"))
-        end
-        push!(out_blocks, Dict("type" => "text",
-                                "text" => "error:\n$(_trim_backtrace(err_text))"))
-        out_blocks
-    else
-        result_blocks = format_for_mcp(val;
-                                       full_output = full_output,
-                                       max_response_bytes = max_bytes,
-                                       stdout_text = stdout_str)
-        prepend!(result_blocks, [code_block])
-        result_blocks
+    timeout = effective_timeout(code, user_to)
+
+    blocks, is_error = try
+        execute(s, code; timeout, max_bytes, full_output)
+    catch e
+        # On timeout / subprocess death, clean the dict so the next call
+        # builds a fresh subprocess.
+        msg = sprint(showerror, e)
+        return Dict{String,Any}(
+            "content" => [Dict("type"=>"text", "text"=>msg)],
+            "isError" => true,
+        )
     end
 
     return Dict{String,Any}(
         "content" => blocks,
-        "isError" => err_text !== nothing,
+        "isError" => is_error,
     )
 end
 
-"""
-Restart a session (drop the module + recreate on next call).
-"""
 function julia_restart_handler(args::AbstractDict)
     env_path = get(args, "env_path", nothing)
-    key = something(env_path, "<temp>")
-    if haskey(SESSIONS, key)
-        delete!(SESSIONS, key)
-        text = "Session for env_path=$(repr(env_path)) cleared. Next call rebuilds it."
+    restart!(manager(), env_path)
+    label = env_path === nothing ? "<temp>" : env_path
+    return Dict{String,Any}(
+        "content" => [Dict("type" => "text",
+                            "text" => "Session for $label cleared. Next call rebuilds it.")],
+        "isError" => false,
+    )
+end
+
+function julia_list_sessions_handler(::AbstractDict)
+    sessions = list_sessions(manager())
+    text = if isempty(sessions)
+        "no active sessions"
     else
-        text = "No active session for env_path=$(repr(env_path))."
+        lines = String["active sessions:"]
+        for s in sessions
+            extras = String[]
+            s.julia_cmd === nothing || push!(extras, "julia_cmd=$(s.julia_cmd)")
+            s.temp                  && push!(extras, "temp")
+            s.alive                 || push!(extras, "DEAD")
+            tail = isempty(extras) ? "" : "  [" * join(extras, ", ") * "]"
+            push!(lines, "  - $(s.env_path)$tail")
+            s.log_path === nothing  || push!(lines, "      log: $(s.log_path)")
+        end
+        join(lines, "\n")
     end
     return Dict{String,Any}(
         "content" => [Dict("type" => "text", "text" => text)],
@@ -131,21 +85,7 @@ function julia_restart_handler(args::AbstractDict)
     )
 end
 
-"""
-List active sessions and their env paths.
-"""
-function julia_list_sessions_handler(::AbstractDict)
-    keys_list = collect(keys(SESSIONS))
-    text = isempty(keys_list) ?
-        "no active sessions" :
-        "active sessions:\n" * join(("  - $k" for k in keys_list), "\n")
-    return Dict{String,Any}(
-        "content" => [Dict("type" => "text", "text" => text)],
-        "isError" => false,
-    )
-end
-
-# tool registration
+# ── Registration ────────────────────────────────────────────────────────────
 register!(
     "bt_julia_eval",
     """
@@ -154,19 +94,30 @@ register!(
     a fresh process every time, so `using Foo` / loaded variables / compiled
     methods don't carry over and you pay full startup cost on each call.
 
-    State (top-level bindings, loaded modules, function defs) carries over
-    across calls with the same `env_path`. Use `bt_julia_restart` to drop the
-    session if it's gotten into a bad state. `bt_julia_list_sessions` shows
-    what's currently live.
+    Each `env_path` runs in its own `julia -i` subprocess; state (top-level
+    bindings, loaded modules, function defs) carries over across calls with
+    the same env. Use `bt_julia_restart` to drop the session if it's gotten
+    into a bad state. `bt_julia_list_sessions` shows what's currently live.
+    Revise.jl is auto-loaded so source edits to packages are picked up
+    without restart. If the env path ends in `/test`, TestEnv is activated
+    automatically so the parent project's test deps are visible.
 
-    Output rules:
-      - stdout, return value, and errors are returned as separate blocks.
+    Output:
+      - Echoed code, captured stdout, return value, and errors are returned
+        as separate blocks.
       - Output is auto-truncated at `max_response_bytes` (default 10000).
         Large arrays / dicts are summarised; pass `full_output=true` to disable.
-      - 2-D arrays of color types are rendered as images.
+      - 2-D arrays of color types are rendered as PNG images when PNGFiles is
+        available in the env.
       - A return value of `nothing` is suppressed to keep responses tight —
         if you need to inspect a value, return it explicitly (last expression
         in the block).
+      - Backtraces are trimmed to user-relevant frames.
+
+    Timeout (`timeout` seconds) defaults to 60s but is auto-disabled when the
+    code matches `Pkg.*` so installs / precompiles aren't killed mid-flight.
+    A hard timeout `kill`s the subprocess; the session is restarted on the
+    next call.
     """,
     Dict{String,Any}(
         "type" => "object",
@@ -174,9 +125,13 @@ register!(
             "code" => Dict("type" => "string",
                            "description" => "Julia code to evaluate"),
             "env_path" => Dict("type" => "string",
-                               "description" => "Optional Julia project directory"),
+                               "description" => "Optional Julia project directory; omit for a temp env"),
+            "timeout" => Dict("type" => "number",
+                              "description" => "Hard timeout in seconds. Default 60s; auto-disabled for `Pkg.*`. Pass 0 to disable."),
+            "julia_cmd" => Dict("type" => "string",
+                                "description" => "Custom Julia invocation, e.g. `julia +1.11` (juliaup channel) or `/path/to/julia --check-bounds=yes`. Use rarely."),
             "full_output" => Dict("type" => "boolean", "default" => false,
-                                  "description" => "Disable output truncation/summarization"),
+                                  "description" => "Disable output truncation/summarisation"),
             "max_response_bytes" => Dict("type" => "integer", "default" => 10_000,
                                           "description" => "Per-block byte cap"),
         ),
@@ -187,12 +142,18 @@ register!(
 
 register!(
     "bt_julia_restart",
-    "Drop the persistent session for env_path so the next eval starts fresh.",
+    """
+    Restart a Julia session, clearing all state. IMPORTANT: restarting is slow
+    and loses everything. Revise.jl is loaded automatically so code changes to
+    loaded packages are picked up without restarting — only restart as a last
+    resort when the session is truly broken or for changes Revise can't fix
+    (e.g. struct field changes).
+    """,
     Dict{String,Any}(
         "type" => "object",
         "properties" => Dict{String,Any}(
             "env_path" => Dict("type" => "string",
-                               "description" => "Project to restart"),
+                               "description" => "Project to restart; omit for the temp session"),
         ),
     ),
     julia_restart_handler,
@@ -200,7 +161,7 @@ register!(
 
 register!(
     "bt_julia_list_sessions",
-    "List currently active per-env_path Julia sessions.",
+    "List currently active per-`env_path` Julia sessions and their log files.",
     Dict{String,Any}("type" => "object", "properties" => Dict{String,Any}()),
     julia_list_sessions_handler,
 )

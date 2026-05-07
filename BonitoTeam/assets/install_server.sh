@@ -90,8 +90,11 @@ sudo chmod 750 "$DATA_DIR"
 ok "owned by $SERVICE_USER"
 
 # ── Julia env ─────────────────────────────────────────────────────────────────
-step "Julia env (BonitoTeam)"
-julia "--project=$MONOREPO_DIR/BonitoTeam" --startup-file=no \
+# Always operate against the MONOREPO ROOT's Project.toml + Manifest.toml.
+# The per-package Project.toml files (BonitoTeam/Project.toml etc.) are
+# metadata for declaring deps and must NEVER be used as a runtime env.
+step "Julia env (monorepo root)"
+julia "--project=$MONOREPO_DIR" --startup-file=no \
     -e 'import Pkg; Pkg.instantiate()'
 ok "instantiated"
 

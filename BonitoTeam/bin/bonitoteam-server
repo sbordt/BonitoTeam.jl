@@ -12,7 +12,12 @@ set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
-PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# The Julia env is the MONOREPO ROOT (two levels up from BonitoTeam/bin/),
+# never the BonitoTeam package's own Project.toml. The package Project.toml
+# is metadata for declaring deps; the operational env is at the monorepo
+# root with its [sources] paths and Manifest.toml.
+PACKAGE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_DIR="$(cd "${PACKAGE_DIR}/.." && pwd)"
 
 if [[ -z "${BONITOTEAM_WORKER_SECRET:-}" ]]; then
     echo "ERROR: BONITOTEAM_WORKER_SECRET must be set" >&2
@@ -35,4 +40,4 @@ exec julia \
     "--project=${PROJECT_DIR}" \
     --startup-file=no \
     --threads=auto \
-    "${PROJECT_DIR}/src/server_standalone.jl"
+    "${PACKAGE_DIR}/src/server_standalone.jl"

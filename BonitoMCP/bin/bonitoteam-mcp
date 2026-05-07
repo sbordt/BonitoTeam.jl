@@ -14,7 +14,11 @@ set -euo pipefail
 # ~/.local/bin/bonitoteam-mcp (a symlink the installer creates).
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
-PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PACKAGE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Operational env is the parent of the package dir, never the package's own
+# Project.toml. On a worker that's $INSTALL_ROOT; in dev that's the monorepo
+# root. The package's own Project.toml is metadata for declaring deps only.
+PROJECT_DIR="$(cd "${PACKAGE_DIR}/.." && pwd)"
 
 exec julia \
     "--project=${PROJECT_DIR}" \

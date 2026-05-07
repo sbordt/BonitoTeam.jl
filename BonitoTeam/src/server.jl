@@ -5,10 +5,12 @@ const MONOREPO_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 
 const INSTALL_TEMPLATE = read(joinpath(ASSETS_DIR, "install_template.sh"), String)
 
-# Worker bundle: ships the lean BonitoMCP and BonitoWorker packages. The worker
-# installs each into its own --project=<dir>. Rebuilt on every request so local
-# edits show up without restarting the server.
-const WORKER_BUNDLE_PATHS = ["BonitoMCP", "BonitoWorker"]
+# Worker bundle: ships the lean packages a worker needs (BonitoMCP +
+# BonitoWorker + their RemoteSync dep). The installer extracts these alongside
+# a generated worker_project.toml at $INSTALL_ROOT and uses that as the SINGLE
+# operational env — never per-package Project.tomls. Rebuilt on every request
+# so local edits show up without restarting the server.
+const WORKER_BUNDLE_PATHS = ["BonitoMCP", "BonitoWorker", "RemoteSync"]
 
 function build_worker_bundle()::Vector{UInt8}
     tmp = tempname() * ".tar.gz"

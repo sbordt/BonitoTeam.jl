@@ -4,11 +4,17 @@
 # Re-runs:  same command — every step is "check / update / create".
 #
 # Layout after install:
-#   ~/.local/share/bonitoteam/BonitoMCP/      stdio MCP server (own Julia env)
-#   ~/.local/share/bonitoteam/BonitoWorker/   WS relay (own Julia env)
+#   ~/.local/share/bonitoteam/Project.toml    SINGLE operational Julia env
+#   ~/.local/share/bonitoteam/Manifest.toml   resolved deps (generated)
+#   ~/.local/share/bonitoteam/BonitoMCP/      source tree
+#   ~/.local/share/bonitoteam/BonitoWorker/   source tree
+#   ~/.local/share/bonitoteam/RemoteSync/     source tree
 #   ~/.local/bin/{bonitoteam-worker,bonitoteam-mcp,bonitoteam-worker-start}
 #   ~/.config/systemd/user/bonitoteam-worker.service
 #   ~/bonitoteam-projects/                    rsync target for project sources
+#
+# Per-package Project.toml files (BonitoMCP/Project.toml etc.) are NEVER
+# used as runtime envs — only the top-level $INSTALL_ROOT/Project.toml is.
 set -eu
 
 SERVER="{{SERVER_URL}}"
@@ -64,7 +70,7 @@ if ! command -v julia > /dev/null 2>&1; then
 fi
 echo "    julia: $(julia --version)"
 
-# ── Worker bundle (BonitoMCP + BonitoWorker source trees) ────────────────────
+# ── Worker bundle (BonitoMCP + BonitoWorker + RemoteSync source trees) ───────
 step "Worker bundle"
 TMP_TAR="$(mktemp -t bonitoteam-bundle.XXXXXX.tar.gz)"
 trap 'rm -f "$TMP_TAR"' EXIT
@@ -74,12 +80,31 @@ tar -xzf "$TMP_TAR" -C "$INSTALL_ROOT"
 chmod +x "$MCP_DIR/bin/"* "$WORKER_DIR/bin/"*
 echo "    extracted to $INSTALL_ROOT"
 
-step "Instantiate Julia envs"
-echo "    BonitoMCP..."
-julia --project="$MCP_DIR" --startup-file=no \
-    -e 'import Pkg; Pkg.instantiate(); Pkg.precompile()'
-echo "    BonitoWorker..."
-julia --project="$WORKER_DIR" --startup-file=no \
+# Single operational env at $INSTALL_ROOT/Project.toml. Both bin scripts
+# (bonitoteam-worker, bonitoteam-mcp) compute --project as the parent of
+# their package dir and land here, so we instantiate once.
+step "Worker env Project.toml at $INSTALL_ROOT"
+cat > "$INSTALL_ROOT/Project.toml" << 'TOML'
+[deps]
+BonitoMCP    = "4a1c91af-1c90-46a4-8594-a3846516869d"
+BonitoWorker = "98909ed9-6989-4829-81af-73688ee23085"
+RemoteSync   = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
+
+[sources]
+BonitoMCP    = {path = "BonitoMCP"}
+BonitoWorker = {path = "BonitoWorker"}
+RemoteSync   = {path = "RemoteSync"}
+
+[compat]
+julia = "1.10"
+TOML
+# Drop any stale Manifest.toml from a previous install — old Manifests can
+# refer to packages or paths that no longer exist after an upgrade.
+rm -f "$INSTALL_ROOT/Manifest.toml"
+echo "    written"
+
+step "Instantiate Julia env"
+julia --project="$INSTALL_ROOT" --startup-file=no \
     -e 'import Pkg; Pkg.instantiate(); Pkg.precompile()'
 
 # ── Wrappers + startup shim ──────────────────────────────────────────────────

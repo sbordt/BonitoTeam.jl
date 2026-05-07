@@ -12,12 +12,14 @@ BonitoBook          = "b416d416-7a6e-4336-8c1a-1f8a8cd59518"
 BonitoMCP           = "4a1c91af-1c90-46a4-8594-a3846516869d"
 BonitoTeam          = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
 BonitoWorker        = "98909ed9-6989-4829-81af-73688ee23085"
+RemoteSync          = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
 
 [sources]
 AgentClientProtocol = {path = "AgentClientProtocol"}
 BonitoMCP           = {path = "BonitoMCP"}
 BonitoTeam          = {path = "BonitoTeam"}
 BonitoWorker        = {path = "BonitoWorker"}
+RemoteSync          = {path = "RemoteSync"}
 # Pinned to branches with our patches (drop once merged + tagged):
 #  - Bonito sd/terminal-output: proxy_url="." emits server-absolute asset URLs
 Bonito              = {url = "https://github.com/SimonDanisch/Bonito.jl.git",     rev = "sd/terminal-output"}

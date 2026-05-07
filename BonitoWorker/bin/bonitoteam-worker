@@ -14,8 +14,13 @@ set -euo pipefail
 # ~/.local/bin/bonitoteam-worker (a symlink the installer creates).
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
-PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-MONOREPO_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
+PACKAGE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Operational env is the parent of the package dir, never the package's own
+# Project.toml. Layout matches the server's monorepo: env Project.toml +
+# Manifest.toml live at the parent, with [sources] paths pointing at sibling
+# packages. On a worker that's $INSTALL_ROOT (= $HOME/.local/share/bonitoteam);
+# in dev that's the monorepo root.
+PROJECT_DIR="$(cd "${PACKAGE_DIR}/.." && pwd)"
 
 if [[ -z "${BONITOTEAM_WORKER_SECRET:-}" ]]; then
     echo "ERROR: BONITOTEAM_WORKER_SECRET must be set" >&2
@@ -27,10 +32,10 @@ if [[ -z "${BONITOTEAM_SERVER_URL:-}" ]]; then
 fi
 
 # Default MCP path to the sibling BonitoMCP/bin/bonitoteam-mcp wrapper
-export BONITOTEAM_MCP_BIN="${BONITOTEAM_MCP_BIN:-${MONOREPO_DIR}/BonitoMCP/bin/bonitoteam-mcp}"
+export BONITOTEAM_MCP_BIN="${BONITOTEAM_MCP_BIN:-${PROJECT_DIR}/BonitoMCP/bin/bonitoteam-mcp}"
 
 exec julia \
     "--project=${PROJECT_DIR}" \
     --startup-file=no \
     --threads=auto \
-    "${PROJECT_DIR}/src/worker_standalone.jl"
+    "${PACKAGE_DIR}/src/worker_standalone.jl"

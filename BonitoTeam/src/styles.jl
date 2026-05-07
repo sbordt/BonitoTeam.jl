@@ -128,8 +128,12 @@ const ChatStyles = Bonito.Styles(
         "flex-shrink" => "0", "overflow-anchor" => "none"),
 
     # ── User message ─────────────────────────────────────────────────────────
-    # max-width caps the bubble at a comfortable reading width on wide screens
+    # max-width caps the bubble at a comfortable reading width on wide screens.
+    # `flex-shrink: 0` is defensive (see .bt-tool-msg note) — even though
+    # this rule has no `overflow` today, future styling shouldn't be able to
+    # make message bubbles collapse under spacer pressure.
     CSS(".bt-user-msg",
+        "flex-shrink" => "0",
         "align-self" => "flex-end",
         "max-width" => "min(80%, 640px)",
         "background" => "var(--bt-accent)", "color" => "#fff",
@@ -141,6 +145,7 @@ const ChatStyles = Bonito.Styles(
 
     # ── Agent message ────────────────────────────────────────────────────────
     CSS(".bt-agent-msg",
+        "flex-shrink" => "0",
         "align-self" => "flex-start",
         "max-width" => "min(85%, 760px)",
         "background" => "var(--bt-surface)",
@@ -163,6 +168,7 @@ const ChatStyles = Bonito.Styles(
 
     # ── Thought (extended thinking) ──────────────────────────────────────────
     CSS(".bt-thought-msg",
+        "flex-shrink" => "0",
         "align-self" => "flex-start",
         "max-width" => "min(85%, 760px)",
         "border" => "1px dashed var(--bt-border-strong)",
@@ -195,7 +201,16 @@ const ChatStyles = Bonito.Styles(
         "padding" => "4px 0"),
 
     # ── Tool call card ───────────────────────────────────────────────────────
+    # NOTE: `flex-shrink: 0` is load-bearing. `.bt-messages` is a flex column
+    # container, and per the CSS Flexbox spec, a flex item with any
+    # `overflow` keyword set has its default `min-height` switch from `auto`
+    # (content height) to `0`. Combined with the virtual-scroll spacer-top
+    # whose height runs into the thousands of px, that lets every tool card
+    # shrink down to a 1px slit (border only). Same trap would catch any
+    # other bubble that grows an `overflow: hidden`, so we apply the same
+    # `flex-shrink: 0` to the other message types defensively below.
     CSS(".bt-tool-msg",
+        "flex-shrink" => "0",
         "align-self" => "flex-start",
         "max-width" => "min(92%, 800px)",
         "background" => "var(--bt-surface)",

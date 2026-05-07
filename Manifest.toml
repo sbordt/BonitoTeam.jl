@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "debdaa6643b7b9a4b25d7a53a1f4d692a6dd26cf"
+project_hash = "84f73710df97a64555df64b37dd1a695b6928250"
 
 [[deps.ANSIColoredPrinters]]
 git-tree-sha1 = "574baf8110975760d391c710b6341da1afa48d8c"
@@ -62,22 +62,28 @@ version = "0.2.0"
     PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 
 [[deps.BonitoMCP]]
-deps = ["Base64", "JSON", "Pkg"]
+deps = ["Base64", "Dates", "JSON", "Malt", "Pkg"]
 path = "BonitoMCP"
 uuid = "4a1c91af-1c90-46a4-8594-a3846516869d"
 version = "0.1.0"
 
 [[deps.BonitoTeam]]
-deps = ["AgentClientProtocol", "Base64", "Bonito", "BonitoBook", "BonitoMCP", "BonitoWorker", "CommonMark", "Dates", "HTTP", "JSON", "Markdown", "SHA", "TOML", "UUIDs"]
+deps = ["AgentClientProtocol", "Base64", "Bonito", "BonitoBook", "BonitoMCP", "BonitoWorker", "CommonMark", "Dates", "HTTP", "JSON", "Markdown", "RemoteSync", "SHA", "TOML", "UUIDs"]
 path = "BonitoTeam"
 uuid = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
 version = "0.1.0"
 
 [[deps.BonitoWorker]]
-deps = ["HTTP", "JSON", "SHA", "Sockets"]
+deps = ["HTTP", "JSON", "RemoteSync", "Sockets"]
 path = "BonitoWorker"
 uuid = "98909ed9-6989-4829-81af-73688ee23085"
 version = "0.1.0"
+
+[[deps.Bzip2_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "1b96ea4a01afe0ea4090c5c8039690672dd13f2e"
+uuid = "6e34b625-4abd-537c-b88f-471c36dfa7a0"
+version = "1.0.9+0"
 
 [[deps.CodecZlib]]
 deps = ["TranscodingStreams", "Zlib_jll"]
@@ -146,6 +152,11 @@ deps = ["Artifacts", "JLLWrappers", "Libdl"]
 git-tree-sha1 = "cd6756e833c377e0ce9cd63fb97689a255f12323"
 uuid = "04572ae6-984a-583e-9378-9577a1c2574d"
 version = "1.33.4+0"
+
+[[deps.Distributed]]
+deps = ["Random", "Serialization", "Sockets"]
+uuid = "8ba89e20-285c-5b6f-9357-94700520ee1b"
+version = "1.11.0"
 
 [[deps.Downloads]]
 deps = ["ArgTools", "FileWatching", "LibCURL", "NetworkOptions"]
@@ -259,6 +270,12 @@ version = "1.11.3+1"
 uuid = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 version = "1.11.0"
 
+[[deps.Libiconv_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "be484f5c92fad0bd8acfef35fe017900b0b73809"
+uuid = "94ce4f54-9a6c-5748-9c1c-f9c7231a4531"
+version = "1.18.0+0"
+
 [[deps.LinearAlgebra]]
 deps = ["Libdl", "OpenBLAS_jll", "libblastrampoline_jll"]
 uuid = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
@@ -273,6 +290,12 @@ deps = ["Dates", "Logging"]
 git-tree-sha1 = "f00544d95982ea270145636c181ceda21c4e2575"
 uuid = "e6f89c97-d47a-5376-807f-9c37f3926c36"
 version = "1.2.0"
+
+[[deps.Malt]]
+deps = ["Distributed", "Logging", "RelocatableFolders", "Serialization", "Sockets"]
+git-tree-sha1 = "c2335b4e291f2422e2be8abf8936ccad58a98992"
+uuid = "36869731-bdee-424d-aa32-cab38c994e3b"
+version = "1.4.1"
 
 [[deps.Markdown]]
 deps = ["Base64", "JuliaSyntaxHighlighting", "StyledStrings"]
@@ -350,6 +373,12 @@ weakdeps = ["REPL"]
     [deps.Pkg.extensions]
     REPLExt = "REPL"
 
+[[deps.Popt_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Libiconv_jll"]
+git-tree-sha1 = "c3c46974a15f0d828463f6ff8d51ab819c68e662"
+uuid = "e80236cf-ab1d-5f5d-8534-1d1285fe49e8"
+version = "1.19.0+0"
+
 [[deps.PrecompileTools]]
 deps = ["Preferences"]
 git-tree-sha1 = "07a921781cab75691315adc645096ed5e370cb77"
@@ -393,6 +422,12 @@ deps = ["SHA", "Scratch"]
 git-tree-sha1 = "ffdaf70d81cf6ff22c2b6e733c900c3321cab864"
 uuid = "05181044-ff0b-4ac5-8273-598c1e38db00"
 version = "1.0.1"
+
+[[deps.RemoteSync]]
+deps = ["SHA", "librsync_jll"]
+path = "RemoteSync"
+uuid = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
+version = "0.1.0"
 
 [[deps.SHA]]
 uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
@@ -534,6 +569,12 @@ version = "1.3.1+2"
 deps = ["Artifacts", "Libdl"]
 uuid = "8e850b90-86db-534c-a0d3-1478176c7d93"
 version = "5.15.0+0"
+
+[[deps.librsync_jll]]
+deps = ["Artifacts", "Bzip2_jll", "JLLWrappers", "Libdl", "Popt_jll", "Zlib_jll"]
+git-tree-sha1 = "2599073965ac2dc9ff92cbe06a1ed77601de6577"
+uuid = "6c5fa084-3dbe-5c56-adb0-3ea4e9e901c0"
+version = "2.3.4+0"
 
 [[deps.nghttp2_jll]]
 deps = ["Artifacts", "Libdl"]

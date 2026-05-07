@@ -71,6 +71,11 @@ const PROJECTS = Dict{String,Any}()
 
 # Per-project runtime — kept out of the persisted state
 const PROJECT_APPS = Dict{String,Bonito.App}()
+# project_id → Ref{AgentClientProtocol.Client}. Populated by chat_app once
+# the ACP client is started; lets test harnesses + tooling drive prompts
+# directly via AgentClientProtocol.prompt! instead of synthesising a click
+# on the chat UI's send button (which has been flaky in synthetic events).
+const CHAT_CLIENTS = Dict{String,Any}()
 
 # Observable; bumped whenever WORKERS or PROJECTS changes so the dashboard re-renders.
 const STATE_VERSION = Observable(0)

@@ -540,6 +540,15 @@ function chat_app(cwd::String;
     end
     update_session_id!(chat_session, client[].session_id)
 
+    # Expose the live client to test harnesses + future programmatic
+    # drivers so they can call AgentClientProtocol.prompt!() without
+    # going through the UI's send-button observable. Keyed by project_id;
+    # chat_app instances without a project_id (e.g. unit-test apps) skip.
+    if !isempty(project_id)
+        @info "registering CHAT_CLIENTS" project_id session_id=client[].session_id
+        BonitoTeam.CHAT_CLIENTS[project_id] = client
+    end
+
     # Session-health state surfaced in the UI. Flipped to false when prompt!
     # raises (worker WS dropped, ACP subprocess died, etc.); the chat banner
     # uses this to show "session ended — restart?" with a button.

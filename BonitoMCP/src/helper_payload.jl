@@ -112,22 +112,15 @@ function format_show(val, max_bytes_image::Int, max_bytes_text::Int)
         end
     end
 
-    # SVG — vector, often smaller than PNG.
-    if showable_safe(MIME"image/svg+xml"(), val)
-        svg = sprint_mime(val, MIME"image/svg+xml"())
-        if !isempty(svg) && length(svg) <= max_bytes_image
-            return [
-                describe(val, "image/svg+xml", length(svg)),
-                Dict{String,Any}(
-                    "type" => "image",
-                    "data" => base64encode(svg),
-                    "mimeType" => "image/svg+xml",
-                    "annotations" => Dict("audience" => ["user"]),
-                ),
-            ]
-        end
-    end
-
+    # NOTE: SVG is NOT used here. Even though many Julia values implement
+    # `showable(MIME"image/svg+xml")` (Colorant matrices, plots), claude's
+    # Messages API does not accept image/svg+xml — it only takes png / jpeg
+    # / gif / webp. Returning SVG would propagate as a tool result that
+    # claude-agent-acp forwards to the model, and the next request would
+    # fail with `400 Could not process image` (verified end-to-end). For
+    # vector content prefer rasterising upstream of bt_show, e.g. via Makie
+    # `colorbuffer` + PNGFiles.save, or via a Plots backend that emits PNG.
+    #
     # NOTE: HTML support is intentionally deferred. The chat-side ACP parser
     # drops `resource` content blocks to the literal string "[tool content:
     # resource]", so we'd render garbage. A follow-up can add an HTML branch

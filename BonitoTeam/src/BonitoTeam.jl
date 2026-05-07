@@ -27,6 +27,7 @@ include("styles.jl")
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("persistence.jl")
 include("dashboard.jl")        # WORKERS / PROJECTS state + dashboard_app
+include("github.jl")           # "From GitHub" project template
 include("server.jl")           # serve()
 
 export serve

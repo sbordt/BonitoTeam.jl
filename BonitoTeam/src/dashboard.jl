@@ -54,11 +54,17 @@ mutable struct ProjectInfo
     # the conversation history back to where claude left off; nothing → fresh
     # session/new. Persisted so server restarts still resume.
     resume_session_id::Union{String,Nothing}
+    # If set, the chat fires this prompt as the first user message the next
+    # time it brings up an ACP session — used by the "From GitHub" template
+    # to seed "fix this issue" / "review this PR" without the operator having
+    # to retype it. Cleared (and persisted as nothing) once the prompt has
+    # been delivered, so a session restart doesn't re-fire.
+    auto_prompt::Union{String,Nothing}
 end
 
 ProjectInfo(id, name, worker_name, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_name, server_path, worker_path, created,
-                nothing, nothing, :unsynced, nothing, nothing)
+                nothing, nothing, :unsynced, nothing, nothing, nothing)
 
 const WORKERS = Dict{String,WorkerInfo}()
 # Value type intentionally `Any` — Julia 1.12's stricter world-age binds
@@ -168,7 +174,8 @@ function save_projects!()
                  # "synced" for a half-transferred mirror.
                  "backup_status" => string(p.backup_status === :syncing ? :stale : p.backup_status),
                  "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at),
-                 "resume_session_id" => p.resume_session_id)
+                 "resume_session_id" => p.resume_session_id,
+                 "auto_prompt"   => p.auto_prompt)
             for p in values(PROJECTS)]
     atomic_write_json(projects_file(), data)
 end
@@ -188,6 +195,9 @@ function load_projects!()
             sid = get(d, "resume_session_id", nothing)
             p.resume_session_id = (sid === nothing || isempty(String(sid))) ?
                                        nothing : String(sid)
+            ap = get(d, "auto_prompt", nothing)
+            p.auto_prompt = (ap === nothing || isempty(String(ap))) ?
+                                       nothing : String(ap)
             PROJECTS[p.id] = p
         catch e
             @warn "skipping malformed project entry" entry=d exception=e
@@ -1380,6 +1390,15 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         error_obs[] = ""
     end
 
+    # ── From-GitHub form ─────────────────────────────────────────────────────
+    # Take any github.com URL (repo / issue / pull) → clone on the worker and,
+    # for issues/PRs, seed the chat with a "fix this" prompt.
+    # Declared before the New-project button handler so the two can mutually
+    # close their respective slide-in panels.
+    gh_show   = Observable(false)
+    gh_url    = Observable("")
+    gh_worker = Observable("")
+
     new_proj_btn = Bonito.Button("+ New project"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(new_proj_btn.value) do clicked
         clicked || return
@@ -1389,6 +1408,53 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         end
         np_worker[] = first(keys(WORKERS))
         new_proj_show[] = true
+        gh_show[]       = false
+        error_obs[] = ""
+    end
+
+    gh_submit = Bonito.Button("Open"; style=nothing, class = "bt-btn")
+    gh_cancel = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
+
+    on(gh_submit.value) do clicked
+        clicked || return
+        isempty(busy_msg[]) || return
+        url = String(strip(gh_url[]))
+        worker_name = String(strip(gh_worker[]))
+        isempty(url) && (error_obs[] = "GitHub URL required."; return)
+        isempty(worker_name) && (error_obs[] = "Pick a worker."; return)
+        busy_msg[] = "Opening from GitHub…"
+        @async begin
+            try
+                create_project_from_github!(srv_ref[], url;
+                    worker_name = worker_name,
+                    progress    = msg -> (busy_msg[] = "From GitHub: $(msg)"))
+                error_obs[] = ""
+                gh_show[] = false
+                gh_url[]  = ""
+            catch e
+                error_obs[] = "Failed to open from GitHub: $(sprint(showerror, e))"
+            finally
+                busy_msg[] = ""
+            end
+        end
+    end
+    on(gh_cancel.value) do clicked
+        clicked || return
+        isempty(busy_msg[]) || return
+        gh_show[]   = false
+        error_obs[] = ""
+    end
+
+    gh_btn = Bonito.Button("+ From GitHub"; style=nothing, class = "bt-btn bt-btn-secondary")
+    on(gh_btn.value) do clicked
+        clicked || return
+        if isempty(WORKERS)
+            error_obs[] = "Register a worker before opening a GitHub project."
+            return
+        end
+        gh_worker[] = first(keys(WORKERS))
+        gh_show[]   = true
+        new_proj_show[] = false
         error_obs[] = ""
     end
 
@@ -1603,6 +1669,23 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         end,
         class = "bt-form")
 
+    gh_form() = DOM.div(
+        DOM.label("GitHub URL"),
+        text_input(gh_url,
+            "https://github.com/<owner>/<repo>  ·  /issues/<n>  ·  /pull/<n>"),
+        DOM.div("Repo → just clone. Issue/PR → clone + auto-prompt 'fix this'.";
+                style = "font-size:11px;color:var(--bt-text-muted);margin-top:-4px"),
+        DOM.label("Worker"),
+        DOM.select(
+            (DOM.option(name; value=name) for name in keys(WORKERS))...;
+            onchange = js"event => $(gh_worker).notify(event.target.value)"),
+        map(busy_msg) do msg
+            isempty(msg) ?
+                DOM.div(gh_cancel, gh_submit, class = "bt-form-actions") :
+                DOM.div(spinner_row(msg), class = "bt-form-actions")
+        end,
+        class = "bt-form")
+
     function remote_picker_form(w_name::String)
         rp = get_remote_picker(w_name)
         create_btn = Bonito.Button("Create"; style=nothing, class = "bt-btn")
@@ -1699,6 +1782,9 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     proj_form_block = map(new_proj_show) do show
         show ? DOM.div(new_proj_form(); class = "bt-slide-in") : DOM.div()
     end
+    gh_form_block = map(gh_show) do show
+        show ? DOM.div(gh_form(); class = "bt-slide-in") : DOM.div()
+    end
     error_block = map(error_obs) do msg
         isempty(msg) ? DOM.div() : DOM.div(msg; class = "bt-error")
     end
@@ -1737,10 +1823,12 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
 
             DOM.div(
                 DOM.h2("Projects"),
-                new_proj_btn;
+                new_proj_btn,
+                gh_btn;
                 class = "bt-section"),
             project_list,
-            proj_form_block;
+            proj_form_block,
+            gh_form_block;
 
             class = "bt-dash")
     end

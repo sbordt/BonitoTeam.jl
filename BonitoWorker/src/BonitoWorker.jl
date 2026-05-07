@@ -72,6 +72,8 @@ function run_control_session(; server_url, secret, name, mcp_path,
                 @async handle_list_dir(ws, cmd)
             elseif t == "scan_sessions"
                 @async handle_scan_sessions(ws, cmd)
+            elseif t == "clone_repo"
+                @async handle_clone_repo(ws, cmd)
             elseif t == "ping"
                 WebSockets.send(ws, JSON.json(Dict("type" => "pong")))
             else
@@ -175,6 +177,52 @@ function handle_list_dir(ws, cmd::AbstractDict)
         WebSockets.send(ws, JSON.json(response))
     catch e
         @warn "list_dir response failed" exception=e
+    end
+end
+
+# Clone a GitHub repo into `dst_path` (must not exist yet). For PRs we then
+# fetch the PR head ref and check it out as a local branch `pr-<n>` so the
+# checkout uses a normal branch name. The server pre-derives `dst_path` so
+# we don't have to repeat the projects_root logic on the worker.
+function handle_clone_repo(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    url        = String(get(cmd, "url", ""))
+    dst_path   = String(get(cmd, "dst_path", ""))
+    pr_raw     = get(cmd, "pr_number", nothing)
+    pr_number  = pr_raw === nothing ? nothing :
+                 (pr_raw isa Integer ? Int(pr_raw) : parse(Int, String(pr_raw)))
+
+    response = try
+        isempty(url)      && error("missing url")
+        isempty(dst_path) && error("missing dst_path")
+        ispath(dst_path)  && error("dst_path already exists: $dst_path")
+        mkpath(dirname(dst_path))
+
+        run(`git clone --depth 50 $url $dst_path`)
+        if pr_number !== nothing
+            ref   = "pull/$(pr_number)/head"
+            local_branch = "pr-$(pr_number)"
+            run(setenv(`git -C $dst_path fetch origin $ref:$local_branch`))
+            run(setenv(`git -C $dst_path checkout $local_branch`))
+        end
+        Dict("type"       => "clone_repo_response",
+             "request_id" => request_id,
+             "dst_path"   => dst_path)
+    catch e
+        # If clone partially populated the dir, clean up so a retry can start
+        # fresh — leaving a half-cloned tree blocks the "already exists" check.
+        try
+            isdir(dst_path) && rm(dst_path; recursive = true, force = true)
+        catch
+        end
+        Dict("type"       => "clone_repo_response",
+             "request_id" => request_id,
+             "error"      => sprint(showerror, e))
+    end
+    try
+        WebSockets.send(ws, JSON.json(response))
+    catch e
+        @warn "clone_repo response failed" exception=e
     end
 end
 

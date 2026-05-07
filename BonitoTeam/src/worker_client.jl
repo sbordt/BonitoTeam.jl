@@ -28,6 +28,8 @@ const PENDING_TRANSFERS = Dict{String,Channel{Any}}()
 const PENDING_LIST_DIR = Dict{String,Channel{Dict}}()
 # request_id → Channel where worker's scan_sessions_result is handed back
 const PENDING_SCAN_SESSIONS = Dict{String,Channel{Vector{Dict{String,Any}}}}()
+# request_id → Channel where worker's clone_repo_response is handed back
+const PENDING_CLONE_REPO = Dict{String,Channel{Dict{String,Any}}}()
 
 # Send a JSON command to a worker over its control WS. Throws if the worker
 # isn't currently connected.
@@ -121,6 +123,12 @@ function handle_worker_control(ws, worker_secret::String)
                         sessions = [Dict{String,Any}(s)
                                     for s in get(cmd, "sessions", Any[])]
                         put!(ch, sessions)
+                    end
+                elseif t == "clone_repo_response"
+                    rid = String(get(cmd, "request_id", ""))
+                    if haskey(PENDING_CLONE_REPO, rid)
+                        ch = pop!(PENDING_CLONE_REPO, rid)
+                        put!(ch, Dict{String,Any}(cmd))
                     end
                 end
             catch e
@@ -481,6 +489,46 @@ function scan_worker_sessions(worker_name::String; timeout::Real = 15.0)
         end
     end
     return take!(ch)
+end
+
+"""
+    clone_repo_on_worker(worker_name, url, dst_path;
+                          pr_number = nothing, timeout = 120.0)
+
+Ask the named worker to `git clone <url>` into `dst_path` (a path on the
+worker, must not exist yet). For PRs, also fetches `pull/<n>/head` and
+checks it out as `pr-<n>`. Throws on timeout or worker-reported errors.
+"""
+function clone_repo_on_worker(worker_name::String, url::AbstractString,
+                                dst_path::AbstractString;
+                                pr_number::Union{Integer,Nothing} = nothing,
+                                timeout::Real = 120.0)
+    haskey(WORKER_CONTROL_WS, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+    rid = string(uuid4())
+    ch  = Channel{Dict{String,Any}}(1)
+    PENDING_CLONE_REPO[rid] = ch
+
+    payload = Dict{String,Any}(
+        "type"       => "clone_repo",
+        "request_id" => rid,
+        "url"        => String(url),
+        "dst_path"   => String(dst_path),
+    )
+    pr_number === nothing || (payload["pr_number"] = Int(pr_number))
+    send_command(worker_name, payload)
+
+    Base.errormonitor(@async begin
+        sleep(timeout)
+        if haskey(PENDING_CLONE_REPO, rid)
+            delete!(PENDING_CLONE_REPO, rid)
+            try put!(ch, Dict{String,Any}("error" => "clone_repo timed out")) catch end
+        end
+    end)
+    resp = take!(ch)
+    haskey(resp, "error") &&
+        error("clone_repo '$url' on '$worker_name': $(resp["error"])")
+    return String(resp["dst_path"])
 end
 
 """

@@ -682,6 +682,35 @@ function chat_app(cwd::String;
     session_alive = Observable(true)
     last_error    = Observable("")
 
+    # Auto-prompt: if the project carries an `auto_prompt` (set by the "From
+    # GitHub" template) and the chat is otherwise empty, fire it once as the
+    # first user message. Cleared + persisted right away so a server restart
+    # or session reconnect doesn't double-fire.
+    if !isempty(project_id) && haskey(PROJECTS, project_id)
+        proj = PROJECTS[project_id]
+        ap = proj.auto_prompt
+        if ap !== nothing && !isempty(ap) && isempty(msgs_store)
+            proj.auto_prompt = nothing
+            try save_projects!() catch e
+                @warn "auto_prompt: persist clear failed" exception=e
+            end
+            user_msg = UserMsg(String(ap))
+            push_msg!(user_msg)
+            append_user(chat_session, user_msg)
+            emit(Dict{String,Any}("type" => "busy_start"))
+            Base.errormonitor(@async begin
+                try
+                    AgentClientProtocol.prompt!(client[], String(ap))
+                    finalize_streaming!()
+                catch e
+                    last_error[]    = sprint(showerror, e)
+                    session_alive[] = false
+                    emit(Dict{String,Any}("type" => "busy_stop"))
+                end
+            end)
+        end
+    end
+
     function restart_session!()
         try
             old = client[]

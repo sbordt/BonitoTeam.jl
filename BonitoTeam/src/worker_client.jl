@@ -293,7 +293,8 @@ Tar `src` on the server, stream it to the worker over a /worker-sync WS, and
 have the worker extract into `dst`.
 """
 function push_dir_to_worker!(worker_name::String, src::String, dst::String;
-                              handoff_timeout::Real = 30.0)
+                              handoff_timeout::Real = 30.0,
+                              progress = nothing)
     isdir(src) || error("Source path is not a directory: $src")
     haskey(WORKER_CONTROL_WS, worker_name) ||
         error("Worker '$worker_name' is not connected")
@@ -302,6 +303,7 @@ function push_dir_to_worker!(worker_name::String, src::String, dst::String;
     ch = Channel{Any}(1)
     PENDING_SYNC_SESSIONS[sync_id] = ch
 
+    progress === nothing || progress("Connecting to worker…")
     send_command(worker_name, Dict(
         "type"      => "open_sync",
         "sync_id"   => sync_id,
@@ -314,13 +316,17 @@ function push_dir_to_worker!(worker_name::String, src::String, dst::String;
     try
         tmp = tempname() * ".tar.gz"
         try
+            progress === nothing || progress("Tarring source…")
             run(Cmd(`tar -czf $tmp .`; dir = src))
             data = read(tmp)
+            progress === nothing || progress("Sending $(format_bytes(length(data))) to worker…")
             WebSockets.send(ws, JSON.json(Dict("type"=>"tar", "size"=>length(data))))
             WebSockets.send(ws, data)
+            progress === nothing || progress("Worker extracting…")
             ack = JSON.parse(String(WebSockets.receive(ws)))
             get(ack, "ok", false) ||
                 error("worker rejected sync: $(get(ack, "error", "unknown"))")
+            progress === nothing || progress("Done")
         finally
             rm(tmp; force = true)
         end
@@ -337,7 +343,8 @@ Inverse of `push_dir_to_worker!` — tells the worker to tar `src` (its path)
 and stream it back; we extract into `dst` (server path).
 """
 function pull_dir_from_worker!(worker_name::String, src::String, dst::String;
-                                handoff_timeout::Real = 30.0)
+                                handoff_timeout::Real = 30.0,
+                                progress = nothing)
     haskey(WORKER_CONTROL_WS, worker_name) ||
         error("Worker '$worker_name' is not connected")
     mkpath(dst)
@@ -346,6 +353,7 @@ function pull_dir_from_worker!(worker_name::String, src::String, dst::String;
     ch = Channel{Any}(1)
     PENDING_SYNC_SESSIONS[sync_id] = ch
 
+    progress === nothing || progress("Connecting to worker…")
     send_command(worker_name, Dict(
         "type"      => "open_sync",
         "sync_id"   => sync_id,
@@ -356,16 +364,20 @@ function pull_dir_from_worker!(worker_name::String, src::String, dst::String;
     ws = take_pending!(ch, PENDING_SYNC_SESSIONS, sync_id, handoff_timeout,
                       "pull from '$worker_name'")
     try
+        progress === nothing || progress("Worker tarring source…")
         header = JSON.parse(String(WebSockets.receive(ws)))
         get(header, "type", "") == "tar" ||
             error("worker sent unexpected sync frame: $(get(header, "type", "?"))")
+        progress === nothing || progress("Receiving $(format_bytes(get(header, "size", 0)))…")
         data = WebSockets.receive(ws)
         tmp  = tempname() * ".tar.gz"
         try
+            progress === nothing || progress("Extracting on server…")
             write(tmp, data)
             mkpath(dst)
             run(Cmd(`tar -xzf $tmp`; dir = dst))
             WebSockets.send(ws, JSON.json(Dict("ok" => true)))
+            progress === nothing || progress("Done")
         finally
             rm(tmp; force = true)
         end
@@ -374,6 +386,15 @@ function pull_dir_from_worker!(worker_name::String, src::String, dst::String;
     end
     return nothing
 end
+
+# Human-readable byte counts used by the progress callbacks above.
+function format_bytes(n::Integer)
+    n < 1024            && return "$n B"
+    n < 1024^2          && return string(round(n / 1024;     digits=1), " KB")
+    n < 1024^3          && return string(round(n / 1024^2;   digits=1), " MB")
+                           return string(round(n / 1024^3;   digits=2), " GB")
+end
+format_bytes(n) = format_bytes(Int(n))
 
 """
     list_worker_dir(worker_name, path; timeout=5.0) → (path, entries) | error

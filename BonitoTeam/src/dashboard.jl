@@ -180,7 +180,8 @@ Create a new project on the named worker. Steps:
 4. Register `/p/<id>` route on the live server.
 """
 function create_project!(srv::Bonito.Server, name::String, src_path::String,
-                          worker_name::String)
+                          worker_name::String;
+                          progress = nothing)
     haskey(WORKERS, worker_name) || error("Unknown worker: $worker_name")
     isempty(name) && error("Project name must not be empty")
     occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
@@ -196,6 +197,7 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
     # 1. Seed the canonical server-side copy from the picked source (local
     # rsync; this is always on the server box, no SSH).
     if abspath(src_path) != abspath(server_path)
+        progress === nothing || progress("Seeding server-side mirror…")
         @info "Seeding server-side mirror" src_path server_path
         mkpath(working_dir())
         run(`rsync -az $(rstrip(src_path, '/'))/ $(rstrip(server_path, '/'))/`)
@@ -203,13 +205,14 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
 
     # 2. Push server → worker over the worker's WS (no SSH, no inbound port).
     @info "Pushing project to worker" worker=worker_name dst=worker_path
-    push_dir_to_worker!(worker_name, server_path, worker_path)
+    push_dir_to_worker!(worker_name, server_path, worker_path; progress)
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     PROJECTS[id] = p
     save_projects!()
 
     # 3 + 4: build the chat app + register the route.
+    progress === nothing || progress("Starting chat session…")
     ensure_project_session!(p, srv)
     bump_state!()
     return p
@@ -222,7 +225,8 @@ as the canonical mirror, then start the session like any other project.
 """
 function create_project_from_worker!(srv::Bonito.Server, worker_name::String,
                                       worker_path::String;
-                                      name::String = basename(rstrip(worker_path, '/')))
+                                      name::String = basename(rstrip(worker_path, '/')),
+                                      progress = nothing)
     haskey(WORKERS, worker_name) || error("Unknown worker: $worker_name")
     isempty(name) && error("Project name must not be empty (folder has no basename?)")
     occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
@@ -232,12 +236,13 @@ function create_project_from_worker!(srv::Bonito.Server, worker_name::String,
     id = string(uuid4())[1:8]
     server_path = joinpath(working_dir(), name)
     @info "Pulling project from worker" worker=worker_name worker_path server_path
-    pull_dir_from_worker!(worker_name, worker_path, server_path)
+    pull_dir_from_worker!(worker_name, worker_path, server_path; progress)
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     PROJECTS[id] = p
     save_projects!()
 
+    progress === nothing || progress("Starting chat session…")
     ensure_project_session!(p, srv)
     bump_state!()
     return p
@@ -640,6 +645,32 @@ const DashboardStyles = Bonito.Styles(
         "background" => "rgba(59,130,246,0.08)"),
     CSS(".bt-link-loading",
         "color" => "var(--bt-text-muted)", "pointer-events" => "none"),
+
+    # ── Global busy toast ────────────────────────────────────────────────────
+    # Fixed top-right (left of the connection LED). Shown whenever any
+    # handler has set busy_msg, regardless of which form is open. Live
+    # progress messages from push/pull file transfers flow in here.
+    CSS(".bt-busy-toast",
+        "position" => "fixed",
+        "top" => "10px", "right" => "44px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-accent)",
+        "border-radius" => "var(--bt-radius)",
+        "padding" => "10px 14px",
+        "box-shadow" => "var(--bt-shadow-md)",
+        "display" => "flex", "align-items" => "center", "gap" => "10px",
+        "z-index" => "9998",
+        "font-size" => "13px",
+        "color" => "var(--bt-text)",
+        "max-width" => "min(80vw, 480px)"),
+
+    # ── Inline "loading" state for click-fired DOM buttons ───────────────────
+    # Used by the Discover Import button — JS flips this class on click for
+    # instant visual feedback (the WS round-trip to set busy_msg can take
+    # tens of ms; the click should respond immediately).
+    CSS(".bt-btn.bt-clicked",
+        "opacity" => "0.55", "cursor" => "wait",
+        "pointer-events" => "none"),
 
     # ── Slide-in for forms / panels ──────────────────────────────────────────
     CSS(".bt-slide-in", "animation" => "bt-slide 160ms ease-out"),
@@ -1054,12 +1085,14 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     on(np_submit.value) do clicked
         clicked || return
         isempty(busy_msg[]) || return   # guard: ignore clicks while busy
-        busy_msg[] = "Syncing files…"
+        nm = String(strip(np_name[]))
+        busy_msg[] = "Creating $(nm)…"
         @async begin
             try
-                create_project!(srv_ref[], String(strip(np_name[])),
+                create_project!(srv_ref[], nm,
                                  String(strip(np_picker.selected[])),
-                                 String(strip(np_worker[])))
+                                 String(strip(np_worker[]));
+                                 progress = msg -> (busy_msg[] = "Creating $(nm): $(msg)"))
                 error_obs[] = ""
                 new_proj_show[] = false
                 np_name[] = ""; np_picker.selected[] = ""; np_worker[] = ""
@@ -1128,10 +1161,12 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         isempty(w_name) && return
         proj_name = replace(basename(rstrip(path, '/')), r"[^a-zA-Z0-9_\-]" => "_")
         isempty(proj_name) && (proj_name = "project")
-        busy_msg[] = "Pulling from worker…"
+        busy_msg[] = "Importing $(proj_name)…"
         @async begin
             try
-                create_project_from_worker!(srv_ref[], w_name, path; name=proj_name)
+                create_project_from_worker!(srv_ref[], w_name, path;
+                                             name = proj_name,
+                                             progress = msg -> (busy_msg[] = "Importing $(proj_name): $(msg)"))
                 error_obs[]      = ""
                 discover_state[] = ""
             catch e
@@ -1166,7 +1201,15 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
             DOM.div("Import";
                 class   = "bt-btn bt-btn-secondary",
                 style   = "cursor:pointer;flex-shrink:0",
-                onclick = js"event => $(import_path).notify($path);"),
+                # Instant visual feedback: flip the button to a loading
+                # state synchronously on click, before the WS round-trip
+                # that sets busy_msg server-side has a chance to land.
+                onclick = js"""event => {
+                    const btn = event.currentTarget;
+                    btn.classList.add('bt-clicked');
+                    btn.textContent = 'Importing…';
+                    $(import_path).notify($path);
+                }"""),
             class = is_active ? "bt-session-row bt-session-active" : "bt-session-row")
     end
 
@@ -1224,10 +1267,12 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
             error_obs[] = "Pick a folder on the worker first (Browse → Choose)."
             return
         end
-        busy_msg[] = "Pulling project from worker…"
+        nm = basename(rstrip(chosen, '/'))
+        busy_msg[] = "Importing $(nm)…"
         @async begin
             try
-                create_project_from_worker!(srv_ref[], w_name, chosen)
+                create_project_from_worker!(srv_ref[], w_name, chosen;
+                    progress = msg -> (busy_msg[] = "Importing $(nm): $(msg)"))
                 error_obs[] = ""
                 picker_state[] = ""
                 rp.selected[] = ""
@@ -1368,6 +1413,19 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         isempty(msg) ? DOM.div() : DOM.div(msg; class = "bt-error")
     end
 
+    # Global busy toast — fixed top-right, shown whenever any handler has set
+    # busy_msg. Used by Import (discover panel), Create project (form), and
+    # Create from worker (per-worker picker form). Stage updates from
+    # push_dir_to_worker! / pull_dir_from_worker! flow into busy_msg via the
+    # progress callback so the toast updates live during transfers.
+    busy_toast = map(busy_msg) do msg
+        isempty(msg) ? DOM.div() :
+            DOM.div(
+                DOM.div(class = "bt-spinner"),
+                DOM.span(msg),
+                class = "bt-busy-toast bt-slide-in")
+    end
+
     # Layout
     App() do session
         DOM.div(
@@ -1375,6 +1433,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
             # Live connection indicator (fixed top-right). Tracks WS state:
             # green=connected, yellow=reconnecting, red=disconnected.
             Bonito.ConnectionIndicator(),
+            busy_toast,
             DOM.div(
                 DOM.h1("BonitoTeam"),
                 DOM.div("Multi-host orchestrator for agentic coding sessions";

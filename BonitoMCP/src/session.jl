@@ -136,46 +136,13 @@ function execute(s::JuliaSession, code::AbstractString;
                   timeout::Union{Real,Nothing} = DEFAULT_TIMEOUT,
                   max_bytes::Int               = 10_000,
                   full_output::Bool            = false)
-    return execute_with(s, code, :format_value, timeout,
-                         (max_bytes, full_output))
-end
-
-# bt_show counterpart: uses the BonitoMCPHelper.format_show formatter, which
-# RENDERS the result to a file under <env>/.bonitoTeam/show/ on the worker
-# side and returns a small text reference. The chat UI on the server side
-# fetches the file (lazily) and renders a collapsible preview — bytes never
-# enter the MCP tool result, so claude-agent-acp can't forward them to the
-# model. Keeps the agent's context small while still showing the user
-# images / SVGs / HTML / text inline.
-function execute_show(s::JuliaSession, code::AbstractString;
-                       timeout::Union{Real,Nothing} = DEFAULT_TIMEOUT,
-                       max_bytes::Int               = 4_000_000)
-    # Anchor the show/ dir in the env_path so it travels with the project
-    # (RemoteSync covers .bonitoTeam/ already; show files persist alongside
-    # the chat history).
-    out_dir = s.env_path === nothing ?
-        mktempdir(prefix = "bt-show-") :
-        joinpath(s.env_path, ".bonitoTeam", "show")
-    return execute_with(s, code, :format_show, timeout,
-                         (out_dir, max_bytes))
-end
-
-# Shared body — the formatter symbol picks which BonitoMCPHelper function the
-# worker calls; `args_tuple` is splatted into that call.
-function execute_with(s::JuliaSession, code::AbstractString,
-                       formatter::Symbol,
-                       timeout::Union{Real,Nothing},
-                       args_tuple::Tuple)
     @lock s.lock begin
         s.in_flight === nothing ||
             error("An eval is already in flight on this session — call " *
                   "bt_julia_continue, bt_julia_interrupt, or bt_julia_restart first.")
         is_alive(s) || start!(s)
-        # Reset the buffer so the agent's `partial` reflects only this call's output.
         drain_output!(s)
 
-        # Parse the code parent-side so we can return a clean error before spawning.
-        # Use `parseall` so multi-statement code blocks work.
         expr = try
             Meta.parseall(String(code))
         catch e
@@ -186,19 +153,25 @@ function execute_with(s::JuliaSession, code::AbstractString,
                     elapsed_s = 0.0)
         end
 
+        # Anchor the .bonitoTeam/show/ dir in env_path so rich-output files
+        # written by format_value travel with the project. RemoteSync
+        # already covers .bonitoTeam/, so show files persist alongside the
+        # chat history. For temp envs we fall back to a tmp dir.
+        out_dir = s.env_path === nothing ?
+            mktempdir(prefix = "bt-show-") :
+            joinpath(s.env_path, ".bonitoTeam", "show")
+
         s.in_flight_code    = String(code)
         s.in_flight_started = time()
         # Wrap in the helper so the worker returns pre-formatted block dicts
         # (base types only, never user-defined types Malt's serialiser
-        # wouldn't recognise on the parent side). The error path always uses
-        # format_error regardless of which value-formatter is picked.
-        max_err_bytes = formatter === :format_value ? args_tuple[1] : 4_000
+        # wouldn't recognise on the parent side).
         wrapped = quote
             try
-                Main.BonitoMCPHelper.$(formatter)($(expr), $(args_tuple...))
+                Main.BonitoMCPHelper.format_value($(expr), $out_dir, $max_bytes, $full_output)
             catch __mcp_err__
                 Main.BonitoMCPHelper.format_error(__mcp_err__, catch_backtrace(),
-                                                   $max_err_bytes, false)
+                                                   $max_bytes, $full_output)
             end
         end
         s.in_flight = Malt.remote_eval(s.worker, wrapped)

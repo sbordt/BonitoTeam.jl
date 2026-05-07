@@ -29,61 +29,39 @@ Turn a Julia value into MCP content blocks. `nothing` returns are suppressed.
 containers are summarised. Always-text blocks use the `result:\\n<body>` shape
 so the chat-side renderer picks them up as labeled Monaco sections.
 """
-function format_value(val, max_bytes::Int, full_output::Bool)
+function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output::Bool)
     val === nothing && return Dict{String,Any}[]   # suppress nothing-result
 
-    # Image-detection: 2-D array of colorants → render as PNG (size-capped).
-    if !full_output && looks_like_image(val)
-        try
-            png = value_to_png(val)
-            if length(png) <= 4 * max_bytes
-                return [Dict{String,Any}(
-                    "type" => "image",
-                    "data" => base64encode(png),
-                    "mimeType" => "image/png",
-                )]
-            end
-        catch
-            # fall through to text repr
-        end
-    end
+    blocks = Dict{String,Any}[]
 
+    # Always include a text representation first so the agent has SOMETHING
+    # readable about the result. Truncated to keep the response small.
     repr = !full_output && is_large_container(val) ?
         summarize_container(val) : sprint(show, "text/plain", val)
-    return [Dict{String,Any}(
+    push!(blocks, Dict{String,Any}(
         "type" => "text",
         "text" => "result:\n$(truncate_text(repr, max_bytes, full_output, "result"))",
-    )]
+    ))
+
+    # If the value supports a richer MIME, render it to a file alongside —
+    # the chat-side render_tool_body picks up the `shown:` reference and
+    # auto-displays the file as a collapsible preview, but the BYTES never
+    # leave the worker until the user actually expands the tool. The agent
+    # sees only the path + mime + size.
+    show_block = try_save_rich(val, out_dir, max_bytes)
+    show_block === nothing || push!(blocks, show_block)
+    return blocks
 end
 
-"""
-    format_show(val, out_dir, max_bytes) → Vector{Dict{String,Any}}
-
-`bt_show` formatter. Writes the value to a file under `out_dir` (typically
-`<cwd>/.bonitoTeam/show/`) and returns ONLY a small text reference. The
-file's bytes never enter the MCP tool result, so claude-agent-acp can't
-forward them to the model — the agent only sees a path + size + mime.
-
-The chat-side renderer parses the reference, fetches the file from the
-worker if needed, and shows a collapsible preview (image / video / html /
-text) inline in the chat.
-
-MIME chain (richest match wins, all rasterised to file extensions
-claude.ai's Messages API doesn't even need to handle since the bytes
-never reach it):
-  • image/png         — Makie/Plots figures, Colorant matrices via
-                        `showable` or PNGFiles
-  • image/svg+xml     — vector graphics (saved as `.svg`)
-  • text/html         — HTML widgets (`.html`)
-  • text/plain        — fallback
-"""
-function format_show(val, out_dir::AbstractString, max_bytes::Int)
-    val === nothing && return [text_block("shown: nothing")]
-
+# Walk the MIME chain (PNG → SVG → HTML, plus PNGFiles for Colorant
+# matrices) and write the first match to disk. Returns a `shown: <relpath>
+# (<mime>, <size>)` text block that the chat-side render_tool_body
+# detects and previews inline. nothing if no rich MIME was renderable.
+function try_save_rich(val, out_dir::AbstractString, max_bytes::Int)
+    val === nothing && return nothing
     mkpath(out_dir)
     base = string(time_ns(), base = 16) * "-" * string(rand(UInt32), base = 16)
 
-    # Image PNG via showable hook (preferred for plots + Makie scenes).
     if showable_safe(MIME"image/png"(), val)
         png = sprint_mime(val, MIME"image/png"())
         if !isempty(png) && length(png) <= max_bytes
@@ -91,7 +69,6 @@ function format_show(val, out_dir::AbstractString, max_bytes::Int)
         end
     end
 
-    # Direct PNG render for 2-D colorant arrays (when PNGFiles is available).
     if looks_like_image(val)
         try
             png = value_to_png(val)
@@ -102,8 +79,6 @@ function format_show(val, out_dir::AbstractString, max_bytes::Int)
         end
     end
 
-    # SVG (vector graphics — fine here because the bytes go to a file, not
-    # to claude). Browsers render image/svg+xml in <img> tags.
     if showable_safe(MIME"image/svg+xml"(), val)
         svg = sprint_mime(val, MIME"image/svg+xml"())
         if !isempty(svg) && length(svg) <= max_bytes
@@ -111,7 +86,6 @@ function format_show(val, out_dir::AbstractString, max_bytes::Int)
         end
     end
 
-    # HTML widgets / DataFrames. Same thing — chat will iframe-render.
     if showable_safe(MIME"text/html"(), val)
         html = sprint_mime(val, MIME"text/html"())
         if !isempty(html) && length(html) <= max_bytes
@@ -119,11 +93,7 @@ function format_show(val, out_dir::AbstractString, max_bytes::Int)
         end
     end
 
-    # Plain text fallback — write to file too so the chat can render it
-    # in Monaco like other tool outputs.
-    repr = sprint(show, "text/plain", val)
-    bytes = codeunits(repr)
-    return write_show_file(out_dir, base, ".txt", "text/plain", bytes, val)
+    return nothing  # text/plain is already in the response — no file
 end
 
 # Write the rendered bytes to disk and produce the reference content block.
@@ -139,7 +109,9 @@ function write_show_file(out_dir::AbstractString, base::AbstractString,
     text = string("shown: ", relpath_str,
                   " (", mime, ", ", format_bytes_short(length(bytes)), ")",
                   "\ntype: ", typeof_short(val))
-    return [text_block(text)]
+    # try_save_rich returns ONE block — the caller (format_value) appends it
+    # to the existing text result. No more `[text_block(text)]` wrapping.
+    return text_block(text)
 end
 
 text_block(text::AbstractString) = Dict{String,Any}(

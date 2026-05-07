@@ -973,6 +973,33 @@ end
 status_dot(s::Symbol) = DOM.span(""; class = "bt-dot bt-dot-$s",
     title = string(s))   # native tooltip
 
+# Pull a likely username out of $HOME (e.g. "/home/simon" → "simon"). Returns
+# "" if we can't find one.
+function _user_from_home(home::AbstractString)
+    isempty(home) && return ""
+    parts = split(home, '/'; keepempty=false)
+    isempty(parts) && return ""
+    return String(last(parts))
+end
+
+# Compose a human-readable worker subtitle. Skips "localhost" since
+# gethostname() returns it on some setups and it's useless metadata.
+# Order: user@host  ·  projects-root.
+function worker_subtitle(w::WorkerInfo)
+    parts = String[]
+    user  = _user_from_home(w.home)
+    host  = (w.hostname == "localhost" || isempty(w.hostname)) ? "" : w.hostname
+    if !isempty(user) && !isempty(host)
+        push!(parts, "$user@$host")
+    elseif !isempty(host)
+        push!(parts, host)
+    elseif !isempty(user)
+        push!(parts, user)
+    end
+    isempty(w.projects_root) || push!(parts, w.projects_root)
+    return isempty(parts) ? "(no metadata)" : join(parts, " · ")
+end
+
 function worker_card(w::WorkerInfo, srv_ref::Ref{Bonito.Server},
                      error_obs::Observable{String}, picker_state::Observable{String},
                      discover_state::Observable{String})
@@ -998,8 +1025,8 @@ function worker_card(w::WorkerInfo, srv_ref::Ref{Bonito.Server},
             DOM.div(status_dot(w.status),
                     DOM.span(w.name; class = "bt-card-name");
                     class = "bt-card-title"),
-            DOM.div(isempty(w.hostname) ? w.url : w.hostname,
-                    class = "bt-card-meta");
+            DOM.div(worker_subtitle(w); class = "bt-card-meta",
+                    title = "$(w.hostname) · home: $(w.home)"),
             class = "bt-card-body"),
         DOM.div(
             is_online ? discover_btn   : DOM.span(),

@@ -52,32 +52,32 @@ function serve(; host::String        = "0.0.0.0",
                  worker_secret::String,
                  state_dir::Union{String,Nothing}   = nothing,
                  working_dir::Union{String,Nothing} = nothing)
+    # `nothing` OR `""` (env-var roundtrip) → use the platform default. Anything
+    # else is taken as an absolute override.
+    isvalid(s) = s !== nothing && !isempty(String(s))
+    sd = isvalid(state_dir)   ? String(state_dir)   :
+         joinpath(homedir(), ".local", "share", "bonitoteam-server")
+    wd = isvalid(working_dir) ? String(working_dir) :
+         joinpath(homedir(), "bonitoteam-server")
 
-    state_dir   === nothing || (SERVER_STATE_DIR[]   = state_dir)
-    working_dir === nothing || (SERVER_WORKING_DIR[] = working_dir)
-    mkpath(SERVER_WORKING_DIR[])
-    load_workers!()
-    load_projects!()
+    state = ServerState(; state_dir = sd, working_dir = wd, worker_secret = worker_secret)
 
     # Mark all loaded workers offline; they'll flip online when they re-dial.
-    for w in values(WORKERS)
+    for w in values(state.workers)
         w.status = :offline
     end
 
-    srv_ref = Ref{Bonito.Server}()
-    dash = dashboard_app(srv_ref)
-
-    srv = Bonito.Server(dash, host, port; proxy_url = ".")
-    srv_ref[] = srv
-    SERVER_REF[] = srv
+    dash = dashboard_app(state)
+    srv  = Bonito.Server(dash, host, port; proxy_url = ".")
+    state.srv = srv
 
     base_url = something(public_url, "http://localhost:$port")
     add_install_routes!(srv, base_url, worker_secret)
-    add_worker_ws_routes!(srv, worker_secret)
+    add_worker_ws_routes!(srv, state)
 
-    @info "BonitoTeam dashboard running" url="http://localhost:$port" state=SERVER_STATE_DIR[]
+    @info "BonitoTeam dashboard running" url="http://localhost:$port" state=sd
     @info "Worker install endpoint"      url="$base_url/install.sh"
-    return srv
+    return state
 end
 
 # HTTP routes
@@ -99,15 +99,14 @@ function render_install_script(public_url::String, worker_secret::String)
     )
 end
 
-# WebSocket routes (worker-side connection terminus)
-function add_worker_ws_routes!(srv::Bonito.Server, worker_secret::String)
-    Bonito.HTTPServer.websocket_route!(srv, "/worker-ws" => function(_ctx, ws)
-        handle_worker_control(ws, worker_secret)
-    end)
-    Bonito.HTTPServer.websocket_route!(srv, "/worker-acp" => function(_ctx, ws)
-        handle_worker_acp(ws, worker_secret)
-    end)
-    Bonito.HTTPServer.websocket_route!(srv, "/transfer-ws" => function(_ctx, ws)
-        handle_transfer_ws(ws, worker_secret)
-    end)
+# WebSocket routes (worker-side connection terminus). Each closure captures
+# `state` so the route handler picks up the same instance the dashboard reads
+# from / the chat writes into.
+function add_worker_ws_routes!(srv::Bonito.Server, state::ServerState)
+    Bonito.HTTPServer.websocket_route!(srv, "/worker-ws"   => (_ctx, ws) ->
+        handle_worker_control(state, ws))
+    Bonito.HTTPServer.websocket_route!(srv, "/worker-acp"  => (_ctx, ws) ->
+        handle_worker_acp(state, ws))
+    Bonito.HTTPServer.websocket_route!(srv, "/transfer-ws" => (_ctx, ws) ->
+        handle_transfer_ws(state, ws))
 end

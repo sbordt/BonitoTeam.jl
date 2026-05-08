@@ -22,11 +22,12 @@ import BonitoBook       # MonacoEditor / DiffEditor / Collapsible for tool rende
 import BonitoMCP        # shipped to workers, also used by the bundle build
 import BonitoWorker     # ditto
 
+include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
 include("styles.jl")
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("persistence.jl")
-include("dashboard.jl")        # WORKERS / PROJECTS state + dashboard_app
+include("dashboard.jl")        # dashboard_app
 include("github.jl")           # "From GitHub" project template
 include("server.jl")           # serve()
 

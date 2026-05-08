@@ -310,8 +310,8 @@ end
 # and fall back to a single-file fetch over the worker control WS. Returns
 # `nothing` if the reference can't be parsed (caller falls back to the
 # default rendering).
-function render_show_reference(text::AbstractString, cwd::AbstractString,
-                                project_id::AbstractString)
+function render_show_reference(state::ServerState, text::AbstractString,
+                                cwd::AbstractString, project_id::AbstractString)
     # Header line is the first line; "type: ..." may follow.
     nl = findfirst('\n', text)
     header = nl === nothing ? text : text[1:prevind(text, nl)]
@@ -330,14 +330,14 @@ function render_show_reference(text::AbstractString, cwd::AbstractString,
     end
 
     # No project context → no worker to ask.
-    if isempty(project_id) || !haskey(PROJECTS, project_id)
+    if isempty(project_id) || !haskey(state.projects, project_id)
         return DOM.div("(file not on server: $relpath_str)";
                        class = "bt-tool-empty")
     end
 
     # Stream from the worker via /transfer-ws + RemoteSync.send_file. Show a
     # spinner immediately and swap in the preview when the file lands on disk.
-    p = PROJECTS[project_id]
+    p = state.projects[project_id]
     worker_path = joinpath(p.worker_path, relpath_str)
 
     state = Observable{Any}(:loading)
@@ -361,7 +361,7 @@ function render_show_reference(text::AbstractString, cwd::AbstractString,
     Base.errormonitor(@async begin
         try
             mkpath(dirname(server_local_path))
-            fetch_file_from_worker(p.worker_name, worker_path, server_local_path;
+            fetch_file_from_worker(state, p.worker_name, worker_path, server_local_path;
                                     handoff_timeout = 30.0)
             state[] = (:ready, read(server_local_path))
         catch e
@@ -411,7 +411,7 @@ function render_show_preview(bytes::AbstractVector{UInt8}, mime::AbstractString,
     end
 end
 
-function render_tool_body(m::ToolMsg, cwd::AbstractString;
+function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString;
                            project_id::AbstractString = "")
     content = load_tool_content(cwd, m.id)
     isempty(content) &&
@@ -425,7 +425,7 @@ function render_tool_body(m::ToolMsg, cwd::AbstractString;
     # renders a collapsible preview without putting the bytes through claude.
     show_text = find_show_reference(content)
     if show_text !== nothing
-        body = render_show_reference(show_text, cwd, project_id)
+        body = render_show_reference(state, show_text, cwd, project_id)
         body === nothing || return body
     end
 
@@ -473,7 +473,7 @@ function render_tool_body(m::ToolMsg, cwd::AbstractString;
 end
 
 # Chat app
-function chat_app(cwd::String;
+function chat_app(state::ServerState, cwd::String;
                   project_id::String = "",
                   mcp_servers    = AgentClientProtocol.MCPServer[],
                   client_factory = nothing)
@@ -672,8 +672,8 @@ function chat_app(cwd::String;
     # going through the UI's send-button observable. Keyed by project_id;
     # chat_app instances without a project_id (e.g. unit-test apps) skip.
     if !isempty(project_id)
-        @info "registering CHAT_CLIENTS" project_id session_id=client[].session_id
-        BonitoTeam.CHAT_CLIENTS[project_id] = client
+        @info "registering chat client" project_id session_id=client[].session_id
+        state.chat_clients[project_id] = client
     end
 
     # Session-health state surfaced in the UI. Flipped to false when prompt!
@@ -686,12 +686,12 @@ function chat_app(cwd::String;
     # GitHub" template) and the chat is otherwise empty, fire it once as the
     # first user message. Cleared + persisted right away so a server restart
     # or session reconnect doesn't double-fire.
-    if !isempty(project_id) && haskey(PROJECTS, project_id)
-        proj = PROJECTS[project_id]
+    if !isempty(project_id) && haskey(state.projects, project_id)
+        proj = state.projects[project_id]
         ap = proj.auto_prompt
         if ap !== nothing && !isempty(ap) && isempty(msgs_store)
             proj.auto_prompt = nothing
-            try save_projects!() catch e
+            try save_projects!(state) catch e
                 @warn "auto_prompt: persist clear failed" exception=e
             end
             user_msg = UserMsg(String(ap))
@@ -828,7 +828,7 @@ function chat_app(cwd::String;
             isempty(tool_id) && return
             idx = findfirst(m -> m isa ToolMsg && m.id == tool_id, msgs_store)
             idx === nothing && return
-            body = render_tool_body(msgs_store[idx], cwd; project_id = project_id)
+            body = render_tool_body(state, msgs_store[idx], cwd; project_id = project_id)
             try
                 Bonito.dom_in_js(bonito_session, body, js"""(elem) => {
                     const slot = document.querySelector(
@@ -905,7 +905,7 @@ function chat_app(cwd::String;
             isempty(tag) && return
             sync_click[] = ""
             isempty(project_id) && (sync_status[] = "no project bound"; return)
-            handle_chat_sync_click(project_id, sync_status)
+            handle_chat_sync_click(state, project_id, sync_status)
         end
 
         sync_button = DOM.button(

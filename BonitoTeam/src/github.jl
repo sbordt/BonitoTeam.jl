@@ -85,32 +85,32 @@ function github_project_name(ref::GithubRef)
 end
 
 """
-    create_project_from_github!(srv, url; worker_name, name=nothing,
+    create_project_from_github!(state, url; worker_name, name=nothing,
                                   progress = nothing) → ProjectInfo
 
 End-to-end "From GitHub" creation. Clones the repo on the worker, sets up
 the auto-prompt for issues/PRs, and registers the project so the chat is
 immediately reachable at `/p/<id>`.
 """
-function create_project_from_github!(srv::Bonito.Server, url::AbstractString;
+function create_project_from_github!(state::ServerState, url::AbstractString;
                                        worker_name::AbstractString,
                                        name::Union{String,Nothing} = nothing,
                                        progress = nothing)
-    haskey(WORKERS, worker_name) || error("Unknown worker: $worker_name")
+    haskey(state.workers, worker_name) || error("Unknown worker: $worker_name")
     ref = parse_github_url(url)
     proj_name = something(name, github_project_name(ref))
     occursin(r"^[a-zA-Z0-9_\-]+$", proj_name) ||
         error("Derived project name '$proj_name' is invalid; pass `name=` explicitly")
 
-    w = WORKERS[worker_name]
+    w = state.workers[worker_name]
     id          = string(uuid4())[1:8]
-    server_path = joinpath(working_dir(), proj_name)
+    server_path = joinpath(state.working_dir, proj_name)
     worker_path = joinpath(w.projects_root, proj_name)
     clone_url   = "https://github.com/$(ref.owner)/$(ref.repo).git"
     pr_number   = ref.kind == :pull ? ref.number : nothing
 
     progress === nothing || progress("Cloning $(ref.owner)/$(ref.repo) on worker…")
-    clone_repo_on_worker(worker_name, clone_url, worker_path; pr_number = pr_number)
+    clone_repo_on_worker(state, worker_name, clone_url, worker_path; pr_number = pr_number)
 
     auto_prompt = if ref.kind == :repo
         nothing
@@ -122,11 +122,11 @@ function create_project_from_github!(srv::Bonito.Server, url::AbstractString;
 
     p = ProjectInfo(id, proj_name, worker_name, server_path, worker_path, now(UTC))
     p.auto_prompt = auto_prompt
-    PROJECTS[id] = p
-    save_projects!()
+    state.projects[id] = p
+    save_projects!(state)
 
     progress === nothing || progress("Starting chat session…")
-    ensure_project_session!(p, srv)
-    bump_state!()
+    ensure_project_session!(state, p)
+    bump_state!(state)
     return p
 end

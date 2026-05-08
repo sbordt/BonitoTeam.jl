@@ -4,8 +4,8 @@
 #
 # Endpoints (registered as Bonito websocket_route!s):
 #   /worker-ws    → control channel. Worker sends a hello frame; we register
-#                   it in WORKERS, mark online, and keep the WS for sending
-#                   commands like "open_session" / "open_transfer" back.
+#                   it in state.workers, mark online, and keep the WS for
+#                   sending commands like "open_session" / "open_transfer".
 #   /worker-acp   → per-session WS. Worker dials this in response to an
 #                   "open_session" command and identifies the WS by sid; we
 #                   pair it with a Channel that `start_session_on_worker` is
@@ -16,44 +16,45 @@
 
 using HTTP, HTTP.WebSockets, JSON, AgentClientProtocol, RemoteSync
 
-# name → live control WS (used by the server to push commands to the worker)
-const WORKER_CONTROL_WS = Dict{String,Any}()
-# sid → Channel{Any} where the matching /worker-acp upgrade hands off the WS
-const PENDING_ACP_SESSIONS = Dict{String,Channel{Any}}()
-# sync_id → Channel{Any} where the /transfer-ws upgrade hands off the WS for
-# a RemoteSync (librsync) directional transfer.
-const PENDING_TRANSFERS = Dict{String,Channel{Any}}()
-# request_id → Channel{Dict} where worker's list_dir_response is handed back
-# to the dashboard task that issued the RPC
-const PENDING_LIST_DIR = Dict{String,Channel{Dict}}()
-# request_id → Channel where worker's scan_sessions_result is handed back
-const PENDING_SCAN_SESSIONS = Dict{String,Channel{Vector{Dict{String,Any}}}}()
-# request_id → Channel where worker's clone_repo_response is handed back
-const PENDING_CLONE_REPO = Dict{String,Channel{Dict{String,Any}}}()
+# All worker-related state lives on `state::ServerState`:
+#   state.worker_control_ws — name → live HTTP.WebSocket
+#   state.pending_rpcs      — request_id/sync_id/sid → Channel{Any}
+#                              one dict for every RPC type (list_dir, scan_sessions,
+#                              clone_repo, /transfer-ws handoff, /worker-acp handoff).
+#                              The keys are uuids so collisions across types can't
+#                              happen, and the unified shape is simpler than the
+#                              previous five typed dicts.
 
 # Send a JSON command to a worker over its control WS. Throws if the worker
 # isn't currently connected.
-function send_command(worker_name::String, payload::AbstractDict)
-    haskey(WORKER_CONTROL_WS, worker_name) ||
+function send_command(state::ServerState, worker_name::String, payload::AbstractDict)
+    haskey(state.worker_control_ws, worker_name) ||
         error("Worker '$worker_name' is not connected")
-    WebSockets.send(WORKER_CONTROL_WS[worker_name], JSON.json(payload))
+    WebSockets.send(state.worker_control_ws[worker_name], JSON.json(payload))
     return nothing
 end
 
-# Take from a pending-handoff channel with a bounded wait. If `timeout` seconds
-# elapse without the worker dialing back, we evict the entry from `pending`
-# (so the worker gets "unknown id" if it arrives late) and put `nothing` on
-# the channel; callers see that and raise `op_name timed out`.
-#
-# `pending::AbstractDict` and `key::String` are the dict + key that the
-# matching handler `pop!`s when the worker arrives. Both sides race-tolerant
-# via the haskey guard.
-function take_pending!(ch::Channel, pending::AbstractDict, key::String,
+# Register a pending RPC: returns (request_id, channel). Caller sends the
+# command (with `request_id`/`sync_id`/`sid` set to the returned id) and waits
+# on the channel via `take_pending!`. The matching control-frame handler /
+# WS upgrade pops the id out of `pending_rpcs` and puts the response on the
+# channel.
+function register_rpc!(state::ServerState)
+    rid = string(uuid4())
+    ch  = Channel{Any}(1)
+    state.pending_rpcs[rid] = ch
+    return (rid, ch)
+end
+
+# Take from a pending-RPC channel with a bounded wait. If `timeout` seconds
+# elapse without the worker replying, evict the entry (so a late reply gets
+# "unknown id") and surface a clear error to the caller.
+function take_pending!(state::ServerState, ch::Channel, key::String,
                        timeout::Real, op_name::AbstractString)
     Base.errormonitor(@async begin
         sleep(timeout)
-        if haskey(pending, key)
-            delete!(pending, key)
+        if haskey(state.pending_rpcs, key)
+            delete!(state.pending_rpcs, key)
             try put!(ch, nothing) catch end
         end
     end)
@@ -62,13 +63,22 @@ function take_pending!(ch::Channel, pending::AbstractDict, key::String,
     return val
 end
 
+# Try to deliver a worker-pushed RPC reply by request_id. No-op if the id is
+# unknown (caller already timed out, or the response races a re-registration).
+function deliver_rpc_response!(state::ServerState, rid::AbstractString, value)
+    haskey(state.pending_rpcs, rid) || return
+    ch = pop!(state.pending_rpcs, rid)
+    try put!(ch, value) catch end
+    return
+end
+
 # Handler for /worker-ws — runs once per worker, for the worker's lifetime.
-function handle_worker_control(ws, worker_secret::String)
+function handle_worker_control(state::ServerState, ws)
     name = "?"
     try
         hello_raw = WebSockets.receive(ws)
         hello = JSON.parse(String(hello_raw))
-        if get(hello, "secret", "") != worker_secret
+        if get(hello, "secret", "") != state.worker_secret
             try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"unauthorized"))) catch end
             return
         end
@@ -80,7 +90,7 @@ function handle_worker_control(ws, worker_secret::String)
         w = WorkerInfo(
             name,
             "<inbound-ws>",          # we no longer dial the worker; URL is moot
-            worker_secret,
+            state.worker_secret,
             nothing,                 # ssh_target reserved for future rsync-over-ssh
             String(get(hello, "hostname", "")),
             String(get(hello, "home", "")),
@@ -89,66 +99,57 @@ function handle_worker_control(ws, worker_secret::String)
             :online,
             now(UTC),
         )
-        WORKERS[name] = w
-        WORKER_CONTROL_WS[name] = ws
-        save_workers!()
-        bump_state!()
+        state.workers[name] = w
+        state.worker_control_ws[name] = ws
+        save_workers!(state)
+        bump_state!(state)
         @info "Worker connected" name=name hostname=w.hostname
 
         # Re-attach any persisted projects on this worker now that it's online.
-        for p in values(PROJECTS)
+        for p in values(state.projects)
             p.worker_name == name || continue
             try
-                ensure_project_session!(p)
+                ensure_project_session!(state, p)
             catch e
                 @warn "Failed to (re)attach project on connect" project=p.name exception=e
             end
         end
 
-        # Process inbound frames from the worker.
+        # Process inbound frames from the worker. Every typed reply maps
+        # back to a pending RPC by request_id; deliver_rpc_response! is a
+        # no-op if the id is unknown (caller already timed out).
         for frame in ws
             try
                 cmd = JSON.parse(String(frame))
-                t = get(cmd, "type", "")
+                t   = get(cmd, "type", "")
+                rid = String(get(cmd, "request_id", ""))
                 if t == "list_dir_response"
-                    rid = String(get(cmd, "request_id", ""))
-                    if haskey(PENDING_LIST_DIR, rid)
-                        ch = pop!(PENDING_LIST_DIR, rid)
-                        put!(ch, Dict{String,Any}(cmd))
-                    end
+                    deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                 elseif t == "scan_sessions_result"
-                    rid = String(get(cmd, "request_id", ""))
-                    if haskey(PENDING_SCAN_SESSIONS, rid)
-                        ch = pop!(PENDING_SCAN_SESSIONS, rid)
-                        sessions = [Dict{String,Any}(s)
-                                    for s in get(cmd, "sessions", Any[])]
-                        put!(ch, sessions)
-                    end
+                    sessions = [Dict{String,Any}(s)
+                                for s in get(cmd, "sessions", Any[])]
+                    deliver_rpc_response!(state, rid, sessions)
                 elseif t == "clone_repo_response"
-                    rid = String(get(cmd, "request_id", ""))
-                    if haskey(PENDING_CLONE_REPO, rid)
-                        ch = pop!(PENDING_CLONE_REPO, rid)
-                        put!(ch, Dict{String,Any}(cmd))
-                    end
+                    deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                 end
             catch e
                 @warn "Worker control frame error" exception=e
             end
         end
     finally
-        delete!(WORKER_CONTROL_WS, name)
-        if haskey(WORKERS, name)
-            WORKERS[name].status = :offline
-            bump_state!()
+        delete!(state.worker_control_ws, name)
+        if haskey(state.workers, name)
+            state.workers[name].status = :offline
+            bump_state!(state)
         end
         # Auto-release any project locks held by this worker — its claude
         # processes are gone, so the locks are stale.
-        release_locks_for_worker!(name)
-        # Tear down the chat_app's PROJECT_APPS entry so the next reconnect
+        release_locks_for_worker!(state, name)
+        # Tear down the chat_app's project_apps entry so the next reconnect
         # builds a fresh ACP session.
-        for p in values(PROJECTS)
+        for p in values(state.projects)
             if p.worker_name == name
-                delete!(PROJECT_APPS, p.id)
+                delete!(state.project_apps, p.id)
             end
         end
         @info "Worker disconnected" name=name
@@ -159,67 +160,46 @@ end
 # Worker (from inside its Malt subprocess) dials this in response to an
 # `open_transfer` command on the control WS. We hand the live WS to the
 # orchestrator task that called sync_dir_to_worker!/sync_dir_from_worker!.
-function handle_transfer_ws(ws, worker_secret::String)
-    auth_raw = WebSockets.receive(ws)
-    auth = JSON.parse(String(auth_raw))
-    if get(auth, "secret", "") != worker_secret
-        try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"unauthorized"))) catch end
-        return
-    end
-    sync_id = String(get(auth, "sync_id", ""))
-    if isempty(sync_id)
-        try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"missing sync_id"))) catch end
-        return
-    end
-    ch = nothing
-    try
-        ch = pop!(PENDING_TRANSFERS, sync_id)
-    catch e
-        e isa KeyError || rethrow()
-        try WebSockets.send(ws, JSON.json(Dict("ok"=>false,
-                                                "error"=>"unknown or expired sync_id"))) catch end
-        return
-    end
-    WebSockets.send(ws, JSON.json(Dict("ok" => true)))
-    put!(ch, ws)
-
-    # Hold the WS open for the duration of the transfer. The orchestrator
-    # task is reading/writing through it on the same process; we just need
-    # to keep Bonito from tearing down the underlying connection.
-    while !WebSockets.isclosed(ws)
-        sleep(1)
-    end
+function handle_transfer_ws(state::ServerState, ws)
+    handle_handoff_ws(state, ws, "sync_id"; close_on_exit = false)
 end
 
 # Handler for /worker-acp — one invocation per ACP session.
-function handle_worker_acp(ws, worker_secret::String)
+function handle_worker_acp(state::ServerState, ws)
+    handle_handoff_ws(state, ws, "sid"; close_on_exit = false)
+end
+
+# Shared handoff: auth on the first frame (`{secret, <id_field>}`), look up
+# the matching pending RPC channel by the id, ack with `{ok:true}`, hand the
+# live WS to the waiting orchestrator task, then block until close so Bonito
+# doesn't tear the connection down underneath us.
+function handle_handoff_ws(state::ServerState, ws, id_field::AbstractString;
+                            close_on_exit::Bool = false)
     auth_raw = WebSockets.receive(ws)
     auth = JSON.parse(String(auth_raw))
-    if get(auth, "secret", "") != worker_secret
+    if get(auth, "secret", "") != state.worker_secret
         try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"unauthorized"))) catch end
         return
     end
-    sid = String(get(auth, "sid", ""))
-    if isempty(sid)
-        try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"missing sid"))) catch end
-        return
-    end
-    ch = nothing
-    try
-        ch = pop!(PENDING_ACP_SESSIONS, sid)
-    catch e
-        e isa KeyError || rethrow()
+    id = String(get(auth, id_field, ""))
+    if isempty(id)
         try WebSockets.send(ws, JSON.json(Dict("ok"=>false,
-                                                "error"=>"unknown or expired sid"))) catch end
+                                                "error"=>"missing $id_field"))) catch end
         return
     end
+    haskey(state.pending_rpcs, id) || begin
+        try WebSockets.send(ws, JSON.json(Dict("ok"=>false,
+                                                "error"=>"unknown or expired $id_field"))) catch end
+        return
+    end
+    ch = pop!(state.pending_rpcs, id)
     WebSockets.send(ws, JSON.json(Dict("ok" => true)))
     put!(ch, ws)
 
-    # Block here so Bonito keeps the WS open for the duration of the session.
     while !WebSockets.isclosed(ws)
         sleep(1)
     end
+    close_on_exit && try close(ws) catch end
 end
 
 # Server-side ACP client over an accepted WS
@@ -237,19 +217,17 @@ When resuming, claude-agent-acp replays the prior conversation as a stream
 of `session/update` notifications — our `update_handler` receives them just
 like live events, so the chat UI fills in automatically.
 """
-function start_session_on_worker(worker_name::String, cwd::String;
+function start_session_on_worker(state::ServerState, worker_name::String, cwd::String;
                                   on_update::Function       = identity,
                                   mcp_servers               = [],
                                   request_handler::Function = AgentClientProtocol.make_request_handler(cwd),
                                   resume_session_id::Union{String,Nothing} = nothing,
                                   timeout::Real             = 30.0)
 
-    haskey(WORKER_CONTROL_WS, worker_name) ||
+    haskey(state.worker_control_ws, worker_name) ||
         error("Worker '$worker_name' is not connected")
 
-    sid = string(uuid4())
-    ch  = Channel{Any}(1)
-    PENDING_ACP_SESSIONS[sid] = ch
+    sid, ch = register_rpc!(state)
 
     mcp_list = [Dict("name"    => s.name,
                      "command" => s.command,
@@ -260,11 +238,11 @@ function start_session_on_worker(worker_name::String, cwd::String;
     # Find the project this session belongs to (purely for the worker-side
     # log line; we don't ship project_id over the wire anymore).
     project_id = ""
-    for p in values(PROJECTS)
+    for p in values(state.projects)
         p.worker_name == worker_name && p.worker_path == cwd && (project_id = p.id; break)
     end
 
-    send_command(worker_name, Dict(
+    send_command(state, worker_name, Dict(
         "type"       => "open_session",
         "sid"        => sid,
         "project_id" => project_id,
@@ -275,7 +253,7 @@ function start_session_on_worker(worker_name::String, cwd::String;
 
     # Wait for the worker's /worker-acp upgrade — bounded so a dead worker
     # doesn't hang the dashboard task that triggered the session.
-    ws = take_pending!(ch, PENDING_ACP_SESSIONS, sid, timeout,
+    ws = take_pending!(state, ch, sid, timeout,
                       "open_session on '$worker_name'")
 
     conn = ws_connection(ws; request_handler, update_handler = on_update)
@@ -329,26 +307,25 @@ Send the contents of server-side `src` to worker-side `dst` via librsync.
 Resumable: subsequent calls compute deltas against the worker's existing
 files, so unchanged content isn't retransmitted.
 """
-function sync_dir_to_worker!(worker_name::String, src::String, dst::String;
+function sync_dir_to_worker!(state::ServerState, worker_name::String,
+                              src::String, dst::String;
                               handoff_timeout::Real = 30.0,
                               on_progress = nothing)
     isdir(src) || error("Source path is not a directory: $src")
-    haskey(WORKER_CONTROL_WS, worker_name) ||
+    haskey(state.worker_control_ws, worker_name) ||
         error("Worker '$worker_name' is not connected")
 
-    sync_id = string(uuid4())
-    ch = Channel{Any}(1)
-    PENDING_TRANSFERS[sync_id] = ch
+    sync_id, ch = register_rpc!(state)
 
     notify_str(on_progress, "Connecting to worker…")
-    send_command(worker_name, Dict(
+    send_command(state, worker_name, Dict(
         "type"      => "open_transfer",
         "sync_id"   => sync_id,
         "direction" => "to_worker",
         "dst_path"  => dst,
     ))
 
-    ws = take_pending!(ch, PENDING_TRANSFERS, sync_id, handoff_timeout,
+    ws = take_pending!(state, ch, sync_id, handoff_timeout,
                       "sync to '$worker_name'")
     try
         notify_str(on_progress, "Streaming via librsync…")
@@ -368,26 +345,25 @@ end
 Inverse: receive worker-side `src` into server-side `dst` via librsync.
 Resumable in the same way as `sync_dir_to_worker!`.
 """
-function sync_dir_from_worker!(worker_name::String, src::String, dst::String;
+function sync_dir_from_worker!(state::ServerState, worker_name::String,
+                                src::String, dst::String;
                                 handoff_timeout::Real = 30.0,
                                 on_progress = nothing)
-    haskey(WORKER_CONTROL_WS, worker_name) ||
+    haskey(state.worker_control_ws, worker_name) ||
         error("Worker '$worker_name' is not connected")
     mkpath(dst)
 
-    sync_id = string(uuid4())
-    ch = Channel{Any}(1)
-    PENDING_TRANSFERS[sync_id] = ch
+    sync_id, ch = register_rpc!(state)
 
     notify_str(on_progress, "Connecting to worker…")
-    send_command(worker_name, Dict(
+    send_command(state, worker_name, Dict(
         "type"      => "open_transfer",
         "sync_id"   => sync_id,
         "direction" => "from_worker",
         "src_path"  => src,
     ))
 
-    ws = take_pending!(ch, PENDING_TRANSFERS, sync_id, handoff_timeout,
+    ws = take_pending!(state, ch, sync_id, handoff_timeout,
                       "sync from '$worker_name'")
     try
         notify_str(on_progress, "Streaming via librsync…")
@@ -445,23 +421,20 @@ Ask the named worker to readdir() `path` over its control WS. Empty `path`
 asks for the worker's \$HOME. Returns a NamedTuple of (path, entries) where
 entries is a Vector of NamedTuple (name, dir).
 """
-function list_worker_dir(worker_name::String, path::AbstractString;
+function list_worker_dir(state::ServerState, worker_name::String, path::AbstractString;
                           timeout::Real = 5.0)
-    haskey(WORKER_CONTROL_WS, worker_name) ||
+    haskey(state.worker_control_ws, worker_name) ||
         error("Worker '$worker_name' is not connected")
 
-    rid = string(uuid4())
-    ch = Channel{Dict}(1)
-    PENDING_LIST_DIR[rid] = ch
-
-    send_command(worker_name, Dict(
+    rid, ch = register_rpc!(state)
+    send_command(state, worker_name, Dict(
         "type"       => "list_dir",
         "request_id" => rid,
         "path"       => String(path),
     ))
 
-    @async (sleep(timeout); isopen(ch) && put!(ch, Dict("error" => "list_dir timed out")))
-    resp = take!(ch)
+    resp = take_pending!(state, ch, rid, timeout, "list_dir on '$worker_name'")
+    resp isa AbstractDict || error("list_dir on '$worker_name': unexpected response shape")
     haskey(resp, "error") && error("list_dir on '$worker_name': $(resp["error"])")
     return (path = String(resp["path"]),
             entries = [(name = String(e["name"]), dir = Bool(e["dir"]))
@@ -475,20 +448,14 @@ Ask the named worker to scan for existing Claude Code sessions (running processe
 + ~/.claude/projects/ history) and return the results. Blocks until the worker
 replies or `timeout` seconds elapse.
 """
-function scan_worker_sessions(worker_name::String; timeout::Real = 15.0)
-    haskey(WORKER_CONTROL_WS, worker_name) ||
+function scan_worker_sessions(state::ServerState, worker_name::String;
+                                timeout::Real = 15.0)
+    haskey(state.worker_control_ws, worker_name) ||
         error("Worker '$worker_name' is not connected")
-    rid = string(uuid4())
-    ch  = Channel{Vector{Dict{String,Any}}}(1)
-    PENDING_SCAN_SESSIONS[rid] = ch
-    send_command(worker_name, Dict("type" => "scan_sessions", "request_id" => rid))
-    @async begin
-        sleep(timeout)
-        if isopen(ch)
-            put!(ch, [Dict{String,Any}("error" => "scan_sessions timed out")])
-        end
-    end
-    return take!(ch)
+    rid, ch = register_rpc!(state)
+    send_command(state, worker_name, Dict("type" => "scan_sessions", "request_id" => rid))
+    resp = take_pending!(state, ch, rid, timeout, "scan_sessions on '$worker_name'")
+    return resp isa AbstractVector ? resp : Dict{String,Any}[]
 end
 
 """
@@ -499,15 +466,13 @@ Ask the named worker to `git clone <url>` into `dst_path` (a path on the
 worker, must not exist yet). For PRs, also fetches `pull/<n>/head` and
 checks it out as `pr-<n>`. Throws on timeout or worker-reported errors.
 """
-function clone_repo_on_worker(worker_name::String, url::AbstractString,
-                                dst_path::AbstractString;
+function clone_repo_on_worker(state::ServerState, worker_name::String,
+                                url::AbstractString, dst_path::AbstractString;
                                 pr_number::Union{Integer,Nothing} = nothing,
                                 timeout::Real = 120.0)
-    haskey(WORKER_CONTROL_WS, worker_name) ||
+    haskey(state.worker_control_ws, worker_name) ||
         error("Worker '$worker_name' is not connected")
-    rid = string(uuid4())
-    ch  = Channel{Dict{String,Any}}(1)
-    PENDING_CLONE_REPO[rid] = ch
+    rid, ch = register_rpc!(state)
 
     payload = Dict{String,Any}(
         "type"       => "clone_repo",
@@ -516,16 +481,10 @@ function clone_repo_on_worker(worker_name::String, url::AbstractString,
         "dst_path"   => String(dst_path),
     )
     pr_number === nothing || (payload["pr_number"] = Int(pr_number))
-    send_command(worker_name, payload)
+    send_command(state, worker_name, payload)
 
-    Base.errormonitor(@async begin
-        sleep(timeout)
-        if haskey(PENDING_CLONE_REPO, rid)
-            delete!(PENDING_CLONE_REPO, rid)
-            try put!(ch, Dict{String,Any}("error" => "clone_repo timed out")) catch end
-        end
-    end)
-    resp = take!(ch)
+    resp = take_pending!(state, ch, rid, timeout, "clone_repo on '$worker_name'")
+    resp isa AbstractDict || error("clone_repo '$url' on '$worker_name': unexpected response")
     haskey(resp, "error") &&
         error("clone_repo '$url' on '$worker_name': $(resp["error"])")
     return String(resp["dst_path"])
@@ -544,26 +503,24 @@ Used by the chat UI's bt_show preview renderer when the file isn't in
 `<server_path>/<relpath>` yet (e.g. unsynced project, or a fresh tool
 result before the file gets RemoteSync'd as part of a project sync).
 """
-function fetch_file_from_worker(worker_name::String,
+function fetch_file_from_worker(state::ServerState, worker_name::String,
                                   src_path::AbstractString,
                                   dst_path::AbstractString;
                                   handoff_timeout::Real = 15.0,
                                   on_progress = nothing)
-    haskey(WORKER_CONTROL_WS, worker_name) ||
+    haskey(state.worker_control_ws, worker_name) ||
         error("Worker '$worker_name' is not connected")
 
-    sync_id = string(uuid4())
-    ch = Channel{Any}(1)
-    PENDING_TRANSFERS[sync_id] = ch
+    sync_id, ch = register_rpc!(state)
 
-    send_command(worker_name, Dict(
+    send_command(state, worker_name, Dict(
         "type"      => "open_transfer",
         "sync_id"   => sync_id,
         "direction" => "file_from_worker",
         "src_path"  => String(src_path),
     ))
 
-    ws = take_pending!(ch, PENDING_TRANSFERS, sync_id, handoff_timeout,
+    ws = take_pending!(state, ch, sync_id, handoff_timeout,
                       "fetch_file from '$worker_name'")
     try
         wsio = RemoteSync.WebSocketIO(ws)

@@ -1,243 +1,39 @@
-# Persistent server state (workers + projects)
-const SERVER_STATE_DIR  = Ref(joinpath(homedir(), ".local", "share", "bonitoteam-server"))
-# Where canonical project copies live on the SERVER. Each project lives at
-# `<SERVER_WORKING_DIR>/<name>` and is mirrored onto the worker at
-# `<worker.projects_root>/<name>`.
-const SERVER_WORKING_DIR = Ref(joinpath(homedir(), "bonitoteam-server"))
-
-state_dir()         = SERVER_STATE_DIR[]
-working_dir()       = SERVER_WORKING_DIR[]
-workers_file()      = joinpath(state_dir(), "workers.json")
-projects_file()     = joinpath(state_dir(), "projects.json")
-
-mutable struct WorkerInfo
-    name::String                       # display name (unique key)
-    url::String                        # ws://host:port
-    secret::String
-    ssh_target::Union{String,Nothing}  # for ssh-based rsync: "user@host". nothing → local rsync
-    # discovered via probe
-    hostname::String
-    home::String
-    mcp_path::String                   # path on worker, used for MCPServer config
-    projects_root::String              # rsync destination root on worker
-    # runtime
-    status::Symbol                     # :unknown, :online, :offline
-    last_check::DateTime
-end
-
-mutable struct ProjectInfo
-    id::String                         # short uuid
-    name::String                       # display name + dir name (server + worker)
-    worker_name::String                # FK to WORKERS
-    server_path::String                # canonical copy on server (= working_dir/name)
-    worker_path::String                # mirrored copy on worker (= worker.projects_root/name)
-    created::DateTime
-    # At most one active ACP session per project. Acquired when
-    # ensure_project_session! brings up the chat_app; released automatically
-    # when the bound worker's control WS drops (the claude process is gone
-    # with it). Worker-only-write model means there's no checksum/divergence
-    # state — anything claude writes on the worker auto-flows back to the
-    # server, the operator never edits server_path.
-    locked_by::Union{String,Nothing}      # worker_name when active, else nothing
-    locked_at::Union{DateTime,Nothing}
-    # :unsynced (default for worker-imported projects) — server has no copy.
-    # :syncing — a librsync transfer is in progress.
-    # :synced — last librsync transfer completed successfully; server has a copy.
-    # :stale — was synced once but content has likely diverged since.
-    # Persistence: only :unsynced vs :synced is durable; :syncing always resets
-    # to :stale on restart so a crash mid-sync doesn't leave a wrong "synced".
-    backup_status::Symbol
-    last_sync_at::Union{DateTime,Nothing}
-    # Set when the project was imported from an existing claude-agent-acp
-    # session — the .jsonl basename in ~/.claude/projects/<encoded>/ on the
-    # worker. start_session_on_worker uses session/load with this ID to bring
-    # the conversation history back to where claude left off; nothing → fresh
-    # session/new. Persisted so server restarts still resume.
-    resume_session_id::Union{String,Nothing}
-    # If set, the chat fires this prompt as the first user message the next
-    # time it brings up an ACP session — used by the "From GitHub" template
-    # to seed "fix this issue" / "review this PR" without the operator having
-    # to retype it. Cleared (and persisted as nothing) once the prompt has
-    # been delivered, so a session restart doesn't re-fire.
-    auto_prompt::Union{String,Nothing}
-end
-
-ProjectInfo(id, name, worker_name, server_path, worker_path, created) =
-    ProjectInfo(id, name, worker_name, server_path, worker_path, created,
-                nothing, nothing, :unsynced, nothing, nothing, nothing)
-
-const WORKERS = Dict{String,WorkerInfo}()
-# Value type intentionally `Any` — Julia 1.12's stricter world-age binds
-# parametric types to the world they were constructed in. With `Dict{...,
-# ProjectInfo}` a Revise-driven hot-reload of the struct makes future
-# inserts fail with a world-age MethodError on convert. The dict only ever
-# holds ProjectInfo (verified at every callsite), so the looser annotation
-# is a dev-ergonomics fix with no production cost.
-const PROJECTS = Dict{String,Any}()
-
-# Per-project runtime — kept out of the persisted state
-const PROJECT_APPS = Dict{String,Bonito.App}()
-# project_id → Ref{AgentClientProtocol.Client}. Populated by chat_app once
-# the ACP client is started; lets test harnesses + tooling drive prompts
-# directly via AgentClientProtocol.prompt! instead of synthesising a click
-# on the chat UI's send button (which has been flaky in synthetic events).
-const CHAT_CLIENTS = Dict{String,Any}()
-
-# Observable; bumped whenever WORKERS or PROJECTS changes so the dashboard re-renders.
-const STATE_VERSION = Observable(0)
-# Setting an Observable propagates to the browser via Bonito's WebSocket;
-# if a session is broken (e.g. a stale tab whose hashed asset URLs went 404
-# after a redeploy), Bonito surfaces that as a JSException from the
-# observable update. We don't want a stale UI tab to break server-side
-# operations, so this swallows + logs the error rather than propagating it.
-function bump_state!()
-    try
-        STATE_VERSION[] = STATE_VERSION[] + 1
-    catch e
-        @debug "bump_state!: observable propagation failed (likely stale browser session)" exception=e
-    end
-    return nothing
-end
-
-# Same shape, for any observable update we want to be best-effort. Use this
-# wherever a UI tick should never block server-side work.
-function safe_set!(obs::Observable, val)
-    try
-        obs[] = val
-    catch e
-        @debug "safe_set!: observable propagation failed (likely stale browser session)" exception=e
-    end
-    return nothing
-end
-
-# Persistence
-# Atomic JSON write: serialise to a sibling .tmp first, then rename into place.
-# `rename(2)` on the same filesystem is atomic, so a crash mid-save can leave
-# only the old file or only the new — never a half-written file.
-function atomic_write_json(path::String, data)
-    mkpath(dirname(path))
-    tmp = path * ".tmp"
-    open(tmp, "w") do io
-        JSON.print(io, data, 2)
-    end
-    mv(tmp, path; force = true)
-end
-
-# Read JSON with corruption tolerance: if the file is truncated/garbled (e.g.
-# from a crash before atomic_write_json existed, or a manual edit gone wrong),
-# log a warning, move it aside as `<file>.bad`, and continue with empty state.
-# We'd rather lose worker/project metadata than refuse to start the server.
-function load_json_tolerant(path::String, label::String)
-    isfile(path) || return nothing
-    try
-        return JSON.parsefile(path)
-    catch e
-        bad = path * ".bad-" * Dates.format(now(UTC), "yyyymmddTHHMMSS")
-        try mv(path, bad; force = true) catch end
-        @warn "$label: failed to parse — moved aside, starting empty" path bad exception=e
-        return nothing
-    end
-end
-
-function save_workers!()
-    data = [Dict("name" => w.name, "url" => w.url, "secret" => w.secret,
-                 "ssh_target" => w.ssh_target,
-                 "hostname" => w.hostname, "home" => w.home,
-                 "mcp_path" => w.mcp_path, "projects_root" => w.projects_root)
-            for w in values(WORKERS)]
-    atomic_write_json(workers_file(), data)
-end
-
-function load_workers!()
-    raw = load_json_tolerant(workers_file(), "workers.json")
-    raw === nothing && return
-    for d in raw
-        try
-            w = WorkerInfo(d["name"], d["url"], d["secret"],
-                           get(d, "ssh_target", nothing),
-                           get(d, "hostname", ""), get(d, "home", ""),
-                           get(d, "mcp_path", ""), get(d, "projects_root", ""),
-                           :unknown, now(UTC))
-            WORKERS[w.name] = w
-        catch e
-            @warn "skipping malformed worker entry" entry=d exception=e
-        end
-    end
-end
-
-function save_projects!()
-    data = [Dict("id" => p.id, "name" => p.name, "worker_name" => p.worker_name,
-                 "server_path" => p.server_path, "worker_path" => p.worker_path,
-                 "created" => string(p.created),
-                 # `:syncing` is a runtime state — persist as `:stale` so a
-                 # crash mid-sync doesn't leave the next start-up reporting
-                 # "synced" for a half-transferred mirror.
-                 "backup_status" => string(p.backup_status === :syncing ? :stale : p.backup_status),
-                 "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at),
-                 "resume_session_id" => p.resume_session_id,
-                 "auto_prompt"   => p.auto_prompt)
-            for p in values(PROJECTS)]
-    atomic_write_json(projects_file(), data)
-end
-
-function load_projects!()
-    raw = load_json_tolerant(projects_file(), "projects.json")
-    raw === nothing && return
-    for d in raw
-        try
-            p = ProjectInfo(d["id"], d["name"], d["worker_name"],
-                            d["server_path"], d["worker_path"],
-                            DateTime(d["created"]))
-            status_str = String(get(d, "backup_status", "unsynced"))
-            p.backup_status = Symbol(status_str)
-            last = get(d, "last_sync_at", nothing)
-            p.last_sync_at = last === nothing ? nothing : DateTime(String(last))
-            sid = get(d, "resume_session_id", nothing)
-            p.resume_session_id = (sid === nothing || isempty(String(sid))) ?
-                                       nothing : String(sid)
-            ap = get(d, "auto_prompt", nothing)
-            p.auto_prompt = (ap === nothing || isempty(String(ap))) ?
-                                       nothing : String(ap)
-            PROJECTS[p.id] = p
-        catch e
-            @warn "skipping malformed project entry" entry=d exception=e
-        end
-    end
-end
-
-# Worker registration is now handled in worker_client.jl when the worker
-# dials the server's /worker-ws endpoint. Liveness comes from the WS itself;
-# no periodic probing or heartbeat task.
+# Project lock + chat / dashboard orchestration. State (workers, projects,
+# pending RPCs, etc.) lives in `state.jl::ServerState`; every public function
+# in this file takes a `state::ServerState` argument as its first parameter.
+# Worker registration is handled in worker_client.jl when the worker dials
+# the server's /worker-ws endpoint. Liveness comes from the WS itself; no
+# periodic probing or heartbeat task.
 
 # Project lock
 """
 Mark a project locked by a worker (active ACP session). Errors if the project
 is already locked by a different worker.
 """
-function acquire_lock!(p::ProjectInfo, worker_name::String)
+function acquire_lock!(state::ServerState, p::ProjectInfo, worker_name::String)
     if p.locked_by !== nothing && p.locked_by != worker_name
         error("Project '$(p.name)' is locked by worker '$(p.locked_by)'")
     end
     p.locked_by = worker_name
     p.locked_at = now(UTC)
-    save_projects!()
-    bump_state!()
+    save_projects!(state)
+    bump_state!(state)
     return p
 end
 
-function release_lock!(p::ProjectInfo)
+function release_lock!(state::ServerState, p::ProjectInfo)
     p.locked_by = nothing
     p.locked_at = nothing
-    save_projects!()
-    bump_state!()
+    save_projects!(state)
+    bump_state!(state)
     return p
 end
 
 # Auto-release every project lock held by `worker_name` (called from
 # handle_worker_control's finally branch when the WS drops).
-function release_locks_for_worker!(worker_name::String)
-    for p in values(PROJECTS)
-        p.locked_by == worker_name && release_lock!(p)
+function release_locks_for_worker!(state::ServerState, worker_name::String)
+    for p in values(state.projects)
+        p.locked_by == worker_name && release_lock!(state, p)
     end
 end
 
@@ -250,19 +46,19 @@ Create a new project on the named worker. Steps:
    to spawn an ACP session and dial back; we drive that session from here.
 4. Register `/p/<id>` route on the live server.
 """
-function create_project!(srv::Bonito.Server, name::String, src_path::String,
+function create_project!(state::ServerState, name::String, src_path::String,
                           worker_name::String;
                           progress = nothing)
-    haskey(WORKERS, worker_name) || error("Unknown worker: $worker_name")
+    haskey(state.workers, worker_name) || error("Unknown worker: $worker_name")
     isempty(name) && error("Project name must not be empty")
     occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
         error("Project name must be alphanumeric/_/- only")
     isempty(src_path) && error("Source path is required (pick a folder).")
     isdir(src_path)   || error("Source path is not a directory: $src_path")
 
-    w = WORKERS[worker_name]
+    w = state.workers[worker_name]
     id          = string(uuid4())[1:8]
-    server_path = joinpath(working_dir(), name)
+    server_path = joinpath(state.working_dir, name)
     worker_path = joinpath(w.projects_root, name)
 
     # 1. Seed the canonical server-side copy from the picked source (local
@@ -270,22 +66,22 @@ function create_project!(srv::Bonito.Server, name::String, src_path::String,
     if abspath(src_path) != abspath(server_path)
         progress === nothing || progress("Seeding server-side mirror…")
         @info "Seeding server-side mirror" src_path server_path
-        mkpath(working_dir())
+        mkpath(state.working_dir)
         run(`rsync -az $(rstrip(src_path, '/'))/ $(rstrip(server_path, '/'))/`)
     end
 
     # 2. Push server → worker over the worker's WS (no SSH, no inbound port).
     @info "Pushing project to worker" worker=worker_name dst=worker_path
-    sync_dir_to_worker!(worker_name, server_path, worker_path; on_progress = progress)
+    sync_dir_to_worker!(state, worker_name, server_path, worker_path; on_progress = progress)
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
-    PROJECTS[id] = p
-    save_projects!()
+    state.projects[id] = p
+    save_projects!(state)
 
     # 3 + 4: build the chat app + register the route.
     progress === nothing || progress("Starting chat session…")
-    ensure_project_session!(p, srv)
-    bump_state!()
+    ensure_project_session!(state, p)
+    bump_state!(state)
     return p
 end
 
@@ -306,30 +102,30 @@ basename in `~/.claude/projects/<encoded>/`), the chat will use ACP's
 chat UI and the agent regains full context. The ID persists across server
 restarts.
 """
-function create_project_from_worker!(srv::Bonito.Server, worker_name::String,
+function create_project_from_worker!(state::ServerState, worker_name::String,
                                       worker_path::String;
                                       name::String = basename(rstrip(worker_path, '/')),
                                       sync::Bool = false,
                                       resume_session_id::Union{String,Nothing} = nothing,
                                       progress = nothing)
-    haskey(WORKERS, worker_name) || error("Unknown worker: $worker_name")
+    haskey(state.workers, worker_name) || error("Unknown worker: $worker_name")
     isempty(name) && error("Project name must not be empty (folder has no basename?)")
     occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
         error("Project name must be alphanumeric/_/- only — got '$name'")
     isempty(worker_path) && error("Worker path is required (pick a folder).")
 
     id = string(uuid4())[1:8]
-    server_path = joinpath(working_dir(), name)
+    server_path = joinpath(state.working_dir, name)
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     p.resume_session_id = resume_session_id
-    PROJECTS[id] = p
+    state.projects[id] = p
 
     if sync
         @info "Pulling project from worker" worker=worker_name worker_path server_path
         p.backup_status = :syncing
         try
-            sync_dir_from_worker!(worker_name, worker_path, server_path; on_progress = progress)
+            sync_dir_from_worker!(state, worker_name, worker_path, server_path; on_progress = progress)
             p.backup_status = :synced
             p.last_sync_at  = now(UTC)
         catch e
@@ -340,11 +136,11 @@ function create_project_from_worker!(srv::Bonito.Server, worker_name::String,
         @info "Registering project from worker (no sync)" worker=worker_name worker_path
     end
 
-    save_projects!()
+    save_projects!(state)
 
     progress === nothing || progress("Starting chat session…")
-    ensure_project_session!(p, srv)
-    bump_state!()
+    ensure_project_session!(state, p)
+    bump_state!(state)
     return p
 end
 
@@ -352,15 +148,15 @@ end
 # project, runs sync_project_to_server! in a Task, pushes status updates
 # back to the chat's sync_status observable so the menu shows progress
 # without redirecting to the dashboard.
-function handle_chat_sync_click(project_id::AbstractString,
+function handle_chat_sync_click(state::ServerState, project_id::AbstractString,
                                  sync_status::Observable{String})
-    haskey(PROJECTS, project_id) || (safe_set!(sync_status, "unknown project"); return)
-    p = PROJECTS[project_id]
+    haskey(state.projects, project_id) || (safe_set!(sync_status, "unknown project"); return)
+    p = state.projects[project_id]
     p.backup_status === :syncing && (safe_set!(sync_status, "already syncing…"); return)
     safe_set!(sync_status, "starting…")
     @async begin
         try
-            sync_project_to_server!(p;
+            sync_project_to_server!(state, p;
                 on_progress = msg -> safe_set!(sync_status, msg))
             safe_set!(sync_status,
                 "✓ synced $(Dates.format(p.last_sync_at, "HH:MM:SS")) UTC")
@@ -374,30 +170,30 @@ function handle_chat_sync_click(project_id::AbstractString,
 end
 
 """
-    sync_project_to_server!(p::ProjectInfo; on_progress=nothing)
+    sync_project_to_server!(state, p::ProjectInfo; on_progress=nothing)
 
 Pull the worker's current `worker_path` into the project's server-side
 mirror via librsync. Resumable — only changed bytes go over the wire.
 Updates `p.backup_status` to `:syncing` for the duration, then `:synced`
 on success or `:stale` on failure.
 """
-function sync_project_to_server!(p::ProjectInfo; on_progress = nothing)
-    haskey(WORKERS, p.worker_name) ||
+function sync_project_to_server!(state::ServerState, p::ProjectInfo; on_progress = nothing)
+    haskey(state.workers, p.worker_name) ||
         error("Worker '$(p.worker_name)' is not connected")
     p.backup_status === :syncing &&
         error("Project '$(p.name)' is already syncing")
     p.backup_status = :syncing
-    bump_state!()
+    bump_state!(state)
     try
-        sync_dir_from_worker!(p.worker_name, p.worker_path, p.server_path;
+        sync_dir_from_worker!(state, p.worker_name, p.worker_path, p.server_path;
                               on_progress = on_progress)
         p.backup_status = :synced
         p.last_sync_at  = now(UTC)
-        save_projects!()
-        bump_state!()
+        save_projects!(state)
+        bump_state!(state)
     catch e
         p.backup_status = :stale
-        bump_state!()
+        bump_state!(state)
         rethrow(e)
     end
     return p
@@ -408,23 +204,21 @@ Build the chat_app + register the /p/<id> route for `p` if not done yet.
 Called both from `create_project!` and from `handle_worker_control` (when a
 worker reconnects, projects belonging to it become serviceable again).
 """
-function ensure_project_session!(p::ProjectInfo, srv::Union{Bonito.Server,Nothing} = nothing)
-    haskey(PROJECT_APPS, p.id) && return PROJECT_APPS[p.id]
-    haskey(WORKERS, p.worker_name) ||
+function ensure_project_session!(state::ServerState, p::ProjectInfo)
+    haskey(state.project_apps, p.id) && return state.project_apps[p.id]
+    haskey(state.workers, p.worker_name) ||
         error("Worker '$(p.worker_name)' is not connected")
-    w = WORKERS[p.worker_name]
+    w = state.workers[p.worker_name]
 
     # Acquire the project lock — at most one active session per project.
-    # tree_hash(server_path) is captured here so the divergence scanner can
-    # detect operator edits during the session.
-    acquire_lock!(p, w.name)
+    acquire_lock!(state, p, w.name)
 
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
         [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path)]
 
     # If the project was imported with a claude session ID, the factory
     # asks the worker to do session/load (resume) instead of session/new.
-    client_factory = on_update -> start_session_on_worker(w.name, p.worker_path;
+    client_factory = on_update -> start_session_on_worker(state, w.name, p.worker_path;
                                                            on_update,
                                                            mcp_servers = mcp,
                                                            resume_session_id = p.resume_session_id)
@@ -433,21 +227,13 @@ function ensure_project_session!(p::ProjectInfo, srv::Union{Bonito.Server,Nothin
     # project. Empty dir is fine; the actual project files live on the worker
     # and only get pulled here if the user clicks "Sync to server".
     mkpath(p.server_path)
-    app = chat_app(p.server_path; project_id = p.id,
+    app = chat_app(state, p.server_path; project_id = p.id,
                     mcp_servers = mcp, client_factory = client_factory)
 
-    PROJECT_APPS[p.id] = app
-    if srv !== nothing
-        Bonito.route!(srv, "/p/$(p.id)" => app)
-    elseif SERVER_REF[] !== nothing
-        Bonito.route!(SERVER_REF[], "/p/$(p.id)" => app)
-    end
+    state.project_apps[p.id] = app
+    state.srv === nothing || Bonito.route!(state.srv, "/p/$(p.id)" => app)
     return app
 end
-
-# Module-level handle to the live server, set by serve(). Used so the worker
-# control handler (which reconnects asynchronously) can register routes.
-const SERVER_REF = Ref{Union{Bonito.Server,Nothing}}(nothing)
 
 # Dashboard styles — modern surface + spacing system, status dots, smooth transitions
 const DashboardStyles = Bonito.Styles(
@@ -819,6 +605,20 @@ const DashboardStyles = Bonito.Styles(
         "background" => "rgba(59,130,246,0.08)"),
     CSS(".bt-link-loading",
         "color" => "var(--bt-text-muted)", "pointer-events" => "none"),
+    # Pure UI feedback for the "Open chat →" link. JS just adds the
+    # `.bt-link-clicked` class on click; the CSS animation flashes the link
+    # and self-clears via `animation-fill-mode: forwards`. No server-side
+    # observable, no @async timer — the new tab loading IS the feedback.
+    CSS(".bt-link-clicked",
+        "background" => "rgba(59,130,246,0.18)",
+        "color" => "var(--bt-text-muted)",
+        "pointer-events" => "none",
+        "animation" => "bt-link-flash 1.6s ease-out forwards"),
+    CSS("@keyframes bt-link-flash",
+        CSS("0%",   "background" => "rgba(59,130,246,0.32)"),
+        CSS("60%",  "background" => "rgba(59,130,246,0.18)"),
+        CSS("100%", "background" => "transparent",
+                    "color"      => "var(--bt-accent)")),
 
     # ── Global busy toast ────────────────────────────────────────────────────
     # Fixed top-right (left of the connection LED). Shown whenever any
@@ -1174,7 +974,7 @@ function worker_subtitle(w::WorkerInfo)
     return isempty(parts) ? "(no metadata)" : join(parts, " · ")
 end
 
-function worker_card(w::WorkerInfo, srv_ref::Ref{Bonito.Server},
+function worker_card(state::ServerState, w::WorkerInfo,
                      error_obs::Observable{String}, picker_state::Observable{String},
                      discover_state::Observable{String})
     new_proj_btn  = Bonito.Button("+ Project"; style=nothing, class = "bt-btn bt-btn-secondary")
@@ -1236,13 +1036,13 @@ function backup_pill(p::ProjectInfo)
     end
 end
 
-# Build a project card. `opening_proj` lets the card show an inline "Opening…"
-# spinner when the user clicks "Open chat" — gives feedback that the click
-# registered, since the chat page itself can take a few seconds to come up.
+# Build a project card. The "Opening…" feedback on the Open-chat link is a
+# pure-CSS animation (`.bt-link-clicked`) that fires on click and self-clears
+# via `animation-fill-mode`. No server-side state, no @async timer — the new
+# tab loading IS the user feedback.
 # `sync_request` is notified with the project id when the user clicks
 # "Sync to server"; the dashboard handler runs the actual transfer.
 function project_card(p::ProjectInfo, error_obs::Observable{String},
-                       opening_proj::Observable{String},
                        sync_request::Observable{String})
     badge = p.locked_by === nothing ? DOM.span() :
         DOM.span("active";
@@ -1250,19 +1050,13 @@ function project_card(p::ProjectInfo, error_obs::Observable{String},
                  style = "margin-left:6px",
                  title = "active session on $(p.locked_by)")
 
-    open_indicator = map(opening_proj) do oid
-        oid == p.id ?
-            DOM.span(DOM.div(class = "bt-spinner bt-spinner-sm"), "Opening…";
-                     class = "bt-spinner-row",
-                     style = "padding-right:8px") :
-            DOM.span()
-    end
-
     open_link = DOM.a("Open chat →";
         href    = Bonito.Link("/p/$(p.id)"),
         target  = "_blank",
         class   = "bt-link",
-        onclick = js"event => $(opening_proj).notify($(p.id))")
+        # Pure UI feedback: tag the link with bt-link-clicked, CSS animates
+        # the label to "Opening…" for a beat. No round-trip to the server.
+        onclick = js"event => event.currentTarget.classList.add('bt-link-clicked')")
 
     sync_btn = if p.backup_status === :syncing
         DOM.span()   # already syncing — pill shows the spinner
@@ -1292,40 +1086,34 @@ function project_card(p::ProjectInfo, error_obs::Observable{String},
                          title = "server: $(p.server_path)\nworker: $(p.worker_path)");
                 class = "bt-card-meta");
             class = "bt-card-body"),
-        DOM.div(sync_btn, open_indicator, open_link;
+        DOM.div(sync_btn, open_link;
                 class = "bt-card-actions"),
         class = "bt-card")
 end
 
-function dashboard_app(srv_ref::Ref{Bonito.Server})
+function dashboard_app(state::ServerState)
     error_obs = Observable("")
 
     # Workers self-register over WS — no manual "Add worker" form.
 
-    # ── New Project form ─────────────────────────────────────────────────────
-    new_proj_show = Observable(false)
-    np_name = Observable("")
-    np_picker = FolderPicker(working_dir())
+    # `which_form` is the single source of truth for which slide-in panel is
+    # open. `:none` (closed), `:new_project`, or `:github`. The two forms are
+    # mutually exclusive; one enum is clearer than two booleans that always
+    # have to be kept opposite.
+    which_form = Observable(:none)
+    busy_msg   = Observable("")        # "" = idle; non-empty = operation in progress
+
+    # Form fields
+    np_name   = Observable("")
+    np_picker = FolderPicker(state.working_dir)
     on(np_picker.selected) do sel
         isempty(strip(np_name[])) || return
         isempty(sel) && return
         np_name[] = basename(rstrip(sel, '/'))
     end
     np_worker = Observable("")
-    busy_msg  = Observable("")   # "" = idle; non-empty = operation in progress
-
-    # ── Open-chat click feedback ─────────────────────────────────────────────
-    # When the user clicks "Open chat →" on a project card, a new tab opens
-    # but the chat app can take a few seconds to come up. We flash an
-    # "Opening…" spinner on that card so the click visibly registers.
-    opening_proj = Observable("")
-    on(opening_proj) do pid
-        isempty(pid) && return
-        @async begin
-            sleep(3)
-            opening_proj[] == pid && (opening_proj[] = "")
-        end
-    end
+    gh_url    = Observable("")
+    gh_worker = Observable("")
 
     # ── Sync-to-server click handler ─────────────────────────────────────────
     # Fired by the project card's "Sync to server" / "Re-sync" button. The
@@ -1335,20 +1123,17 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     on(sync_request) do pid
         isempty(pid) && return
         sync_request[] = ""           # reset so the same card can re-fire
-        haskey(PROJECTS, pid) || return
-        p = PROJECTS[pid]
+        haskey(state.projects, pid) || return
+        p = state.projects[pid]
         p.backup_status === :syncing && return    # already in flight
         @async begin
             try
                 # safe_set! on busy_msg: a JS hiccup updating the toast must
                 # not abort the in-flight transfer.
-                sync_project_to_server!(p;
+                sync_project_to_server!(state, p;
                     on_progress = msg -> safe_set!(busy_msg, "Syncing $(p.name): $(msg)"))
                 safe_set!(error_obs, "")
             catch e
-                # Log the full backtrace server-side so the next time we
-                # diagnose a failure, we know which call raised. The toast
-                # itself only shows the short message.
                 bt = catch_backtrace()
                 @warn "sync_project_to_server! failed" project=p.name exception=(e, bt)
                 safe_set!(error_obs,
@@ -1369,12 +1154,12 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         busy_msg[] = "Creating $(nm)…"
         @async begin
             try
-                create_project!(srv_ref[], nm,
+                create_project!(state, nm,
                                  String(strip(np_picker.selected[])),
                                  String(strip(np_worker[]));
                                  progress = msg -> (busy_msg[] = "Creating $(nm): $(msg)"))
                 error_obs[] = ""
-                new_proj_show[] = false
+                which_form[] = :none
                 np_name[] = ""; np_picker.selected[] = ""; np_worker[] = ""
             catch e
                 error_obs[] = "Failed to create project: $e"
@@ -1386,30 +1171,20 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     on(np_cancel.value) do clicked
         clicked || return
         isempty(busy_msg[]) || return   # don't cancel mid-create
-        new_proj_show[] = false
+        which_form[] = :none
         error_obs[] = ""
     end
-
-    # ── From-GitHub form ─────────────────────────────────────────────────────
-    # Take any github.com URL (repo / issue / pull) → clone on the worker and,
-    # for issues/PRs, seed the chat with a "fix this" prompt.
-    # Declared before the New-project button handler so the two can mutually
-    # close their respective slide-in panels.
-    gh_show   = Observable(false)
-    gh_url    = Observable("")
-    gh_worker = Observable("")
 
     new_proj_btn = Bonito.Button("+ New project"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(new_proj_btn.value) do clicked
         clicked || return
-        if isempty(WORKERS)
+        if isempty(state.workers)
             error_obs[] = "Register a worker before creating a project."
             return
         end
-        np_worker[] = first(keys(WORKERS))
-        new_proj_show[] = true
-        gh_show[]       = false
-        error_obs[] = ""
+        np_worker[]  = first(keys(state.workers))
+        which_form[] = :new_project
+        error_obs[]  = ""
     end
 
     gh_submit = Bonito.Button("Open"; style=nothing, class = "bt-btn")
@@ -1425,12 +1200,12 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         busy_msg[] = "Opening from GitHub…"
         @async begin
             try
-                create_project_from_github!(srv_ref[], url;
+                create_project_from_github!(state, url;
                     worker_name = worker_name,
                     progress    = msg -> (busy_msg[] = "From GitHub: $(msg)"))
-                error_obs[] = ""
-                gh_show[] = false
-                gh_url[]  = ""
+                error_obs[]  = ""
+                which_form[] = :none
+                gh_url[]     = ""
             catch e
                 error_obs[] = "Failed to open from GitHub: $(sprint(showerror, e))"
             finally
@@ -1441,21 +1216,20 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     on(gh_cancel.value) do clicked
         clicked || return
         isempty(busy_msg[]) || return
-        gh_show[]   = false
-        error_obs[] = ""
+        which_form[] = :none
+        error_obs[]  = ""
     end
 
     gh_btn = Bonito.Button("+ From GitHub"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(gh_btn.value) do clicked
         clicked || return
-        if isempty(WORKERS)
+        if isempty(state.workers)
             error_obs[] = "Register a worker before opening a GitHub project."
             return
         end
-        gh_worker[] = first(keys(WORKERS))
-        gh_show[]   = true
-        new_proj_show[] = false
-        error_obs[] = ""
+        gh_worker[]  = first(keys(state.workers))
+        which_form[] = :github
+        error_obs[]  = ""
     end
 
     # Per-worker remote-folder pickers (persistent across re-renders so the
@@ -1509,7 +1283,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
             "Resuming $(proj_name) (session $(resume_session_id[1:8])…)"
         @async begin
             try
-                create_project_from_worker!(srv_ref[], w_name, path;
+                create_project_from_worker!(state, w_name, path;
                                              name = proj_name,
                                              resume_session_id = resume_session_id,
                                              progress = msg -> (busy_msg[] = "Importing $(proj_name): $(msg)"))
@@ -1626,7 +1400,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
         busy_msg[] = "Importing $(nm)…"
         @async begin
             try
-                create_project_from_worker!(srv_ref[], w_name, chosen;
+                create_project_from_worker!(state, w_name, chosen;
                     progress = msg -> (busy_msg[] = "Importing $(nm): $(msg)"))
                 error_obs[] = ""
                 picker_state[] = ""
@@ -1660,7 +1434,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
             end),
         DOM.label("Worker"),
         DOM.select(
-            (DOM.option(name; value=name) for name in keys(WORKERS))...;
+            (DOM.option(name; value=name) for name in keys(state.workers))...;
             onchange = js"event => $(np_worker).notify(event.target.value)"),
         map(busy_msg) do msg
             isempty(msg) ?
@@ -1677,7 +1451,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
                 style = "font-size:11px;color:var(--bt-text-muted);margin-top:-4px"),
         DOM.label("Worker"),
         DOM.select(
-            (DOM.option(name; value=name) for name in keys(WORKERS))...;
+            (DOM.option(name; value=name) for name in keys(state.workers))...;
             onchange = js"event => $(gh_worker).notify(event.target.value)"),
         map(busy_msg) do msg
             isempty(msg) ?
@@ -1715,11 +1489,11 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     end
 
     # ── Stats strip ──────────────────────────────────────────────────────────
-    stats_strip = map(STATE_VERSION) do _
-        online   = count(w -> w.status == :online, values(WORKERS))
-        total    = length(WORKERS)
-        n_proj   = length(PROJECTS)
-        n_active = count(p -> p.locked_by !== nothing, values(PROJECTS))
+    stats_strip = map(state.version) do _
+        online   = count(w -> w.status == :online, values(state.workers))
+        total    = length(state.workers)
+        n_proj   = length(state.projects)
+        n_active = count(p -> p.locked_by !== nothing, values(state.projects))
         sep()    = DOM.span("·"; class = "bt-stat-sep")
         DOM.div(
             DOM.div(
@@ -1741,8 +1515,8 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
     end
 
     # ── Worker / project lists ───────────────────────────────────────────────
-    worker_list = map(STATE_VERSION, picker_state, discover_state) do _, picked, discovered
-        if isempty(WORKERS)
+    worker_list = map(state.version, picker_state, discover_state) do _, picked, discovered
+        if isempty(state.workers)
             install_url = "$(public_url_or_default())/install.sh"
             install_cmd = "curl -fsSL $install_url | sh"
             return DOM.div(
@@ -1763,27 +1537,31 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
                 class = "bt-install-block")
         end
         rows = []
-        for w in values(WORKERS)
-            push!(rows, worker_card(w, srv_ref, error_obs, picker_state, discover_state))
+        for w in values(state.workers)
+            push!(rows, worker_card(state, w, error_obs, picker_state, discover_state))
             picked     == w.name && push!(rows, remote_picker_form(w.name))
             discovered == w.name && push!(rows, discover_panel(w.name))
         end
         DOM.div(rows...)
     end
 
-    project_list = map(STATE_VERSION) do _
-        isempty(PROJECTS) ?
+    project_list = map(state.version) do _
+        isempty(state.projects) ?
             DOM.div("No projects yet — pick a worker above and click + Project, or import an existing Claude session via Discover.";
                     class = "bt-empty") :
-            DOM.div((project_card(p, error_obs, opening_proj, sync_request)
-                     for p in values(PROJECTS))...)
+            DOM.div((project_card(p, error_obs, sync_request)
+                     for p in values(state.projects))...)
     end
 
-    proj_form_block = map(new_proj_show) do show
-        show ? DOM.div(new_proj_form(); class = "bt-slide-in") : DOM.div()
-    end
-    gh_form_block = map(gh_show) do show
-        show ? DOM.div(gh_form(); class = "bt-slide-in") : DOM.div()
+    # Two slide-in forms, one source of truth: which one is open right now.
+    form_block = map(which_form) do which
+        if which === :new_project
+            DOM.div(new_proj_form(); class = "bt-slide-in")
+        elseif which === :github
+            DOM.div(gh_form(); class = "bt-slide-in")
+        else
+            DOM.div()
+        end
     end
     error_block = map(error_obs) do msg
         isempty(msg) ? DOM.div() : DOM.div(msg; class = "bt-error")
@@ -1827,8 +1605,7 @@ function dashboard_app(srv_ref::Ref{Bonito.Server})
                 gh_btn;
                 class = "bt-section"),
             project_list,
-            proj_form_block,
-            gh_form_block;
+            form_block;
 
             class = "bt-dash")
     end

@@ -833,26 +833,20 @@ function chat_session_banner(model::ChatModel)
     end
 end
 
-# Inline SVG icons render crisply at any size, independent of installed
-# fonts (Arial's ▶ glyph is tiny on Linux).
-const SEND_SVG = Bonito.HTML(
-    """<svg viewBox="0 0 24 24" width="20" height="20" fill="none"
-            stroke="currentColor" stroke-width="2.2"
-            stroke-linecap="round" stroke-linejoin="round">
-         <line x1="12" y1="19" x2="12" y2="5"></line>
-         <polyline points="5 12 12 5 19 12"></polyline>
-       </svg>""")
-const STOP_SVG = Bonito.HTML(
-    """<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-         <rect x="5" y="5" width="14" height="14" rx="2.5"></rect>
-       </svg>""")
+# Icons live as standalone SVG files under assets/icons/ and ship as
+# Bonito.Asset (hashed URL, served by the same machinery as bonitoteam.js).
+# Colors are baked into the SVGs since <img> doesn't inherit currentColor.
+const SEND_ICON = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "icons", "send.svg"))
+const STOP_ICON = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "icons", "stop.svg"))
+icon_img(asset, alt) = DOM.img(src = asset, alt = alt, draggable = "false",
+                                style = "pointer-events:none;user-select:none")
 
 function chat_input_area(model::ChatModel, bonito_session)
     text_val = Observable("")
-    send_btn = Bonito.Button(SEND_SVG; style=nothing, class="bt-send-btn",
-                             title="Send (Enter)")
-    stop_btn = Bonito.Button(STOP_SVG; style=nothing, class="bt-stop-btn",
-                             title="Stop generation")
+    send_btn = Bonito.Button(icon_img(SEND_ICON, "Send"); style=nothing,
+                             class="bt-send-btn", title="Send (Enter)")
+    stop_btn = Bonito.Button(icon_img(STOP_ICON, "Stop"); style=nothing,
+                             class="bt-stop-btn", title="Stop generation")
 
     text_input = DOM.textarea(""; placeholder="Message…",
         title="Enter to send  ·  Shift+Enter for newline",

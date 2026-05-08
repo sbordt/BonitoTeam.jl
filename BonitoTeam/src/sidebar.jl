@@ -62,6 +62,8 @@ function sidebar_entry(label::AbstractString, icon::Bonito.Node,
         onclick = js"event => $(current_view).notify($(target_value))")
 end
 
+const HOME_ICON = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "icons", "home.svg"))
+
 """
     project_sidebar(state, current_view) → DOM
 
@@ -71,7 +73,13 @@ new/deleted projects show up live, and on `current_view` so the active
 highlight tracks the user's selection.
 """
 function project_sidebar(state::ServerState, current_view::Observable{String})
-    home_icon = DOM.div("⌂"; class = "bt-proj-icon bt-side-home-icon",
+    # House icon centered in a 32px tile colored with the muted text color.
+    # The img inside fixes its own size so a fallback alt-text doesn't
+    # blow out the icon's footprint.
+    home_icon = DOM.div(
+        DOM.img(src = HOME_ICON, alt = "Home", draggable = "false",
+                style = "width:20px;height:20px;display:block;pointer-events:none");
+        class = "bt-proj-icon bt-side-home-icon",
         title = "Dashboard")
 
     # `state.version` triggers a re-render whenever workers/projects mutate;
@@ -121,7 +129,11 @@ const SidebarStyles = Bonito.Styles(
         "text-align" => "center",
         "flex-shrink" => "0",
         "user-select" => "none",
-        "font-family" => "'Inter', system-ui, sans-serif"),
+        "font-family" => "'Inter', system-ui, sans-serif",
+        # Flex-center the contents so the home <img> sits perfectly in the
+        # middle. For initials we still use line-height (set inline by
+        # `project_icon`) which falls into the same flex box gracefully.
+        "display" => "flex", "align-items" => "center", "justify-content" => "center"),
     CSS(".bt-side-home-icon",
         "background" => "var(--bt-text-muted)"),
     CSS(".bt-side-name",

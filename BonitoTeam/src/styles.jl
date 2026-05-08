@@ -461,10 +461,14 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-text-input::-webkit-scrollbar-button",
         "display" => "none"),
 
-    # Send / stop buttons — circles, big enough for thumb
+    # Send / stop buttons — circles, big enough for thumb. `box-sizing:
+    # border-box` is load-bearing: stop has a 1px border, send doesn't, so
+    # without it the buttons end up 42x42 vs 40x40 and the row baselines
+    # disagree by a pixel.
     CSS(".bt-send-btn, .bt-stop-btn",
         "border" => "none", "border-radius" => "50%",
         "width" => "40px", "height" => "40px",
+        "box-sizing" => "border-box",
         "font-size" => "20px",                       # larger glyph fills the circle
         "line-height" => "1",
         "cursor" => "pointer", "flex-shrink" => "0",

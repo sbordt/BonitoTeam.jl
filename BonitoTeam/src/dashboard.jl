@@ -1271,7 +1271,7 @@ function dashboard_dom(state::ServerState;
         discover_results[] = Dict{String,Any}[]
         @async begin
             try
-                discover_results[] = scan_worker_sessions(w_name)
+                discover_results[] = scan_worker_sessions(state, w_name)
             catch e
                 discover_results[] = [Dict{String,Any}("error" => sprint(showerror, e))]
             finally

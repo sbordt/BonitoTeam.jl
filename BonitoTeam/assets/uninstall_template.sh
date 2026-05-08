@@ -45,11 +45,25 @@ else
 fi
 
 # ── Confirmation ──────────────────────────────────────────────────────────────
+# When run as `curl ... | sh` stdin is the pipe, not the terminal — `read`
+# would get EOF and silently fall through to "Aborted". Re-open /dev/tty so
+# the prompt actually reaches the user.
+#
+# `[ -r /dev/tty ]` is misleading: the file always exists, but opening it
+# fails when the process has no controlling terminal (cron / CI / nested
+# Docker exec). Use an actual open-test in a subshell so we can fall back
+# cleanly when there's no terminal at all.
 if [ "$ASSUME_YES" -ne 1 ]; then
-    echo ""
-    printf "Proceed? [y/N] "
-    read -r reply
-    case "$reply" in [Yy]*) ;; *) echo "Aborted."; exit 1 ;; esac
+    if (exec < /dev/tty) 2>/dev/null; then
+        echo ""
+        printf "Proceed? [y/N] " > /dev/tty
+        read -r reply < /dev/tty
+        case "$reply" in [Yy]*) ;; *) echo "Aborted."; exit 1 ;; esac
+    else
+        echo "ERROR: no controlling terminal for the confirmation prompt;" >&2
+        echo "       re-run with --yes to skip it." >&2
+        exit 1
+    fi
 fi
 
 # ── Stop + disable user service ───────────────────────────────────────────────

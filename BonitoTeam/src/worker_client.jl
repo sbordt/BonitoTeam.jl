@@ -205,7 +205,7 @@ end
 
 # Server-side ACP client over an accepted WS
 """
-    start_session_on_worker(worker_name, cwd; on_update, mcp_servers,
+    start_session_on_worker(state, worker_name, cwd; on_update, mcp_servers,
                              request_handler, resume_session_id=nothing)
         → AgentClientProtocol.Client
 
@@ -416,7 +416,7 @@ end
 format_bytes(n) = format_bytes(Int(n))
 
 """
-    list_worker_dir(worker_name, path; timeout=5.0) → (path, entries) | error
+    list_worker_dir(state, worker_name, path; timeout=5.0) → (path, entries) | error
 
 Ask the named worker to readdir() `path` over its control WS. Empty `path`
 asks for the worker's \$HOME. Returns a NamedTuple of (path, entries) where
@@ -443,7 +443,7 @@ function list_worker_dir(state::ServerState, worker_name::String, path::Abstract
 end
 
 """
-    scan_worker_sessions(worker_name; timeout=15.0) → Vector{Dict{String,Any}}
+    scan_worker_sessions(state, worker_name; timeout=15.0) → Vector{Dict{String,Any}}
 
 Ask the named worker to scan for existing Claude Code sessions (running processes
 + ~/.claude/projects/ history) and return the results. Blocks until the worker
@@ -460,7 +460,7 @@ function scan_worker_sessions(state::ServerState, worker_name::String;
 end
 
 """
-    clone_repo_on_worker(worker_name, url, dst_path;
+    clone_repo_on_worker(state, worker_name, url, dst_path;
                           pr_number = nothing, timeout = 120.0)
 
 Ask the named worker to `git clone <url>` into `dst_path` (a path on the
@@ -492,7 +492,7 @@ function clone_repo_on_worker(state::ServerState, worker_name::String,
 end
 
 """
-    fetch_file_from_worker(worker_name, src_path, dst_path;
+    fetch_file_from_worker(state, worker_name, src_path, dst_path;
                             handoff_timeout = 15.0, on_progress = nothing)
 
 Stream a single file from the named worker into `dst_path` on the server.

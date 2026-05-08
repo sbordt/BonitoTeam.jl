@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
-# BonitoTeam worker uninstaller — reverses install_template.sh.
+# BonitoTeam worker uninstaller — reverses install_worker.sh.
 #
-#   curl -fsSL {{SERVER_URL}}/uninstall.sh | sh
+#   curl -fsSL <server-url>/uninstall.sh | sh
 #
 # OR, if you already have the file locally:
-#   sh ~/.local/share/bonitoteam/BonitoWorker/uninstall.sh
+#   sh ~/.local/share/bonitoteam/BonitoWorker/assets/uninstall_worker.sh
 #
 # Stops + disables the user systemd service, removes the install root
 # (~/.local/share/bonitoteam), the wrapper symlinks, and the systemd unit.

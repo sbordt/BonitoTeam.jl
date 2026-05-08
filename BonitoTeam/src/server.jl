@@ -3,7 +3,8 @@ const ASSETS_DIR    = normpath(joinpath(@__DIR__, "..", "assets"))
 # Monorepo root (sibling of BonitoTeam/) — contains BonitoMCP/, BonitoWorker/, AgentClientProtocol/.
 const MONOREPO_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 
-const INSTALL_TEMPLATE = read(joinpath(ASSETS_DIR, "install_template.sh"), String)
+const INSTALL_TEMPLATE   = read(joinpath(ASSETS_DIR, "install_template.sh"),   String)
+const UNINSTALL_TEMPLATE = read(joinpath(ASSETS_DIR, "uninstall_template.sh"), String)
 
 # Worker bundle: ships the lean packages a worker needs (BonitoMCP +
 # BonitoWorker + their RemoteSync dep). The installer extracts these alongside
@@ -85,6 +86,14 @@ function add_install_routes!(srv::Bonito.Server, public_url::String, worker_secr
     Bonito.route!(srv, "/install.sh" => function(context)
         script = render_install_script(public_url, worker_secret)
         HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], body=script)
+    end)
+    # Worker uninstaller. Same shape as /install.sh (curl-pipeable). The
+    # template has no placeholders to substitute today, but we keep the
+    # rendering hook so future flags (e.g. server-pinned PROJECTS_ROOT)
+    # have an obvious place to land.
+    Bonito.route!(srv, "/uninstall.sh" => function(context)
+        HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"],
+                      body = UNINSTALL_TEMPLATE)
     end)
     Bonito.route!(srv, "/worker/bundle.tar.gz" => function(context)
         bytes = build_worker_bundle()

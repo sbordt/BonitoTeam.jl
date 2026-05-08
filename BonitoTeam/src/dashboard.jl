@@ -200,39 +200,44 @@ function sync_project_to_server!(state::ServerState, p::ProjectInfo; on_progress
 end
 
 """
-Build the chat_app + register the /p/<id> route for `p` if not done yet.
-Called both from `create_project!` and from `handle_worker_control` (when a
-worker reconnects, projects belonging to it become serviceable again).
+Build the chat ChatModel for `p` if not done yet, cache it in
+state.chat_models, and start its ACP client. Idempotent: subsequent calls
+return the cached model. Called from project creation flows + on worker
+reconnect (projects belonging to that worker become serviceable again).
+
+The unified app's main panel pulls the cached model out of state.chat_models
+when the user selects this project in the sidebar.
 """
 function ensure_project_session!(state::ServerState, p::ProjectInfo)
-    haskey(state.project_apps, p.id) && return state.project_apps[p.id]
+    haskey(state.chat_models, p.id) && return state.chat_models[p.id]
     haskey(state.workers, p.worker_name) ||
         error("Worker '$(p.worker_name)' is not connected")
     w = state.workers[p.worker_name]
 
-    # Acquire the project lock — at most one active session per project.
     acquire_lock!(state, p, w.name)
 
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
         [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path)]
 
-    # If the project was imported with a claude session ID, the factory
-    # asks the worker to do session/load (resume) instead of session/new.
+    # If the project was imported with a claude session ID, the factory asks
+    # the worker to do session/load (resume) instead of session/new.
     client_factory = on_update -> start_session_on_worker(state, w.name, p.worker_path;
                                                            on_update,
                                                            mcp_servers = mcp,
                                                            resume_session_id = p.resume_session_id)
     # Ensure server_path exists so BonitoBook (which reads files from cwd to
     # render the chat notebook + tools) doesn't crash on a never-synced
-    # project. Empty dir is fine; the actual project files live on the worker
-    # and only get pulled here if the user clicks "Sync to server".
+    # project. Empty dir is fine; project files live on the worker and only
+    # get pulled here if the user clicks "Sync to server".
     mkpath(p.server_path)
-    app = chat_app(state, p.server_path; project_id = p.id,
-                    mcp_servers = mcp, client_factory = client_factory)
 
-    state.project_apps[p.id] = app
-    state.srv === nothing || Bonito.route!(state.srv, "/p/$(p.id)" => app)
-    return app
+    model = ChatModel(state, p.server_path;
+                       project_id     = p.id,
+                       mcp_servers    = mcp,
+                       client_factory = client_factory)
+    start_chat_client!(model)        # also caches into state.chat_models
+    fire_auto_prompt!(model)
+    return model
 end
 
 # Dashboard styles — modern surface + spacing system, status dots, smooth transitions
@@ -1036,27 +1041,30 @@ function backup_pill(p::ProjectInfo)
     end
 end
 
-# Build a project card. The "Opening…" feedback on the Open-chat link is a
-# pure-CSS animation (`.bt-link-clicked`) that fires on click and self-clears
-# via `animation-fill-mode`. No server-side state, no @async timer — the new
-# tab loading IS the user feedback.
+# Build a project card. "Open chat" notifies the unified app's current_view
+# observable to swap the main panel to this project's chat — no navigation,
+# no new tab. Falls back to a no-op if no current_view was provided (e.g.
+# when project_card is rendered standalone in tests).
 # `sync_request` is notified with the project id when the user clicks
 # "Sync to server"; the dashboard handler runs the actual transfer.
 function project_card(p::ProjectInfo, error_obs::Observable{String},
-                       sync_request::Observable{String})
+                       sync_request::Observable{String},
+                       current_view::Union{Observable{String},Nothing} = nothing)
     badge = p.locked_by === nothing ? DOM.span() :
         DOM.span("active";
                  class = "bt-pill bt-pill-active",
                  style = "margin-left:6px",
                  title = "active session on $(p.locked_by)")
 
-    open_link = DOM.a("Open chat →";
-        href    = Bonito.Link("/p/$(p.id)"),
-        target  = "_blank",
-        class   = "bt-link",
-        # Pure UI feedback: tag the link with bt-link-clicked, CSS animates
-        # the label to "Opening…" for a beat. No round-trip to the server.
-        onclick = js"event => event.currentTarget.classList.add('bt-link-clicked')")
+    open_link = if current_view === nothing
+        DOM.span("(no chat available)";
+            class = "bt-link", style = "color:var(--bt-text-muted)")
+    else
+        DOM.span("Open chat →";
+            class   = "bt-link",
+            style   = "cursor:pointer",
+            onclick = js"event => $(current_view).notify($(p.id))")
+    end
 
     sync_btn = if p.backup_status === :syncing
         DOM.span()   # already syncing — pill shows the spinner
@@ -1091,7 +1099,16 @@ function project_card(p::ProjectInfo, error_obs::Observable{String},
         class = "bt-card")
 end
 
-function dashboard_app(state::ServerState)
+"""
+    dashboard_dom(state; current_view = nothing) → DOM
+
+Build the dashboard's DOM block. When `current_view` is provided (the
+unified app's view-selector observable), the project-creation flows
+auto-navigate to the new project's chat by setting it; otherwise creation
+just leaves the user on the dashboard.
+"""
+function dashboard_dom(state::ServerState;
+                        current_view::Union{Observable{String},Nothing} = nothing)
     error_obs = Observable("")
 
     # Workers self-register over WS — no manual "Add worker" form.
@@ -1154,13 +1171,14 @@ function dashboard_app(state::ServerState)
         busy_msg[] = "Creating $(nm)…"
         @async begin
             try
-                create_project!(state, nm,
+                p = create_project!(state, nm,
                                  String(strip(np_picker.selected[])),
                                  String(strip(np_worker[]));
                                  progress = msg -> (busy_msg[] = "Creating $(nm): $(msg)"))
                 error_obs[] = ""
                 which_form[] = :none
                 np_name[] = ""; np_picker.selected[] = ""; np_worker[] = ""
+                current_view !== nothing && (current_view[] = p.id)
             catch e
                 error_obs[] = "Failed to create project: $e"
             finally
@@ -1200,12 +1218,13 @@ function dashboard_app(state::ServerState)
         busy_msg[] = "Opening from GitHub…"
         @async begin
             try
-                create_project_from_github!(state, url;
+                p = create_project_from_github!(state, url;
                     worker_name = worker_name,
                     progress    = msg -> (busy_msg[] = "From GitHub: $(msg)"))
                 error_obs[]  = ""
                 which_form[] = :none
                 gh_url[]     = ""
+                current_view !== nothing && (current_view[] = p.id)
             catch e
                 error_obs[] = "Failed to open from GitHub: $(sprint(showerror, e))"
             finally
@@ -1283,12 +1302,13 @@ function dashboard_app(state::ServerState)
             "Resuming $(proj_name) (session $(resume_session_id[1:8])…)"
         @async begin
             try
-                create_project_from_worker!(state, w_name, path;
+                p = create_project_from_worker!(state, w_name, path;
                                              name = proj_name,
                                              resume_session_id = resume_session_id,
                                              progress = msg -> (busy_msg[] = "Importing $(proj_name): $(msg)"))
                 error_obs[]      = ""
                 discover_state[] = ""
+                current_view !== nothing && (current_view[] = p.id)
             catch e
                 error_obs[] = "Failed to import: $(sprint(showerror, e))"
             finally
@@ -1400,11 +1420,12 @@ function dashboard_app(state::ServerState)
         busy_msg[] = "Importing $(nm)…"
         @async begin
             try
-                create_project_from_worker!(state, w_name, chosen;
+                p = create_project_from_worker!(state, w_name, chosen;
                     progress = msg -> (busy_msg[] = "Importing $(nm): $(msg)"))
                 error_obs[] = ""
                 picker_state[] = ""
                 rp.selected[] = ""
+                current_view !== nothing && (current_view[] = p.id)
             catch e
                 error_obs[] = "Failed to create project from worker: $e"
             finally
@@ -1549,7 +1570,7 @@ function dashboard_app(state::ServerState)
         isempty(state.projects) ?
             DOM.div("No projects yet — pick a worker above and click + Project, or import an existing Claude session via Discover.";
                     class = "bt-empty") :
-            DOM.div((project_card(p, error_obs, sync_request)
+            DOM.div((project_card(p, error_obs, sync_request, current_view)
                      for p in values(state.projects))...)
     end
 
@@ -1580,34 +1601,41 @@ function dashboard_app(state::ServerState)
                 class = "bt-busy-toast bt-slide-in")
     end
 
-    # Layout
+    # Layout — DOM only; the App() wrapper + global assets (DashboardStyles,
+    # ConnectionIndicator) live in the caller (unified_app or dashboard_app).
+    DOM.div(
+        busy_toast,
+        DOM.div(
+            DOM.h1("BonitoTeam"),
+            DOM.div("Multi-host orchestrator for agentic coding sessions";
+                    class = "bt-tagline");
+            class = "bt-header"),
+        stats_strip,
+        error_block,
+
+        DOM.div(DOM.h2("Workers"); class = "bt-section"),
+        worker_list,
+
+        DOM.div(
+            DOM.h2("Projects"),
+            new_proj_btn,
+            gh_btn;
+            class = "bt-section"),
+        project_list,
+        form_block;
+
+        class = "bt-dash")
+end
+
+# Thin shim for callers that want a standalone dashboard App (tests, the
+# pre-unified-app routes). The unified app instead embeds dashboard_dom
+# directly into its main panel.
+function dashboard_app(state::ServerState)
     App() do session
         DOM.div(
             DashboardStyles,
-            # Live connection indicator (fixed top-right). Tracks WS state:
-            # green=connected, yellow=reconnecting, red=disconnected.
             Bonito.ConnectionIndicator(),
-            busy_toast,
-            DOM.div(
-                DOM.h1("BonitoTeam"),
-                DOM.div("Multi-host orchestrator for agentic coding sessions";
-                        class = "bt-tagline");
-                class = "bt-header"),
-            stats_strip,
-            error_block,
-
-            DOM.div(DOM.h2("Workers"); class = "bt-section"),
-            worker_list,
-
-            DOM.div(
-                DOM.h2("Projects"),
-                new_proj_btn,
-                gh_btn;
-                class = "bt-section"),
-            project_list,
-            form_block;
-
-            class = "bt-dash")
+            dashboard_dom(state))
     end
 end
 

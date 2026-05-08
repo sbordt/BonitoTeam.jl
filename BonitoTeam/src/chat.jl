@@ -504,6 +504,12 @@ mutable struct ChatModel
     request_thought_render :: Observable{String}
     session_alive          :: Observable{Bool}
     last_error             :: Observable{String}
+
+    # Latest Bonito session that has the chat mounted. Updated on each
+    # chat_dom call so the once-installed lazy-render handlers can target the
+    # currently-mounted DOM. Wrapped in a Ref so the on(...) closures don't
+    # capture a stale binding.
+    bonito_session :: Ref{Any}
 end
 
 function ChatModel(state::ServerState, cwd::AbstractString;
@@ -525,7 +531,8 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(""),
         Observable(""),
         Observable(true),
-        Observable(""))
+        Observable(""),
+        Ref{Any}(nothing))
 end
 
 # ── Small helpers shared by every handler ─────────────────────────────────
@@ -694,11 +701,19 @@ function start_chat_client!(model::ChatModel)
     end
     update_session_id!(model.chat_session, model.client[].session_id)
 
-    # Expose live client to test harnesses + programmatic drivers (test rigs
-    # call AgentClientProtocol.prompt!() directly without synthesising a click).
+    # Range / lazy-render handlers wire once at client-start time so chat_dom
+    # remounts (when the user navigates back to this project's chat in the
+    # unified app) don't stack duplicate handlers. Lazy-render reads the live
+    # session from `model.bonito_session[]`, which chat_dom updates on mount.
+    wire_range_request!(model)
+    wire_lazy_render!(model)
+
+    # Cache the live model so the unified app's sidebar can swap to this chat
+    # instantly on second visit, and test rigs can drive prompts via
+    # state.chat_models[pid].client[] without going through the UI.
     if !isempty(model.project_id)
-        @info "registering chat client" project_id=model.project_id session_id=model.client[].session_id
-        model.state.chat_clients[model.project_id] = model.client
+        @info "registering chat model" project_id=model.project_id session_id=model.client[].session_id
+        model.state.chat_models[model.project_id] = model
     end
     return nothing
 end
@@ -787,10 +802,9 @@ function chat_header(model::ChatModel)
         handle_chat_sync_click(state, project_id, sync_status)
     end
 
+    # No back arrow — the unified app's sidebar Home icon is the way home.
     DOM.div(
         DOM.div(
-            DOM.a("←"; href = Bonito.Link("/"), class = "bt-header-back",
-                   title = "Back to dashboard"),
             status_dot,
             DOM.div(
                 DOM.span(basename(rstrip(cwd, '/')); title = cwd),
@@ -884,15 +898,21 @@ end
 # Lazy tool/thought body rendering. JS notifies *_render Observable with the
 # msg id when the user expands a placeholder; we look the message up, build
 # its body, and ship it back via dom_in_js (tool) or emit (thought).
-function wire_lazy_render!(model::ChatModel, bonito_session)
+#
+# Wired ONCE per ChatModel (in start_chat_client!) so re-mounting the chat
+# in the unified app doesn't stack duplicate handlers. The handler reads
+# the current Bonito session from `model.bonito_session[]`, which chat_dom
+# updates on each remount.
+function wire_lazy_render!(model::ChatModel)
     on(model.request_tool_render) do tool_id
         isempty(tool_id) && return
+        bs = model.bonito_session[];  bs === nothing && return
         idx = findfirst(m -> m isa ToolMsg && m.id == tool_id, model.msgs_store)
         idx === nothing && return
         body = render_tool_body(model.state, model.msgs_store[idx], model.cwd;
                                  project_id = model.project_id)
         try
-            Bonito.dom_in_js(bonito_session, body, js"""(elem) => {
+            Bonito.dom_in_js(bs, body, js"""(elem) => {
                 const slot = document.querySelector(
                     '.bt-tool-body[data-tool-id="' + $(tool_id) + '"]');
                 if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
@@ -927,11 +947,20 @@ function wire_range_request!(model::ChatModel)
 end
 
 # Compose the chat's full DOM. Returns a DOM block (no App wrapping) so the
-# unified single-page App can drop it into its main panel directly.
+# unified single-page App can drop it into its main panel directly. Each
+# call updates `model.bonito_session[]` to the new mount and re-runs
+# initBonitoChat on the JS side (which destroys any prior BonitoChat first,
+# see assets/bonitoteam.js).
 function chat_dom(model::ChatModel, bonito_session)
-    wire_range_request!(model)
-    wire_lazy_render!(model, bonito_session)
+    model.bonito_session[] = bonito_session
     n = length(model.msgs_store)
+    # Two-step init: bring up BonitoChat, then nudge a refresh on the next
+    # tick. The constructor's refresh-on-initialCount fires before the JS
+    # observable subscriptions are observed by Bonito's runloop on a re-mount,
+    # so the resulting requestRange notify can be missed. The setTimeout(0)
+    # nudge is racing-safe: it always fires after the WS subscription is
+    # established, and Bonito's request_range listener will produce the
+    # rangeResponse the new BonitoChat needs to populate the message list.
     evaljs(bonito_session, js"""
         window.initBonitoChat({
             totalCount:           $(model.total_count),
@@ -942,6 +971,7 @@ function chat_dom(model::ChatModel, bonito_session)
             requestThoughtRender: $(model.request_thought_render),
             initialCount:         $n,
         });
+        setTimeout(() => window.bonitochat && window.bonitochat.refresh(), 0);
     """)
     DOM.div(
         chat_header(model),

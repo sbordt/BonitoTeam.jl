@@ -7,6 +7,8 @@ class BonitoChat {
     constructor(container, obs) {
         this.container = container;
         this.obs       = obs;
+        this.destroyed = false;     // tripped by destroy(); observable callbacks
+                                    // self-deregister by returning false
 
         this.cache    = new Map();  // idx (0-based) → DOMNode
         this.heights  = new Map();  // idx → measured px
@@ -24,10 +26,23 @@ class BonitoChat {
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
         this.busyEl       = container.parentElement.querySelector('.bt-busy');
 
-        // Julia → JS
-        obs.totalCount.on(n      => { this.totalCount = n; this.refresh(); });
-        obs.newMsg.on(str        => { if (str) this.handleNewMsg(JSON.parse(str)); });
-        obs.rangeResponse.on(str => { if (str) this.onRange(JSON.parse(str)); });
+        // Julia → JS. Each callback short-circuits if `destroyed` and returns
+        // `false` so Bonito splices it out of the observable's callback list
+        // (see Observable.notify in Bonito.bundled.js — `false` self-deregisters).
+        // This lets the unified app re-init the chat for a different project
+        // without leaking subscriptions from the previous mount.
+        obs.totalCount.on((n) => {
+            if (this.destroyed) return false;
+            this.totalCount = n; this.refresh();
+        });
+        obs.newMsg.on((str) => {
+            if (this.destroyed) return false;
+            if (str) this.handleNewMsg(JSON.parse(str));
+        });
+        obs.rangeResponse.on((str) => {
+            if (this.destroyed) return false;
+            if (str) this.onRange(JSON.parse(str));
+        });
 
         // Bootstrap history on page load — totalCount.on only fires on future changes
         if (obs.initialCount > 0) {
@@ -36,16 +51,31 @@ class BonitoChat {
             this.refresh();
         }
 
-        // Scroll
-        container.addEventListener('scroll', () => {
+        // Scroll + viewport listeners — saved as bound functions so destroy()
+        // can remove them via removeEventListener (anonymous arrows can't).
+        this._onScroll = () => {
             this.wasAtBottom = this.atBottom();
             this.refresh();
-        }, { passive: true });
+        };
+        container.addEventListener('scroll', this._onScroll, { passive: true });
 
         // Mobile: keep input visible when virtual keyboard opens
         if (window.visualViewport) {
-            window.visualViewport.addEventListener('resize', () => this.onViewportResize());
+            this._onVPResize = () => this.onViewportResize();
+            window.visualViewport.addEventListener('resize', this._onVPResize);
         }
+    }
+
+    destroy() {
+        this.destroyed = true;
+        if (this._onScroll) {
+            this.container.removeEventListener('scroll', this._onScroll);
+        }
+        if (this._onVPResize && window.visualViewport) {
+            window.visualViewport.removeEventListener('resize', this._onVPResize);
+        }
+        this.ros.forEach((ro) => ro.disconnect());
+        this.ros.clear();
     }
 
     // Range / virtual scroll
@@ -356,10 +386,15 @@ function escapeAttr(str) {
     return escapeHTML(str).replace(/"/g, '&quot;');
 }
 
-// Entry point called from Julia evaljs after session is ready
+// Entry point called from Julia evaljs after session is ready. Tears down
+// any previous BonitoChat first — the unified app re-mounts the chat
+// component each time the user navigates to a different project.
 function initBonitoChat(obs) {
     const container = document.querySelector('.bt-messages');
     if (!container) { requestAnimationFrame(() => initBonitoChat(obs)); return; }
+    if (window.bonitochat) {
+        try { window.bonitochat.destroy(); } catch (_) {}
+    }
     window.bonitochat = new BonitoChat(container, obs);
 }
 

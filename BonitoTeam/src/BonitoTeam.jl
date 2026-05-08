@@ -28,6 +28,7 @@ include("styles.jl")
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("persistence.jl")
 include("dashboard.jl")        # dashboard_app
+include("sidebar.jl")          # project_sidebar + auto-generated icons
 include("github.jl")           # "From GitHub" project template
 include("server.jl")           # serve()
 

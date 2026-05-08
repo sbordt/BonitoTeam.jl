@@ -67,8 +67,8 @@ function serve(; host::String        = "0.0.0.0",
         w.status = :offline
     end
 
-    dash = dashboard_app(state)
-    srv  = Bonito.Server(dash, host, port; proxy_url = ".")
+    # Single-page app: sidebar + dashboard/chat swap. No per-project routes.
+    srv = Bonito.Server(unified_app(state), host, port; proxy_url = ".")
     state.srv = srv
 
     base_url = something(public_url, "http://localhost:$port")

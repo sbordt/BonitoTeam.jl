@@ -95,9 +95,11 @@ mutable struct ServerState
     workers  :: Dict{String,WorkerInfo}
     projects :: Dict{String,Any}        # id → ProjectInfo. Any: see comment in old dashboard
 
-    # Runtime caches (not persisted)
-    project_apps :: Dict{String,Bonito.App}
-    chat_clients :: Dict{String,Any}   # id → Ref{AgentClientProtocol.Client}
+    # Runtime caches (not persisted). One ChatModel per project, lazily built
+    # the first time the project's chat is opened or the worker reconnects;
+    # holds the live ACP client and message store. The unified app's main
+    # panel pulls the model from here when a project icon is selected.
+    chat_models :: Dict{String,Any}   # id → ChatModel
 
     # Live worker connections (name → HTTP.WebSocket)
     worker_control_ws :: Dict{String,Any}
@@ -123,13 +125,12 @@ function ServerState(; state_dir::String,
     s = ServerState(
         state_dir, working_dir, worker_secret,
         nothing,
-        Dict{String,WorkerInfo}(),
-        Dict{String,Any}(),
-        Dict{String,Bonito.App}(),
-        Dict{String,Any}(),
-        Dict{String,Any}(),
-        Dict{String,Channel{Any}}(),
-        Observable(0),
+        Dict{String,WorkerInfo}(),    # workers
+        Dict{String,Any}(),           # projects
+        Dict{String,Any}(),           # chat_models
+        Dict{String,Any}(),           # worker_control_ws
+        Dict{String,Channel{Any}}(),  # pending_rpcs
+        Observable(0),                # version
     )
     load_workers!(s)
     load_projects!(s)

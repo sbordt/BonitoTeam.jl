@@ -145,11 +145,12 @@ function handle_worker_control(state::ServerState, ws)
         # Auto-release any project locks held by this worker — its claude
         # processes are gone, so the locks are stale.
         release_locks_for_worker!(state, name)
-        # Tear down the chat_app's project_apps entry so the next reconnect
-        # builds a fresh ACP session.
+        # Drop cached ChatModels for projects on this worker — their ACP
+        # connection is dead. The next reconnect calls ensure_project_session!
+        # which builds a fresh model + client.
         for p in values(state.projects)
             if p.worker_name == name
-                delete!(state.project_apps, p.id)
+                delete!(state.chat_models, p.id)
             end
         end
         @info "Worker disconnected" name=name

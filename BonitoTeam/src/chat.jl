@@ -473,483 +473,507 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString;
 end
 
 # Chat app
+# ── ChatModel ──────────────────────────────────────────────────────────────
+# Single bag holding everything one chat session needs. Every helper below
+# takes `model::ChatModel` so functions can be small and focused.
+mutable struct ChatModel
+    state         :: ServerState
+    cwd           :: String
+    project_id    :: String
+
+    # Persistent state (loaded from disk on construction)
+    chat_session  :: Any                    # ChatSession from persistence.jl
+    msgs_store    :: Vector{ChatMsg}
+
+    # ACP client + factory (factory captured so restart_session! can rebuild)
+    client         :: Ref{Union{AgentClientProtocol.Client,Nothing}}
+    mcp_servers    :: Vector{AgentClientProtocol.MCPServer}
+    client_factory :: Any                   # nothing OR (on_update -> Client)
+
+    # Streaming bookkeeping (which message id the next chunk extends)
+    agent_id       :: Ref{String}
+    thought_id     :: Ref{String}
+    user_streaming :: Ref{Bool}
+
+    # Server↔browser observables
+    total_count            :: Observable{Int}
+    new_msg_obs            :: Observable{String}      # JSON: typed event
+    range_response         :: Observable{String}      # JSON: {start, messages}
+    request_range          :: Observable{Vector{Any}} # [start, end] from JS
+    request_tool_render    :: Observable{String}
+    request_thought_render :: Observable{String}
+    session_alive          :: Observable{Bool}
+    last_error             :: Observable{String}
+end
+
+function ChatModel(state::ServerState, cwd::AbstractString;
+                    project_id::AbstractString = "",
+                    mcp_servers = AgentClientProtocol.MCPServer[],
+                    client_factory = nothing)
+    chat_session = load_session(cwd)
+    msgs_store   = load_history(chat_session)
+    return ChatModel(state, String(cwd), String(project_id),
+        chat_session, msgs_store,
+        Ref{Union{AgentClientProtocol.Client,Nothing}}(nothing),
+        collect(AgentClientProtocol.MCPServer, mcp_servers),
+        client_factory,
+        Ref(""), Ref(""), Ref(false),
+        Observable(length(msgs_store)),
+        Observable(""),
+        Observable(""),
+        Observable(Any[]),
+        Observable(""),
+        Observable(""),
+        Observable(true),
+        Observable(""))
+end
+
+# ── Small helpers shared by every handler ─────────────────────────────────
+chat_emit(model::ChatModel, event::AbstractDict) =
+    (model.new_msg_obs[] = JSON.json(event); nothing)
+
+function chat_push_msg!(model::ChatModel, msg::ChatMsg)
+    push!(model.msgs_store, msg)
+    model.total_count[] = length(model.msgs_store)
+    model.new_msg_obs[] = JSON.json(msg_to_dict(msg))
+    return nothing
+end
+
+# Close any in-flight thought/agent stream, persist + emit a "_final" event
+# so the JS side swaps the streaming bubble for the rendered Markdown HTML.
+# User messages are persisted at chunk-receive time, so closing them only
+# clears the in-flight flag.
+function chat_finalize_streaming!(model::ChatModel)
+    model.user_streaming[] = false
+    if !isempty(model.thought_id[])
+        idx = findfirst(m -> m isa ThoughtMsg && m.id == model.thought_id[], model.msgs_store)
+        if idx !== nothing
+            m = model.msgs_store[idx]
+            append_thought(model.chat_session, m)
+            html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
+            chat_emit(model, Dict{String,Any}("type" => "thought_final", "id" => m.id, "html" => html))
+        end
+        model.thought_id[] = ""
+    end
+    if !isempty(model.agent_id[])
+        idx = findfirst(m -> m isa AgentMsg && m.id == model.agent_id[], model.msgs_store)
+        if idx !== nothing
+            m = model.msgs_store[idx]
+            finalize_agent(model.chat_session, m)
+            html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
+            chat_emit(model, Dict{String,Any}("type" => "agent_final", "id" => m.id, "html" => html))
+        end
+        model.agent_id[] = ""
+    end
+    return nothing
+end
+
+# ── ACP update handlers (one per event type) ───────────────────────────────
+# All three streaming handlers (user/agent/thought) follow the same shape:
+#   1. If we're already streaming the same type → accumulate by ID lookup
+#      (NOT msgs_store[end] — interleaved events from session/load replay
+#      can put a different message there).
+#   2. Otherwise → finalize_streaming! to close any other in-flight stream,
+#      then push a fresh message and remember its ID.
+function chat_on_user_chunk!(model::ChatModel, upd::UserMessageChunk)
+    upd.content isa TextContent || return
+    text = upd.content.text
+    if !model.user_streaming[]
+        chat_finalize_streaming!(model)
+        model.user_streaming[] = true
+        msg = UserMsg(text)
+        push!(model.msgs_store, msg)
+        append_user(model.chat_session, msg)
+        model.total_count[] = length(model.msgs_store)
+        chat_emit(model, Dict{String,Any}("type" => "user", "text" => text))
+    else
+        idx = findlast(m -> m isa UserMsg, model.msgs_store)
+        idx === nothing && return
+        model.msgs_store[idx].text *= text
+        chat_emit(model, Dict{String,Any}("type" => "user_chunk", "text" => text))
+    end
+end
+
+function chat_on_agent_chunk!(model::ChatModel, upd::AgentMessageChunk)
+    upd.content isa TextContent || return
+    text = upd.content.text
+    if isempty(model.agent_id[])
+        chat_finalize_streaming!(model)
+        id = string(uuid4())
+        model.agent_id[] = id
+        msg = AgentMsg(id, text)
+        push!(model.msgs_store, msg)
+        model.total_count[] = length(model.msgs_store)
+        chat_emit(model, Dict{String,Any}("type" => "agent", "id" => id,
+                                            "html" => "", "streaming" => true))
+    else
+        idx = findfirst(m -> m isa AgentMsg && m.id == model.agent_id[], model.msgs_store)
+        idx === nothing && return
+        model.msgs_store[idx].text *= text
+        chat_emit(model, Dict{String,Any}("type" => "chunk",
+                                            "id"   => model.agent_id[], "text" => text))
+    end
+end
+
+function chat_on_thought_chunk!(model::ChatModel, upd::AgentThoughtChunk)
+    upd.content isa TextContent || return
+    text = upd.content.text
+    # claude-agent-acp's session/load replay emits placeholder thought chunks
+    # with empty content — the underlying jsonl doesn't persist thought text.
+    # Filter those so we don't spawn empty bubbles after a resume.
+    isempty(text) && return
+    if isempty(model.thought_id[])
+        chat_finalize_streaming!(model)
+        id = string(uuid4())
+        model.thought_id[] = id
+        msg = ThoughtMsg(id, text)
+        push!(model.msgs_store, msg)
+        model.total_count[] = length(model.msgs_store)
+        chat_emit(model, Dict{String,Any}("type" => "thought", "id" => id,
+                                            "html" => "", "streaming" => true))
+    else
+        idx = findfirst(m -> m isa ThoughtMsg && m.id == model.thought_id[], model.msgs_store)
+        idx === nothing && return
+        model.msgs_store[idx].text *= text
+        chat_emit(model, Dict{String,Any}("type" => "thought_chunk",
+                                            "id"   => model.thought_id[], "text" => text))
+    end
+end
+
+function chat_on_tool!(model::ChatModel, upd::ToolCallNotif)
+    chat_finalize_streaming!(model)
+    update_tool_file!(model.cwd, upd.tool_call_id, upd.raw)
+    summary = content_summary(upd.kind, upd.content)
+    msg = ToolMsg(upd.tool_call_id, upd.kind, upd.title, upd.status, summary)
+    chat_push_msg!(model, msg)
+    upd.status in ("completed", "failed") && append_tool(model.chat_session, msg)
+end
+
+function chat_on_tool_update!(model::ChatModel, upd::ToolCallUpdateNotif)
+    idx = findfirst(m -> m isa ToolMsg && m.id == upd.tool_call_id, model.msgs_store)
+    idx === nothing && return
+    m = model.msgs_store[idx]
+    update_tool_file!(model.cwd, upd.tool_call_id, upd.raw)
+    upd.status !== nothing && (m.status = upd.status)
+    upd.title  !== nothing && (m.title  = upd.title)
+    isempty(upd.content) || (m.summary = content_summary(m.kind, upd.content))
+    chat_emit(model, Dict{String,Any}("type" => "tool_update",
+        "id" => m.id, "status" => m.status, "title" => m.title, "summary" => m.summary))
+    m.status in ("completed", "failed") && append_tool(model.chat_session, m)
+end
+
+function chat_on_plan!(model::ChatModel, upd::PlanUpdate)
+    chat_finalize_streaming!(model)
+    msg = PlanMsg(upd.entries)
+    chat_push_msg!(model, msg)
+    append_plan(model.chat_session, msg)
+end
+
+# Single dispatcher: ACP feeds us SessionUpdate-typed events; we route by
+# concrete subtype to the matching handler. The closure captures `model`.
+function make_on_update(model::ChatModel)
+    return function (upd)
+        if     upd isa UserMessageChunk    chat_on_user_chunk!(model, upd)
+        elseif upd isa AgentMessageChunk   chat_on_agent_chunk!(model, upd)
+        elseif upd isa AgentThoughtChunk   chat_on_thought_chunk!(model, upd)
+        elseif upd isa ToolCallNotif       chat_on_tool!(model, upd)
+        elseif upd isa ToolCallUpdateNotif chat_on_tool_update!(model, upd)
+        elseif upd isa PlanUpdate          chat_on_plan!(model, upd)
+        end
+        return nothing
+    end
+end
+
+# ── Client lifecycle ───────────────────────────────────────────────────────
+function start_chat_client!(model::ChatModel)
+    on_update = make_on_update(model)
+    model.client[] = if model.client_factory !== nothing
+        model.client_factory(on_update)
+    else
+        AgentClientProtocol.Client(model.cwd; on_update, mcp_servers = model.mcp_servers)
+    end
+    update_session_id!(model.chat_session, model.client[].session_id)
+
+    # Expose live client to test harnesses + programmatic drivers (test rigs
+    # call AgentClientProtocol.prompt!() directly without synthesising a click).
+    if !isempty(model.project_id)
+        @info "registering chat client" project_id=model.project_id session_id=model.client[].session_id
+        model.state.chat_clients[model.project_id] = model.client
+    end
+    return nothing
+end
+
+function restart_chat_session!(model::ChatModel)
+    try
+        old = model.client[]
+        if old !== nothing
+            try AgentClientProtocol.send_request(old.conn, "session/cancel",
+                    Dict("sessionId" => old.session_id)) catch end
+        end
+        start_chat_client!(model)
+        model.session_alive[] = true
+        model.last_error[]    = ""
+    catch e
+        model.last_error[] = "restart failed: $(sprint(showerror, e))"
+    end
+end
+
+# Auto-prompt: if the project carries an `auto_prompt` (set by the "From
+# GitHub" template) and the chat is otherwise empty, fire it once as the
+# first user message. Cleared + persisted right away so a server restart or
+# session reconnect doesn't double-fire.
+function fire_auto_prompt!(model::ChatModel)
+    isempty(model.project_id) && return
+    haskey(model.state.projects, model.project_id) || return
+    proj = model.state.projects[model.project_id]
+    ap = proj.auto_prompt
+    (ap === nothing || isempty(ap) || !isempty(model.msgs_store)) && return
+    proj.auto_prompt = nothing
+    try save_projects!(model.state) catch e
+        @warn "auto_prompt: persist clear failed" exception=e
+    end
+    user_msg = UserMsg(String(ap))
+    chat_push_msg!(model, user_msg)
+    append_user(model.chat_session, user_msg)
+    chat_emit(model, Dict{String,Any}("type" => "busy_start"))
+    Base.errormonitor(@async send_prompt_async!(model, String(ap)))
+    return nothing
+end
+
+# Common send-and-handle for both auto_prompt and user-typed prompts. Splits
+# transient ACP errors (which we surface inline as a chat bubble) from
+# session-death errors (which flip the banner so the user can restart).
+function send_prompt_async!(model::ChatModel, text::AbstractString)
+    try
+        AgentClientProtocol.prompt!(model.client[], String(text))
+        chat_finalize_streaming!(model)
+    catch e
+        msg = sprint(showerror, e)
+        if occursin("connection closed", msg) || occursin("EOFError", msg) ||
+           occursin("BrokenPipe", msg)
+            model.session_alive[] = false
+            model.last_error[]    = msg
+        else
+            id = string(uuid4())
+            err_msg = AgentMsg(id, "[error: $msg]")
+            chat_push_msg!(model, err_msg)
+            finalize_agent(model.chat_session, err_msg)
+        end
+    finally
+        chat_emit(model, Dict{String,Any}("type" => "busy_end"))
+    end
+end
+
+# ── DOM building (split into header / messages / input / banner) ──────────
+function chat_header(model::ChatModel)
+    state    = model.state
+    project_id = model.project_id
+    cwd      = model.cwd
+
+    status_dot = map(model.session_alive) do alive
+        DOM.span(""; class = alive ? "bt-dot bt-dot-online" : "bt-dot bt-dot-offline",
+                     title = alive ? "session live" : "session ended")
+    end
+
+    sync_status = Observable("")
+    sync_button = DOM.button(map(s -> isempty(s) ? "Sync" : s, sync_status);
+        class   = "bt-header-sync",
+        title   = "Pull this project from the worker to the server",
+        onclick = js"event => Bonito.notify_observable($(sync_status), '__click__')")
+    on(sync_status) do s
+        s == "__click__" || return
+        sync_status[] = ""
+        isempty(project_id) && (sync_status[] = "no project bound"; return)
+        handle_chat_sync_click(state, project_id, sync_status)
+    end
+
+    DOM.div(
+        DOM.div(
+            DOM.a("←"; href = Bonito.Link("/"), class = "bt-header-back",
+                   title = "Back to dashboard"),
+            status_dot,
+            DOM.div(
+                DOM.span(basename(rstrip(cwd, '/')); title = cwd),
+                class = "bt-header-title"),
+            sync_button;
+            class = "bt-header-row");
+        class = "bt-header")
+end
+
+function chat_session_banner(model::ChatModel)
+    restart_btn = Bonito.Button("Restart session"; style=nothing,
+                                class = "bt-btn bt-btn-secondary")
+    on(restart_btn.value) do clicked
+        clicked && @async restart_chat_session!(model)
+    end
+    map(model.session_alive, model.last_error) do alive, err
+        alive && return DOM.div()
+        DOM.div(
+            DOM.div(
+                DOM.span("⚠ Session ended"; style = "font-weight:600"),
+                DOM.div(isempty(err) ? "The agent connection was closed." : err;
+                        class = "bt-banner-detail");
+                style = "flex:1 1 auto; min-width:0"),
+            restart_btn;
+            class = "bt-banner-error")
+    end
+end
+
+# Inline SVG icons render crisply at any size, independent of installed
+# fonts (Arial's ▶ glyph is tiny on Linux).
+const SEND_SVG = Bonito.HTML(
+    """<svg viewBox="0 0 24 24" width="20" height="20" fill="none"
+            stroke="currentColor" stroke-width="2.2"
+            stroke-linecap="round" stroke-linejoin="round">
+         <line x1="12" y1="19" x2="12" y2="5"></line>
+         <polyline points="5 12 12 5 19 12"></polyline>
+       </svg>""")
+const STOP_SVG = Bonito.HTML(
+    """<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+         <rect x="5" y="5" width="14" height="14" rx="2.5"></rect>
+       </svg>""")
+
+function chat_input_area(model::ChatModel, bonito_session)
+    text_val = Observable("")
+    send_btn = Bonito.Button(SEND_SVG; style=nothing, class="bt-send-btn",
+                             title="Send (Enter)")
+    stop_btn = Bonito.Button(STOP_SVG; style=nothing, class="bt-stop-btn",
+                             title="Stop generation")
+
+    text_input = DOM.textarea(""; placeholder="Message…",
+        title="Enter to send  ·  Shift+Enter for newline",
+        class="bt-text-input", rows=1,
+        oninput=js"""event => {
+            $(text_val).notify(event.target.value);
+            event.target.style.height = 'auto';
+            event.target.style.height = Math.min(event.target.scrollHeight, 120) + 'px';
+        }""",
+        onkeydown=js"""event => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                $(send_btn.value).notify(true);
+            }
+        }""")
+
+    on(send_btn.value) do clicked
+        clicked || return
+        send_user_text!(model, bonito_session, text_input, text_val)
+    end
+    on(stop_btn.value) do clicked
+        clicked || return
+        c = model.client[]
+        c !== nothing && AgentClientProtocol.cancel!(c)
+    end
+    DOM.div(DOM.div(text_input, send_btn, stop_btn, class = "bt-input-row");
+            class = "bt-input-area")
+end
+
+function send_user_text!(model::ChatModel, bonito_session, text_input, text_val)
+    text = strip(text_val[])
+    isempty(text) && return
+    text_val[] = ""
+    evaljs(bonito_session, js"$(text_input).value = ''; $(text_input).style.height = 'auto';")
+    user_msg = UserMsg(String(text))
+    chat_push_msg!(model, user_msg)
+    append_user(model.chat_session, user_msg)
+    model.agent_id[] = ""
+    chat_emit(model, Dict{String,Any}("type" => "busy_start"))
+    @async send_prompt_async!(model, String(text))
+end
+
+# Lazy tool/thought body rendering. JS notifies *_render Observable with the
+# msg id when the user expands a placeholder; we look the message up, build
+# its body, and ship it back via dom_in_js (tool) or emit (thought).
+function wire_lazy_render!(model::ChatModel, bonito_session)
+    on(model.request_tool_render) do tool_id
+        isempty(tool_id) && return
+        idx = findfirst(m -> m isa ToolMsg && m.id == tool_id, model.msgs_store)
+        idx === nothing && return
+        body = render_tool_body(model.state, model.msgs_store[idx], model.cwd;
+                                 project_id = model.project_id)
+        try
+            Bonito.dom_in_js(bonito_session, body, js"""(elem) => {
+                const slot = document.querySelector(
+                    '.bt-tool-body[data-tool-id="' + $(tool_id) + '"]');
+                if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
+            }""")
+        catch e
+            @warn "tool render failed" tool_id exception=e
+        end
+    end
+    on(model.request_thought_render) do thought_id
+        isempty(thought_id) && return
+        idx = findfirst(m -> m isa ThoughtMsg && m.id == thought_id, model.msgs_store)
+        idx === nothing && return
+        html = sprint(show, MIME("text/html"),
+                      Markdown.parse(model.msgs_store[idx].text))
+        chat_emit(model, Dict{String,Any}("type" => "thought_body",
+                                            "id"   => thought_id, "html" => html))
+    end
+    return nothing
+end
+
+function wire_range_request!(model::ChatModel)
+    on(model.request_range) do rng
+        isempty(rng) && return
+        s, e = Int(rng[1]), Int(rng[2])
+        n = length(model.msgs_store)
+        s = clamp(s, 0, n - 1);  e = clamp(e, 0, n - 1)
+        s > e && return
+        batch = [msg_to_dict(model.msgs_store[i]) for i in (s+1):(e+1)]
+        model.range_response[] = JSON.json(Dict{String,Any}(
+            "start" => s, "messages" => batch))
+    end
+end
+
+# Compose the chat's full DOM. Returns a DOM block (no App wrapping) so the
+# unified single-page App can drop it into its main panel directly.
+function chat_dom(model::ChatModel, bonito_session)
+    wire_range_request!(model)
+    wire_lazy_render!(model, bonito_session)
+    n = length(model.msgs_store)
+    evaljs(bonito_session, js"""
+        window.initBonitoChat({
+            totalCount:           $(model.total_count),
+            requestRange:         $(model.request_range),
+            rangeResponse:        $(model.range_response),
+            newMsg:               $(model.new_msg_obs),
+            requestToolRender:    $(model.request_tool_render),
+            requestThoughtRender: $(model.request_thought_render),
+            initialCount:         $n,
+        });
+    """)
+    DOM.div(
+        chat_header(model),
+        chat_session_banner(model),
+        DOM.div(DOM.div(class="bt-spacer-top"),
+                DOM.div(class="bt-spacer-bottom");
+                class="bt-messages"),
+        DOM.div(DOM.div(class="bt-busy-dot"),
+                DOM.div(class="bt-busy-dot"),
+                DOM.div(class="bt-busy-dot");
+                class="bt-busy"),
+        chat_input_area(model, bonito_session);
+        class = "bt-app")
+end
+
+# Top-level: build the model, start the ACP client, fire any auto_prompt,
+# then return an App that renders the chat DOM. <50 LOC because every step
+# delegates.
 function chat_app(state::ServerState, cwd::String;
                   project_id::String = "",
                   mcp_servers    = AgentClientProtocol.MCPServer[],
                   client_factory = nothing)
-    chat_session = load_session(cwd)
-    msgs_store   = load_history(chat_session)
-    agent_id     = Ref("")
-    thought_id   = Ref("")
-    # Tracks whether a user_message_chunk replay is currently in flight,
-    # so consecutive chunks accumulate into one UserMsg bubble. Live user
-    # input never goes through on_update, so this only matters during
-    # session/load replay.
-    user_streaming = Ref(false)
-    client       = Ref{Union{AgentClientProtocol.Client,Nothing}}(nothing)
-
-    # Observables
-    # Julia → JS
-    total_count    = Observable(length(msgs_store))
-    new_msg_obs    = Observable("")           # JSON: typed event
-    range_response = Observable("")           # JSON: {start, messages}
-
-    # JS → Julia
-    request_range          = Observable(Any[])  # [start_idx, end_idx]
-    request_tool_render    = Observable("")     # tool_id
-    request_thought_render = Observable("")     # thought_id
-
-    function push_msg!(msg::ChatMsg)
-        push!(msgs_store, msg)
-        total_count[] = length(msgs_store)
-        new_msg_obs[] = JSON.json(msg_to_dict(msg))
-    end
-
-    function emit(event::Dict)
-        new_msg_obs[] = JSON.json(event)
-    end
-
-    # ACP update handlers
-    #
-    # All three streaming handlers (user/agent/thought) follow the same shape:
-    #   1. If we're already streaming the same type → accumulate by ID lookup
-    #      (NOT msgs_store[end] — interleaved events from session/load replay
-    #      can put a different message there).
-    #   2. Otherwise → finalize_streaming! to close any other in-flight stream,
-    #      then push a fresh message and remember its ID.
-    function finalize_streaming!()
-        # User messages are persisted at creation (append_user runs in
-        # on_update(::UserMessageChunk) the moment the first chunk arrives),
-        # so closing the stream just clears the in-flight flag.
-        user_streaming[] = false
-        if !isempty(thought_id[])
-            idx = findfirst(m -> m isa ThoughtMsg && m.id == thought_id[], msgs_store)
-            if idx !== nothing
-                m = msgs_store[idx]
-                append_thought(chat_session, m)
-                html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
-                emit(Dict{String,Any}("type" => "thought_final", "id" => m.id, "html" => html))
-            end
-            thought_id[] = ""
-        end
-        if !isempty(agent_id[])
-            idx = findfirst(m -> m isa AgentMsg && m.id == agent_id[], msgs_store)
-            if idx !== nothing
-                m = msgs_store[idx]
-                finalize_agent(chat_session, m)
-                html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
-                emit(Dict{String,Any}("type" => "agent_final", "id" => m.id, "html" => html))
-            end
-            agent_id[] = ""
-        end
-    end
-
-    function on_update(upd::UserMessageChunk)
-        upd.content isa TextContent || return
-        text = upd.content.text
-        if !user_streaming[]
-            finalize_streaming!()
-            user_streaming[] = true
-            msg = UserMsg(text)
-            push!(msgs_store, msg)
-            append_user(chat_session, msg)
-            total_count[] = length(msgs_store)
-            emit(Dict{String,Any}("type" => "user", "text" => text))
-        else
-            # Accumulate into the most-recent UserMsg (the in-flight one).
-            idx = findlast(m -> m isa UserMsg, msgs_store)
-            idx === nothing && return
-            msgs_store[idx].text *= text
-            emit(Dict{String,Any}("type" => "user_chunk", "text" => text))
-        end
-    end
-
-    function on_update(upd::AgentMessageChunk)
-        upd.content isa TextContent || return
-        text = upd.content.text
-        if isempty(agent_id[])
-            finalize_streaming!()
-            id = string(uuid4())
-            agent_id[] = id
-            msg = AgentMsg(id, text)
-            push!(msgs_store, msg)
-            total_count[] = length(msgs_store)
-            emit(Dict{String,Any}("type" => "agent", "id" => id,
-                                  "html" => "", "streaming" => true))
-        else
-            idx = findfirst(m -> m isa AgentMsg && m.id == agent_id[], msgs_store)
-            idx === nothing && return
-            msgs_store[idx].text *= text
-            emit(Dict{String,Any}("type" => "chunk", "id" => agent_id[], "text" => text))
-        end
-    end
-
-    function on_update(upd::AgentThoughtChunk)
-        upd.content isa TextContent || return
-        text = upd.content.text
-        # claude-agent-acp's session/load replay emits placeholder thought
-        # chunks with empty content — the underlying jsonl doesn't persist
-        # thought text, so the agent fakes "there was thinking here" markers.
-        # Live sessions deliver real text; this filters the placeholders out
-        # so we don't spawn empty bubbles after a resume.
-        isempty(text) && return
-        if isempty(thought_id[])
-            finalize_streaming!()
-            id = string(uuid4())
-            thought_id[] = id
-            msg = ThoughtMsg(id, text)
-            push!(msgs_store, msg)
-            total_count[] = length(msgs_store)
-            emit(Dict{String,Any}("type" => "thought", "id" => id,
-                                  "html" => "", "streaming" => true))
-        else
-            idx = findfirst(m -> m isa ThoughtMsg && m.id == thought_id[], msgs_store)
-            idx === nothing && return
-            msgs_store[idx].text *= text
-            emit(Dict{String,Any}("type" => "thought_chunk", "id" => thought_id[], "text" => text))
-        end
-    end
-
-    function on_update(upd::ToolCallNotif)
-        finalize_streaming!()
-        update_tool_file!(cwd, upd.tool_call_id, upd.raw)
-        summary = content_summary(upd.kind, upd.content)
-        msg = ToolMsg(upd.tool_call_id, upd.kind, upd.title, upd.status, summary)
-        push_msg!(msg)
-        upd.status in ("completed", "failed") && append_tool(chat_session, msg)
-    end
-
-    function on_update(upd::ToolCallUpdateNotif)
-        idx = findfirst(m -> m isa ToolMsg && m.id == upd.tool_call_id, msgs_store)
-        idx === nothing && return
-        m = msgs_store[idx]
-        update_tool_file!(cwd, upd.tool_call_id, upd.raw)
-        upd.status !== nothing && (m.status = upd.status)
-        upd.title  !== nothing && (m.title  = upd.title)
-        # Only refresh summary when this update actually carries content
-        # (status-only updates leave the prior summary in place).
-        if !isempty(upd.content)
-            m.summary = content_summary(m.kind, upd.content)
-        end
-        emit(Dict{String,Any}("type"    => "tool_update",
-                              "id"      => m.id,
-                              "status"  => m.status,
-                              "title"   => m.title,
-                              "summary" => m.summary))
-        m.status in ("completed", "failed") && append_tool(chat_session, m)
-    end
-
-    function on_update(upd::PlanUpdate)
-        finalize_streaming!()
-        msg = PlanMsg(upd.entries)
-        push_msg!(msg)
-        append_plan(chat_session, msg)
-    end
-
-    on_update(::SessionUpdate) = nothing
-
-    # Range request handler (JS asks for a slice of msgs_store)
-    on(request_range) do rng
-        isempty(rng) && return
-        s = Int(rng[1]);  e = Int(rng[2])
-        n = length(msgs_store)
-        s = clamp(s, 0, n - 1);  e = clamp(e, 0, n - 1)
-        s > e && return
-        batch = [msg_to_dict(msgs_store[i]) for i in s+1:e+1]
-        range_response[] = JSON.json(Dict{String,Any}("start" => s, "messages" => batch))
-    end
-
-    # Start ACP session
-    client[] = if client_factory !== nothing
-        client_factory(on_update)
-    else
-        AgentClientProtocol.Client(cwd; on_update, mcp_servers)
-    end
-    update_session_id!(chat_session, client[].session_id)
-
-    # Expose the live client to test harnesses + future programmatic
-    # drivers so they can call AgentClientProtocol.prompt!() without
-    # going through the UI's send-button observable. Keyed by project_id;
-    # chat_app instances without a project_id (e.g. unit-test apps) skip.
-    if !isempty(project_id)
-        @info "registering chat client" project_id session_id=client[].session_id
-        state.chat_clients[project_id] = client
-    end
-
-    # Session-health state surfaced in the UI. Flipped to false when prompt!
-    # raises (worker WS dropped, ACP subprocess died, etc.); the chat banner
-    # uses this to show "session ended — restart?" with a button.
-    session_alive = Observable(true)
-    last_error    = Observable("")
-
-    # Auto-prompt: if the project carries an `auto_prompt` (set by the "From
-    # GitHub" template) and the chat is otherwise empty, fire it once as the
-    # first user message. Cleared + persisted right away so a server restart
-    # or session reconnect doesn't double-fire.
-    if !isempty(project_id) && haskey(state.projects, project_id)
-        proj = state.projects[project_id]
-        ap = proj.auto_prompt
-        if ap !== nothing && !isempty(ap) && isempty(msgs_store)
-            proj.auto_prompt = nothing
-            try save_projects!(state) catch e
-                @warn "auto_prompt: persist clear failed" exception=e
-            end
-            user_msg = UserMsg(String(ap))
-            push_msg!(user_msg)
-            append_user(chat_session, user_msg)
-            emit(Dict{String,Any}("type" => "busy_start"))
-            Base.errormonitor(@async begin
-                try
-                    AgentClientProtocol.prompt!(client[], String(ap))
-                    finalize_streaming!()
-                catch e
-                    last_error[]    = sprint(showerror, e)
-                    session_alive[] = false
-                    emit(Dict{String,Any}("type" => "busy_stop"))
-                end
-            end)
-        end
-    end
-
-    function restart_session!()
-        try
-            old = client[]
-            if old !== nothing
-                # Best-effort close of the old conn so the worker stops sending.
-                try AgentClientProtocol.send_request(old.conn, "session/cancel",
-                                                      Dict("sessionId" => old.session_id)) catch end
-            end
-            client[] = if client_factory !== nothing
-                client_factory(on_update)
-            else
-                AgentClientProtocol.Client(cwd; on_update, mcp_servers)
-            end
-            update_session_id!(chat_session, client[].session_id)
-            session_alive[] = true
-            last_error[]    = ""
-        catch e
-            last_error[] = "restart failed: $(sprint(showerror, e))"
-        end
-    end
-
-    # Bonito App
+    model = ChatModel(state, cwd;
+                       project_id    = project_id,
+                       mcp_servers   = mcp_servers,
+                       client_factory = client_factory)
+    start_chat_client!(model)
+    fire_auto_prompt!(model)
     App() do bonito_session
-        text_val  = Observable("")
-        # Inline SVG icons render crisply at any size, independent of installed
-        # fonts (Arial's ▶ glyph is tiny on Linux).
-        send_icon = Bonito.HTML(
-            """<svg viewBox="0 0 24 24" width="20" height="20" fill="none"
-                    stroke="currentColor" stroke-width="2.2"
-                    stroke-linecap="round" stroke-linejoin="round">
-                 <line x1="12" y1="19" x2="12" y2="5"></line>
-                 <polyline points="5 12 12 5 19 12"></polyline>
-               </svg>""")
-        stop_icon = Bonito.HTML(
-            """<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-                 <rect x="5" y="5" width="14" height="14" rx="2.5"></rect>
-               </svg>""")
-        send_btn  = Bonito.Button(send_icon; style=nothing, class="bt-send-btn",
-                                  title="Send (Enter)")
-        stop_btn  = Bonito.Button(stop_icon; style=nothing, class="bt-stop-btn",
-                                  title="Stop generation")
-
-        text_input = DOM.textarea(
-            "";
-            placeholder="Message…",
-            title="Enter to send  ·  Shift+Enter for newline",
-            class="bt-text-input",
-            rows=1,
-            oninput=js"""event => {
-                $(text_val).notify(event.target.value);
-                event.target.style.height = 'auto';
-                event.target.style.height = Math.min(event.target.scrollHeight, 120) + 'px';
-            }""",
-            onkeydown=js"""event => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                    event.preventDefault();
-                    $(send_btn.value).notify(true);
-                }
-            }"""
-        )
-
-        on(send_btn.value) do clicked
-            clicked || return
-            text = strip(text_val[])
-            isempty(text) && return
-            text_val[] = ""
-            evaljs(bonito_session, js"$(text_input).value = ''; $(text_input).style.height = 'auto';")
-
-            user_msg = UserMsg(String(text))
-            push_msg!(user_msg)
-            append_user(chat_session, user_msg)
-            agent_id[] = ""
-            emit(Dict{String,Any}("type" => "busy_start"))
-
-            @async begin
-                try
-                    AgentClientProtocol.prompt!(client[], String(text))
-                    finalize_streaming!()
-                catch e
-                    # Distinguish transient errors from session death. If the
-                    # underlying ACP connection is gone, the chat banner shows
-                    # the restart affordance; otherwise we still log the error
-                    # inline as a chat bubble so the user has context.
-                    msg = sprint(showerror, e)
-                    if occursin("connection closed", msg) ||
-                       occursin("EOFError",          msg) ||
-                       occursin("BrokenPipe",        msg)
-                        session_alive[] = false
-                        last_error[]    = msg
-                    else
-                        id = string(uuid4())
-                        err_msg = AgentMsg(id, "[error: $msg]")
-                        push_msg!(err_msg)
-                        finalize_agent(chat_session, err_msg)
-                    end
-                finally
-                    emit(Dict{String,Any}("type" => "busy_end"))
-                end
-            end
-        end
-
-        on(stop_btn.value) do clicked
-            clicked || return
-            c = client[]
-            c !== nothing && AgentClientProtocol.cancel!(c)
-        end
-
-        # Lazy tool-body rendering: when the user clicks expand on a tool, JS
-        # notifies request_tool_render with the tool_id; we look up the
-        # ToolMsg, build its body (Monaco / DiffEditor / Markdown), and ship
-        # it via Bonito.dom_in_js — which creates a sub-session, ships the
-        # rendered HTML+init JS, and runs the supplied function on the JS
-        # side to inject it into the right placeholder.
-        on(request_tool_render) do tool_id
-            isempty(tool_id) && return
-            idx = findfirst(m -> m isa ToolMsg && m.id == tool_id, msgs_store)
-            idx === nothing && return
-            body = render_tool_body(state, msgs_store[idx], cwd; project_id = project_id)
-            try
-                Bonito.dom_in_js(bonito_session, body, js"""(elem) => {
-                    const slot = document.querySelector(
-                        '.bt-tool-body[data-tool-id="' + $(tool_id) + '"]');
-                    if (slot) {
-                        slot.innerHTML = '';
-                        slot.appendChild(elem);
-                    }
-                }""")
-            catch e
-                @warn "tool render failed" tool_id exception=e
-            end
-        end
-
-        # Lazy thought body rendering: msg_to_dict ships a header only; when
-        # the user expands the <details>, JS notifies request_thought_render
-        # with the thought id and we ship the rendered HTML back via emit.
-        on(request_thought_render) do thought_id
-            isempty(thought_id) && return
-            idx = findfirst(m -> m isa ThoughtMsg && m.id == thought_id, msgs_store)
-            idx === nothing && return
-            html = sprint(show, MIME("text/html"), Markdown.parse(msgs_store[idx].text))
-            emit(Dict{String,Any}("type" => "thought_body",
-                                  "id"   => thought_id,
-                                  "html" => html))
-        end
-
-        n = length(msgs_store)
-        evaljs(bonito_session, js"""
-            window.initBonitoChat({
-                totalCount:           $(total_count),
-                requestRange:         $(request_range),
-                rangeResponse:        $(range_response),
-                newMsg:               $(new_msg_obs),
-                requestToolRender:    $(request_tool_render),
-                requestThoughtRender: $(request_thought_render),
-                initialCount:         $n,
-            });
-        """)
-
-        # Status dot reflects ACP session health, not Bonito's WS — the WS
-        # indicator is the floater in the corner, this is "is claude alive".
-        status_dot = map(session_alive) do alive
-            DOM.span(""; class = alive ? "bt-dot bt-dot-online" : "bt-dot bt-dot-offline",
-                         title = alive ? "session live" : "session ended")
-        end
-
-        # Restart banner shown when the agent died. Hidden when alive=true.
-        restart_btn_inner = Bonito.Button("Restart session"; style=nothing,
-                                          class = "bt-btn bt-btn-secondary")
-        on(restart_btn_inner.value) do clicked
-            clicked && @async restart_session!()
-        end
-        banner = map(session_alive, last_error) do alive, err
-            alive && return DOM.div()
-            DOM.div(
-                DOM.div(
-                    DOM.span("⚠ Session ended"; style = "font-weight:600"),
-                    DOM.div(isempty(err) ? "The agent connection was closed." : err;
-                            class = "bt-banner-detail");
-                    style = "flex:1 1 auto; min-width:0"),
-                restart_btn_inner;
-                class = "bt-banner-error")
-        end
-
-        # Sync action: a single inline button. Skip the popover — there's
-        # only one meaningful action on the project (back-to-dashboard is
-        # already the ← arrow). State flows through one observable so the
-        # button label morphs in place: "Sync" → "Syncing…" → "✓ HH:MM:SS"
-        # / "failed".
-        sync_click  = Observable("")
-        sync_status = Observable("")
-        on(sync_click) do tag
-            isempty(tag) && return
-            sync_click[] = ""
-            isempty(project_id) && (sync_status[] = "no project bound"; return)
-            handle_chat_sync_click(state, project_id, sync_status)
-        end
-
-        sync_button = DOM.button(
-            map(sync_status) do msg
-                isempty(msg) ? "Sync" : msg
-            end;
-            class = "bt-header-sync",
-            title = "Pull this project from the worker to the server",
-            onclick = js"event => $(sync_click).notify('sync')")
-
         DOM.div(
-            ChatStyles,
-            BonitoTeamJS,
-            Bonito.MarkdownCSS,
-            # Live WS-connection indicator (fixed top-right corner).
+            ChatStyles, BonitoTeamJS, Bonito.MarkdownCSS,
             Bonito.ConnectionIndicator(),
-            DOM.div(
-                DOM.div(
-                    DOM.a("←"; href = Bonito.Link("/"), class = "bt-header-back",
-                           title = "Back to dashboard"),
-                    status_dot,
-                    DOM.div(
-                        DOM.span(basename(rstrip(cwd, '/'));
-                                 # Hover shows the full cwd. The visible
-                                 # text stays short so the navbar doesn't
-                                 # eat horizontal space on small screens.
-                                 title = cwd),
-                        class = "bt-header-title"),
-                    sync_button;
-                    class = "bt-header-row");
-                class = "bt-header"),
-            banner,
-            DOM.div(
-                DOM.div(class="bt-spacer-top"),
-                DOM.div(class="bt-spacer-bottom"),
-                class="bt-messages"),
-            DOM.div(
-                DOM.div(class="bt-busy-dot"),
-                DOM.div(class="bt-busy-dot"),
-                DOM.div(class="bt-busy-dot"),
-                class="bt-busy"),
-            DOM.div(
-                DOM.div(text_input, send_btn, stop_btn, class = "bt-input-row");
-                class = "bt-input-area"),
-            class="bt-app")
+            chat_dom(model, bonito_session))
     end
 end

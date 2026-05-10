@@ -57,9 +57,20 @@ function create_project!(state::ServerState, name::String, src_path::String,
     isdir(src_path)   || error("Source path is not a directory: $src_path")
 
     w = state.workers[worker_name]
-    id          = string(uuid4())[1:8]
     server_path = joinpath(state.working_dir, name)
     worker_path = joinpath(w.projects_root, name)
+
+    # Idempotent re-import: if the same folder on the same worker is already
+    # registered, return the existing entry instead of creating a duplicate.
+    existing = find_project_by_location(state, worker_name, worker_path)
+    if existing !== nothing
+        @info "create_project!: existing project at this worker_path; reusing" id=existing.id name=existing.name
+        ensure_project_session!(state, existing)
+        bump_state!(state)
+        return existing
+    end
+
+    id = string(uuid4())[1:8]
 
     # 1. Seed the canonical server-side copy from the picked source (local
     # rsync; this is always on the server box, no SSH).
@@ -113,6 +124,23 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
         error("Project name must be alphanumeric/_/- only — got '$name'")
     isempty(worker_path) && error("Worker path is required (pick a folder).")
+
+    # Idempotent re-import: same (worker_name, worker_path) returns the
+    # already-registered project. If this caller supplied a `resume_session_id`
+    # and the existing entry didn't have one, adopt it so the next chat session
+    # uses session/load instead of session/new.
+    existing = find_project_by_location(state, worker_name, worker_path)
+    if existing !== nothing
+        @info "create_project_from_worker!: reusing existing project" id=existing.id name=existing.name
+        if resume_session_id !== nothing && existing.resume_session_id === nothing
+            existing.resume_session_id = resume_session_id
+            save_projects!(state)
+        end
+        progress === nothing || progress("Reusing existing project…")
+        ensure_project_session!(state, existing)
+        bump_state!(state)
+        return existing
+    end
 
     id = string(uuid4())[1:8]
     server_path = joinpath(state.working_dir, name)

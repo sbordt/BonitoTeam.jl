@@ -103,9 +103,28 @@ function create_project_from_github!(state::ServerState, url::AbstractString;
         error("Derived project name '$proj_name' is invalid; pass `name=` explicitly")
 
     w = state.workers[worker_name]
-    id          = string(uuid4())[1:8]
     server_path = joinpath(state.working_dir, proj_name)
     worker_path = joinpath(w.projects_root, proj_name)
+
+    # Idempotent re-clone: a project at the same `(worker, worker_path)` is
+    # treated as the canonical one; we don't reclone, but we do refresh the
+    # auto_prompt for issue/PR URLs since the operator likely wants the new
+    # task seeded into the chat.
+    existing = find_project_by_location(state, worker_name, worker_path)
+    if existing !== nothing
+        @info "create_project_from_github!: reusing existing project" id=existing.id name=existing.name
+        if ref.kind != :repo
+            progress === nothing || progress("Fetching $(ref.kind) #$(ref.number) metadata…")
+            meta = fetch_github_issue(ref.owner, ref.repo, ref.number)
+            existing.auto_prompt = github_issue_prompt(ref, meta.title, meta.body)
+            save_projects!(state)
+        end
+        ensure_project_session!(state, existing)
+        bump_state!(state)
+        return existing
+    end
+
+    id          = string(uuid4())[1:8]
     clone_url   = "https://github.com/$(ref.owner)/$(ref.repo).git"
     pr_number   = ref.kind == :pull ? ref.number : nothing
 

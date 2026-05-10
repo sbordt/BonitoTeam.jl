@@ -61,9 +61,18 @@ class BonitoChat {
             catch (_) {}
         }
 
-        // Bootstrap history on page load — totalCount.on only fires on future changes
-        if (obs.initialCount > 0) {
-            this.totalCount  = obs.initialCount;
+        // Bootstrap history on page load — read totalCount's *current* value,
+        // not a snapshot taken at evaljs serialisation time. For an imported
+        // claude session, the ACP `session/load` replay can update totalCount
+        // between when Julia builds this initBonitoChat call and when the
+        // browser actually runs it; relying on a stale snapshot caused the
+        // chat to render empty until the user refreshed (the second mount
+        // saw the post-replay total). Reading `obs.totalCount.value` here is
+        // race-free because Bonito guarantees the proxy's `.value` reflects
+        // the latest UpdateObservable processed by the time this code runs.
+        const initial = obs.totalCount.value || 0;
+        if (initial > 0) {
+            this.totalCount  = initial;
             this.initialLoad = true;
             this.refresh();
         }

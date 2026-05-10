@@ -1012,14 +1012,10 @@ end
 # see assets/bonitoteam.js).
 function chat_dom(model::ChatModel, bonito_session)
     model.bonito_session[] = bonito_session
-    n = length(model.msgs_store)
-    # Two-step init: bring up BonitoChat, then nudge a refresh on the next
-    # tick. The constructor's refresh-on-initialCount fires before the JS
-    # observable subscriptions are observed by Bonito's runloop on a re-mount,
-    # so the resulting requestRange notify can be missed. The setTimeout(0)
-    # nudge is racing-safe: it always fires after the WS subscription is
-    # established, and Bonito's request_range listener will produce the
-    # rangeResponse the new BonitoChat needs to populate the message list.
+    # No `initialCount` snapshot anymore: the JS reads `obs.totalCount.value`
+    # at construction time, which is race-free against ACP replay events
+    # that may fire between this evaljs and the browser actually running it.
+    # See assets/bonitoteam.js (the bootstrap block) for the rationale.
     evaljs(bonito_session, js"""
         window.initBonitoChat({
             totalCount:           $(model.total_count),
@@ -1028,7 +1024,6 @@ function chat_dom(model::ChatModel, bonito_session)
             newMsg:               $(model.new_msg_obs),
             requestToolRender:    $(model.request_tool_render),
             requestThoughtRender: $(model.request_thought_render),
-            initialCount:         $n,
         });
         setTimeout(() => window.bonitochat && window.bonitochat.refresh(), 0);
     """)

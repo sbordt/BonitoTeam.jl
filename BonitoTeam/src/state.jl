@@ -253,4 +253,80 @@ function load_projects!(s::ServerState)
             @warn "skipping malformed project entry" entry=d exception=e
         end
     end
+    dedup_projects!(s)
+end
+
+"""
+    project_location_key(p) -> Tuple{String,String}
+
+Identity tuple used to detect duplicate projects: a project is uniquely
+identified by the worker it lives on (`worker_name`) and the absolute path
+inside that worker (`worker_path`, normalised by stripping a trailing `/`).
+"""
+project_location_key(p::ProjectInfo) =
+    (p.worker_name, rstrip(p.worker_path, '/'))
+
+"""
+    find_project_by_location(state, worker_name, worker_path)
+        -> Union{ProjectInfo,Nothing}
+
+Look up the existing project at `(worker_name, worker_path)`. The import
+flows use this to short-circuit when the user re-imports the same folder
+from the same worker — instead of generating a fresh `id` they reuse the
+already-registered project.
+"""
+function find_project_by_location(state::ServerState,
+                                   worker_name::AbstractString,
+                                   worker_path::AbstractString)
+    key = (String(worker_name), rstrip(String(worker_path), '/'))
+    for p in values(state.projects)
+        project_location_key(p) == key && return p
+    end
+    return nothing
+end
+
+# Collapse projects.json entries that share `(worker_name, worker_path)`.
+# Same coordinates means the same on-disk folder — and since the project
+# name is derived from `basename(worker_path)`, both copies actually share
+# the same `server_path` (and therefore the same `.bonitoTeam/chat.md`),
+# so dropping the runner-up loses no chat history. When picking which
+# entry to keep we prefer the one carrying state we can't easily
+# reconstruct (resume_session_id > auto_prompt > earliest `created`).
+function dedup_projects!(s::ServerState)
+    isempty(s.projects) && return
+    groups = Dict{Tuple{String,String},Vector{ProjectInfo}}()
+    for p in values(s.projects)
+        push!(get!(() -> ProjectInfo[], groups, project_location_key(p)), p)
+    end
+    dropped = Tuple{String,String,String}[]   # (worker, path, dropped_id)
+    for (key, members) in groups
+        length(members) <= 1 && continue
+        keeper = pick_dedup_keeper(members)
+        for p in members
+            p === keeper && continue
+            delete!(s.projects, p.id)
+            push!(dropped, (key[1], key[2], p.id))
+        end
+    end
+    if !isempty(dropped)
+        @warn "dedup: collapsed duplicate projects sharing (worker_name, worker_path)" dropped
+        save_projects!(s)
+    end
+    return
+end
+
+function pick_dedup_keeper(members::Vector{ProjectInfo})
+    # 1. resume_session_id set → keep that (otherwise we'd silently drop the
+    #    `session/load` link to the imported claude session).
+    for p in members
+        p.resume_session_id !== nothing && return p
+    end
+    # 2. auto_prompt set → keep that (the seeded "fix this PR" prompt is
+    #    user-visible state we can't reconstruct).
+    for p in members
+        p.auto_prompt !== nothing && return p
+    end
+    # 3. else: keep the earliest-created (the one the user has presumably
+    #    been using longer).
+    return reduce((a, b) -> a.created <= b.created ? a : b, members)
 end

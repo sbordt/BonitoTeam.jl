@@ -225,12 +225,14 @@ class BonitoChat {
         if (!node) return;
         const t = node.querySelector('.bt-stream-text');
         if (t) t.textContent += text;
+        if (this.wasAtBottom) this.scrollToBottom();
     }
     appendUserChunk(text) {
         const idx = this.totalCount - 1;
         const node = this.cache.get(idx);
         if (node && node.classList.contains('bt-user-msg')) {
             node.textContent += text;
+            if (this.wasAtBottom) this.scrollToBottom();
         }
     }
     onAgentFinal(msg) {

@@ -59,6 +59,11 @@ function sidebar_entry(label::AbstractString, icon::Bonito.Node,
     DOM.div(icon, DOM.span(label; class = "bt-side-name"),
         class = "bt-side-item" * (active ? " bt-side-active" : ""),
         title = title,
+        # `data-project-id` is the empty string for "Home" (the dashboard
+        # entry) and the project id for everything else. Used by the
+        # stress tests to target entries deterministically; production
+        # JS reaches them via `.bt-side-item` already.
+        dataProjectId = target_value,
         onclick = js"event => $(current_view).notify($(target_value))")
 end
 
@@ -209,9 +214,13 @@ function unified_main(state::ServerState, current_view::Observable{String})
         if isempty(pid)
             dashboard_dom(state; current_view = current_view)
         elseif haskey(state.chat_models, pid)
-            # `ChatModel` is a Bonito component (jsrender(::Session, ::ChatModel))
-            # — Bonito picks it up and renders the chat DOM on its own.
-            state.chat_models[pid]
+            # Wrap the ChatModel in a Node — Bonito's reactive Observable
+            # renderer (jsrender(::Session, ::Observable)) calls
+            # render_subsession on the Observable's *value*, which only
+            # accepts a Hyperscript.Node (or App). DOM.div(model) gives it
+            # a Node and lets Bonito recurse into the child to call
+            # jsrender(::Session, ::ChatModel).
+            DOM.div(state.chat_models[pid])
         elseif haskey(state.projects, pid)
             DOM.div("Starting chat for $(state.projects[pid].name)…";
                     class = "bt-empty",

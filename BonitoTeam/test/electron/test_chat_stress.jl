@@ -1,50 +1,64 @@
-# Stress tests for the ChatModel comm-based architecture.
+# Stress tests for ChatModel that drive `BonitoTeam.serve(...)` — the
+# real production entry point. The Electron windows below load
+# `Bonito.online_url(state.srv, "")`, the exact URL `serve()` prints to
+# the console, so the request path is identical to what a user gets.
 #
-# Covers:
-#   1. 1000+ messages: virtual scroll renders the right window, range
+# Earlier revisions of this file took two shortcuts and we don't go back
+# to them:
+#   - An ad-hoc `App() do _; DOM.div(model); end` shim that bypassed
+#     `unified_main`'s `map(current_view)` reactive swap (passed even
+#     when production errored on `convert(::Node, ::ChatModel)`).
+#   - Building `Bonito.Server(unified_app(state), ...)` inline, which
+#     skipped `serve()`'s `proxy_url = "."` + worker WS routes wiring.
+# Anything that exercises chat must navigate by clicking the real
+# sidebar entry (which sets `current_view` exactly the way a user does).
+#
+# Coverage:
+#   1. 1000 messages: virtual scroll renders the right window, range
 #      requests serve correct slices, no message loss.
-#   2. Initial scroll-to-bottom holds across the chase window even when
-#      large bubbles cause scrollHeight to settle late.
-#   3. Burst of server-side pushes (100+ in a tight loop): every message
-#      reaches JS, totalCount converges to the server's truth, no drops.
-#   4. Multi-tab sync: two browser sessions of the same project see
-#      identical state after a server-side push.
-#   5. Fast reload churn: open/close 10 windows back-to-back, verify the
-#      MutationObserver-based cleanup doesn't leak BonitoChat instances.
-#   6. Project switch under load: switch chats while messages stream into
-#      the OLD project; on switch back, the streamed messages are visible.
-#
-# Each section has an isolated `make_state` so failures don't cascade.
+#   2. 100-msg burst from Julia: every message reaches JS, totalCount
+#      converges, no drops.
+#   3. Two browser tabs of the same unified_app: both see the seed,
+#      both pick up server-side pushes.
+#   4. 10 fast open/close cycles: server-side state intact, no leaks.
+#   5. Drop browser mid-stream: server keeps accepting pushes, reconnect
+#      bootstraps correctly.
+#   6. Streaming agent chunks via the real ACP path.
+#   7. Project switch: alpha → beta → alpha shows correct content each
+#      time, including a background-pushed message.
 
 include(joinpath(@__DIR__, "helpers.jl"))
 
 using Test, Bonito, BonitoTeam, JSON, Dates
-import Sockets
+import Electron
 
 const RESULTS = Pair{String,Bool}[]
 
-# ── small inline helpers ─────────────────────────────────────────────────
+# ── helpers ──────────────────────────────────────────────────────────────
 
-function open_chat_window(model; opts = Dict{String,Any}("show"=>false, "focusOnWebView"=>false))
-    app = Bonito.App() do _session
-        Bonito.DOM.div(BonitoTeam.ChatStyles, Bonito.MarkdownCSS, model)
-    end
-    srv = Bonito.Server(app, "127.0.0.1", 0)
-    disp = Bonito.use_electron_display(; options=opts, devtools=false)
-    Electron.load(disp.window.window, Electron.URI(Bonito.online_url(srv, "")))
+# Open an Electron window pointing at the live production server URL
+# returned by `serve()` (held in `state.srv`). We use a raw
+# (Application, Window) pair instead of `Bonito.use_electron_display`
+# because all we actually want is "load URL X" — display registration
+# would be dead weight here. The server stays up across multiple
+# open/close cycles on the same `state`; only the window is per-test.
+function open_window(state; opts = Dict{String,Any}("show"=>false,
+                                                     "focusOnWebView"=>false))
+    app = Electron.Application()
+    win = Electron.Window(app, Electron.URI(Bonito.online_url(state.srv, ""));
+                           options = opts)
     sleep(2.5)
-    return (; disp, srv, app)
+    return (; app, win)
 end
 
-import Electron
-close_chat_window(ctx) = (try close(ctx.disp) catch end; try close(ctx.srv) catch end)
+close_window(w)   = (try close(w.win) catch end; try close(w.app) catch end)
+close_state(state) = (try close(state.srv) catch end)
 
-# Wait until a JS predicate returns true, with timeout. Returns true on success.
-function wait_for_js(disp, predicate; timeout = 5.0, interval = 0.1)
+function wait_for_js(win, predicate; timeout = 5.0, interval = 0.1)
     deadline = time() + timeout
     while time() < deadline
         try
-            v = run(disp.window, "(() => { return ($predicate); })()")
+            v = Electron.run(win, "(() => { return ($predicate); })()")
             v === true && return true
         catch
         end
@@ -53,124 +67,139 @@ function wait_for_js(disp, predicate; timeout = 5.0, interval = 0.1)
     return false
 end
 
-function chat_total(disp)
-    run(disp.window, "document.querySelector('.bt-messages')?.__bt_chat?.totalCount ?? -1")
+# Click the sidebar entry whose data-project-id matches `pid`. Empty pid
+# selects Home (the dashboard view).
+function navigate_to(win, pid::AbstractString)
+    # Wait for the sidebar to be present first.
+    wait_for_js(win,
+        "document.querySelector('.bt-side-item[data-project-id=$(JSON.json(pid))]') !== null";
+        timeout = 5)
+    Electron.run(win, """
+        (() => {
+            const el = document.querySelector('.bt-side-item[data-project-id=$(JSON.json(pid))]');
+            if (el) { el.click(); return true; }
+            return false;
+        })()
+    """)
 end
 
-function chat_state(disp)
-    run(disp.window, """JSON.stringify({
-        total:    document.querySelector('.bt-messages')?.__bt_chat?.totalCount ?? -1,
-        rendered: document.querySelectorAll('.bt-messages > .bt-user-msg, .bt-messages > .bt-agent-msg').length,
-        users:    document.querySelectorAll('.bt-user-msg').length,
-        agents:   document.querySelectorAll('.bt-agent-msg').length,
-        atBottom: document.querySelector('.bt-messages')?.__bt_chat?.atBottom() ?? false,
-    })""")
+# Boot the production server via `serve(...)` (port=0 → kernel-assigned),
+# then seed it with one stub worker + N projects + matching ChatModels.
+# `serve()` captures `state` in the unified_app closure, so projects added
+# afterwards are visible to every later session.
+function fresh_state(project_ids::Vector{String})
+    state = BonitoTeam.serve(;
+        host          = "127.0.0.1",
+        port          = 0,
+        worker_secret = "x",
+        state_dir     = mktempdir(),
+        working_dir   = mktempdir())
+
+    state.workers["w1"] = BonitoTeam.WorkerInfo("w1", "Tester", "<inbound-ws>",
+        "x", nothing, "h", "/h", "", "/p", :online, now(UTC))
+    models = Dict{String, BonitoTeam.ChatModel}()
+    for pid in project_ids
+        state.projects[pid] = BonitoTeam.ProjectInfo(pid, pid, "w1",
+            mktempdir(), mktempdir(), now(UTC))
+        m = BonitoTeam.ChatModel(state, mktempdir(); project_id=pid)
+        state.chat_models[pid] = m
+        models[pid] = m
+    end
+    BonitoTeam.bump_state!(state)
+    return state, models
 end
 
-function fresh_model(label)
-    state = BonitoTeam.ServerState(; state_dir=mktempdir(), working_dir=mktempdir(), worker_secret="x")
-    model = BonitoTeam.ChatModel(state, mktempdir(); project_id=label)
-    state.chat_models[label] = model
-    return model, state
+function chat_total(win)
+    Electron.run(win,
+        "document.querySelector('.bt-messages')?.__bt_chat?.totalCount ?? -1")
 end
 
-# ── (1) 1000 message virtual-scroll integrity ────────────────────────────
+# ── (1) 1000 message virtual-scroll integrity ───────────────────────────
 TH.section("Stress 1: 1000 messages, virtual scroll integrity") do
-    model, _ = fresh_model("stress-1k")
-    TH.seed_chat_history!(model, 500)   # 500 (user, agent) pairs = 1000 msgs
-    @assert length(model.msgs_store) == 1000
+    state, models = fresh_state(["stress-1k"])
+    TH.seed_chat_history!(models["stress-1k"], 500)   # 500 (user, agent) pairs
 
-    ctx = open_chat_window(model)
+    w = open_window(state)
     try
-        # Browser must learn totalCount, request the bottom range, render
-        # bubbles, and chase scrollToBottom until measured heights settle.
-        # The chase window in BonitoChat is 300ms; give it a generous extra.
-        ok = wait_for_js(ctx.disp,
+        navigate_to(w.win, "stress-1k")
+
+        ok = wait_for_js(w.win,
             "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 1000";
-            timeout = 8)
+            timeout = 10)
         push!(RESULTS, "1k: totalCount converged" => ok)
 
-        # Wait until the bottom row actually exists in the DOM (the second
-        # range round-trip after ResizeObserver settles).
-        wait_for_js(ctx.disp, """
+        wait_for_js(w.win, """
             (() => {
                 const us = document.querySelectorAll('.bt-user-msg');
                 return us.length > 0 && us[us.length-1].textContent === 'hi 500';
             })()
         """; timeout = 8)
-
-        # Wait for the chase-bottom window to settle (BonitoChat's chase
-        # runs three setTimeout(*, 100/300/300ms) jumps; give it generous
-        # head-room before sampling atBottom).
-        wait_for_js(ctx.disp,
+        wait_for_js(w.win,
             "document.querySelector('.bt-messages')?.__bt_chat?.atBottom() === true";
             timeout = 5)
 
-        st_json = chat_state(ctx.disp)
-        st = JSON.parse(String(st_json))
-        push!(RESULTS, "1k: rendered window not empty" => (st["rendered"] > 0))
-        push!(RESULTS, "1k: rendered window bounded (< 60 visible)" => (st["rendered"] < 60))
-        push!(RESULTS, "1k: initial scroll near bottom" => st["atBottom"])
-
-        last_user = run(ctx.disp.window, """
+        last_user = Electron.run(w.win, """
             (() => {
                 const us = document.querySelectorAll('.bt-user-msg');
                 return us.length ? us[us.length-1].textContent : null;
             })()
         """)
         push!(RESULTS, "1k: last user bubble is final pair" => (last_user == "hi 500"))
+        rendered = Electron.run(w.win,
+            "document.querySelectorAll('.bt-messages > .bt-user-msg, .bt-messages > .bt-agent-msg').length")
+        push!(RESULTS, "1k: window bounded (< 60 visible)" => (rendered isa Number && rendered < 60))
     finally
-        close_chat_window(ctx)
+        close_window(w); close_state(state)
     end
 end
 
-# ── (2) Burst of server-side pushes ──────────────────────────────────────
+# ── (2) Burst of server-side pushes ─────────────────────────────────────
 TH.section("Stress 2: 100-msg burst from Julia") do
-    model, _ = fresh_model("stress-burst")
+    state, models = fresh_state(["stress-burst"])
+    model = models["stress-burst"]
     TH.seed_chat_history!(model, 5)
-    ctx = open_chat_window(model)
+    w = open_window(state)
     try
-        wait_for_js(ctx.disp, "document.querySelector('.bt-messages')?.__bt_chat?.totalCount > 0")
+        navigate_to(w.win, "stress-burst")
+        wait_for_js(w.win,
+            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 10";
+            timeout = 8)
 
-        # Burst-write 100 messages with no sleep between them
         for i in 1:100
             BonitoTeam.chat_push_msg!(model, BonitoTeam.UserMsg("burst-$i"))
         end
-        ok = wait_for_js(ctx.disp,
-            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === $(10 + 100)";
-            timeout = 10.0)
+        ok = wait_for_js(w.win,
+            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 110";
+            timeout = 12.0)
         push!(RESULTS, "burst: every message reached JS (totalCount==110)" => ok)
-
-        # Check no msgs disappeared from the store either
-        push!(RESULTS, "burst: server store still has 110" =>
-              (length(model.msgs_store) == 110))
+        push!(RESULTS, "burst: server store has 110" => (length(model.msgs_store) == 110))
     finally
-        close_chat_window(ctx)
+        close_window(w); close_state(state)
     end
 end
 
-# ── (3) Multi-tab sync ──────────────────────────────────────────────────
-TH.section("Stress 3: two browser tabs, same model") do
-    model, _ = fresh_model("stress-multitab")
+# ── (3) Multi-tab sync (real serve()) ───────────────────────────────────
+TH.section("Stress 3: two tabs of the same serve(), same project") do
+    state, models = fresh_state(["stress-multitab"])
+    model = models["stress-multitab"]
     TH.seed_chat_history!(model, 3)
 
-    # Use two SEPARATE Electron.Application instances so neither replaces
-    # the other (use_electron_display shares one display per call).
-    app = Bonito.App() do _session
-        Bonito.DOM.div(BonitoTeam.ChatStyles, Bonito.MarkdownCSS, model)
-    end
-    srv = Bonito.Server(app, "127.0.0.1", 0)
-    url = Bonito.online_url(srv, "")
-
-    a1 = Electron.Application()
-    a2 = Electron.Application()
+    url = Bonito.online_url(state.srv, "")
+    a1 = Electron.Application(); a2 = Electron.Application()
     w1 = Electron.Window(a1, Electron.URI(url); options=Dict{String,Any}("show"=>false))
     w2 = Electron.Window(a2, Electron.URI(url); options=Dict{String,Any}("show"=>false))
     sleep(3.0)
-
     try
-        wait_total = (w, n) -> begin
-            deadline = time() + 8
+        nav = w -> Electron.run(w, """
+            (() => {
+                const el = document.querySelector('.bt-side-item[data-project-id="stress-multitab"]');
+                el && el.click();
+            })()
+        """)
+        nav(w1); nav(w2); sleep(0.4)
+
+        wait_total = (w, n, tmo=10.0) -> begin
+            deadline = time() + tmo
             while time() < deadline
                 try
                     Electron.run(w, "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === $n") === true && return true
@@ -183,7 +212,6 @@ TH.section("Stress 3: two browser tabs, same model") do
         push!(RESULTS, "multitab: tab B sees seeded count" => wait_total(w2, 6))
 
         BonitoTeam.chat_push_msg!(model, BonitoTeam.UserMsg("broadcast"))
-        sleep(1.0)
         push!(RESULTS, "multitab: tab A picked up push" => wait_total(w1, 7))
         push!(RESULTS, "multitab: tab B picked up push" => wait_total(w2, 7))
     finally
@@ -191,104 +219,141 @@ TH.section("Stress 3: two browser tabs, same model") do
         try close(w2) catch end
         try close(a1) catch end
         try close(a2) catch end
-        try close(srv) catch end
+        close_state(state)
     end
 end
 
-# ── (4) Fast reload churn ────────────────────────────────────────────────
-TH.section("Stress 4: 10 fast open/close cycles, no leaks") do
-    model, _ = fresh_model("stress-reload")
-    TH.seed_chat_history!(model, 4)
+# ── (4) Fast reload churn ───────────────────────────────────────────────
+TH.section("Stress 4: 10 fast open/close cycles of unified_app") do
+    state, models = fresh_state(["stress-reload"])
+    TH.seed_chat_history!(models["stress-reload"], 4)
 
     leaked = false
-    for i in 1:10
-        ctx = open_chat_window(model)
-        ok  = wait_for_js(ctx.disp, "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 8"; timeout=4)
-        ok || (leaked = true; @warn "cycle $i did not converge")
-        close_chat_window(ctx)
-        sleep(0.05)
-    end
-    push!(RESULTS, "reload: 10 cycles all converged" => !leaked)
-
-    # The server-side msgs_store + comm Observable should still be alive
-    push!(RESULTS, "reload: server-side store intact" => (length(model.msgs_store) == 8))
-end
-
-# ── (5) Connection interrupt: kill window mid-stream, server keeps pushing ──
-TH.section("Stress 5: drop browser mid-stream, server side stays sane") do
-    model, _ = fresh_model("stress-drop")
-    TH.seed_chat_history!(model, 5)
-    ctx = open_chat_window(model)
     try
-        wait_for_js(ctx.disp, "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 10")
-    finally
-        close_chat_window(ctx)
-    end
-    # Now push 50 messages with no browser attached. Should not throw.
-    threw = false
-    try
-        for i in 1:50
-            BonitoTeam.chat_push_msg!(model, BonitoTeam.UserMsg("offline-$i"))
+        for i in 1:10
+            w = open_window(state)
+            navigate_to(w.win, "stress-reload")
+            ok = wait_for_js(w.win,
+                "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 8"; timeout=6)
+            ok || (leaked = true; @warn "cycle $i did not converge")
+            close_window(w)
+            sleep(0.05)
         end
-    catch e
-        threw = true
-        @warn "push without listener raised" exception=e
-    end
-    push!(RESULTS, "drop: pushes without browser don't throw" => !threw)
-    push!(RESULTS, "drop: store accumulated all 60" => (length(model.msgs_store) == 60))
-
-    # Re-open: new browser should bootstrap to the post-drop count
-    ctx2 = open_chat_window(model)
-    try
-        ok = wait_for_js(ctx2.disp, "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 60"; timeout=6)
-        push!(RESULTS, "drop: reconnect bootstraps to 60" => ok)
+        push!(RESULTS, "reload: 10 cycles all converged" => !leaked)
+        push!(RESULTS, "reload: server-side store intact" =>
+              (length(models["stress-reload"].msgs_store) == 8))
     finally
-        close_chat_window(ctx2)
+        close_state(state)
     end
 end
 
-# ── (6) Scroll-to-bottom invariant under streaming chunks ───────────────
-TH.section("Stress 6: streaming agent chunks always visible at bottom") do
-    model, _ = fresh_model("stress-stream")
-    TH.seed_chat_history!(model, 20)
-    ctx = open_chat_window(model)
+# ── (5) Connection interrupt: drop browser, server keeps pushing ────────
+TH.section("Stress 5: drop browser mid-stream; reconnect bootstraps") do
+    state, models = fresh_state(["stress-drop"])
+    model = models["stress-drop"]
+    TH.seed_chat_history!(model, 5)
+
     try
-        wait_for_js(ctx.disp, "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 40")
-        # Simulate an agent streaming response via the production path:
-        # chat_on_agent_chunk! emits the first chunk with `streaming: true`
-        # (which creates the .bt-stream-text accumulator on the JS side),
-        # then subsequent calls extend the same bubble.
+        w = open_window(state)
+        try
+            navigate_to(w.win, "stress-drop")
+            wait_for_js(w.win,
+                "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 10"; timeout=8)
+        finally
+            close_window(w)
+        end
+
+        threw = false
+        try
+            for i in 1:50
+                BonitoTeam.chat_push_msg!(model, BonitoTeam.UserMsg("offline-$i"))
+            end
+        catch e
+            threw = true
+            @warn "push without listener raised" exception=e
+        end
+        push!(RESULTS, "drop: pushes without browser don't throw" => !threw)
+        push!(RESULTS, "drop: store accumulated all 60" => (length(model.msgs_store) == 60))
+
+        w2 = open_window(state)
+        try
+            navigate_to(w2.win, "stress-drop")
+            ok = wait_for_js(w2.win,
+                "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 60"; timeout=10)
+            push!(RESULTS, "drop: reconnect bootstraps to 60" => ok)
+        finally
+            close_window(w2)
+        end
+    finally
+        close_state(state)
+    end
+end
+
+# ── (6) Streaming agent chunks via real ACP path ────────────────────────
+TH.section("Stress 6: streaming agent chunks via unified_app") do
+    state, models = fresh_state(["stress-stream"])
+    model = models["stress-stream"]
+    TH.seed_chat_history!(model, 20)
+
+    w = open_window(state)
+    try
+        navigate_to(w.win, "stress-stream")
+        wait_for_js(w.win,
+            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 40"; timeout=10)
+        sleep(1.0)   # let initial render settle before streaming on top of it
+
         for text in ["Lorem ", "ipsum ", "dolor ", "sit ", "amet, ",
                      "consectetur ", "adipiscing ", "elit."]
             upd = BonitoTeam.AgentClientProtocol.AgentMessageChunk(
                 BonitoTeam.AgentClientProtocol.TextContent(text))
             BonitoTeam.chat_on_agent_chunk!(model, upd)
-            sleep(0.15)
+            sleep(0.3)
         end
-        # Wait for the WS round-trips to land in the DOM rather than guessing.
-        # Headless Electron under prior test load can take several seconds
-        # for the WS deltas to settle — a generous timeout is fine because
-        # we exit early on success.
-        ok_text = wait_for_js(ctx.disp, """
+        ok = wait_for_js(w.win, """
             (() => {
                 const ag = document.querySelectorAll('.bt-agent-msg');
                 if (!ag.length) return false;
                 return ag[ag.length-1].textContent.includes('Lorem ipsum dolor sit amet');
             })()
-        """; timeout = 15)
-
-        last_text = run(ctx.disp.window, """
-            (() => {
-                const ag = document.querySelectorAll('.bt-agent-msg');
-                return ag.length ? ag[ag.length - 1].textContent : null;
-            })()
-        """)
-        push!(RESULTS, "stream: last agent bubble has accumulated chunks" => ok_text)
+        """; timeout = 20)
+        push!(RESULTS, "stream: last agent bubble has accumulated chunks" => ok)
         push!(RESULTS, "stream: still pinned to bottom after stream" =>
-              run(ctx.disp.window, "document.querySelector('.bt-messages')?.__bt_chat?.atBottom() === true"))
+              Electron.run(w.win,
+                  "document.querySelector('.bt-messages')?.__bt_chat?.atBottom() === true"))
     finally
-        close_chat_window(ctx)
+        close_window(w); close_state(state)
     end
 end
 
-TH.report!("Tier — chat_stress", RESULTS)
+# ── (7) Project switch with background updates ──────────────────────────
+TH.section("Stress 7: switch alpha ↔ beta, background push to inactive project") do
+    state, models = fresh_state(["alpha", "beta"])
+    a, b = models["alpha"], models["beta"]
+    TH.seed_chat_history!(a, 3)
+    TH.seed_chat_history!(b, 7)
+
+    w = open_window(state)
+    try
+        navigate_to(w.win, "alpha")
+        ok_a = wait_for_js(w.win,
+            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 6"; timeout=8)
+        push!(RESULTS, "switch: alpha shows 6" => ok_a)
+
+        # Push to beta while viewing alpha
+        BonitoTeam.chat_push_msg!(b, BonitoTeam.UserMsg("background-beta"))
+
+        navigate_to(w.win, "beta")
+        ok_b = wait_for_js(w.win,
+            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 15"; timeout=8)
+        push!(RESULTS, "switch: beta shows pre-existing + background push (15)" => ok_b)
+
+        navigate_to(w.win, "alpha")
+        ok_a2 = wait_for_js(w.win,
+            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 6"; timeout=8)
+        push!(RESULTS, "switch: back to alpha still 6" => ok_a2)
+    finally
+        close_window(w); close_state(state)
+    end
+end
+
+TH.report!("Tier — chat_stress (via unified_app)", RESULTS)

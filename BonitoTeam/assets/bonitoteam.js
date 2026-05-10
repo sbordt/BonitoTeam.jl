@@ -242,6 +242,11 @@ class BonitoChat {
         if (!node) return;
         const t = node.querySelector('.bt-stream-text');
         if (t) t.textContent += text;
+        // Streaming text grows the bubble downward; if the user was
+        // following the tail, keep them at the tail. wasAtBottom is
+        // refreshed by the scroll listener so a deliberate scroll-up
+        // releases the chase.
+        if (this.wasAtBottom) this.scrollToBottom();
     }
 
     appendUserChunk(text) {
@@ -250,6 +255,7 @@ class BonitoChat {
         const node = this.cache.get(idx);
         if (node && node.classList.contains('bt-user-msg')) {
             node.textContent += text;
+            if (this.wasAtBottom) this.scrollToBottom();
         }
     }
 

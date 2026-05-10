@@ -10,6 +10,10 @@
 # Set BONITOTEAM_NO_SCREENSHOT=0 to inline base64 PNGs in the per-test
 # output (off by default — keeps CI logs sane).
 
+# Ensure BonitoTeam is in Main scope — individual test files reference
+# `BonitoTeam.WorkerInfo`, `BonitoTeam.ChatModel`, etc. at top level.
+using BonitoTeam
+
 const HERE = @__DIR__
 # Each test saves a screenshot of its final state to /tmp/jl_*.png and
 # prints the path; nothing more to configure.
@@ -39,7 +43,11 @@ const FILES = [
     "test_virtual_scroll.jl",
     "test_chat_controls.jl",
     "test_chat_remount.jl",
-    "test_callback_dereg.jl",
+    # test_callback_dereg.jl removed — it asserted the old global
+    # `window.BonitoChat` + multi-callback architecture. The new ES6
+    # module ships a single `comm` subscription with a `destroyed` flag
+    # and never returns `false`, so the splice-during-forEach bug class
+    # it guarded against can't recur.
     "test_chat_errors.jl",
     "test_chat_show.jl",
     "test_chat_show_extras.jl",

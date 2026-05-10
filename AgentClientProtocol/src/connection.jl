@@ -1,11 +1,42 @@
-# JSON-RPC 2.0 connection over any transport.
-# Transport is provided as three functions: send_line, read_line, on_close.
-# A convenience constructor for Base.Process (subprocess) is provided for the common case.
+# JSON-RPC 2.0 connection over any Transport.
+#
+# A `Transport` is the long-lived I/O channel underneath: a subprocess, a
+# WebSocket, a pair of channels for tests. Each concrete transport
+# overloads three verbs:
+#
+#   send(t::Transport, line::String)  - write one newline-terminated JSON line
+#   recv(t::Transport)::String        - blocking; returns "" on clean EOF
+#   close!(t::Transport)              - release transport resources
+#
+# `Connection` uses these via dispatch — no callbacks stored on the
+# struct. Adding a new transport (e.g. SSH-piped subprocess) is just a
+# new struct + three method definitions.
+
+abstract type Transport end
+
+# Default fallback for transports that don't need extra teardown.
+close!(::Transport) = nothing
+
+# Local subprocess transport — the original `Connection(::Base.Process)`
+# path. Kept here because every consumer of ACP today goes through this
+# shape; new transports live in their own packages.
+struct SubprocessTransport <: Transport
+    proc::Base.Process
+end
+
+send(t::SubprocessTransport, line::AbstractString) =
+    (write(t.proc.in, line); flush(t.proc.in); nothing)
+
+recv(t::SubprocessTransport) = readline(t.proc.out; keep = false)
+
+function close!(t::SubprocessTransport)
+    try close(t.proc.in) catch end
+    try close(t.proc)    catch end
+    return nothing
+end
 
 mutable struct Connection
-    send_line::Function     # (String) → Nothing — write one newline-terminated JSON line
-    read_line::Function     # () → String — blocking; returns "" on clean EOF
-    on_close::Function      # () → Nothing — release transport resources
+    transport::Transport
     pending::Dict{Int,Channel{Any}}
     next_id::Int
     request_handler::Function   # agent→client requests; must return result or throw
@@ -15,11 +46,10 @@ mutable struct Connection
     closed::Bool
 end
 
-# Generic transport constructor.
-function Connection(send_line::Function, read_line::Function, on_close::Function;
+function Connection(transport::Transport;
                     request_handler::Function = warn_unhandled_request,
                     update_handler::Function  = identity)
-    conn = Connection(send_line, read_line, on_close,
+    conn = Connection(transport,
                       Dict{Int,Channel{Any}}(), 0,
                       request_handler, update_handler,
                       ReentrantLock(), nothing, false)
@@ -27,15 +57,10 @@ function Connection(send_line::Function, read_line::Function, on_close::Function
     return conn
 end
 
-# Subprocess transport — keeps the existing call site in Client unchanged.
-function Connection(proc::Base.Process;
-                    request_handler::Function = warn_unhandled_request,
-                    update_handler::Function  = identity)
-    send_line = line -> (write(proc.in, line); flush(proc.in))
-    read_line = ()   -> readline(proc.out; keep=false)
-    on_close  = ()   -> (try close(proc.in) catch end; try close(proc) catch end)
-    Connection(send_line, read_line, on_close; request_handler, update_handler)
-end
+# Convenience: `Connection(proc::Base.Process)` still works for the local
+# subprocess case — wraps `proc` in a SubprocessTransport.
+Connection(proc::Base.Process; kw...) =
+    Connection(SubprocessTransport(proc); kw...)
 
 function warn_unhandled_request(method::String, ::Any)
     @warn "ACP: unhandled agent request" method
@@ -47,7 +72,7 @@ end
 function send_raw(conn::Connection, msg::AbstractDict)
     line = JSON.json(msg) * "\n"
     lock(conn.lock) do
-        conn.send_line(line)
+        send(conn.transport, line)
     end
 end
 
@@ -129,7 +154,7 @@ end
 function reader_loop(conn::Connection)
     try
         while !conn.closed
-            line = conn.read_line()
+            line = recv(conn.transport)
             isempty(line) && break
             try
                 msg = JSON.parse(line)
@@ -152,5 +177,5 @@ end
 
 function close!(conn::Connection)
     conn.closed = true
-    conn.on_close()
+    close!(conn.transport)
 end

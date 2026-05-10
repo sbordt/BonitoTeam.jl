@@ -7,10 +7,10 @@ state = TH.make_state(; n_workers = 1, n_projects = 2)
 # Seed a ChatModel for p-1 with the mock factory BEFORE opening the window so
 # the chat-panel section can navigate into a real chat without racing the
 # reactive remount against an empty state.chat_models dict.
-let proj = state.projects["p-1"]
+let proj = state.projects[]["p-1"]
     model = BonitoTeam.ChatModel(state, proj.server_path;
                                   project_id    = proj.id,
-                                  client_factory = TH.mock_factory())
+                                  transport = TH.mock_transport())
     BonitoTeam.start_chat_client!(model)
 end
 

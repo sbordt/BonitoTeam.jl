@@ -397,14 +397,14 @@ function render_show_reference(state::ServerState, text::AbstractString,
     end
 
     # No project context → no worker to ask.
-    if isempty(project_id) || !haskey(state.projects, project_id)
+    if isempty(project_id) || !haskey(state.projects[], project_id)
         return DOM.div("(file not on server: $relpath_str)";
                        class = "bt-tool-empty")
     end
 
     # Stream from the worker via /transfer-ws + RemoteSync.send_file. Show a
     # spinner immediately and swap in the preview when the file lands on disk.
-    p = state.projects[project_id]
+    p = state.projects[][project_id]
     worker_path = joinpath(p.worker_path, relpath_str)
 
     # NOTE: keep this Observable's binding distinct from the `state` parameter
@@ -569,10 +569,13 @@ mutable struct ChatModel
     chat_session  :: Any                    # ChatSession from persistence.jl
     msgs_store    :: Vector{ChatMsg}
 
-    # ACP client + factory (factory captured so restart_session! can rebuild)
-    client         :: Ref{Union{AgentClientProtocol.Client,Nothing}}
-    mcp_servers    :: Vector{AgentClientProtocol.MCPServer}
-    client_factory :: Any                   # nothing OR (on_update -> Client)
+    # ACP client + the typed Transport that knows how to (re)build it. Each
+    # concrete transport (LocalTransport, WorkerTransport, MockTransport)
+    # encapsulates everything needed to bring up a new session — no opaque
+    # closure stored on the model.
+    client      :: Ref{Union{AgentClientProtocol.Client,Nothing}}
+    mcp_servers :: Vector{AgentClientProtocol.MCPServer}
+    transport   :: ChatTransport
 
     # Streaming bookkeeping (which message id the next chunk extends)
     agent_id       :: Ref{String}
@@ -589,25 +592,38 @@ mutable struct ChatModel
     # Status surface for the chat header (banner + reconnect state).
     session_alive :: Observable{Bool}
     last_error    :: Observable{String}
+
+    # Backreference for per-session copies. `nothing` for the shared
+    # parent (the one in `state.chat_models[pid]`); points back to that
+    # parent for any `copy(model, session)` view. Handlers use
+    # `shared(model)` to reach the parent so writes to `session_alive` /
+    # `last_error` / `comm` broadcast to every connected tab instead of
+    # silently flipping only the per-session view.
+    parent :: Union{ChatModel, Nothing}
 end
 
 function ChatModel(state::ServerState, cwd::AbstractString;
                     project_id::AbstractString = "",
                     mcp_servers = AgentClientProtocol.MCPServer[],
-                    client_factory = nothing)
+                    transport::Union{ChatTransport,Nothing} = nothing)
     chat_session = load_session(cwd)
     msgs_store   = load_history(chat_session)
+    # Default transport: spawn claude-agent-acp locally for `cwd`.
+    actual_transport = transport === nothing ?
+        LocalTransport(cwd; mcp_servers = collect(AgentClientProtocol.MCPServer, mcp_servers)) :
+        transport
     return ChatModel(
         ReentrantLock(),
         state, String(cwd), String(project_id),
         chat_session, msgs_store,
         Ref{Union{AgentClientProtocol.Client,Nothing}}(nothing),
         collect(AgentClientProtocol.MCPServer, mcp_servers),
-        client_factory,
+        actual_transport,
         Ref(""), Ref(""), Ref(false),
         Observable(Dict{String,Any}()),
         Observable(true),
         Observable(""),
+        nothing,                    # parent: this is the shared instance itself
     )
 end
 
@@ -624,22 +640,34 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.lock,
             m.state, m.cwd, m.project_id,
             m.chat_session, m.msgs_store,
-            m.client, m.mcp_servers, m.client_factory,
+            m.client, m.mcp_servers, m.transport,
             m.agent_id, m.thought_id, m.user_streaming,
             map(identity, session, m.comm),
             map(identity, session, m.session_alive),
             map(identity, session, m.last_error),
+            m,    # parent → the shared instance we copied from
         )
     end
 end
+
+# Resolve to the shared parent. Handlers invoked from per-session
+# listeners use this so writes to broadcast observables (`comm`,
+# `session_alive`, `last_error`) reach every connected tab via the
+# parent→child `map(identity, session, ...)` bridges instead of
+# silently flipping just this session's view.
+shared(m::ChatModel) = m.parent === nothing ? m : m.parent
 
 # ── Small helpers shared by every handler ─────────────────────────────────
 # `chat_emit` writes to `comm`. Since Bonito propagates Julia-side writes to
 # every JS subscriber on every per-session child of `m.comm`, all open tabs
 # of this chat see the event. JS sends back via the same channel
 # (`comm.notify({type, ...})`) — Julia's listener dispatches by `type`.
+# Always writes to the SHARED comm so every connected tab sees the
+# event via its own per-session bridge. Callers freely pass either the
+# shared parent or a per-session view — `shared(model)` resolves the
+# right target.
 chat_emit(model::ChatModel, event::AbstractDict) =
-    (model.comm[] = Dict{String,Any}(event); nothing)
+    (shared(model).comm[] = Dict{String,Any}(event); nothing)
 
 function chat_push_msg!(model::ChatModel, msg::ChatMsg)
     n = lock(model.lock) do
@@ -813,11 +841,10 @@ end
 # ── Client lifecycle ───────────────────────────────────────────────────────
 function start_chat_client!(model::ChatModel)
     on_update = make_on_update(model)
-    model.client[] = if model.client_factory !== nothing
-        model.client_factory(on_update)
-    else
-        AgentClientProtocol.Client(model.cwd; on_update, mcp_servers = model.mcp_servers)
-    end
+    # All transport-specific bring-up (subprocess spawn / worker WS dial /
+    # mock channel setup) lives in `start_session(::ChatTransport, on_update)`
+    # — see src/transport.jl.
+    model.client[] = start_session(model.transport, on_update)
     update_session_id!(model.chat_session, model.client[].session_id)
 
     # Browser-side handlers (range requests + lazy tool/thought renders) are
@@ -844,13 +871,36 @@ function restart_chat_session!(model::ChatModel)
         if old !== nothing
             try AgentClientProtocol.send_request(old.conn, "session/cancel",
                     Dict("sessionId" => old.session_id)) catch end
+            # Tear down the old transport so a stale subprocess / WS / mock
+            # responder doesn't keep running alongside the new one. Without
+            # this, restart leaks resources and (for mocks) two responders
+            # race on the same channels.
+            try AgentClientProtocol.close!(old) catch end
         end
         start_chat_client!(model)
-        model.session_alive[] = true
-        model.last_error[]    = ""
+        # Broadcast the recovery to every connected tab via the shared
+        # parent — never the per-session view, which would leave other
+        # tabs (and external observers) seeing the stale `false`.
+        s = shared(model)
+        s.session_alive[] = true
+        s.last_error[]    = ""
     catch e
-        model.last_error[] = "restart failed: $(sprint(showerror, e))"
+        shared(model).last_error[] = "restart failed: $(sprint(showerror, e))"
     end
+end
+
+# Single-entry "user submitted a message" path. Every call site that wants
+# to deliver a user message — typed in the input area, fired by the
+# auto-prompt template, future scripted hooks — goes through here. That
+# guarantees the same four steps happen in the same order: store push,
+# MD persist, busy banner, async dispatch to the agent.
+function send_message!(model::ChatModel, msg::UserMsg)
+    chat_push_msg!(model, msg)
+    append_user(model.chat_session, msg)
+    model.agent_id[] = ""    # any in-flight agent stream is over once the user sends
+    chat_emit(model, Dict{String,Any}("type" => "busy_start"))
+    Base.errormonitor(@async send_prompt_async!(model, msg.text))
+    return nothing
 end
 
 # Auto-prompt: if the project carries an `auto_prompt` (set by the "From
@@ -859,19 +909,15 @@ end
 # session reconnect doesn't double-fire.
 function fire_auto_prompt!(model::ChatModel)
     isempty(model.project_id) && return
-    haskey(model.state.projects, model.project_id) || return
-    proj = model.state.projects[model.project_id]
+    haskey(model.state.projects[], model.project_id) || return
+    proj = model.state.projects[][model.project_id]
     ap = proj.auto_prompt
     (ap === nothing || isempty(ap) || !isempty(model.msgs_store)) && return
     proj.auto_prompt = nothing
     try save_projects!(model.state) catch e
         @warn "auto_prompt: persist clear failed" exception=e
     end
-    user_msg = UserMsg(String(ap))
-    chat_push_msg!(model, user_msg)
-    append_user(model.chat_session, user_msg)
-    chat_emit(model, Dict{String,Any}("type" => "busy_start"))
-    Base.errormonitor(@async send_prompt_async!(model, String(ap)))
+    send_message!(model, UserMsg(String(ap)))
     return nothing
 end
 
@@ -886,8 +932,9 @@ function send_prompt_async!(model::ChatModel, text::AbstractString)
         msg = sprint(showerror, e)
         if occursin("connection closed", msg) || occursin("EOFError", msg) ||
            occursin("BrokenPipe", msg)
-            model.session_alive[] = false
-            model.last_error[]    = msg
+            s = shared(model)
+            s.session_alive[] = false
+            s.last_error[]    = msg
         else
             id = string(uuid4())
             err_msg = AgentMsg(id, "[error: $msg]")
@@ -1011,12 +1058,7 @@ function send_user_text!(model::ChatModel, text_val)
     # height-reset is folded into the existing `oninput` handler — when
     # value flips to "", oninput fires once and the auto-grow recomputes.
     text_val[] = ""
-    user_msg = UserMsg(String(text))
-    chat_push_msg!(model, user_msg)
-    append_user(model.chat_session, user_msg)
-    model.agent_id[] = ""
-    chat_emit(model, Dict{String,Any}("type" => "busy_start"))
-    @async send_prompt_async!(model, String(text))
+    send_message!(model, UserMsg(String(text)))
 end
 
 # JS counterpart. `connect(node, comm)` is called by the inline init JS in
@@ -1085,13 +1127,18 @@ end
 # session. The shared bits (msgs_store, ACP client, lock) are still shared
 # (sessions cooperate); the Observable `comm` is a connected child so each
 # tab's JS bridge GC's cleanly when the tab closes.
-function Bonito.jsrender(session::Session, shared::ChatModel)
-    model = copy(shared, session)
+function Bonito.jsrender(session::Session, shared_model::ChatModel)
+    # `model` is the per-session view: its `comm`, `session_alive`, and
+    # `last_error` are connected children of `shared_model`'s, so the JS
+    # bridge stays scoped to this tab. Rendering reads from `model`.
+    # Handlers reach the shared parent via `shared(m)` so writes
+    # broadcast to every connected tab — see the `parent` field doc on
+    # ChatModel.
+    model = copy(shared_model, session)
 
-    # Single per-session dispatcher: any JS notification on `comm` lands here
-    # and routes by `type`. Closure captures `session` for `dom_in_js`.
-    # `on(f, session, obs)` is Bonito's session-scoped overload — the
-    # listener auto-deregisters when the session closes.
+    # Single per-session dispatcher. `chat_dispatch!` itself does
+    # `shared(m)` for any state-mutating writes, so passing `model` is
+    # safe AND gives the handler access to `session` (for `dom_in_js`).
     on(session, model.comm) do msg
         chat_dispatch!(model, session, msg)
     end
@@ -1114,29 +1161,7 @@ function Bonito.jsrender(session::Session, shared::ChatModel)
                 DOM.div(class="bt-busy-dot"),
                 DOM.div(class="bt-busy-dot");
                 class="bt-busy"),
-        chat_input_area(model);
+        chat_input_area(model),
         class = "bt-app"))
 end
 
-# Top-level: build the model, start the ACP client, fire any auto_prompt,
-# then return an App that renders the chat DOM. <50 LOC because every step
-# delegates.
-function chat_app(state::ServerState, cwd::String;
-                  project_id::String = "",
-                  mcp_servers    = AgentClientProtocol.MCPServer[],
-                  client_factory = nothing)
-    model = ChatModel(state, cwd;
-                       project_id    = project_id,
-                       mcp_servers   = mcp_servers,
-                       client_factory = client_factory)
-    start_chat_client!(model)
-    fire_auto_prompt!(model)
-    App() do _session
-        # `model` is itself a Bonito component (jsrender on ChatModel) — we
-        # just drop it into the DOM tree and Bonito handles the rest.
-        DOM.div(
-            ChatStyles, Bonito.MarkdownCSS,
-            Bonito.ConnectionIndicator(),
-            model)
-    end
-end

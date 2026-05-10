@@ -13,10 +13,10 @@ state = TH.make_state(; n_workers = 1, n_projects = 1)
 # 0.3s each = 3s of streaming.
 slow_script = [(0.3, TH.agent_chunk_update("chunk$i ")) for i in 1:10]
 
-let proj = state.projects["p-1"]
+let proj = state.projects[]["p-1"]
     model = BonitoTeam.ChatModel(state, proj.server_path;
                                   project_id     = proj.id,
-                                  client_factory = TH.mock_factory(; scripted = slow_script))
+                                  transport = TH.mock_transport(; scripted = slow_script))
     BonitoTeam.start_chat_client!(model)
 end
 

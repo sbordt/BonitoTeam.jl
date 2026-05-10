@@ -8,10 +8,10 @@ state = TH.make_state(; n_workers = 1, n_projects = 1)
 # Seed an idle ChatModel for p-1 — empty `scripted` means the mock will
 # end_turn the prompt immediately with zero updates. That's enough: we only
 # care that the user-side bubble appears and the input clears.
-let proj = state.projects["p-1"]
+let proj = state.projects[]["p-1"]
     model = BonitoTeam.ChatModel(state, proj.server_path;
                                   project_id     = proj.id,
-                                  client_factory = TH.mock_factory())
+                                  transport = TH.mock_transport())
     BonitoTeam.start_chat_client!(model)
 end
 

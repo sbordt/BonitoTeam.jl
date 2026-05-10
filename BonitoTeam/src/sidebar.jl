@@ -49,35 +49,47 @@ function project_icon(p::ProjectInfo; size_px::Int = 32)
         title = p.name)
 end
 
-# Sidebar entry: icon + label, "active" state highlighted with a left-edge
-# accent bar via the bt-side-active class. Click notifies `current_view`,
-# which the App's main panel observes.
+# A single sidebar row: icon + label + identifying data-attribute. NO
+# Observables interpolated in here — the click handler and the
+# active-highlight class swap are delegated from the outer `<aside>`,
+# so this DOM can be recycled by the structural `map(state.projects)`
+# below without churning any tracked Observable IDs.
 function sidebar_entry(label::AbstractString, icon::Bonito.Node,
-                        target_value::AbstractString,
-                        current_view::Observable{String}, title::AbstractString)
-    active = current_view[] == target_value
+                        target_value::AbstractString, title::AbstractString;
+                        active::Bool = false)
     DOM.div(icon, DOM.span(label; class = "bt-side-name"),
         class = "bt-side-item" * (active ? " bt-side-active" : ""),
         title = title,
         # `data-project-id` is the empty string for "Home" (the dashboard
-        # entry) and the project id for everything else. Used by the
-        # stress tests to target entries deterministically; production
-        # JS reaches them via `.bt-side-item` already.
-        dataProjectId = target_value,
-        onclick = js"event => $(current_view).notify($(target_value))")
+        # entry) and the project id for everything else. The delegated
+        # click handler reads this to know which view to switch to.
+        dataProjectId = target_value)
 end
 
 const HOME_ICON = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "icons", "home.svg"))
 
 """
-    project_sidebar(state, current_view) → DOM
+    project_sidebar(session, state, current_view) → DOM
 
 Always-visible vertical nav. Top entry is "Home" (dashboard view); below
-it, one entry per registered project. Re-renders on `state.version` so
-new/deleted projects show up live, and on `current_view` so the active
-highlight tracks the user's selection.
+it, one entry per registered project.
+
+The body re-renders ONLY when `state.projects` changes (project add /
+remove / rename). Worker churn doesn't touch this section, so connecting
+a new laptop or a worker going offline does not trigger any sidebar
+work. Navigation (`current_view` change) does NOT
+trigger a re-render: the click handler is delegated on the outer
+`<aside>` via `onload`, and active-highlighting is handled by an `onjs`
+class swap on the existing DOM. This matters because every re-render
+tears down the body subsession, and any Observable interpolated into
+that subsession's DOM gets caught in a tracked-object refcount race
+with the new subsession (Bonito Sessions.js GLOBAL_OBJECT_CACHE). By
+keeping `current_view` only on the OUTER aside (parent session, never
+torn down), it crosses the JS bridge once at initial render and stays
+in cache forever.
 """
-function project_sidebar(state::ServerState, current_view::Observable{String})
+function project_sidebar(session::Bonito.Session, state::ServerState,
+                          current_view::Observable{String})
     # The home glyph isn't a project — it's nav. Renders as a borderless
     # 32px slot so it visually reads as "go home" instead of competing
     # with the colored project tiles below it.
@@ -88,19 +100,45 @@ function project_sidebar(state::ServerState, current_view::Observable{String})
         class = "bt-side-home-icon",
         title = "Dashboard")
 
-    # `state.version` triggers a re-render whenever workers/projects mutate;
-    # `current_view` triggers it whenever the user navigates so the
-    # highlighted entry stays in sync.
-    body = map(state.version, current_view) do _, _
-        entries = [sidebar_entry("Home", home_icon, "", current_view, "Dashboard")]
-        for p in values(state.projects)
+    # Structural re-renders only. We read `current_view[]` synchronously
+    # so the *initial* `bt-side-active` class is correct on each
+    # re-render, but subsequent navigation flips the class via the
+    # `onjs` handler below — no body re-render.
+    body = map(state.projects) do projects
+        active_pid = current_view[]
+        entries = [sidebar_entry("Home", home_icon, "", "Dashboard";
+                                  active = active_pid == "")]
+        for p in values(projects)
             push!(entries,
-                  sidebar_entry(p.name, project_icon(p), p.id, current_view, p.name))
+                  sidebar_entry(p.name, project_icon(p), p.id, p.name;
+                                active = active_pid == p.id))
         end
         DOM.div(entries...; class = "bt-side-list")
     end
 
-    DOM.aside(body; class = "bt-sidebar")
+    aside = DOM.aside(body; class = "bt-sidebar")
+
+    # Delegated click handler: one listener on the aside, walks up to
+    # the nearest .bt-side-item, notifies current_view with its
+    # data-project-id. `current_view` enters the JS object cache here
+    # exactly once and never gets re-tracked by a recycling subsession.
+    Bonito.onload(session, aside, js"""(el) => {
+        el.addEventListener('click', e => {
+            const item = e.target.closest('.bt-side-item');
+            if (item) $(current_view).notify(item.dataset.projectId || '');
+        });
+    }""")
+
+    # Active-highlight swap: when current_view changes, find every
+    # sidebar item, toggle .bt-side-active based on data-project-id
+    # match. No DOM replacement, no subsession recycling.
+    Bonito.onjs(session, current_view, js"""(pid) => {
+        document.querySelectorAll('.bt-sidebar .bt-side-item').forEach(el => {
+            el.classList.toggle('bt-side-active', el.dataset.projectId === pid);
+        });
+    }""")
+
+    return aside
 end
 
 # CSS for the sidebar + icons. Mobile (≤640px) collapses to icons-only at
@@ -219,10 +257,18 @@ function unified_main(state::ServerState, current_view::Observable{String})
             # render_subsession on the Observable's *value*, which only
             # accepts a Hyperscript.Node (or App). DOM.div(model) gives it
             # a Node and lets Bonito recurse into the child to call
-            # jsrender(::Session, ::ChatModel).
-            DOM.div(state.chat_models[pid])
-        elseif haskey(state.projects, pid)
-            DOM.div("Starting chat for $(state.projects[pid].name)…";
+            # jsrender(::Session, ::ChatModel). The flex sizing here is
+            # load-bearing: the chat shell (.bt-app) uses `height: 100%`,
+            # so without `flex: 1; min-height: 0; display:flex` on the
+            # wrapper the chat collapses to zero height inside the
+            # `.bt-main` flex column.
+            DOM.div(state.chat_models[pid];
+                style = Styles("flex"          => "1 1 auto",
+                               "min-height"    => "0",
+                               "display"       => "flex",
+                               "flex-direction"=> "column"))
+        elseif haskey(state.projects[], pid)
+            DOM.div("Starting chat for $(state.projects[][pid].name)…";
                     class = "bt-empty",
                     style = Styles("padding" => "40px"))
         else
@@ -242,12 +288,12 @@ function unified_app(state::ServerState)
     App() do session
         # Per-session view of the shared state. `copy(state, session)` shares
         # the workers/projects/chat_models tables and the lock, but gives this
-        # session its OWN connected child of `state.version` (via
+        # session its OWN connected child of each version Observable (via
         # `map(identity, session, ...)` — auto-deregisters on tab close).
         # `current_view` is per-session (transient navigation state).
         view = copy(state, session)
         current_view = Observable("")
-        sidebar = project_sidebar(view, current_view)
+        sidebar = project_sidebar(session, view, current_view)
         main_panel = unified_main(view, current_view)
         DOM.div(
             UnifiedShellStyles,

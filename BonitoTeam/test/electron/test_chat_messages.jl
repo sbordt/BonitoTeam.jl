@@ -26,10 +26,10 @@ scripted = [
     ])),
 ]
 
-let proj = state.projects["p-1"]
+let proj = state.projects[]["p-1"]
     model = BonitoTeam.ChatModel(state, proj.server_path;
                                   project_id     = proj.id,
-                                  client_factory = TH.mock_factory(; scripted))
+                                  transport = TH.mock_transport(; scripted))
     BonitoTeam.start_chat_client!(model)
 end
 

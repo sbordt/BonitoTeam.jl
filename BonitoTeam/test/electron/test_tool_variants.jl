@@ -12,7 +12,7 @@ state = TH.make_state(; n_workers = 1, n_projects = 1)
 
 # Pre-write a couple of files so the diffs reference real on-disk state
 # (DiffEditor doesn't strictly need them, but it's closer to production).
-proj_cwd = state.projects["p-1"].server_path
+proj_cwd = state.projects[]["p-1"].server_path
 mkpath(joinpath(proj_cwd, "src"))
 write(joinpath(proj_cwd, "src", "a.jl"), "x = 1\n")
 write(joinpath(proj_cwd, "src", "b.jl"), "y = 2\n")
@@ -64,10 +64,10 @@ scripted = [
     ])),
 ]
 
-let proj = state.projects["p-1"]
+let proj = state.projects[]["p-1"]
     model = BonitoTeam.ChatModel(state, proj.server_path;
                                   project_id     = proj.id,
-                                  client_factory = TH.mock_factory(; scripted))
+                                  transport = TH.mock_transport(; scripted))
     BonitoTeam.start_chat_client!(model)
 end
 

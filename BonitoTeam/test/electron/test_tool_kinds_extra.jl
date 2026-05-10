@@ -10,7 +10,7 @@
 isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
 state = TH.make_state(; n_workers = 1, n_projects = 1)
-proj  = state.projects["p-1"]
+proj  = state.projects[]["p-1"]
 
 # Pre-write the file the `read` tool will reference, so render_tool_body
 # can run detect_language("a.py") → "python".
@@ -72,7 +72,7 @@ scripted = [
 let
     model = BonitoTeam.ChatModel(state, proj.server_path;
                                   project_id     = proj.id,
-                                  client_factory = TH.mock_factory(; scripted))
+                                  transport = TH.mock_transport(; scripted))
     BonitoTeam.start_chat_client!(model)
 end
 

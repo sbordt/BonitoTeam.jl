@@ -24,6 +24,7 @@ import BonitoWorker     # ditto
 
 include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
+include("transport.jl")        # ChatTransport + LocalTransport / WorkerTransport / MockTransport
 include("styles.jl")
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("persistence.jl")

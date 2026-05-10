@@ -5,7 +5,7 @@
 isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
 state = TH.make_state(; n_workers = 1, n_projects = 1)
-proj  = state.projects["p-1"]
+proj  = state.projects[]["p-1"]
 proj.auto_prompt = "review the README and tell me what's wrong"
 
 # A short streaming reply so the auto_prompt path runs end-to-end.
@@ -14,7 +14,7 @@ scripted = [(0.05, TH.agent_chunk_update("README looks fine."))]
 let
     model = BonitoTeam.ChatModel(state, proj.server_path;
                                   project_id     = proj.id,
-                                  client_factory = TH.mock_factory(; scripted))
+                                  transport = TH.mock_transport(; scripted))
     BonitoTeam.start_chat_client!(model)
     BonitoTeam.fire_auto_prompt!(model)
 end
@@ -42,7 +42,7 @@ try
     TH.section("auto_prompt is cleared on the project (so it doesn't re-fire)") do
         # fire_auto_prompt! sets proj.auto_prompt = nothing immediately.
         record("proj.auto_prompt now nothing",
-               @TH.test_eq state.projects["p-1"].auto_prompt nothing)
+               @TH.test_eq state.projects[]["p-1"].auto_prompt nothing)
     end
 
     TH.section("Agent reply still arrives normally") do
@@ -64,7 +64,7 @@ try
                 working_dir   = state.working_dir,
                 worker_secret = state.worker_secret)
         record("post-restart proj.auto_prompt still nothing",
-               @TH.test_eq s2.projects["p-1"].auto_prompt nothing)
+               @TH.test_eq s2.projects[]["p-1"].auto_prompt nothing)
     end
 
     TH.section("Calling fire_auto_prompt! again is a no-op") do

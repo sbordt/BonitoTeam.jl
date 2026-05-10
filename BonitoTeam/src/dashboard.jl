@@ -7,43 +7,46 @@
 
 # Project lock
 """
-Mark a project locked by a worker (active ACP session). Errors if the project
-is already locked by a different worker. `worker_id` is the worker's stable
-UUID, NOT its display name.
+Mark a project as claimed (i.e. has an active ACP session) by a worker.
+Errors if the project is already claimed by a different worker.
+`worker_id` is the worker's stable UUID, NOT its display name.
+
+The claim is persisted to projects.json so it survives a server restart,
+and the matching project card shows a "locked by …" badge in the UI.
 """
-function acquire_lock!(state::ServerState, p::ProjectInfo, worker_id::String)
+function claim_project!(state::ServerState, p::ProjectInfo, worker_id::String)
     lock(state.lock) do
         if p.locked_by !== nothing && p.locked_by != worker_id
-            error("Project '$(p.name)' is locked by worker '$(p.locked_by)'")
+            error("Project '$(p.name)' is claimed by worker '$(p.locked_by)'")
         end
         p.locked_by = worker_id
         p.locked_at = now(UTC)
         save_projects!(state)
     end
-    bump_state!(state)
+    safe_notify!(state.projects)
     return p
 end
 
-function release_lock!(state::ServerState, p::ProjectInfo)
+function release_project!(state::ServerState, p::ProjectInfo)
     lock(state.lock) do
         p.locked_by = nothing
         p.locked_at = nothing
         save_projects!(state)
     end
-    bump_state!(state)
+    safe_notify!(state.projects)
     return p
 end
 
-# Auto-release every project lock held by `worker_id` (called from
+# Release every project claim held by `worker_id` (called from
 # handle_worker_control's finally branch when the WS drops). Snapshot the
-# matching projects under the lock so we don't iterate `state.projects`
-# while a concurrent writer is mutating it; `release_lock!` re-takes the
+# matching projects under the lock so we don't iterate `state.projects[]`
+# while a concurrent writer is mutating it; `release_project!` re-takes the
 # lock per project (reentrant, harmless).
-function release_locks_for_worker!(state::ServerState, worker_id::String)
+function release_projects_for_worker!(state::ServerState, worker_id::String)
     targets = lock(state.lock) do
-        [p for p in values(state.projects) if p.locked_by == worker_id]
+        [p for p in values(state.projects[]) if p.locked_by == worker_id]
     end
-    foreach(p -> release_lock!(state, p), targets)
+    foreach(p -> release_project!(state, p), targets)
 end
 
 """
@@ -51,21 +54,22 @@ Create a new project on the named worker. Steps:
 1. Seed `<server_working_dir>/<name>` from the picked source folder (if not
    already there).
 2. Mirror to `<worker.projects_root>/<name>` (via rsync — local or ssh).
-3. Build chat_app whose client_factory asks the worker (over its control WS)
-   to spawn an ACP session and dial back; we drive that session from here.
-4. Register `/p/<id>` route on the live server.
+3. Build the project's ChatModel (its `WorkerTransport` asks the worker over
+   its control WS to spawn an ACP session and dial back) and cache it in
+   `state.chat_models[id]` so `unified_main` can render it when the user
+   selects this project in the sidebar.
 """
 function create_project!(state::ServerState, name::String, src_path::String,
                           worker_name::String;
                           progress = nothing)
-    haskey(state.workers, worker_name) || error("Unknown worker: $worker_name")
+    haskey(state.workers[], worker_name) || error("Unknown worker: $worker_name")
     isempty(name) && error("Project name must not be empty")
     occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
         error("Project name must be alphanumeric/_/- only")
     isempty(src_path) && error("Source path is required (pick a folder).")
     isdir(src_path)   || error("Source path is not a directory: $src_path")
 
-    w = state.workers[worker_name]
+    w = state.workers[][worker_name]
     server_path = joinpath(state.working_dir, name)
     worker_path = joinpath(w.projects_root, name)
 
@@ -75,7 +79,6 @@ function create_project!(state::ServerState, name::String, src_path::String,
     if existing !== nothing
         @info "create_project!: existing project at this worker_path; reusing" id=existing.id name=existing.name
         ensure_project_session!(state, existing)
-        bump_state!(state)
         return existing
     end
 
@@ -96,14 +99,14 @@ function create_project!(state::ServerState, name::String, src_path::String,
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     lock(state.lock) do
-        state.projects[id] = p
+        state.projects[][id] = p
         save_projects!(state)
     end
+    safe_notify!(state.projects)
 
     # 3 + 4: build the chat app + register the route.
     progress === nothing || progress("Starting chat session…")
     ensure_project_session!(state, p)
-    bump_state!(state)
     return p
 end
 
@@ -130,7 +133,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
                                       sync::Bool = false,
                                       resume_session_id::Union{String,Nothing} = nothing,
                                       progress = nothing)
-    haskey(state.workers, worker_name) || error("Unknown worker: $worker_name")
+    haskey(state.workers[], worker_name) || error("Unknown worker: $worker_name")
     isempty(name) && error("Project name must not be empty (folder has no basename?)")
     occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
         error("Project name must be alphanumeric/_/- only — got '$name'")
@@ -149,7 +152,6 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
         end
         progress === nothing || progress("Reusing existing project…")
         ensure_project_session!(state, existing)
-        bump_state!(state)
         return existing
     end
 
@@ -159,7 +161,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     p.resume_session_id = resume_session_id
     lock(state.lock) do
-        state.projects[id] = p
+        state.projects[][id] = p
     end
 
     if sync
@@ -180,10 +182,10 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     lock(state.lock) do
         save_projects!(state)
     end
+    safe_notify!(state.projects)
 
     progress === nothing || progress("Starting chat session…")
     ensure_project_session!(state, p)
-    bump_state!(state)
     return p
 end
 
@@ -193,8 +195,8 @@ end
 # without redirecting to the dashboard.
 function handle_chat_sync_click(state::ServerState, project_id::AbstractString,
                                  sync_status::Observable{String})
-    haskey(state.projects, project_id) || (safe_set!(sync_status, "unknown project"); return)
-    p = state.projects[project_id]
+    haskey(state.projects[], project_id) || (safe_set!(sync_status, "unknown project"); return)
+    p = state.projects[][project_id]
     p.backup_status === :syncing && (safe_set!(sync_status, "already syncing…"); return)
     safe_set!(sync_status, "starting…")
     @async begin
@@ -221,22 +223,22 @@ Updates `p.backup_status` to `:syncing` for the duration, then `:synced`
 on success or `:stale` on failure.
 """
 function sync_project_to_server!(state::ServerState, p::ProjectInfo; on_progress = nothing)
-    haskey(state.workers, p.worker_id) ||
+    haskey(state.workers[], p.worker_id) ||
         error("Worker '$(p.worker_id)' is not connected")
     p.backup_status === :syncing &&
         error("Project '$(p.name)' is already syncing")
     p.backup_status = :syncing
-    bump_state!(state)
+    safe_notify!(state.projects)
     try
         sync_dir_from_worker!(state, p.worker_id, p.worker_path, p.server_path;
                               on_progress = on_progress)
         p.backup_status = :synced
         p.last_sync_at  = now(UTC)
         save_projects!(state)
-        bump_state!(state)
+        safe_notify!(state.projects)
     catch e
         p.backup_status = :stale
-        bump_state!(state)
+        safe_notify!(state.projects)
         rethrow(e)
     end
     return p
@@ -253,21 +255,22 @@ when the user selects this project in the sidebar.
 """
 function ensure_project_session!(state::ServerState, p::ProjectInfo)
     haskey(state.chat_models, p.id) && return state.chat_models[p.id]
-    haskey(state.workers, p.worker_id) ||
+    haskey(state.workers[], p.worker_id) ||
         error("Worker '$(p.worker_id)' is not connected")
-    w = state.workers[p.worker_id]
+    w = state.workers[][p.worker_id]
 
-    acquire_lock!(state, p, w.worker_id)
+    claim_project!(state, p, w.worker_id)
 
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
         [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path)]
 
-    # If the project was imported with a claude session ID, the factory asks
-    # the worker to do session/load (resume) instead of session/new.
-    client_factory = on_update -> start_session_on_worker(state, w.worker_id, p.worker_path;
-                                                           on_update,
-                                                           mcp_servers = mcp,
-                                                           resume_session_id = p.resume_session_id)
+    # The transport carries everything start_session needs — including the
+    # `resume_session_id` so the worker bring-up path uses session/load
+    # instead of session/new for imported claude sessions.
+    transport = WorkerTransport(state, w.worker_id, p.worker_path;
+                                 mcp_servers       = mcp,
+                                 resume_session_id = p.resume_session_id)
+
     # Ensure server_path exists so BonitoBook (which reads files from cwd to
     # render the chat notebook + tools) doesn't crash on a never-synced
     # project. Empty dir is fine; project files live on the worker and only
@@ -275,9 +278,9 @@ function ensure_project_session!(state::ServerState, p::ProjectInfo)
     mkpath(p.server_path)
 
     model = ChatModel(state, p.server_path;
-                       project_id     = p.id,
-                       mcp_servers    = mcp,
-                       client_factory = client_factory)
+                       project_id  = p.id,
+                       mcp_servers = mcp,
+                       transport   = transport)
     start_chat_client!(model)        # also caches into state.chat_models
     fire_auto_prompt!(model)
     return model
@@ -1119,7 +1122,7 @@ function worker_card(state::ServerState, w::WorkerInfo,
 end
 
 # Render a small pill describing the project's backup status. Read at card-
-# render time; the dashboard re-renders on bump_state! whenever sync state
+# render time; the dashboard re-renders on `notify(state.projects)` whenever sync state
 # changes.
 function backup_pill(p::ProjectInfo)
     if p.backup_status === :syncing
@@ -1197,8 +1200,8 @@ function project_card(state::ServerState, p::ProjectInfo,
                 # not the raw UUID. Falls back to a short prefix of the
                 # worker_id if the worker is unknown to state right now
                 # (offline + never connected since the last server start).
-                DOM.span(haskey(state.workers, p.worker_id) ?
-                         state.workers[p.worker_id].name :
+                DOM.span(haskey(state.workers[], p.worker_id) ?
+                         state.workers[][p.worker_id].name :
                          "worker:$(first(p.worker_id, 8))"),
                 DOM.span("·"; class = "bt-stat-sep"),
                 DOM.span(p.worker_path; class = "bt-mono",
@@ -1245,14 +1248,14 @@ function dashboard_dom(state::ServerState;
 
     # ── Sync-to-server click handler ─────────────────────────────────────────
     # Fired by the project card's "Sync to server" / "Re-sync" button. The
-    # actual transfer runs in the background; we update busy_msg + bump_state!
+    # actual transfer runs in the background; we update busy_msg + notify(state.projects)
     # so the UI shows the syncing state on the card.
     sync_request = Observable("")
     on(sync_request) do pid
         isempty(pid) && return
         sync_request[] = ""           # reset so the same card can re-fire
-        haskey(state.projects, pid) || return
-        p = state.projects[pid]
+        haskey(state.projects[], pid) || return
+        p = state.projects[][pid]
         p.backup_status === :syncing && return    # already in flight
         @async begin
             try
@@ -1307,11 +1310,11 @@ function dashboard_dom(state::ServerState;
     new_proj_btn = Bonito.Button("+ New project"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(new_proj_btn.value) do clicked
         clicked || return
-        if isempty(state.workers)
+        if isempty(state.workers[])
             error_obs[] = "Register a worker before creating a project."
             return
         end
-        np_worker[]  = first(keys(state.workers))
+        np_worker[]  = first(keys(state.workers[]))
         which_form[] = :new_project
         error_obs[]  = ""
     end
@@ -1353,17 +1356,17 @@ function dashboard_dom(state::ServerState;
     gh_btn = Bonito.Button("+ From GitHub"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(gh_btn.value) do clicked
         clicked || return
-        if isempty(state.workers)
+        if isempty(state.workers[])
             error_obs[] = "Register a worker before opening a GitHub project."
             return
         end
-        gh_worker[]  = first(keys(state.workers))
+        gh_worker[]  = first(keys(state.workers[]))
         which_form[] = :github
         error_obs[]  = ""
     end
 
     # Per-worker remote-folder pickers (persistent across re-renders so the
-    # current path / expanded state survives bump_state! triggers). The
+    # current path / expanded state survives notify(state.workers) triggers). The
     # `picker_state` observable holds the name of the worker whose picker
     # form is currently visible (""  → none).
     picker_state = Observable("")
@@ -1481,7 +1484,7 @@ function dashboard_dom(state::ServerState;
 
         # Display label = worker.name (mutable); fallback to wid if the
         # worker has gone offline since the panel was opened.
-        display_name = haskey(state.workers, wid) ? state.workers[wid].name : wid
+        display_name = haskey(state.workers[], wid) ? state.workers[][wid].name : wid
         panel_content = map(discover_busy, discover_results) do busy, results
             if busy
                 spinner_row("Scanning $display_name for Claude Code sessions…")
@@ -1573,7 +1576,7 @@ function dashboard_dom(state::ServerState;
         DOM.select(
             # Show w.name (mutable display label) but submit w.worker_id
             # (stable UUID, the dict key into state.workers).
-            (DOM.option(w.name; value=w.worker_id) for w in values(state.workers))...;
+            (DOM.option(w.name; value=w.worker_id) for w in values(state.workers[]))...;
             onchange = js"event => $(np_worker).notify(event.target.value)"),
         map(busy_msg) do msg
             isempty(msg) ?
@@ -1592,7 +1595,7 @@ function dashboard_dom(state::ServerState;
                                "margin-top" => "-4px")),
         DOM.label("Worker"),
         DOM.select(
-            (DOM.option(w.name; value=w.worker_id) for w in values(state.workers))...;
+            (DOM.option(w.name; value=w.worker_id) for w in values(state.workers[]))...;
             onchange = js"event => $(gh_worker).notify(event.target.value)"),
         map(busy_msg) do msg
             isempty(msg) ?
@@ -1617,7 +1620,7 @@ function dashboard_dom(state::ServerState;
             isempty(busy_msg[]) || return   # don't cancel mid-create
             picker_state[] = ""; error_obs[] = ""
         end
-        display_name = haskey(state.workers, wid) ? state.workers[wid].name : wid
+        display_name = haskey(state.workers[], wid) ? state.workers[][wid].name : wid
         DOM.div(
             DOM.label("Folder on $(display_name)"),
             DOM.div(remote_folder_picker_render(rp),
@@ -1637,11 +1640,12 @@ function dashboard_dom(state::ServerState;
     end
 
     # ── Stats strip ──────────────────────────────────────────────────────────
-    stats_strip = map(state.version) do _
-        online   = count(w -> w.status == :online, values(state.workers))
-        total    = length(state.workers)
-        n_proj   = length(state.projects)
-        n_active = count(p -> p.locked_by !== nothing, values(state.projects))
+    # Stats touch both worker counts and project counts → listen to both.
+    stats_strip = map(state.workers, state.projects) do workers, projects
+        online   = count(w -> w.status == :online, values(workers))
+        total    = length(workers)
+        n_proj   = length(projects)
+        n_active = count(p -> p.locked_by !== nothing, values(projects))
         sep()    = DOM.span("·"; class = "bt-stat-sep")
         DOM.div(
             DOM.div(
@@ -1663,8 +1667,10 @@ function dashboard_dom(state::ServerState;
     end
 
     # ── Worker / project lists ───────────────────────────────────────────────
-    worker_list = map(state.version, picker_state, discover_state) do _, picked, discovered
-        if isempty(state.workers)
+    # Worker cards: re-render on worker churn or open form state. Adding a
+    # project does NOT redraw worker cards.
+    worker_list = map(state.workers, picker_state, discover_state) do workers, picked, discovered
+        if isempty(workers)
             install_url = "$(public_url_or_default())/install.sh"
             install_cmd = "curl -fsSL $install_url | sh"
             return DOM.div(
@@ -1688,7 +1694,7 @@ function dashboard_dom(state::ServerState;
                 class = "bt-install-block")
         end
         rows = []
-        for w in values(state.workers)
+        for w in values(workers)
             push!(rows, worker_card(state, w, error_obs, picker_state, discover_state))
             # picker_state / discover_state hold the worker_id (UUID), not the
             # display name, so we compare against w.worker_id and pass it
@@ -1700,12 +1706,12 @@ function dashboard_dom(state::ServerState;
         DOM.div(rows...; class = "bt-cards")
     end
 
-    project_list = map(state.version) do _
-        isempty(state.projects) ?
+    project_list = map(state.projects) do projects
+        isempty(projects) ?
             DOM.div("No projects yet — pick a worker above and click + Project, or import an existing Claude session via Discover.";
                     class = "bt-empty") :
             DOM.div((project_card(state, p, error_obs, sync_request, current_view)
-                     for p in values(state.projects))...;
+                     for p in values(projects))...;
                     class = "bt-cards")
     end
 

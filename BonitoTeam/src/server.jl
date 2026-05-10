@@ -64,7 +64,7 @@ function serve(; host::String        = "0.0.0.0",
     state = ServerState(; state_dir = sd, working_dir = wd, worker_secret = worker_secret)
 
     # Mark all loaded workers offline; they'll flip online when they re-dial.
-    for w in values(state.workers)
+    for w in values(state.workers[])
         w.status = :offline
     end
 

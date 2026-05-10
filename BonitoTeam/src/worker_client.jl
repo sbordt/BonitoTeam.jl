@@ -8,7 +8,7 @@
 #                   sending commands like "open_session" / "open_transfer".
 #   /worker-acp   → per-session WS. Worker dials this in response to an
 #                   "open_session" command and identifies the WS by sid; we
-#                   pair it with a Channel that `start_session_on_worker` is
+#                   pair it with a Channel that `start_session(::WorkerTransport)` is
 #                   blocked on.
 #   /transfer-ws  → directional librsync transfer; worker dials this in
 #                   response to an "open_transfer" command; pairs the WS
@@ -103,8 +103,8 @@ function handle_worker_control(state::ServerState, ws)
         # If the user previously renamed this worker via the UI, preserve
         # that name across reconnects instead of overwriting it with the
         # worker's hello-frame default.
-        existing_name = haskey(state.workers, worker_id) ?
-                        state.workers[worker_id].name : nothing
+        existing_name = haskey(state.workers[], worker_id) ?
+                        state.workers[][worker_id].name : nothing
         display_name  = existing_name === nothing ? name : existing_name
 
         WebSockets.send(ws, JSON.json(Dict("ok" => true,
@@ -130,7 +130,7 @@ function handle_worker_control(state::ServerState, ws)
         # are mutually consistent across concurrent observers (other RPC
         # handlers, App-body re-renders).
         projects_to_attach = lock(state.lock) do
-            state.workers[worker_id] = w
+            state.workers[][worker_id] = w
             state.worker_control_ws[worker_id] = ws
             migrate_legacy_worker_refs!(state, w)
             save_workers!(state)
@@ -138,9 +138,15 @@ function handle_worker_control(state::ServerState, ws)
             # lock — `ensure_project_session!` itself takes the lock and
             # also does network I/O, so we don't want to hold the mutex
             # across that work.
-            [p for p in values(state.projects) if p.worker_id == worker_id]
+            [p for p in values(state.projects[]) if p.worker_id == worker_id]
         end
-        bump_state!(state)
+        # Worker added → fan out to worker-cards consumers. If any
+        # legacy projects had their worker_id rewritten by
+        # migrate_legacy_worker_refs!, the project list also needs to
+        # know (the project card shows the worker name and that lookup
+        # was previously broken).
+        safe_notify!(state.workers)
+        safe_notify!(state.projects)
         @info "Worker connected" worker_id=worker_id name=display_name hostname=w.hostname
 
         for p in projects_to_attach
@@ -174,21 +180,21 @@ function handle_worker_control(state::ServerState, ws)
         end
     finally
         # Atomic teardown: mark offline, drop the WS handle, evict the
-        # ChatModels for this worker's projects. release_locks_for_worker!
+        # ChatModels for this worker's projects. release_projects_for_worker!
         # also takes the lock per release; safe because ReentrantLock is.
         lock(state.lock) do
             delete!(state.worker_control_ws, worker_id)
-            if haskey(state.workers, worker_id)
-                state.workers[worker_id].status = :offline
+            if haskey(state.workers[], worker_id)
+                state.workers[][worker_id].status = :offline
             end
-            for p in values(state.projects)
+            for p in values(state.projects[])
                 if p.worker_id == worker_id
                     delete!(state.chat_models, p.id)
                 end
             end
         end
-        bump_state!(state)
-        release_locks_for_worker!(state, worker_id)
+        safe_notify!(state.workers)
+        release_projects_for_worker!(state, worker_id)
         @info "Worker disconnected" worker_id=worker_id
     end
 end
@@ -205,7 +211,7 @@ every connect — it's a no-op once everything is on the new schema.
 function migrate_legacy_worker_refs!(state::ServerState, w::WorkerInfo)
     legacy_keys = (w.name, w.hostname)
     rewrote = 0
-    for p in values(state.projects)
+    for p in values(state.projects[])
         if p.worker_id != w.worker_id && p.worker_id in legacy_keys
             @info "migrating project worker reference" project=p.name from=p.worker_id to=w.worker_id
             p.worker_id = w.worker_id
@@ -224,13 +230,13 @@ is unchanged so all FK references in `projects` keep resolving.
 """
 function rename_worker!(state::ServerState, worker_id::AbstractString,
                          new_name::AbstractString)
-    haskey(state.workers, worker_id) || error("Unknown worker_id: $worker_id")
+    haskey(state.workers[], worker_id) || error("Unknown worker_id: $worker_id")
     new = strip(String(new_name))
     isempty(new) && error("Worker name must not be empty")
-    state.workers[worker_id].name = new
+    state.workers[][worker_id].name = new
     save_workers!(state)
-    bump_state!(state)
-    return state.workers[worker_id]
+    safe_notify!(state.workers)
+    return state.workers[][worker_id]
 end
 
 # Handler for /transfer-ws — one invocation per directional RemoteSync transfer.
@@ -277,91 +283,6 @@ function handle_handoff_ws(state::ServerState, ws, id_field::AbstractString;
         sleep(1)
     end
     close_on_exit && try close(ws) catch end
-end
-
-# Server-side ACP client over an accepted WS
-"""
-    start_session_on_worker(state, worker_name, cwd; on_update, mcp_servers,
-                             request_handler, resume_session_id=nothing)
-        → AgentClientProtocol.Client
-
-Tell the worker to spawn claude-agent-acp for `cwd` and dial back an ACP WS.
-Block until the WS arrives, then drive `initialize`, then either
-`session/load` (when `resume_session_id` is set) or `session/new`. Returns
-the live ACP `Client`.
-
-When resuming, claude-agent-acp replays the prior conversation as a stream
-of `session/update` notifications — our `update_handler` receives them just
-like live events, so the chat UI fills in automatically.
-"""
-function start_session_on_worker(state::ServerState, worker_name::String, cwd::String;
-                                  on_update::Function       = identity,
-                                  mcp_servers               = [],
-                                  request_handler::Function = AgentClientProtocol.make_request_handler(cwd),
-                                  resume_session_id::Union{String,Nothing} = nothing,
-                                  timeout::Real             = 30.0)
-
-    haskey(state.worker_control_ws, worker_name) ||
-        error("Worker '$worker_name' is not connected")
-
-    sid, ch = register_rpc!(state)
-
-    mcp_list = [Dict("name"    => s.name,
-                     "command" => s.command,
-                     "args"    => s.args,
-                     "env"     => [Dict("name" => k, "value" => v) for (k,v) in s.env])
-                for s in mcp_servers]
-
-    # Find the project this session belongs to (purely for the worker-side
-    # log line; we don't ship project_id over the wire anymore).
-    project_id = ""
-    for p in values(state.projects)
-        p.worker_id == worker_name && p.worker_path == cwd && (project_id = p.id; break)
-    end
-
-    send_command(state, worker_name, Dict(
-        "type"       => "open_session",
-        "sid"        => sid,
-        "project_id" => project_id,
-        "cwd"        => cwd,
-        "env"        => Dict{String,String}(),
-        "mcpServers" => mcp_list,
-    ))
-
-    # Wait for the worker's /worker-acp upgrade — bounded so a dead worker
-    # doesn't hang the dashboard task that triggered the session.
-    ws = take_pending!(state, ch, sid, timeout,
-                      "open_session on '$worker_name'")
-
-    conn = ws_connection(ws; request_handler, update_handler = on_update)
-
-    AgentClientProtocol.send_request(conn, "initialize", Dict(
-        "protocolVersion"    => 1,
-        "clientCapabilities" => Dict(
-            "fs" => Dict("readTextFile" => true, "writeTextFile" => true),
-        ),
-        "clientInfo" => Dict("name" => "BonitoTeam", "version" => "0.1.0"),
-    ))
-
-    session_id = if resume_session_id !== nothing
-        @info "ACP: resuming session" cwd resume_session_id
-        # `session/load` returns no useful body — the agent's reply is the
-        # stream of session/update notifications that our update_handler
-        # picks up. The session ID we use afterwards is the one we asked
-        # for (claude-agent-acp keeps it stable across load).
-        AgentClientProtocol.send_request(conn, "session/load", Dict(
-            "sessionId"  => resume_session_id,
-            "cwd"        => cwd,
-            "mcpServers" => mcp_list,
-        ))
-        resume_session_id
-    else
-        result = AgentClientProtocol.send_request(conn, "session/new",
-                     Dict("cwd" => cwd, "mcpServers" => mcp_list))
-        result["sessionId"]
-    end
-
-    return AgentClientProtocol.Client(conn, session_id, cwd)
 end
 
 # File transport over WS
@@ -608,27 +529,6 @@ function fetch_file_from_worker(state::ServerState, worker_name::String,
     return String(dst_path)
 end
 
-# Build an AgentClientProtocol.Connection backed by a WebSocket. Each ACP
-# message is one WS frame; the trailing newline is implicit in the framing.
-function ws_connection(ws; request_handler, update_handler)
-    send_line = line -> WebSockets.send(ws, rstrip(line, '\n'))
-    read_line = ()   -> begin
-        WebSockets.isclosed(ws) && return ""
-        try
-            String(WebSockets.receive(ws))
-        catch e
-            (e isa Base.IOError || e isa WebSockets.WebSocketError) && return ""
-            rethrow(e)
-        end
-    end
-    on_close = () -> begin
-        try
-            close(ws)
-        catch e
-            (e isa Base.IOError || e isa WebSockets.WebSocketError) && return
-            @warn "ws_connection: close failed" exception=e
-        end
-    end
-    return AgentClientProtocol.Connection(send_line, read_line, on_close;
-                                          request_handler, update_handler)
-end
+# NOTE: WS-backed ACP I/O now lives in `WorkerTransport` (src/transport.jl)
+# as `AgentClientProtocol.send` / `recv` / `close!` overloads — the
+# Connection talks to the transport via dispatched verbs, not callbacks.

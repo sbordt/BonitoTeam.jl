@@ -40,7 +40,7 @@ mutable struct ProjectInfo
     worker_path::String                # mirrored copy on worker (= worker.projects_root/name)
     created::DateTime
     # At most one active ACP session per project. Acquired when
-    # ensure_project_session! brings up the chat_app; released automatically
+    # ensure_project_session! brings up the ChatModel; released automatically
     # when the bound worker's control WS drops (the claude process is gone
     # with it). Worker-only-write model means there's no checksum/divergence
     # state — anything claude writes on the worker auto-flows back to the
@@ -57,7 +57,7 @@ mutable struct ProjectInfo
     last_sync_at::Union{DateTime,Nothing}
     # Set when the project was imported from an existing claude-agent-acp
     # session — the .jsonl basename in ~/.claude/projects/<encoded>/ on the
-    # worker. start_session_on_worker uses session/load with this ID to bring
+    # worker. start_session(::WorkerTransport) uses session/load with this ID to bring
     # the conversation history back to where claude left off; nothing → fresh
     # session/new. Persisted so server restarts still resume.
     resume_session_id::Union{String,Nothing}
@@ -83,8 +83,13 @@ handlers. Five things deserve a paragraph each:
 - `pending_rpcs` collapses what used to be five separate dicts (one per
   RPC type). The keys are uuids, so cross-RPC-type collisions can't happen,
   and the unified shape removes a lot of duplicated bookkeeping.
-- `version` drives reactive re-renders. Bumped via `bump_state!` whenever
-  workers/projects mutates.
+- `workers` and `projects` are themselves Observables wrapping the live
+  Dicts. Mutators do in-place updates and then `notify(state.projects)`
+  (or `state.workers`) to fan out to listeners. Sidebar / dashboard
+  consumers `map(state.projects) do projects … end` — they get the
+  current Dict by value, so adding a worker doesn't redraw the project
+  list and vice versa. There's no separate version-int sentinel: the
+  data IS the change signal.
 - `worker_control_ws` keys workers by name (the same key as `workers`).
 - `srv` is filled in after `Bonito.Server` is constructed (chicken-and-egg:
   the dashboard app captures the state, but the server constructor takes
@@ -111,9 +116,21 @@ mutable struct ServerState
     # Live Bonito server (set by serve() after construction)
     srv :: Union{Bonito.Server,Nothing}
 
-    # Persisted state (mutated at runtime, written to disk via save_workers!/save_projects!)
-    workers  :: Dict{String,WorkerInfo}
-    projects :: Dict{String,Any}        # id → ProjectInfo. Any: see comment in old dashboard
+    # Persisted state, wrapped in Observables so consumers can `map` them
+    # directly (no sentinel version-int). Mutators do in-place updates and
+    # then `notify(state.workers)` / `notify(state.projects)` to fan out
+    # to listeners. The .{} access forms — `state.projects[][id]`,
+    # `values(state.projects[])`, etc. — are the price for collection-
+    # level reactivity, but they're mechanical and the win is that the
+    # sidebar (project-only) ignores worker churn and the worker cards
+    # ignore project churn.
+    #
+    # SHARED parents: App bodies must not `map(state.projects)` directly.
+    # Take `view = copy(state, session)` and `map(view.projects)` so each
+    # session subscribes to its own connected child Observable (auto-GC'd
+    # on session close).
+    workers  :: Observable{Dict{String,WorkerInfo}}
+    projects :: Observable{Dict{String,ProjectInfo}}
 
     # Runtime caches (not persisted). One ChatModel per project, lazily built
     # the first time the project's chat is opened or the worker reconnects;
@@ -127,12 +144,6 @@ mutable struct ServerState
     # Pending request_id → channel handoffs for every RPC type. Channel{Any}
     # because the answer shape varies (WS for handoff, Dict for rpc result).
     pending_rpcs :: Dict{String,Channel{Any}}
-
-    # Reactive re-render trigger. SHARED parent — App bodies must not
-    # `map(state.version)` directly: take `view = copy(state)` and
-    # `map(view.version)` so each session subscribes to its own connected
-    # child Observable (auto-GC'd on session close).
-    version :: Observable{Int}
 end
 
 """
@@ -149,12 +160,11 @@ function ServerState(; state_dir::String,
         ReentrantLock(),
         state_dir, working_dir, worker_secret,
         nothing,
-        Dict{String,WorkerInfo}(),    # workers
-        Dict{String,Any}(),           # projects
-        Dict{String,Any}(),           # chat_models
-        Dict{String,Any}(),           # worker_control_ws
-        Dict{String,Channel{Any}}(),  # pending_rpcs
-        Observable(0),                # version
+        Observable(Dict{String,WorkerInfo}()),    # workers
+        Observable(Dict{String,ProjectInfo}()),   # projects
+        Dict{String,Any}(),                       # chat_models
+        Dict{String,Any}(),                       # worker_control_ws
+        Dict{String,Channel{Any}}(),              # pending_rpcs
     )
     load_workers!(s)
     load_projects!(s)
@@ -176,12 +186,11 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             s.lock,
             s.state_dir, s.working_dir, s.worker_secret,
             s.srv,
-            s.workers,
-            s.projects,
+            map(identity, session, s.workers),
+            map(identity, session, s.projects),
             s.chat_models,
             s.worker_control_ws,
             s.pending_rpcs,
-            map(identity, session, s.version),
         )
     end
 end
@@ -193,24 +202,26 @@ projects_file(s::ServerState) = joinpath(s.state_dir, "projects.json")
 # if a session is broken (e.g. a stale tab whose hashed asset URLs went 404
 # after a redeploy), Bonito surfaces that as a JSException from the
 # observable update. We don't want a stale UI tab to break server-side
-# operations, so this swallows + logs the error rather than propagating it.
-#
-# Hold `state.lock` for the read-modify-write so concurrent bumps don't
-# observe stale `version[]` and clobber each other; child sessions see a
-# strictly monotonically-increasing version.
-function bump_state!(s::ServerState)
-    lock(s.lock) do
-        safe_set!(s.version, s.version[] + 1)
-    end
-    return nothing
-end
+# operations, so we swallow + log via these helpers instead of letting the
+# JSException unwind a server thread.
 
-# Same shape, for any observable update we want to be best-effort.
+# Best-effort `obs[] = val`. Use for plain Observable updates.
 function safe_set!(obs::Observable, val)
     try
         obs[] = val
     catch e
         @debug "safe_set!: observable propagation failed (likely stale browser session)" exception=e
+    end
+    return nothing
+end
+
+# Best-effort `notify(obs)` — fires listeners without changing the value.
+# Use after in-place mutation of `state.workers[]` / `state.projects[]`.
+function safe_notify!(obs::Observable)
+    try
+        notify(obs)
+    catch e
+        @debug "safe_notify!: observable propagation failed (likely stale browser session)" exception=e
     end
     return nothing
 end
@@ -250,7 +261,7 @@ function save_workers!(s::ServerState)
                  "ssh_target" => w.ssh_target,
                  "hostname" => w.hostname, "home" => w.home,
                  "mcp_path" => w.mcp_path, "projects_root" => w.projects_root)
-            for w in values(s.workers)]
+            for w in values(s.workers[])]
     atomic_write_json(workers_file(s), data)
 end
 
@@ -270,7 +281,7 @@ function load_workers!(s::ServerState)
                            get(d, "hostname", ""), get(d, "home", ""),
                            get(d, "mcp_path", ""), get(d, "projects_root", ""),
                            :unknown, now(UTC))
-            s.workers[wid] = w
+            s.workers[][wid] = w
         catch e
             @warn "skipping malformed worker entry" entry=d exception=e
         end
@@ -288,7 +299,7 @@ function save_projects!(s::ServerState)
                  "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at),
                  "resume_session_id" => p.resume_session_id,
                  "auto_prompt"   => p.auto_prompt)
-            for p in values(s.projects)]
+            for p in values(s.projects[])]
     atomic_write_json(projects_file(s), data)
 end
 
@@ -315,7 +326,7 @@ function load_projects!(s::ServerState)
             ap = get(d, "auto_prompt", nothing)
             p.auto_prompt = (ap === nothing || isempty(String(ap))) ?
                                        nothing : String(ap)
-            s.projects[p.id] = p
+            s.projects[][p.id] = p
         catch e
             @warn "skipping malformed project entry" entry=d exception=e
         end
@@ -346,7 +357,7 @@ function find_project_by_location(state::ServerState,
                                    worker_id::AbstractString,
                                    worker_path::AbstractString)
     key = (String(worker_id), rstrip(String(worker_path), '/'))
-    for p in values(state.projects)
+    for p in values(state.projects[])
         project_location_key(p) == key && return p
     end
     return nothing
@@ -360,9 +371,9 @@ end
 # entry to keep we prefer the one carrying state we can't easily
 # reconstruct (resume_session_id > auto_prompt > earliest `created`).
 function dedup_projects!(s::ServerState)
-    isempty(s.projects) && return
+    isempty(s.projects[]) && return
     groups = Dict{Tuple{String,String},Vector{ProjectInfo}}()
-    for p in values(s.projects)
+    for p in values(s.projects[])
         push!(get!(() -> ProjectInfo[], groups, project_location_key(p)), p)
     end
     dropped = Tuple{String,String,String}[]   # (worker, path, dropped_id)
@@ -371,7 +382,7 @@ function dedup_projects!(s::ServerState)
         keeper = pick_dedup_keeper(members)
         for p in members
             p === keeper && continue
-            delete!(s.projects, p.id)
+            delete!(s.projects[], p.id)
             push!(dropped, (key[1], key[2], p.id))
         end
     end

@@ -15,10 +15,10 @@ record(name, ok) = push!(results, name => ok)
 
 # --- Sub-test 1: transport-died error → banner ---------------------------------
 state1 = TH.make_state(; n_workers = 1, n_projects = 1)
-let proj = state1.projects["p-1"]
+let proj = state1.projects[]["p-1"]
     model = BonitoTeam.ChatModel(state1, proj.server_path;
         project_id     = proj.id,
-        client_factory = TH.mock_factory(; prompt_error = "connection closed by peer"))
+        transport = TH.mock_transport(; prompt_error = "connection closed by peer"))
     BonitoTeam.start_chat_client!(model)
 end
 ctx1 = TH.open_window(state1)
@@ -70,10 +70,10 @@ end
 
 # --- Sub-test 2: arbitrary error → inline [error: ...] bubble -----------------
 state2 = TH.make_state(; n_workers = 1, n_projects = 1)
-let proj = state2.projects["p-1"]
+let proj = state2.projects[]["p-1"]
     model = BonitoTeam.ChatModel(state2, proj.server_path;
         project_id     = proj.id,
-        client_factory = TH.mock_factory(; prompt_error = "model overloaded, please retry"))
+        transport = TH.mock_transport(; prompt_error = "model overloaded, please retry"))
     BonitoTeam.start_chat_client!(model)
 end
 ctx2 = TH.open_window(state2)

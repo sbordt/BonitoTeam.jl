@@ -7,8 +7,8 @@ isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 # Two workers — one we'll mark online for the +Project / Discover paths,
 # one stays offline so we can verify the offline pill renders.
 state = TH.make_state(; n_workers = 2, n_projects = 2)
-state.workers["w-1"].status = :online
-state.workers["w-2"].status = :offline
+state.workers[]["w-1"].status = :online
+state.workers[]["w-2"].status = :offline
 
 ctx = TH.open_window(state)
 
@@ -28,7 +28,7 @@ try
                 const cards = document.querySelectorAll('.bt-card');
                 for (const c of cards) {
                     const name = c.querySelector('.bt-card-name');
-                    if (!name || name.innerText !== 'w-1') continue;
+                    if (!name || (name.value || name.innerText) !== 'w-1') continue;
                     const buttons = c.querySelectorAll('button');
                     return buttons.length >= 2;  // + Project + Discover
                 }
@@ -42,7 +42,7 @@ try
                 const cards = document.querySelectorAll('.bt-card');
                 for (const c of cards) {
                     const name = c.querySelector('.bt-card-name');
-                    if (!name || name.innerText !== 'w-2') continue;
+                    if (!name || (name.value || name.innerText) !== 'w-2') continue;
                     return c.innerText.indexOf('offline') !== -1;
                 }
                 return false;
@@ -125,7 +125,7 @@ try
             const cards = document.querySelectorAll('.bt-card');
             for (const c of cards) {
                 const name = c.querySelector('.bt-card-name');
-                if (!name || name.innerText !== 'w-1') continue;
+                if (!name || (name.value || name.innerText) !== 'w-1') continue;
                 const btn = Array.from(c.querySelectorAll('button')).find(b => b.innerText.indexOf('Discover') !== -1);
                 if (btn) btn.click();
                 break;

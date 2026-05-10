@@ -34,7 +34,7 @@ try
     sleep(0.3)  # let HTTPServer start accepting
 
     record("server has zero workers initially",
-           @TH.test_eq length(server_state.workers) 0)
+           @TH.test_eq length(server_state.workers[]) 0)
 
     TH.section("Connect + hello → worker registers as online") do
         # Dial the control WS, send a well-formed hello frame, read the ack,
@@ -87,14 +87,14 @@ try
         # be scheduled.
         let deadline = time() + 10
             while time() < deadline
-                haskey(server_state.workers, "fake-worker-1") && break
+                haskey(server_state.workers[], "fake-worker-1") && break
                 sleep(0.1)
             end
         end
         record("worker present in state.workers",
-               @TH.test_true haskey(server_state.workers, "fake-worker-1"))
-        if haskey(server_state.workers, "fake-worker-1")
-            w = server_state.workers["fake-worker-1"]
+               @TH.test_true haskey(server_state.workers[], "fake-worker-1"))
+        if haskey(server_state.workers[], "fake-worker-1")
+            w = server_state.workers[]["fake-worker-1"]
             record("worker.status == :online",
                    @TH.test_eq w.status :online)
             record("worker.hostname round-tripped",
@@ -136,7 +136,7 @@ try
                    @TH.test_true (result !== nothing && result[1] !== :ack))
         end
         record("rogue-worker NOT in state",
-               @TH.test_true !haskey(server_state.workers, "rogue-worker"))
+               @TH.test_true !haskey(server_state.workers[], "rogue-worker"))
     end
 
 finally

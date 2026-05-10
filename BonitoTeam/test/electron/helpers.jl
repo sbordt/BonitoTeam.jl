@@ -34,9 +34,10 @@ function make_state(; n_projects::Int = 0, n_workers::Int = 0)
     for i in 1:n_workers
         name = "w-$i"
         w = BonitoTeam.WorkerInfo(
-            name,
-            "ws://localhost:$(8100+i)",
-            "test-secret",
+            name,                             # worker_id (stable UUID — uses name in tests)
+            name,                             # display name
+            "ws://localhost:$(8100+i)",       # url
+            "test-secret",                    # secret
             nothing,                          # ssh_target
             "host-$i",                        # hostname
             "/home/agent",                    # home
@@ -44,8 +45,9 @@ function make_state(; n_projects::Int = 0, n_workers::Int = 0)
             "/tmp/worker-$i-projects",        # projects_root
             :offline,                         # status
             now(UTC))                         # last_check
-        state.workers[name] = w
+        state.workers[][name] = w
     end
+    n_workers > 0 && notify(state.workers)
 
     for i in 1:n_projects
         id = "p-$i"
@@ -55,39 +57,38 @@ function make_state(; n_projects::Int = 0, n_workers::Int = 0)
             mktempdir(),         # server_path (real dir, so chat persistence works)
             "/tmp/worker-side-$i",
             now())
-        state.projects[id] = proj
+        state.projects[][id] = proj
     end
+    n_projects > 0 && notify(state.projects)
 
     return state
 end
 
-# ── Mock ACP client ───────────────────────────────────────────────────────────
+# ── Mock ACP transport ────────────────────────────────────────────────────────
 
 """
-    mock_factory(; scripted::Vector = [])
+    mock_transport(; scripted = [], prompt_error = nothing) -> BonitoTeam.MockTransport
 
-Return a client_factory closure suitable for `ChatModel(...; client_factory=...)`.
-
-The mock ACP client is backed by a loopback Connection: outgoing JSON-RPC
-lines route through an in-memory channel and a tiny dispatcher that auto-
-responds to `initialize`, `session/new`, `session/prompt`, and `session/cancel`.
+Build a `BonitoTeam.MockTransport` for `ChatModel(...; transport=...)`.
+The transport carries an `on_setup(out, in)` closure that spawns the
+loopback responder against its (outgoing, incoming) channel pair —
+auto-responding to `initialize`, `session/new`, `session/prompt`, and
+`session/cancel`.
 
 `scripted` is a vector of `(delay_seconds, update_dict)` tuples. After a
-`session/prompt` request lands, the mock spawns a task that emits each
-update in order via the connection's `update_handler`, then completes the
-prompt request. Use this to simulate streaming agent / thought / tool
-events without a real claude subprocess.
-"""
-function mock_factory(; scripted::Vector = Tuple{Float64,Dict}[],
-                        prompt_error::Union{AbstractString,Nothing} = nothing)
-    return function(on_update::Function)
-        outgoing = Channel{String}(64)
-        incoming = Channel{String}(64)
+`session/prompt` request lands, the responder emits each update in order
+through the transport's incoming channel (which the ACP reader_loop
+hands to `update_handler`), then completes the prompt request. Use this
+to simulate streaming agent / thought / tool events without a real
+claude subprocess.
 
-        # Process outgoing JSON-RPC lines from the BonitoTeam side. Auto-
-        # respond to the bring-up trio (initialize / session/new) plus the
-        # interactive ones (session/prompt streams scripted updates;
-        # session/cancel is a fire-and-forget notification).
+`prompt_error` (if set) makes the responder reply to `session/prompt`
+with a JSON-RPC error instead — exercises send_prompt_async!'s
+banner-vs-inline-bubble error split.
+"""
+function mock_transport(; scripted::Vector = Tuple{Float64,Dict}[],
+                          prompt_error::Union{AbstractString,Nothing} = nothing)
+    on_setup = function(outgoing::Channel{String}, incoming::Channel{String})
         Base.errormonitor(@async try
             for line in outgoing
                 msg = JSON.parse(line)
@@ -101,11 +102,6 @@ function mock_factory(; scripted::Vector = Tuple{Float64,Dict}[],
                     put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
                                                    "result"=>Dict("sessionId"=>"mock-sess-1"))))
                 elseif method == "session/prompt" && id !== nothing
-                    # Stream scripted updates, then complete the request —
-                    # unless `prompt_error` is set, in which case we
-                    # respond with a JSON-RPC error so the client side's
-                    # send_request raises (lets us cover send_prompt_async!'s
-                    # banner-vs-inline-bubble error split).
                     @async try
                         for (delay, upd) in scripted
                             delay > 0 && sleep(delay)
@@ -126,7 +122,6 @@ function mock_factory(; scripted::Vector = Tuple{Float64,Dict}[],
                         @warn "mock prompt streamer failed" exception=e
                     end
                 elseif id !== nothing
-                    # Any other request: empty success response.
                     put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
                                                    "result"=>nothing)))
                 end
@@ -135,19 +130,9 @@ function mock_factory(; scripted::Vector = Tuple{Float64,Dict}[],
         catch e
             e isa InvalidStateException || @warn "mock responder failed" exception=e
         end)
-
-        send_line = line -> put!(outgoing, line)
-        read_line = ()   -> take!(incoming)
-        on_close  = ()   -> (close(outgoing); close(incoming))
-
-        conn = ACP.Connection(send_line, read_line, on_close;
-                               update_handler = on_update)
-
-        ACP.send_request(conn, "initialize", Dict("protocolVersion" => 1))
-        result = ACP.send_request(conn, "session/new",
-                                   Dict("cwd" => "/tmp", "mcpServers" => []))
-        return ACP.Client(conn, result["sessionId"], "/tmp")
+        return nothing
     end
+    return BonitoTeam.MockTransport(on_setup)
 end
 
 # Helper: build the four update payloads we care about. Shape mirrors what

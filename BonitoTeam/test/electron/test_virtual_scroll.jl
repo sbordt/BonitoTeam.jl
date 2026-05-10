@@ -8,10 +8,10 @@ const N_HISTORY = 200    # 100 user + 100 agent pairs
 
 state = TH.make_state(; n_workers = 1, n_projects = 1)
 
-let proj = state.projects["p-1"]
+let proj = state.projects[]["p-1"]
     model = BonitoTeam.ChatModel(state, proj.server_path;
                                   project_id     = proj.id,
-                                  client_factory = TH.mock_factory())
+                                  transport = TH.mock_transport())
     BonitoTeam.start_chat_client!(model)
     TH.seed_chat_history!(model, N_HISTORY ÷ 2)
     @assert length(model.msgs_store) == N_HISTORY

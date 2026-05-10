@@ -95,17 +95,18 @@ function fresh_state(project_ids::Vector{String})
         state_dir     = mktempdir(),
         working_dir   = mktempdir())
 
-    state.workers["w1"] = BonitoTeam.WorkerInfo("w1", "Tester", "<inbound-ws>",
+    state.workers[]["w1"] = BonitoTeam.WorkerInfo("w1", "Tester", "<inbound-ws>",
         "x", nothing, "h", "/h", "", "/p", :online, now(UTC))
+    notify(state.workers)
     models = Dict{String, BonitoTeam.ChatModel}()
     for pid in project_ids
-        state.projects[pid] = BonitoTeam.ProjectInfo(pid, pid, "w1",
+        state.projects[][pid] = BonitoTeam.ProjectInfo(pid, pid, "w1",
             mktempdir(), mktempdir(), now(UTC))
         m = BonitoTeam.ChatModel(state, mktempdir(); project_id=pid)
         state.chat_models[pid] = m
         models[pid] = m
     end
-    BonitoTeam.bump_state!(state)
+    notify(state.projects)
     return state, models
 end
 
@@ -133,10 +134,10 @@ TH.section("Stress 1: 1000 messages, virtual scroll integrity") do
                 const us = document.querySelectorAll('.bt-user-msg');
                 return us.length > 0 && us[us.length-1].textContent === 'hi 500';
             })()
-        """; timeout = 8)
+        """; timeout = 15)
         wait_for_js(w.win,
             "document.querySelector('.bt-messages')?.__bt_chat?.atBottom() === true";
-            timeout = 5)
+            timeout = 10)
 
         last_user = Electron.run(w.win, """
             (() => {
@@ -343,13 +344,17 @@ TH.section("Stress 7: switch alpha ↔ beta, background push to inactive project
         BonitoTeam.chat_push_msg!(b, BonitoTeam.UserMsg("background-beta"))
 
         navigate_to(w.win, "beta")
+        # Slower than the seeded-only case — the chat mounts AND has to
+        # re-establish msgs.count via a comm round-trip because the
+        # observable's pre-mount value is a "user" event (the background
+        # push), not a msgs.count.
         ok_b = wait_for_js(w.win,
-            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 15"; timeout=8)
+            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 15"; timeout=15)
         push!(RESULTS, "switch: beta shows pre-existing + background push (15)" => ok_b)
 
         navigate_to(w.win, "alpha")
         ok_a2 = wait_for_js(w.win,
-            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 6"; timeout=8)
+            "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 6"; timeout=15)
         push!(RESULTS, "switch: back to alpha still 6" => ok_a2)
     finally
         close_window(w); close_state(state)

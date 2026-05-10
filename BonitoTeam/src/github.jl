@@ -96,13 +96,13 @@ function create_project_from_github!(state::ServerState, url::AbstractString;
                                        worker_name::AbstractString,
                                        name::Union{String,Nothing} = nothing,
                                        progress = nothing)
-    haskey(state.workers, worker_name) || error("Unknown worker: $worker_name")
+    haskey(state.workers[], worker_name) || error("Unknown worker: $worker_name")
     ref = parse_github_url(url)
     proj_name = something(name, github_project_name(ref))
     occursin(r"^[a-zA-Z0-9_\-]+$", proj_name) ||
         error("Derived project name '$proj_name' is invalid; pass `name=` explicitly")
 
-    w = state.workers[worker_name]
+    w = state.workers[][worker_name]
     server_path = joinpath(state.working_dir, proj_name)
     worker_path = joinpath(w.projects_root, proj_name)
 
@@ -120,7 +120,6 @@ function create_project_from_github!(state::ServerState, url::AbstractString;
             save_projects!(state)
         end
         ensure_project_session!(state, existing)
-        bump_state!(state)
         return existing
     end
 
@@ -142,12 +141,12 @@ function create_project_from_github!(state::ServerState, url::AbstractString;
     p = ProjectInfo(id, proj_name, worker_name, server_path, worker_path, now(UTC))
     p.auto_prompt = auto_prompt
     lock(state.lock) do
-        state.projects[id] = p
+        state.projects[][id] = p
         save_projects!(state)
     end
+    safe_notify!(state.projects)
 
     progress === nothing || progress("Starting chat session…")
     ensure_project_session!(state, p)
-    bump_state!(state)
     return p
 end

@@ -12,30 +12,38 @@ is already locked by a different worker. `worker_id` is the worker's stable
 UUID, NOT its display name.
 """
 function acquire_lock!(state::ServerState, p::ProjectInfo, worker_id::String)
-    if p.locked_by !== nothing && p.locked_by != worker_id
-        error("Project '$(p.name)' is locked by worker '$(p.locked_by)'")
+    lock(state.lock) do
+        if p.locked_by !== nothing && p.locked_by != worker_id
+            error("Project '$(p.name)' is locked by worker '$(p.locked_by)'")
+        end
+        p.locked_by = worker_id
+        p.locked_at = now(UTC)
+        save_projects!(state)
     end
-    p.locked_by = worker_id
-    p.locked_at = now(UTC)
-    save_projects!(state)
     bump_state!(state)
     return p
 end
 
 function release_lock!(state::ServerState, p::ProjectInfo)
-    p.locked_by = nothing
-    p.locked_at = nothing
-    save_projects!(state)
+    lock(state.lock) do
+        p.locked_by = nothing
+        p.locked_at = nothing
+        save_projects!(state)
+    end
     bump_state!(state)
     return p
 end
 
 # Auto-release every project lock held by `worker_id` (called from
-# handle_worker_control's finally branch when the WS drops).
+# handle_worker_control's finally branch when the WS drops). Snapshot the
+# matching projects under the lock so we don't iterate `state.projects`
+# while a concurrent writer is mutating it; `release_lock!` re-takes the
+# lock per project (reentrant, harmless).
 function release_locks_for_worker!(state::ServerState, worker_id::String)
-    for p in values(state.projects)
-        p.locked_by == worker_id && release_lock!(state, p)
+    targets = lock(state.lock) do
+        [p for p in values(state.projects) if p.locked_by == worker_id]
     end
+    foreach(p -> release_lock!(state, p), targets)
 end
 
 """
@@ -87,8 +95,10 @@ function create_project!(state::ServerState, name::String, src_path::String,
     sync_dir_to_worker!(state, worker_name, server_path, worker_path; on_progress = progress)
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
-    state.projects[id] = p
-    save_projects!(state)
+    lock(state.lock) do
+        state.projects[id] = p
+        save_projects!(state)
+    end
 
     # 3 + 4: build the chat app + register the route.
     progress === nothing || progress("Starting chat session…")
@@ -148,7 +158,9 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     p.resume_session_id = resume_session_id
-    state.projects[id] = p
+    lock(state.lock) do
+        state.projects[id] = p
+    end
 
     if sync
         @info "Pulling project from worker" worker=worker_name worker_path server_path
@@ -165,7 +177,9 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
         @info "Registering project from worker (no sync)" worker=worker_name worker_path
     end
 
-    save_projects!(state)
+    lock(state.lock) do
+        save_projects!(state)
+    end
 
     progress === nothing || progress("Starting chat session…")
     ensure_project_session!(state, p)
@@ -873,11 +887,11 @@ function folder_picker_render(p::FolderPicker)
             sort!(filter(n -> isdir(joinpath(path, n)) && !startswith(n, "."),
                          readdir(path)))
         catch e
-            return DOM.div("error: $e", class = "bt-picker", style = "color:#b91c1c")
+            return DOM.div("error: $e"; class = "bt-picker", style = Styles("color" => "#b91c1c"))
         end
         rows = isempty(entries) ?
             [DOM.div("(no subfolders)";
-                class = "bt-picker-row", style = "color:var(--bt-text-faint)")] :
+                class = "bt-picker-row", style = Styles("color" => "var(--bt-text-faint)"))] :
             [DOM.div("📁 $name";
                 class   = "bt-picker-row",
                 onclick = js"event => $(p.cur).notify($(joinpath(path, name)));")
@@ -986,11 +1000,11 @@ function remote_folder_picker_render(p::RemoteFolderPicker)
         end
         if !isempty(err)
             return DOM.div("error: $err";
-                           class = "bt-picker", style = "color:#b91c1c")
+                           class = "bt-picker", style = Styles("color" => "#b91c1c"))
         end
         rows = isempty(entries) ?
             [DOM.div("(no subfolders)";
-                class = "bt-picker-row", style = "color:var(--bt-text-faint)")] :
+                class = "bt-picker-row", style = Styles("color" => "var(--bt-text-faint)"))] :
             [DOM.div("📁 $(e.name)";
                 class   = "bt-picker-row",
                 onclick = js"event => $(p.cur).notify($(joinpath(cur, e.name)));")
@@ -1112,21 +1126,21 @@ function backup_pill(p::ProjectInfo)
         DOM.span(DOM.div(class = "bt-spinner bt-spinner-sm"),
                  DOM.span("Backing up…");
                  class = "bt-pill bt-pill-syncing bt-spinner-row",
-                 style = "margin-left:6px",
+                 style = Styles("margin-left" => "6px"),
                  title = "Project is syncing to server")
     elseif p.backup_status === :synced
         last = p.last_sync_at === nothing ? "" :
                " (last: $(Dates.format(p.last_sync_at, "yyyy-mm-dd HH:MM")) UTC)"
         DOM.span("backed up"; class = "bt-pill bt-pill-online",
-                 style = "margin-left:6px",
+                 style = Styles("margin-left" => "6px"),
                  title = "Server has a copy of this project's files$(last)")
     elseif p.backup_status === :stale
         DOM.span("stale backup"; class = "bt-pill bt-pill-warn",
-                 style = "margin-left:6px",
+                 style = Styles("margin-left" => "6px"),
                  title = "Server copy may be out of date — re-sync to refresh")
     else
         DOM.span("not backed up"; class = "bt-pill bt-pill-muted",
-                 style = "margin-left:6px",
+                 style = Styles("margin-left" => "6px"),
                  title = "Server has no copy — chat works directly against the worker")
     end
 end
@@ -1144,16 +1158,16 @@ function project_card(state::ServerState, p::ProjectInfo,
     badge = p.locked_by === nothing ? DOM.span() :
         DOM.span("active";
                  class = "bt-pill bt-pill-active",
-                 style = "margin-left:6px",
+                 style = Styles("margin-left" => "6px"),
                  title = "active session on $(p.locked_by)")
 
     open_link = if current_view === nothing
         DOM.span("(no chat available)";
-            class = "bt-link", style = "color:var(--bt-text-muted)")
+            class = "bt-link", style = Styles("color" => "var(--bt-text-muted)"))
     else
         DOM.span("Open chat →";
             class   = "bt-link",
-            style   = "cursor:pointer",
+            style   = Styles("cursor" => "pointer"),
             onclick = js"event => $(current_view).notify($(p.id))")
     end
 
@@ -1163,7 +1177,7 @@ function project_card(state::ServerState, p::ProjectInfo,
         label = p.backup_status === :synced ? "Re-sync" : "Sync to server"
         DOM.span(label;
             class   = "bt-btn bt-btn-secondary bt-btn-sm",
-            style   = "cursor:pointer;margin-right:8px",
+            style   = Styles("cursor" => "pointer", "margin-right" => "8px"),
             # Instant feedback before the WS round-trip lands.
             onclick = js"""event => {
                 const btn = event.currentTarget;
@@ -1446,7 +1460,7 @@ function dashboard_dom(state::ServerState;
                 isempty(meta) ? DOM.span() : DOM.div(meta; class = "bt-session-meta")),
             DOM.div(btn_label;
                 class   = "bt-btn bt-btn-secondary",
-                style   = "cursor:pointer;flex-shrink:0",
+                style   = Styles("cursor" => "pointer", "flex-shrink" => "0"),
                 # Instant visual feedback: flip the button to a loading
                 # state synchronously on click, before the WS round-trip
                 # that sets busy_msg server-side has a chance to land.
@@ -1551,7 +1565,9 @@ function dashboard_dom(state::ServerState;
             map(np_picker.selected) do sel
                 isempty(sel) ? DOM.div() :
                     DOM.div("✓ selected: $sel",
-                            style = "color:#065f46;font-size:12px;margin-top:4px")
+                            style = Styles("color" => "#065f46",
+                                           "font-size" => "12px",
+                                           "margin-top" => "4px"))
             end),
         DOM.label("Worker"),
         DOM.select(
@@ -1571,7 +1587,9 @@ function dashboard_dom(state::ServerState;
         text_input(gh_url,
             "https://github.com/<owner>/<repo>  ·  /issues/<n>  ·  /pull/<n>"),
         DOM.div("Repo → just clone. Issue/PR → clone + auto-prompt 'fix this'.";
-                style = "font-size:11px;color:var(--bt-text-muted);margin-top:-4px"),
+                style = Styles("font-size" => "11px",
+                               "color" => "var(--bt-text-muted)",
+                               "margin-top" => "-4px")),
         DOM.label("Worker"),
         DOM.select(
             (DOM.option(w.name; value=w.worker_id) for w in values(state.workers))...;
@@ -1606,7 +1624,9 @@ function dashboard_dom(state::ServerState;
                     map(rp.selected) do sel
                         isempty(sel) ? DOM.div() :
                             DOM.div("✓ selected: $sel",
-                                    style = "color:#065f46;font-size:12px;margin-top:4px")
+                                    style = Styles("color" => "#065f46",
+                                           "font-size" => "12px",
+                                           "margin-top" => "4px"))
                     end),
             map(busy_msg) do msg
                 isempty(msg) ?
@@ -1649,9 +1669,12 @@ function dashboard_dom(state::ServerState;
             install_cmd = "curl -fsSL $install_url | sh"
             return DOM.div(
                 DOM.div("No workers connected yet.";
-                        style = "color:var(--bt-text-muted);font-size:13px"),
+                        style = Styles("color" => "var(--bt-text-muted)",
+                                       "font-size" => "13px")),
                 DOM.div("Run on each agent machine:";
-                        style = "color:var(--bt-text-faint);font-size:12px;margin-top:8px"),
+                        style = Styles("color" => "var(--bt-text-faint)",
+                                       "font-size" => "12px",
+                                       "margin-top" => "8px")),
                 DOM.div(
                     DOM.span(install_cmd),
                     DOM.span("Copy";
@@ -1744,10 +1767,15 @@ end
 # directly into its main panel.
 function dashboard_app(state::ServerState)
     App() do session
+        # Per-session view (see ServerState's Base.copy). `dashboard_dom`
+        # subscribes to `view.version`, so the per-session connected child
+        # Observable is what drives re-renders for this tab — and tears
+        # down via `session.deregister_callbacks` on close.
+        view = copy(state, session)
         DOM.div(
             DashboardStyles,
             Bonito.ConnectionIndicator(),
-            dashboard_dom(state))
+            dashboard_dom(view))
     end
 end
 

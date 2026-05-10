@@ -78,7 +78,8 @@ function project_sidebar(state::ServerState, current_view::Observable{String})
     # with the colored project tiles below it.
     home_icon = DOM.div(
         DOM.img(src = HOME_ICON, alt = "Home", draggable = "false",
-                style = "width:18px;height:18px;display:block;pointer-events:none");
+                style = Styles("width" => "18px", "height" => "18px",
+                               "display" => "block", "pointer-events" => "none"));
         class = "bt-side-home-icon",
         title = "Dashboard")
 
@@ -203,20 +204,21 @@ const UnifiedShellStyles = Bonito.Styles(
 
 # Render the main panel given the current view + the bonito session. Pulled
 # out so unified_app's body stays small.
-function unified_main(state::ServerState, current_view::Observable{String},
-                       session)
+function unified_main(state::ServerState, current_view::Observable{String})
     map(current_view) do pid
         if isempty(pid)
             dashboard_dom(state; current_view = current_view)
         elseif haskey(state.chat_models, pid)
-            chat_dom(state.chat_models[pid], session)
+            # `ChatModel` is a Bonito component (jsrender(::Session, ::ChatModel))
+            # — Bonito picks it up and renders the chat DOM on its own.
+            state.chat_models[pid]
         elseif haskey(state.projects, pid)
             DOM.div("Starting chat for $(state.projects[pid].name)…";
                     class = "bt-empty",
-                    style = "padding:40px")
+                    style = Styles("padding" => "40px"))
         else
             DOM.div("Unknown project: $pid"; class = "bt-empty",
-                    style = "padding:40px")
+                    style = Styles("padding" => "40px"))
         end
     end
 end
@@ -228,16 +230,21 @@ Single-page app: sidebar on the left, dashboard or chat in the main area
 depending on `current_view`. Replaces the old per-project `/p/<id>` routes.
 """
 function unified_app(state::ServerState)
-    current_view = Observable("")
     App() do session
-        sidebar = project_sidebar(state, current_view)
-        main_panel = unified_main(state, current_view, session)
+        # Per-session view of the shared state. `copy(state, session)` shares
+        # the workers/projects/chat_models tables and the lock, but gives this
+        # session its OWN connected child of `state.version` (via
+        # `map(identity, session, ...)` — auto-deregisters on tab close).
+        # `current_view` is per-session (transient navigation state).
+        view = copy(state, session)
+        current_view = Observable("")
+        sidebar = project_sidebar(view, current_view)
+        main_panel = unified_main(view, current_view)
         DOM.div(
             UnifiedShellStyles,
             DashboardStyles,
             ChatStyles,
             SidebarStyles,
-            BonitoTeamJS,
             Bonito.MarkdownCSS,
             Bonito.ConnectionIndicator(),
             sidebar,

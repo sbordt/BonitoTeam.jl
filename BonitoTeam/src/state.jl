@@ -93,6 +93,16 @@ handlers. Five things deserve a paragraph each:
   frame; same secret across all workers, baked into the install script.
 """
 mutable struct ServerState
+    # Convention: every shared-state struct's first field is its lock.
+    # Bonito App bodies run on different threads per browser tab and the
+    # WS handler / RPC pumps can mutate the dicts at any time, so all
+    # multi-field reads/writes go through `lock(state.lock) do … end`.
+    # Per-session views are produced by `Base.copy(state, session)` (below)
+    # which SHARES this lock with the parent — sessions cooperate, they
+    # don't each get their own mutex. See .claude/skills/bonito/SKILL.md
+    # § "Thread-safe shared state".
+    lock :: ReentrantLock
+
     # Disk paths (immutable after construction)
     state_dir   :: String
     working_dir :: String
@@ -118,7 +128,10 @@ mutable struct ServerState
     # because the answer shape varies (WS for handoff, Dict for rpc result).
     pending_rpcs :: Dict{String,Channel{Any}}
 
-    # Reactive re-render trigger
+    # Reactive re-render trigger. SHARED parent — App bodies must not
+    # `map(state.version)` directly: take `view = copy(state)` and
+    # `map(view.version)` so each session subscribes to its own connected
+    # child Observable (auto-GC'd on session close).
     version :: Observable{Int}
 end
 
@@ -133,6 +146,7 @@ function ServerState(; state_dir::String,
                        worker_secret::String)
     mkpath(working_dir)
     s = ServerState(
+        ReentrantLock(),
         state_dir, working_dir, worker_secret,
         nothing,
         Dict{String,WorkerInfo}(),    # workers
@@ -147,6 +161,31 @@ function ServerState(; state_dir::String,
     return s
 end
 
+# Per-session view of `state`. SHARES the lock, dicts, and the live `srv`
+# field with the parent — sessions cooperate on the same workers/projects/
+# chat_models tables and the same lock. Each Observable field is bridged
+# via `map(identity, session, obs)`: that produces a connected child
+# AND registers the parent→child callback on `session.deregister_callbacks`,
+# so when the tab closes the bridge tears down automatically. (Plain
+# `copy(obs)` would leak the callback on the parent forever.)
+#
+# Use `view = copy(state, session)` at the top of every `App() do session ... end` body.
+function Base.copy(s::ServerState, session::Bonito.Session)
+    lock(s.lock) do
+        ServerState(
+            s.lock,
+            s.state_dir, s.working_dir, s.worker_secret,
+            s.srv,
+            s.workers,
+            s.projects,
+            s.chat_models,
+            s.worker_control_ws,
+            s.pending_rpcs,
+            map(identity, session, s.version),
+        )
+    end
+end
+
 workers_file(s::ServerState)  = joinpath(s.state_dir, "workers.json")
 projects_file(s::ServerState) = joinpath(s.state_dir, "projects.json")
 
@@ -155,8 +194,14 @@ projects_file(s::ServerState) = joinpath(s.state_dir, "projects.json")
 # after a redeploy), Bonito surfaces that as a JSException from the
 # observable update. We don't want a stale UI tab to break server-side
 # operations, so this swallows + logs the error rather than propagating it.
+#
+# Hold `state.lock` for the read-modify-write so concurrent bumps don't
+# observe stale `version[]` and clobber each other; child sessions see a
+# strictly monotonically-increasing version.
 function bump_state!(s::ServerState)
-    safe_set!(s.version, s.version[] + 1)
+    lock(s.lock) do
+        safe_set!(s.version, s.version[] + 1)
+    end
     return nothing
 end
 

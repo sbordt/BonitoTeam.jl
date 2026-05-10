@@ -1,4 +1,8 @@
-const BonitoTeamJS = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "bonitoteam.js"))
+# bonitoteam.js is now an ES6 module — see `ChatLib` further down. It's
+# loaded lazily by the `Bonito.ES6Module(...).then(...)` interpolation
+# inside ChatModel's jsrender, NOT injected as a classic <script> tag.
+# Loading it as a classic script would syntax-error on the `export`
+# statements.
 
 # Message types
 abstract type ChatMsg end
@@ -413,8 +417,9 @@ function render_show_reference(state::ServerState, text::AbstractString,
             DOM.div(
                 DOM.span(""; class = "bt-spinner"),
                 DOM.span("Fetching $relpath_str from worker… ($size_str)";
-                         style = "margin-left:8px"),
-                style = "display:flex; align-items:center; padding:8px; color:var(--bt-text-muted)")
+                         style = Styles("margin-left" => "8px")),
+                style = Styles("display" => "flex", "align-items" => "center",
+                               "padding" => "8px", "color" => "var(--bt-text-muted)"))
         elseif s isa Tuple && s[1] === :ready
             render_show_preview(s[2], mime, size_str, relpath_str)
         elseif s isa Tuple && s[1] === :error
@@ -448,18 +453,23 @@ function render_show_preview(bytes::AbstractVector{UInt8}, mime::AbstractString,
         b64 = Base64.base64encode(bytes)
         return DOM.div(
             DOM.img(src = "data:$mime;base64,$b64",
-                    style = "max-width:100%; display:block"),
+                    style = Styles("max-width" => "100%", "display" => "block")),
             DOM.div("$relpath_str · $size_str";
-                    style = "font-size:11px;color:var(--bt-text-faint);margin-top:4px"))
+                    style = Styles("font-size" => "11px",
+                                   "color" => "var(--bt-text-faint)",
+                                   "margin-top" => "4px")))
     elseif startswith(mime, "video/")
         b64 = Base64.base64encode(bytes)
         return DOM.div(
             # Bonito enforces strict booleans for HTML boolean attrs —
             # `controls = ""` (or any string) raises at render time.
-            DOM.video(controls = true, style = "max-width:100%; display:block",
+            DOM.video(controls = true,
+                       style = Styles("max-width" => "100%", "display" => "block"),
                        DOM.source(src = "data:$mime;base64,$b64", type = mime)),
             DOM.div("$relpath_str · $size_str";
-                    style = "font-size:11px;color:var(--bt-text-faint);margin-top:4px"))
+                    style = Styles("font-size" => "11px",
+                                   "color" => "var(--bt-text-faint)",
+                                   "margin-top" => "4px")))
     # NOTE: text/html is intentionally NOT special-cased. Rendering arbitrary
     # HTML inline would clobber chat styles + JS; iframes have their own
     # downsides (Chromium opaque-origin churn for sandboxed data: URLs;
@@ -530,7 +540,7 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString;
             push!(parts, render_diff_block(c))
         elseif c isa ImageContent
             push!(parts, DOM.img(src = "data:$(c.mime_type);base64,$(c.data)",
-                                  style = "max-width:100%"))
+                                  style = Styles("max-width" => "100%")))
         end
     end
     isempty(parts) && return DOM.div("(empty)", class = "bt-tool-empty")
@@ -539,9 +549,18 @@ end
 
 # Chat app
 # ── ChatModel ──────────────────────────────────────────────────────────────
-# Single bag holding everything one chat session needs. Every helper below
-# takes `model::ChatModel` so functions can be small and focused.
+# Shared per project, lifetime = project's lifetime. One instance lives in
+# `state.chat_models[project_id]`; every browser tab viewing the project gets
+# a per-session view via `Base.copy(::ChatModel)` (below). The shared bits —
+# message store, ACP client, persistent chat session — are mutated under
+# `lock` and broadcast via `comm`; the per-session copies share those refs
+# but each get their own connected child of `comm` (and the small status
+# Observables) so their JS bridges are GC'd cleanly when the tab closes.
 mutable struct ChatModel
+    # Convention: lock as the first field. Held by every mutator that touches
+    # `msgs_store` together with `comm` or other multi-step state. See
+    # .claude/skills/bonito/SKILL.md § "Thread-safe shared state".
+    lock          :: ReentrantLock
     state         :: ServerState
     cwd           :: String
     project_id    :: String
@@ -560,21 +579,16 @@ mutable struct ChatModel
     thought_id     :: Ref{String}
     user_streaming :: Ref{Bool}
 
-    # Server↔browser observables
-    total_count            :: Observable{Int}
-    new_msg_obs            :: Observable{String}      # JSON: typed event
-    range_response         :: Observable{String}      # JSON: {start, messages}
-    request_range          :: Observable{Vector{Any}} # [start, end] from JS
-    request_tool_render    :: Observable{String}
-    request_thought_render :: Observable{String}
-    session_alive          :: Observable{Bool}
-    last_error             :: Observable{String}
+    # Single bidirectional channel between Julia and the browser-side BonitoChat.
+    # Wire format is a tagged dict; see chat_emit / chat_dispatch! below for
+    # the message types. Bonito's `update_nocycle!` prevents JS-originated
+    # notifications from echoing back to JS, so one Observable serves both
+    # directions cleanly.
+    comm          :: Observable{Dict{String,Any}}
 
-    # Latest Bonito session that has the chat mounted. Updated on each
-    # chat_dom call so the once-installed lazy-render handlers can target the
-    # currently-mounted DOM. Wrapped in a Ref so the on(...) closures don't
-    # capture a stale binding.
-    bonito_session :: Ref{Any}
+    # Status surface for the chat header (banner + reconnect state).
+    session_alive :: Observable{Bool}
+    last_error    :: Observable{String}
 end
 
 function ChatModel(state::ServerState, cwd::AbstractString;
@@ -583,32 +597,61 @@ function ChatModel(state::ServerState, cwd::AbstractString;
                     client_factory = nothing)
     chat_session = load_session(cwd)
     msgs_store   = load_history(chat_session)
-    return ChatModel(state, String(cwd), String(project_id),
+    return ChatModel(
+        ReentrantLock(),
+        state, String(cwd), String(project_id),
         chat_session, msgs_store,
         Ref{Union{AgentClientProtocol.Client,Nothing}}(nothing),
         collect(AgentClientProtocol.MCPServer, mcp_servers),
         client_factory,
         Ref(""), Ref(""), Ref(false),
-        Observable(length(msgs_store)),
-        Observable(""),
-        Observable(""),
-        Observable(Any[]),
-        Observable(""),
-        Observable(""),
+        Observable(Dict{String,Any}()),
         Observable(true),
         Observable(""),
-        Ref{Any}(nothing))
+    )
+end
+
+# Per-session view. SHARES the lock, ACP client, msgs_store, chat_session,
+# Refs etc. with the parent — sessions cooperate on the same chat history
+# and the same lock. The Observable fields are bridged via
+# `map(identity, session, obs)` so each session ends up with its own
+# connected child Observable AND the parent→child callback is registered
+# on `session.deregister_callbacks` (auto-GC'd on session close).
+# `copy(obs)` would also produce a child but leak the callback forever.
+function Base.copy(m::ChatModel, session::Bonito.Session)
+    lock(m.lock) do
+        ChatModel(
+            m.lock,
+            m.state, m.cwd, m.project_id,
+            m.chat_session, m.msgs_store,
+            m.client, m.mcp_servers, m.client_factory,
+            m.agent_id, m.thought_id, m.user_streaming,
+            map(identity, session, m.comm),
+            map(identity, session, m.session_alive),
+            map(identity, session, m.last_error),
+        )
+    end
 end
 
 # ── Small helpers shared by every handler ─────────────────────────────────
+# `chat_emit` writes to `comm`. Since Bonito propagates Julia-side writes to
+# every JS subscriber on every per-session child of `m.comm`, all open tabs
+# of this chat see the event. JS sends back via the same channel
+# (`comm.notify({type, ...})`) — Julia's listener dispatches by `type`.
 chat_emit(model::ChatModel, event::AbstractDict) =
-    (model.new_msg_obs[] = JSON.json(event); nothing)
+    (model.comm[] = Dict{String,Any}(event); nothing)
 
 function chat_push_msg!(model::ChatModel, msg::ChatMsg)
-    push!(model.msgs_store, msg)
-    model.total_count[] = length(model.msgs_store)
-    model.new_msg_obs[] = JSON.json(msg_to_dict(msg, model.cwd))
-    return nothing
+    n = lock(model.lock) do
+        push!(model.msgs_store, msg)
+        length(model.msgs_store)
+    end
+    # Emit the typed dict directly (e.g. {type: "user", text, ...}) with the
+    # new total count piggybacked. The JS `dispatch` routes by `type` and
+    # bumps `totalCount` from the `n` field — no separate "msg.new" wrapper.
+    payload = msg_to_dict(msg, model.cwd)
+    payload["n"] = n
+    chat_emit(model, payload)
 end
 
 # Close any in-flight thought/agent stream, persist + emit a "_final" event
@@ -654,10 +697,12 @@ function chat_on_user_chunk!(model::ChatModel, upd::UserMessageChunk)
         chat_finalize_streaming!(model)
         model.user_streaming[] = true
         msg = UserMsg(text)
-        push!(model.msgs_store, msg)
-        append_user(model.chat_session, msg)
-        model.total_count[] = length(model.msgs_store)
-        chat_emit(model, Dict{String,Any}("type" => "user", "text" => text))
+        n = lock(model.lock) do
+            push!(model.msgs_store, msg)
+            append_user(model.chat_session, msg)
+            length(model.msgs_store)
+        end
+        chat_emit(model, Dict{String,Any}("type" => "user", "text" => text, "n" => n))
     else
         idx = findlast(m -> m isa UserMsg, model.msgs_store)
         idx === nothing && return
@@ -674,10 +719,16 @@ function chat_on_agent_chunk!(model::ChatModel, upd::AgentMessageChunk)
         id = string(uuid4())
         model.agent_id[] = id
         msg = AgentMsg(id, text)
-        push!(model.msgs_store, msg)
-        model.total_count[] = length(model.msgs_store)
-        chat_emit(model, Dict{String,Any}("type" => "agent", "id" => id,
-                                            "html" => "", "streaming" => true))
+        n = lock(model.lock) do
+            push!(model.msgs_store, msg)
+            length(model.msgs_store)
+        end
+        # Seed the bubble's streaming accumulator with this first chunk's
+        # text so a viewer that reconnected mid-stream sees content right
+        # away (without waiting for the next chunk to arrive).
+        chat_emit(model, Dict{String,Any}("type" => "agent", "id" => id, "n" => n,
+                                            "html" => "", "streaming" => true,
+                                            "text" => text))
     else
         idx = findfirst(m -> m isa AgentMsg && m.id == model.agent_id[], model.msgs_store)
         idx === nothing && return
@@ -699,10 +750,13 @@ function chat_on_thought_chunk!(model::ChatModel, upd::AgentThoughtChunk)
         id = string(uuid4())
         model.thought_id[] = id
         msg = ThoughtMsg(id, text)
-        push!(model.msgs_store, msg)
-        model.total_count[] = length(model.msgs_store)
-        chat_emit(model, Dict{String,Any}("type" => "thought", "id" => id,
-                                            "html" => "", "streaming" => true))
+        n = lock(model.lock) do
+            push!(model.msgs_store, msg)
+            length(model.msgs_store)
+        end
+        chat_emit(model, Dict{String,Any}("type" => "thought", "id" => id, "n" => n,
+                                            "html" => "", "streaming" => true,
+                                            "text" => text))
     else
         idx = findfirst(m -> m isa ThoughtMsg && m.id == model.thought_id[], model.msgs_store)
         idx === nothing && return
@@ -766,19 +820,20 @@ function start_chat_client!(model::ChatModel)
     end
     update_session_id!(model.chat_session, model.client[].session_id)
 
-    # Range / lazy-render handlers wire once at client-start time so chat_dom
-    # remounts (when the user navigates back to this project's chat in the
-    # unified app) don't stack duplicate handlers. Lazy-render reads the live
-    # session from `model.bonito_session[]`, which chat_dom updates on mount.
-    wire_range_request!(model)
-    wire_lazy_render!(model)
+    # Browser-side handlers (range requests + lazy tool/thought renders) are
+    # wired in `Bonito.jsrender(::Session, ::ChatModel)` — once per mount,
+    # session-scoped via `Observables.on(f, session, obs)` so they tear down
+    # automatically when that tab closes. No more `bonito_session :: Ref`,
+    # no more "wire once + dispatch via the latest session" shenanigans.
 
     # Cache the live model so the unified app's sidebar can swap to this chat
     # instantly on second visit, and test rigs can drive prompts via
     # state.chat_models[pid].client[] without going through the UI.
     if !isempty(model.project_id)
         @info "registering chat model" project_id=model.project_id session_id=model.client[].session_id
-        model.state.chat_models[model.project_id] = model
+        lock(model.state.lock) do
+            model.state.chat_models[model.project_id] = model
+        end
     end
     return nothing
 end
@@ -889,10 +944,10 @@ function chat_session_banner(model::ChatModel)
         alive && return DOM.div()
         DOM.div(
             DOM.div(
-                DOM.span("⚠ Session ended"; style = "font-weight:600"),
+                DOM.span("⚠ Session ended"; style = Styles("font-weight" => "600")),
                 DOM.div(isempty(err) ? "The agent connection was closed." : err;
                         class = "bt-banner-detail");
-                style = "flex:1 1 auto; min-width:0"),
+                style = Styles("flex" => "1 1 auto", "min-width" => "0")),
             restart_btn;
             class = "bt-banner-error")
     end
@@ -904,24 +959,31 @@ end
 const SEND_ICON = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "icons", "send.svg"))
 const STOP_ICON = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "icons", "stop.svg"))
 icon_img(asset, alt) = DOM.img(src = asset, alt = alt, draggable = "false",
-                                style = "pointer-events:none;user-select:none")
+                                style = Styles("pointer-events" => "none",
+                                               "user-select" => "none"))
 
-function chat_input_area(model::ChatModel, bonito_session)
+function chat_input_area(model::ChatModel)
     text_val = Observable("")
     send_btn = Bonito.Button(icon_img(SEND_ICON, "Send"); style=nothing,
                              class="bt-send-btn", title="Send (Enter)")
     stop_btn = Bonito.Button(icon_img(STOP_ICON, "Stop"); style=nothing,
                              class="bt-stop-btn", title="Stop generation")
 
-    text_input = DOM.textarea(""; placeholder="Message…",
-        title="Enter to send  ·  Shift+Enter for newline",
-        class="bt-text-input", rows=1,
-        oninput=js"""event => {
+    # `value = text_val` is a two-way bind: oninput pushes JS → Julia
+    # below, and any Julia-side write to text_val[] propagates back to
+    # the DOM (so clearing text_val[] = "" after send empties the box,
+    # no separate evaljs needed). The JS height-adjust still rides on
+    # the same oninput event since CSS auto-grow on textareas needs JS.
+    text_input = DOM.textarea(value = text_val,
+        placeholder = "Message…",
+        title = "Enter to send  ·  Shift+Enter for newline",
+        class = "bt-text-input", rows = 1,
+        oninput = js"""event => {
             $(text_val).notify(event.target.value);
             event.target.style.height = 'auto';
             event.target.style.height = Math.min(event.target.scrollHeight, 120) + 'px';
         }""",
-        onkeydown=js"""event => {
+        onkeydown = js"""event => {
             if (event.key === 'Enter' && !event.shiftKey) {
                 event.preventDefault();
                 $(send_btn.value).notify(true);
@@ -930,7 +992,7 @@ function chat_input_area(model::ChatModel, bonito_session)
 
     on(send_btn.value) do clicked
         clicked || return
-        send_user_text!(model, bonito_session, text_input, text_val)
+        send_user_text!(model, text_val)
     end
     on(stop_btn.value) do clicked
         clicked || return
@@ -941,11 +1003,14 @@ function chat_input_area(model::ChatModel, bonito_session)
             class = "bt-input-area")
 end
 
-function send_user_text!(model::ChatModel, bonito_session, text_input, text_val)
+function send_user_text!(model::ChatModel, text_val)
     text = strip(text_val[])
     isempty(text) && return
+    # `value=text_val` on the textarea (chat_input_area) is a two-way bind,
+    # so this single assignment empties the input on the JS side too. The
+    # height-reset is folded into the existing `oninput` handler — when
+    # value flips to "", oninput fires once and the auto-grow recomputes.
     text_val[] = ""
-    evaljs(bonito_session, js"$(text_input).value = ''; $(text_input).style.height = 'auto';")
     user_msg = UserMsg(String(text))
     chat_push_msg!(model, user_msg)
     append_user(model.chat_session, user_msg)
@@ -954,24 +1019,46 @@ function send_user_text!(model::ChatModel, bonito_session, text_input, text_val)
     @async send_prompt_async!(model, String(text))
 end
 
-# Lazy tool/thought body rendering. JS notifies *_render Observable with the
-# msg id when the user expands a placeholder; we look the message up, build
-# its body, and ship it back via dom_in_js (tool) or emit (thought).
+# JS counterpart. `connect(node, comm)` is called by the inline init JS in
+# `jsrender(::ChatModel)` below — same pattern as BonitoBook's MonacoEditor.
+const ChatLib = Bonito.ES6Module(joinpath(@__DIR__, "..", "assets", "bonitoteam.js"))
+
+# Single dispatcher for all JS-originated commands. Reads `msg["type"]` and
+# routes to the appropriate Julia handler. Called from `jsrender(::ChatModel)`
+# on each session's `comm` Observable; session-scoped `Observables.on(f, session, …)`
+# means the handler dies with its session — no manual deregistration.
 #
-# Wired ONCE per ChatModel (in start_chat_client!) so re-mounting the chat
-# in the unified app doesn't stack duplicate handlers. The handler reads
-# the current Bonito session from `model.bonito_session[]`, which chat_dom
-# updates on each remount.
-function wire_lazy_render!(model::ChatModel)
-    on(model.request_tool_render) do tool_id
+# `session` is the *closure* binding for `Bonito.dom_in_js` (lazy tool body
+# rendering needs a live session to mount sub-DOM with embedded MonacoEditors).
+# No more `model.bonito_session :: Ref{Any}`.
+function chat_dispatch!(model::ChatModel, session::Session, msg::AbstractDict)
+    type = String(get(msg, "type", ""))
+    if type == "init"
+        # Browser just connected; tell it how many messages exist so it can
+        # bootstrap virtual-scroll + request the visible range.
+        chat_emit(model, Dict{String,Any}(
+            "type" => "msgs.count", "n" => length(model.msgs_store)))
+    elseif type == "msgs.request"
+        # JS asked for messages [s, e]; reply via comm with msgs.range.
+        rng = get(msg, "range", nothing)
+        rng isa AbstractVector && length(rng) == 2 || return
+        s, e = Int(rng[1]), Int(rng[2])
+        store = model.msgs_store
+        n = length(store)
+        s = clamp(s, 0, n - 1);  e = clamp(e, 0, n - 1)
+        s > e && return
+        batch = [msg_to_dict(store[i], model.cwd) for i in (s+1):(e+1)]
+        chat_emit(model, Dict{String,Any}(
+            "type" => "msgs.range", "start" => s, "msgs" => batch))
+    elseif type == "tool.render"
+        tool_id = String(get(msg, "id", ""))
         isempty(tool_id) && return
-        bs = model.bonito_session[];  bs === nothing && return
         idx = findfirst(m -> m isa ToolMsg && m.id == tool_id, model.msgs_store)
         idx === nothing && return
         body = render_tool_body(model.state, model.msgs_store[idx], model.cwd;
                                  project_id = model.project_id)
         try
-            Bonito.dom_in_js(bs, body, js"""(elem) => {
+            Bonito.dom_in_js(session, body, js"""(elem) => {
                 const slot = document.querySelector(
                     '.bt-tool-body[data-tool-id="' + $(tool_id) + '"]');
                 if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
@@ -979,66 +1066,56 @@ function wire_lazy_render!(model::ChatModel)
         catch e
             @warn "tool render failed" tool_id exception=e
         end
-    end
-    on(model.request_thought_render) do thought_id
+    elseif type == "thought.render"
+        thought_id = String(get(msg, "id", ""))
         isempty(thought_id) && return
         idx = findfirst(m -> m isa ThoughtMsg && m.id == thought_id, model.msgs_store)
         idx === nothing && return
         html = sprint(show, MIME("text/html"),
                       Markdown.parse(model.msgs_store[idx].text))
-        chat_emit(model, Dict{String,Any}("type" => "thought_body",
-                                            "id"   => thought_id, "html" => html))
+        chat_emit(model, Dict{String,Any}("type" => "thought.body",
+                                            "id" => thought_id, "html" => html))
     end
-    return nothing
+    return
 end
 
-function wire_range_request!(model::ChatModel)
-    on(model.request_range) do rng
-        isempty(rng) && return
-        s, e = Int(rng[1]), Int(rng[2])
-        n = length(model.msgs_store)
-        s = clamp(s, 0, n - 1);  e = clamp(e, 0, n - 1)
-        s > e && return
-        batch = [msg_to_dict(model.msgs_store[i], model.cwd) for i in (s+1):(e+1)]
-        model.range_response[] = JSON.json(Dict{String,Any}(
-            "start" => s, "messages" => batch))
-    end
-end
+# `ChatModel` is a Bonito component. Per the convention, the shared instance
+# (the one in `state.chat_models[pid]`) should never be rendered directly —
+# we make a per-session view via `copy(model)` and bind handlers to *that*
+# session. The shared bits (msgs_store, ACP client, lock) are still shared
+# (sessions cooperate); the Observable `comm` is a connected child so each
+# tab's JS bridge GC's cleanly when the tab closes.
+function Bonito.jsrender(session::Session, shared::ChatModel)
+    model = copy(shared, session)
 
-# Compose the chat's full DOM. Returns a DOM block (no App wrapping) so the
-# unified single-page App can drop it into its main panel directly. Each
-# call updates `model.bonito_session[]` to the new mount and re-runs
-# initBonitoChat on the JS side (which destroys any prior BonitoChat first,
-# see assets/bonitoteam.js).
-function chat_dom(model::ChatModel, bonito_session)
-    model.bonito_session[] = bonito_session
-    # No `initialCount` snapshot anymore: the JS reads `obs.totalCount.value`
-    # at construction time, which is race-free against ACP replay events
-    # that may fire between this evaljs and the browser actually running it.
-    # See assets/bonitoteam.js (the bootstrap block) for the rationale.
-    evaljs(bonito_session, js"""
-        window.initBonitoChat({
-            totalCount:           $(model.total_count),
-            requestRange:         $(model.request_range),
-            rangeResponse:        $(model.range_response),
-            newMsg:               $(model.new_msg_obs),
-            requestToolRender:    $(model.request_tool_render),
-            requestThoughtRender: $(model.request_thought_render),
-        });
-        setTimeout(() => window.bonitochat && window.bonitochat.refresh(), 0);
-    """)
-    DOM.div(
+    # Single per-session dispatcher: any JS notification on `comm` lands here
+    # and routes by `type`. Closure captures `session` for `dom_in_js`.
+    # `on(f, session, obs)` is Bonito's session-scoped overload — the
+    # listener auto-deregisters when the session closes.
+    on(session, model.comm) do msg
+        chat_dispatch!(model, session, msg)
+    end
+
+    messages_container = DOM.div(
+        DOM.div(class="bt-spacer-top"),
+        DOM.div(class="bt-spacer-bottom");
+        class="bt-messages")
+
+    init_script = js"""
+        $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm)))
+    """
+
+    Bonito.jsrender(session, DOM.div(
         chat_header(model),
         chat_session_banner(model),
-        DOM.div(DOM.div(class="bt-spacer-top"),
-                DOM.div(class="bt-spacer-bottom");
-                class="bt-messages"),
+        messages_container,
+        init_script,
         DOM.div(DOM.div(class="bt-busy-dot"),
                 DOM.div(class="bt-busy-dot"),
                 DOM.div(class="bt-busy-dot");
                 class="bt-busy"),
-        chat_input_area(model, bonito_session);
-        class = "bt-app")
+        chat_input_area(model);
+        class = "bt-app"))
 end
 
 # Top-level: build the model, start the ACP client, fire any auto_prompt,
@@ -1054,10 +1131,12 @@ function chat_app(state::ServerState, cwd::String;
                        client_factory = client_factory)
     start_chat_client!(model)
     fire_auto_prompt!(model)
-    App() do bonito_session
+    App() do _session
+        # `model` is itself a Bonito component (jsrender on ChatModel) — we
+        # just drop it into the DOM tree and Bonito handles the rest.
         DOM.div(
-            ChatStyles, BonitoTeamJS, Bonito.MarkdownCSS,
+            ChatStyles, Bonito.MarkdownCSS,
             Bonito.ConnectionIndicator(),
-            chat_dom(model, bonito_session))
+            model)
     end
 end

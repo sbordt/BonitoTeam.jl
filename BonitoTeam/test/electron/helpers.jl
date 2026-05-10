@@ -262,11 +262,12 @@ need a populated history at mount time.
 function seed_chat_history!(model, n::Int;
                               user_text::AbstractString = "hi",
                               agent_text::AbstractString = "ok")
-    for i in 1:n
-        push!(model.msgs_store, BonitoTeam.UserMsg("$user_text $i"))
-        push!(model.msgs_store, BonitoTeam.AgentMsg("agent-$i", "$agent_text $i"))
+    lock(model.lock) do
+        for i in 1:n
+            push!(model.msgs_store, BonitoTeam.UserMsg("$user_text $i"))
+            push!(model.msgs_store, BonitoTeam.AgentMsg("agent-$i", "$agent_text $i"))
+        end
     end
-    model.total_count[] = length(model.msgs_store)
     return model
 end
 

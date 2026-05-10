@@ -42,7 +42,9 @@ end
 function register_rpc!(state::ServerState)
     rid = string(uuid4())
     ch  = Channel{Any}(1)
-    state.pending_rpcs[rid] = ch
+    lock(state.lock) do
+        state.pending_rpcs[rid] = ch
+    end
     return (rid, ch)
 end
 
@@ -53,10 +55,17 @@ function take_pending!(state::ServerState, ch::Channel, key::String,
                        timeout::Real, op_name::AbstractString)
     Base.errormonitor(@async begin
         sleep(timeout)
-        if haskey(state.pending_rpcs, key)
-            delete!(state.pending_rpcs, key)
-            try put!(ch, nothing) catch end
+        # Atomic "take if present" so we don't race a concurrent
+        # deliver_rpc_response! popping the same key.
+        had = lock(state.lock) do
+            if haskey(state.pending_rpcs, key)
+                delete!(state.pending_rpcs, key)
+                true
+            else
+                false
+            end
         end
+        had && try put!(ch, nothing) catch end
     end)
     val = take!(ch)
     val === nothing && error("$op_name timed out after $(timeout)s — worker may be offline or stuck")
@@ -66,8 +75,10 @@ end
 # Try to deliver a worker-pushed RPC reply by request_id. No-op if the id is
 # unknown (caller already timed out, or the response races a re-registration).
 function deliver_rpc_response!(state::ServerState, rid::AbstractString, value)
-    haskey(state.pending_rpcs, rid) || return
-    ch = pop!(state.pending_rpcs, rid)
+    ch = lock(state.lock) do
+        haskey(state.pending_rpcs, rid) ? pop!(state.pending_rpcs, rid) : nothing
+    end
+    ch === nothing && return
     try put!(ch, value) catch end
     return
 end
@@ -114,19 +125,25 @@ function handle_worker_control(state::ServerState, ws)
             :online,
             now(UTC),
         )
-        state.workers[worker_id] = w
-        state.worker_control_ws[worker_id] = ws
-        # Lazy migration: any persisted project that still references this
-        # worker by display name (legacy schema) gets remapped to the UUID
-        # now that we know the binding.
-        migrate_legacy_worker_refs!(state, w)
-        save_workers!(state)
+        # All shared-state writes for this worker's registration go in one
+        # critical section so the workers/worker_control_ws/projects tables
+        # are mutually consistent across concurrent observers (other RPC
+        # handlers, App-body re-renders).
+        projects_to_attach = lock(state.lock) do
+            state.workers[worker_id] = w
+            state.worker_control_ws[worker_id] = ws
+            migrate_legacy_worker_refs!(state, w)
+            save_workers!(state)
+            # Snapshot the projects we want to attach BEFORE leaving the
+            # lock — `ensure_project_session!` itself takes the lock and
+            # also does network I/O, so we don't want to hold the mutex
+            # across that work.
+            [p for p in values(state.projects) if p.worker_id == worker_id]
+        end
         bump_state!(state)
         @info "Worker connected" worker_id=worker_id name=display_name hostname=w.hostname
 
-        # Re-attach any persisted projects on this worker now that it's online.
-        for p in values(state.projects)
-            p.worker_id == worker_id || continue
+        for p in projects_to_attach
             try
                 ensure_project_session!(state, p)
             catch e
@@ -156,22 +173,22 @@ function handle_worker_control(state::ServerState, ws)
             end
         end
     finally
-        delete!(state.worker_control_ws, worker_id)
-        if haskey(state.workers, worker_id)
-            state.workers[worker_id].status = :offline
-            bump_state!(state)
-        end
-        # Auto-release any project locks held by this worker — its claude
-        # processes are gone, so the locks are stale.
-        release_locks_for_worker!(state, worker_id)
-        # Drop cached ChatModels for projects on this worker — their ACP
-        # connection is dead. The next reconnect calls ensure_project_session!
-        # which builds a fresh model + client.
-        for p in values(state.projects)
-            if p.worker_id == worker_id
-                delete!(state.chat_models, p.id)
+        # Atomic teardown: mark offline, drop the WS handle, evict the
+        # ChatModels for this worker's projects. release_locks_for_worker!
+        # also takes the lock per release; safe because ReentrantLock is.
+        lock(state.lock) do
+            delete!(state.worker_control_ws, worker_id)
+            if haskey(state.workers, worker_id)
+                state.workers[worker_id].status = :offline
+            end
+            for p in values(state.projects)
+                if p.worker_id == worker_id
+                    delete!(state.chat_models, p.id)
+                end
             end
         end
+        bump_state!(state)
+        release_locks_for_worker!(state, worker_id)
         @info "Worker disconnected" worker_id=worker_id
     end
 end

@@ -141,8 +141,10 @@ function create_project_from_github!(state::ServerState, url::AbstractString;
 
     p = ProjectInfo(id, proj_name, worker_name, server_path, worker_path, now(UTC))
     p.auto_prompt = auto_prompt
-    state.projects[id] = p
-    save_projects!(state)
+    lock(state.lock) do
+        state.projects[id] = p
+        save_projects!(state)
+    end
 
     progress === nothing || progress("Starting chat session…")
     ensure_project_session!(state, p)

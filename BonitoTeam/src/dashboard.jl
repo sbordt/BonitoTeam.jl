@@ -8,13 +8,14 @@
 # Project lock
 """
 Mark a project locked by a worker (active ACP session). Errors if the project
-is already locked by a different worker.
+is already locked by a different worker. `worker_id` is the worker's stable
+UUID, NOT its display name.
 """
-function acquire_lock!(state::ServerState, p::ProjectInfo, worker_name::String)
-    if p.locked_by !== nothing && p.locked_by != worker_name
+function acquire_lock!(state::ServerState, p::ProjectInfo, worker_id::String)
+    if p.locked_by !== nothing && p.locked_by != worker_id
         error("Project '$(p.name)' is locked by worker '$(p.locked_by)'")
     end
-    p.locked_by = worker_name
+    p.locked_by = worker_id
     p.locked_at = now(UTC)
     save_projects!(state)
     bump_state!(state)
@@ -29,11 +30,11 @@ function release_lock!(state::ServerState, p::ProjectInfo)
     return p
 end
 
-# Auto-release every project lock held by `worker_name` (called from
+# Auto-release every project lock held by `worker_id` (called from
 # handle_worker_control's finally branch when the WS drops).
-function release_locks_for_worker!(state::ServerState, worker_name::String)
+function release_locks_for_worker!(state::ServerState, worker_id::String)
     for p in values(state.projects)
-        p.locked_by == worker_name && release_lock!(state, p)
+        p.locked_by == worker_id && release_lock!(state, p)
     end
 end
 
@@ -206,14 +207,14 @@ Updates `p.backup_status` to `:syncing` for the duration, then `:synced`
 on success or `:stale` on failure.
 """
 function sync_project_to_server!(state::ServerState, p::ProjectInfo; on_progress = nothing)
-    haskey(state.workers, p.worker_name) ||
-        error("Worker '$(p.worker_name)' is not connected")
+    haskey(state.workers, p.worker_id) ||
+        error("Worker '$(p.worker_id)' is not connected")
     p.backup_status === :syncing &&
         error("Project '$(p.name)' is already syncing")
     p.backup_status = :syncing
     bump_state!(state)
     try
-        sync_dir_from_worker!(state, p.worker_name, p.worker_path, p.server_path;
+        sync_dir_from_worker!(state, p.worker_id, p.worker_path, p.server_path;
                               on_progress = on_progress)
         p.backup_status = :synced
         p.last_sync_at  = now(UTC)
@@ -238,18 +239,18 @@ when the user selects this project in the sidebar.
 """
 function ensure_project_session!(state::ServerState, p::ProjectInfo)
     haskey(state.chat_models, p.id) && return state.chat_models[p.id]
-    haskey(state.workers, p.worker_name) ||
-        error("Worker '$(p.worker_name)' is not connected")
-    w = state.workers[p.worker_name]
+    haskey(state.workers, p.worker_id) ||
+        error("Worker '$(p.worker_id)' is not connected")
+    w = state.workers[p.worker_id]
 
-    acquire_lock!(state, p, w.name)
+    acquire_lock!(state, p, w.worker_id)
 
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
         [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path)]
 
     # If the project was imported with a claude session ID, the factory asks
     # the worker to do session/load (resume) instead of session/new.
-    client_factory = on_update -> start_session_on_worker(state, w.name, p.worker_path;
+    client_factory = on_update -> start_session_on_worker(state, w.worker_id, p.worker_path;
                                                            on_update,
                                                            mcp_servers = mcp,
                                                            resume_session_id = p.resume_session_id)
@@ -290,14 +291,22 @@ const DashboardStyles = Bonito.Styles(
         "--bt-radius-sm"     => "6px"),
 
     # ── Shell ────────────────────────────────────────────────────────────────
+    # No own max-width: the whole app is bounded by `.bt-shell` (defined in
+    # sidebar.jl::UnifiedShellStyles). The dashboard fills whatever space the
+    # main panel gives it, so the sidebar and the dashboard are visually
+    # adjacent instead of being separated by an arbitrary gap.
     CSS(".bt-dash",
         "font-family"  => "'Inter', system-ui, -apple-system, sans-serif",
         "font-size"    => "14px", "line-height" => "1.5",
         "color"        => "var(--bt-text)", "background" => "var(--bt-bg)",
         "min-height"   => "100vh",
         "padding"      => "32px 24px",
-        "max-width"    => "960px", "margin" => "0 auto",
         "-webkit-font-smoothing" => "antialiased"),
+    # Wrapper for a list of `.bt-card` rows. Single column today; we can
+    # later switch to `repeat(auto-fit, minmax(420px, 1fr))` if the workers
+    # / projects lists grow long.
+    CSS(".bt-cards",
+        "display" => "flex", "flex-direction" => "column", "gap" => "8px"),
 
     # ── Header + tagline ─────────────────────────────────────────────────────
     CSS(".bt-header",
@@ -360,6 +369,27 @@ const DashboardStyles = Bonito.Styles(
         "text-overflow" => "ellipsis",
         "white-space" => "nowrap",
         "word-break" => "keep-all"),
+    # Inline-editable variant for the worker name. Reads as plain text until
+    # the user clicks/focuses it; on focus we surface a soft border so it's
+    # discoverable that the field is editable.
+    CSS("input.bt-card-name-edit",
+        "border" => "none",
+        "background" => "transparent",
+        "padding" => "2px 6px",
+        "margin" => "-2px -6px",
+        "border-radius" => "var(--bt-radius-sm)",
+        "font" => "inherit",
+        "color" => "inherit",
+        "min-width" => "0",
+        "max-width" => "100%",
+        "outline" => "none",
+        "cursor" => "text",
+        "transition" => "background 80ms, box-shadow 80ms"),
+    CSS("input.bt-card-name-edit:hover",
+        "background" => "var(--bt-surface-2)"),
+    CSS("input.bt-card-name-edit:focus",
+        "background" => "var(--bt-surface-2)",
+        "box-shadow" => "inset 0 0 0 1px var(--bt-border-strong)"),
     CSS(".bt-card-meta",
         "color" => "var(--bt-text-muted)", "font-size" => "12px",
         "margin-top" => "2px",
@@ -1016,21 +1046,53 @@ function worker_card(state::ServerState, w::WorkerInfo,
 
     on(new_proj_btn.value) do clicked
         clicked || return
-        picker_state[]   = picker_state[]   == w.name ? "" : w.name
+        picker_state[]   = picker_state[]   == w.worker_id ? "" : w.worker_id
         discover_state[] = ""
         error_obs[]      = ""
     end
     on(discover_btn.value) do clicked
         clicked || return
-        discover_state[] = discover_state[] == w.name ? "" : w.name
+        discover_state[] = discover_state[] == w.worker_id ? "" : w.worker_id
         picker_state[]   = ""
         error_obs[]      = ""
+    end
+
+    # Inline-editable display name. Plain `<input>` styled like static text
+    # until you focus it; commits on Enter / blur, reverts on Escape. The
+    # observable holds the in-progress value; the actual rename runs through
+    # rename_worker! which persists to workers.json. Errors flow into
+    # `error_obs` so the dashboard's error block surfaces them.
+    name_obs = Observable(w.name)
+    function commit_rename(v)
+        new = strip(String(v))
+        isempty(new) && (name_obs[] = w.name; return)
+        new == w.name && return
+        try
+            rename_worker!(state, w.worker_id, new)
+            error_obs[] = ""
+        catch e
+            error_obs[] = "Rename failed: $(sprint(showerror, e))"
+            name_obs[]  = w.name
+        end
+    end
+    name_input = DOM.input(
+        type  = "text",
+        value = name_obs,
+        class = "bt-card-name bt-card-name-edit",
+        title = "Click to rename — Enter to save, Esc to cancel",
+        onblur    = js"event => $(name_obs).notify(event.target.value)",
+        onkeydown = js"""event => {
+            if (event.key === 'Enter')  { event.target.blur(); }
+            if (event.key === 'Escape') { event.target.value = $(w.name); event.target.blur(); }
+        }""")
+    on(name_obs) do v
+        commit_rename(v)
     end
 
     DOM.div(
         DOM.div(
             DOM.div(status_dot(w.status),
-                    DOM.span(w.name; class = "bt-card-name");
+                    name_input;
                     class = "bt-card-title"),
             DOM.div(worker_subtitle(w); class = "bt-card-meta",
                     title = "$(w.hostname) · home: $(w.home)"),
@@ -1075,7 +1137,8 @@ end
 # when project_card is rendered standalone in tests).
 # `sync_request` is notified with the project id when the user clicks
 # "Sync to server"; the dashboard handler runs the actual transfer.
-function project_card(p::ProjectInfo, error_obs::Observable{String},
+function project_card(state::ServerState, p::ProjectInfo,
+                       error_obs::Observable{String},
                        sync_request::Observable{String},
                        current_view::Union{Observable{String},Nothing} = nothing)
     badge = p.locked_by === nothing ? DOM.span() :
@@ -1116,7 +1179,13 @@ function project_card(p::ProjectInfo, error_obs::Observable{String},
                     badge, backup_pill(p);
                     class = "bt-card-title"),
             DOM.div(
-                DOM.span(p.worker_name),
+                # Show the worker's *display* name (mutable, user-renameable),
+                # not the raw UUID. Falls back to a short prefix of the
+                # worker_id if the worker is unknown to state right now
+                # (offline + never connected since the last server start).
+                DOM.span(haskey(state.workers, p.worker_id) ?
+                         state.workers[p.worker_id].name :
+                         "worker:$(first(p.worker_id, 8))"),
                 DOM.span("·"; class = "bt-stat-sep"),
                 DOM.span(p.worker_path; class = "bt-mono",
                          title = "server: $(p.server_path)\nworker: $(p.worker_path)");
@@ -1390,17 +1459,20 @@ function dashboard_dom(state::ServerState;
             class = is_active ? "bt-session-row bt-session-active" : "bt-session-row")
     end
 
-    function discover_panel(w_name::String)
+    function discover_panel(wid::String)
         close_btn  = Bonito.Button("✕"; style=nothing, class = "bt-btn bt-btn-ghost")
         rescan_btn = Bonito.Button("↻ Rescan"; style=nothing, class = "bt-btn bt-btn-secondary")
         on(close_btn.value)  do clicked; clicked && (discover_state[] = ""); end
-        on(rescan_btn.value) do clicked; clicked && trigger_scan!(w_name); end
+        on(rescan_btn.value) do clicked; clicked && trigger_scan!(wid); end
 
+        # Display label = worker.name (mutable); fallback to wid if the
+        # worker has gone offline since the panel was opened.
+        display_name = haskey(state.workers, wid) ? state.workers[wid].name : wid
         panel_content = map(discover_busy, discover_results) do busy, results
             if busy
-                spinner_row("Scanning $w_name for Claude Code sessions…")
+                spinner_row("Scanning $display_name for Claude Code sessions…")
             elseif isempty(results)
-                DOM.div("No Claude Code sessions found on $w_name."; class = "bt-empty")
+                DOM.div("No Claude Code sessions found on $display_name."; class = "bt-empty")
             else
                 # Surface errors first, then split active vs historical.
                 errors = [DOM.div("Error: $(r["error"])"; class = "bt-error")
@@ -1424,7 +1496,7 @@ function dashboard_dom(state::ServerState;
 
         DOM.div(
             DOM.div(
-                DOM.span("Claude Code sessions on $w_name"; class = "bt-discover-title"),
+                DOM.span("Claude Code sessions on $display_name"; class = "bt-discover-title"),
                 DOM.div(rescan_btn, close_btn; class = "bt-discover-actions");
                 class = "bt-discover-header"),
             panel_content;
@@ -1483,7 +1555,9 @@ function dashboard_dom(state::ServerState;
             end),
         DOM.label("Worker"),
         DOM.select(
-            (DOM.option(name; value=name) for name in keys(state.workers))...;
+            # Show w.name (mutable display label) but submit w.worker_id
+            # (stable UUID, the dict key into state.workers).
+            (DOM.option(w.name; value=w.worker_id) for w in values(state.workers))...;
             onchange = js"event => $(np_worker).notify(event.target.value)"),
         map(busy_msg) do msg
             isempty(msg) ?
@@ -1500,7 +1574,7 @@ function dashboard_dom(state::ServerState;
                 style = "font-size:11px;color:var(--bt-text-muted);margin-top:-4px"),
         DOM.label("Worker"),
         DOM.select(
-            (DOM.option(name; value=name) for name in keys(state.workers))...;
+            (DOM.option(w.name; value=w.worker_id) for w in values(state.workers))...;
             onchange = js"event => $(gh_worker).notify(event.target.value)"),
         map(busy_msg) do msg
             isempty(msg) ?
@@ -1509,20 +1583,25 @@ function dashboard_dom(state::ServerState;
         end,
         class = "bt-form")
 
-    function remote_picker_form(w_name::String)
-        rp = get_remote_picker(w_name)
+    # `wid` is the worker_id (UUID), not the display name. Display label
+    # resolves it via state.workers; the dispatch helpers
+    # (submit_remote_pick / get_remote_picker) accept the wid as their
+    # dict key.
+    function remote_picker_form(wid::String)
+        rp = get_remote_picker(wid)
         create_btn = Bonito.Button("Create"; style=nothing, class = "bt-btn")
         cancel_btn = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
         on(create_btn.value) do clicked
-            clicked && submit_remote_pick(w_name)
+            clicked && submit_remote_pick(wid)
         end
         on(cancel_btn.value) do clicked
             clicked || return
             isempty(busy_msg[]) || return   # don't cancel mid-create
             picker_state[] = ""; error_obs[] = ""
         end
+        display_name = haskey(state.workers, wid) ? state.workers[wid].name : wid
         DOM.div(
-            DOM.label("Folder on $(w_name)"),
+            DOM.label("Folder on $(display_name)"),
             DOM.div(remote_folder_picker_render(rp),
                     map(rp.selected) do sel
                         isempty(sel) ? DOM.div() :
@@ -1588,18 +1667,23 @@ function dashboard_dom(state::ServerState;
         rows = []
         for w in values(state.workers)
             push!(rows, worker_card(state, w, error_obs, picker_state, discover_state))
-            picked     == w.name && push!(rows, remote_picker_form(w.name))
-            discovered == w.name && push!(rows, discover_panel(w.name))
+            # picker_state / discover_state hold the worker_id (UUID), not the
+            # display name, so we compare against w.worker_id and pass it
+            # through to the form helpers (they look up the display name from
+            # state.workers when they need it).
+            picked     == w.worker_id && push!(rows, remote_picker_form(w.worker_id))
+            discovered == w.worker_id && push!(rows, discover_panel(w.worker_id))
         end
-        DOM.div(rows...)
+        DOM.div(rows...; class = "bt-cards")
     end
 
     project_list = map(state.version) do _
         isempty(state.projects) ?
             DOM.div("No projects yet — pick a worker above and click + Project, or import an existing Claude session via Discover.";
                     class = "bt-empty") :
-            DOM.div((project_card(p, error_obs, sync_request, current_view)
-                     for p in values(state.projects))...)
+            DOM.div((project_card(state, p, error_obs, sync_request, current_view)
+                     for p in values(state.projects))...;
+                    class = "bt-cards")
     end
 
     # Two slide-in forms, one source of truth: which one is open right now.

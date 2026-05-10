@@ -74,7 +74,7 @@ end
 
 # Handler for /worker-ws — runs once per worker, for the worker's lifetime.
 function handle_worker_control(state::ServerState, ws)
-    name = "?"
+    worker_id = "?"
     try
         hello_raw = WebSockets.receive(ws)
         hello = JSON.parse(String(hello_raw))
@@ -82,13 +82,28 @@ function handle_worker_control(state::ServerState, ws)
             try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"unauthorized"))) catch end
             return
         end
-        name = String(get(hello, "name", get(hello, "hostname", "anon")))
+        # Worker identity. Newer workers send `worker_id` (stable UUID); old
+        # ones (and the migration pass for an existing install) only have
+        # `name`. Fall back so legacy workers keep working — the dict key
+        # is just a string either way.
+        name      = String(get(hello, "name", get(hello, "hostname", "anon")))
+        worker_id = String(get(hello, "worker_id", name))
 
-        WebSockets.send(ws, JSON.json(Dict("ok" => true, "registered_as" => name)))
+        # If the user previously renamed this worker via the UI, preserve
+        # that name across reconnects instead of overwriting it with the
+        # worker's hello-frame default.
+        existing_name = haskey(state.workers, worker_id) ?
+                        state.workers[worker_id].name : nothing
+        display_name  = existing_name === nothing ? name : existing_name
+
+        WebSockets.send(ws, JSON.json(Dict("ok" => true,
+                                            "registered_as" => display_name,
+                                            "worker_id"     => worker_id)))
 
         # Build / refresh the WorkerInfo from the hello frame.
         w = WorkerInfo(
-            name,
+            worker_id,
+            display_name,
             "<inbound-ws>",          # we no longer dial the worker; URL is moot
             state.worker_secret,
             nothing,                 # ssh_target reserved for future rsync-over-ssh
@@ -99,15 +114,19 @@ function handle_worker_control(state::ServerState, ws)
             :online,
             now(UTC),
         )
-        state.workers[name] = w
-        state.worker_control_ws[name] = ws
+        state.workers[worker_id] = w
+        state.worker_control_ws[worker_id] = ws
+        # Lazy migration: any persisted project that still references this
+        # worker by display name (legacy schema) gets remapped to the UUID
+        # now that we know the binding.
+        migrate_legacy_worker_refs!(state, w)
         save_workers!(state)
         bump_state!(state)
-        @info "Worker connected" name=name hostname=w.hostname
+        @info "Worker connected" worker_id=worker_id name=display_name hostname=w.hostname
 
         # Re-attach any persisted projects on this worker now that it's online.
         for p in values(state.projects)
-            p.worker_name == name || continue
+            p.worker_id == worker_id || continue
             try
                 ensure_project_session!(state, p)
             catch e
@@ -137,24 +156,64 @@ function handle_worker_control(state::ServerState, ws)
             end
         end
     finally
-        delete!(state.worker_control_ws, name)
-        if haskey(state.workers, name)
-            state.workers[name].status = :offline
+        delete!(state.worker_control_ws, worker_id)
+        if haskey(state.workers, worker_id)
+            state.workers[worker_id].status = :offline
             bump_state!(state)
         end
         # Auto-release any project locks held by this worker — its claude
         # processes are gone, so the locks are stale.
-        release_locks_for_worker!(state, name)
+        release_locks_for_worker!(state, worker_id)
         # Drop cached ChatModels for projects on this worker — their ACP
         # connection is dead. The next reconnect calls ensure_project_session!
         # which builds a fresh model + client.
         for p in values(state.projects)
-            if p.worker_name == name
+            if p.worker_id == worker_id
                 delete!(state.chat_models, p.id)
             end
         end
-        @info "Worker disconnected" name=name
+        @info "Worker disconnected" worker_id=worker_id
     end
+end
+
+"""
+    migrate_legacy_worker_refs!(state, w::WorkerInfo)
+
+Pre-UUID `projects.json` rows stored the worker's display name in their
+`worker_id` field (the JSON key was `worker_name` then; on load we feed it
+into the same struct field). When the matching worker reconnects we know
+the real UUID, so this rewrites those entries in place. Safe to call on
+every connect — it's a no-op once everything is on the new schema.
+"""
+function migrate_legacy_worker_refs!(state::ServerState, w::WorkerInfo)
+    legacy_keys = (w.name, w.hostname)
+    rewrote = 0
+    for p in values(state.projects)
+        if p.worker_id != w.worker_id && p.worker_id in legacy_keys
+            @info "migrating project worker reference" project=p.name from=p.worker_id to=w.worker_id
+            p.worker_id = w.worker_id
+            rewrote += 1
+        end
+    end
+    rewrote > 0 && save_projects!(state)
+    return rewrote
+end
+
+"""
+    rename_worker!(state, worker_id, new_name)
+
+Update the display name of a connected worker. The worker_id (dict key)
+is unchanged so all FK references in `projects` keep resolving.
+"""
+function rename_worker!(state::ServerState, worker_id::AbstractString,
+                         new_name::AbstractString)
+    haskey(state.workers, worker_id) || error("Unknown worker_id: $worker_id")
+    new = strip(String(new_name))
+    isempty(new) && error("Worker name must not be empty")
+    state.workers[worker_id].name = new
+    save_workers!(state)
+    bump_state!(state)
+    return state.workers[worker_id]
 end
 
 # Handler for /transfer-ws — one invocation per directional RemoteSync transfer.
@@ -240,7 +299,7 @@ function start_session_on_worker(state::ServerState, worker_name::String, cwd::S
     # log line; we don't ship project_id over the wire anymore).
     project_id = ""
     for p in values(state.projects)
-        p.worker_name == worker_name && p.worker_path == cwd && (project_id = p.id; break)
+        p.worker_id == worker_name && p.worker_path == cwd && (project_id = p.id; break)
     end
 
     send_command(state, worker_name, Dict(

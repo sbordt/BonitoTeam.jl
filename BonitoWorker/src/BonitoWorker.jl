@@ -9,6 +9,63 @@ module BonitoWorker
 
 using HTTP, HTTP.WebSockets, JSON, RemoteSync
 
+# Stable per-install identity for this worker. Generated once and persisted to
+# `~/.local/share/bonitoteam-worker/worker_id` so the server can recognise the
+# same physical install across hostname/IP changes (DHCP renew, VPN flip,
+# laptop carried between Wi-Fi networks). The display name is just a label —
+# this id is the dict key on the server.
+function worker_id_path()
+    base = get(ENV, "XDG_DATA_HOME", joinpath(get(ENV, "HOME", ""), ".local", "share"))
+    return joinpath(base, "bonitoteam-worker", "worker_id")
+end
+
+# UUIDv4-shaped identifier built from `hash(time_ns(), gethostname(), pid())`.
+# We deliberately avoid pulling in the Random or UUIDs stdlibs here — adding
+# a new dep to BonitoWorker forces the user's runtime Manifest.toml to be
+# re-resolved (Pkg.resolve), which is friction we don't need for a one-shot
+# id generation. The id is persisted on first run, so collision risk is
+# limited to two installs that happen in the same nanosecond from the same
+# pid on the same host (i.e. effectively zero).
+function generate_worker_id()
+    seed = "$(time_ns())-$(getpid())-$(gethostname())-$(rand(UInt64))"
+    h1 = string(hash(seed),                     base = 16, pad = 16)
+    h2 = string(hash(string(h1, time_ns())),    base = 16, pad = 16)
+    bytes = h1 * h2  # 32 hex chars
+    return string(bytes[1:8],   "-",
+                  bytes[9:12],  "-",
+                  bytes[13:16], "-",
+                  bytes[17:20], "-",
+                  bytes[21:32])
+end
+
+function load_or_generate_worker_id()
+    path = worker_id_path()
+    if isfile(path)
+        id = strip(read(path, String))
+        !isempty(id) && return String(id)
+    end
+    id = generate_worker_id()
+    mkpath(dirname(path))
+    write(path, id)
+    @info "BonitoWorker: generated stable worker_id" path id
+    return id
+end
+
+# Default display name. Falls back through hostname → username → "worker".
+# When hostname is "localhost"/empty (common on freshly-installed Linux
+# distros) we splice in a 4-char chunk of the worker_id so two laptops with
+# the same `gethostname()=="localhost"` still get distinct *display* names —
+# the dict key is the full UUID either way, but the user sees something
+# friendlier than "localhost" twice.
+function default_worker_name(worker_id::String)
+    h = gethostname()
+    if !isempty(h) && lowercase(h) != "localhost"
+        return h
+    end
+    user = get(ENV, "USER", get(ENV, "USERNAME", "worker"))
+    return "$(user)-$(first(worker_id, 4))"
+end
+
 # Public entry
 """
     BonitoWorker.connect_and_serve(; server_url, secret, name, mcp_path,
@@ -19,14 +76,15 @@ on commands. Reconnects with `retry_delay` between attempts. Blocks forever.
 """
 function connect_and_serve(; server_url::String,
                             secret::String,
-                            name::String         = gethostname(),
+                            worker_id::String     = load_or_generate_worker_id(),
+                            name::String         = default_worker_name(worker_id),
                             mcp_path::String     = "",
                             projects_root::String = joinpath(get(ENV, "HOME", ""), "bonitoteam-projects"),
                             agent_bin::String     = find_agent_bin(),
                             retry_delay::Real     = 5.0)
     while true
         try
-            run_control_session(; server_url, secret, name, mcp_path,
+            run_control_session(; server_url, secret, worker_id, name, mcp_path,
                                   projects_root, agent_bin)
         catch e
             e isa InterruptException && rethrow()
@@ -38,14 +96,15 @@ function connect_and_serve(; server_url::String,
 end
 
 # Control WS lifecycle
-function run_control_session(; server_url, secret, name, mcp_path,
+function run_control_session(; server_url, secret, worker_id, name, mcp_path,
                                projects_root, agent_bin)
     control_url = ws_url(server_url, "/worker-ws")
-    @info "BonitoWorker: connecting to control WS" control_url name
+    @info "BonitoWorker: connecting to control WS" control_url worker_id name
     WebSockets.open(control_url) do ws
         WebSockets.send(ws, JSON.json(Dict(
             "type"          => "hello",
             "secret"        => secret,
+            "worker_id"     => worker_id,
             "name"          => name,
             "hostname"      => gethostname(),
             "username"      => get(ENV, "USER", ""),

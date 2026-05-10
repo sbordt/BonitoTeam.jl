@@ -6,7 +6,9 @@
 # Env (all optional except SECRET + SERVER_URL):
 #   BONITOTEAM_WORKER_SECRET   shared secret (required)
 #   BONITOTEAM_SERVER_URL      e.g. http://server:8038 (required)
-#   BONITOTEAM_WORKER_NAME     display name (default: hostname)
+#   BONITOTEAM_WORKER_NAME     display name (default: hostname; if hostname is
+#                              "localhost" we fall back to "$USER-<short-id>"
+#                              so two installs don't collide on the dashboard)
 #   BONITOTEAM_PROJECTS_ROOT   default: ~/bonitoteam-projects
 #   BONITOTEAM_MCP_BIN         path to bonitoteam-mcp; reported to server for
 #                              MCPServer config when spawning claude-agent-acp
@@ -20,10 +22,14 @@ const server_url = get(ENV, "BONITOTEAM_SERVER_URL", "")
 isempty(secret)     && error("BONITOTEAM_WORKER_SECRET must be set")
 isempty(server_url) && error("BONITOTEAM_SERVER_URL must be set")
 
+const worker_id = BonitoWorker.load_or_generate_worker_id()
+const default_name = BonitoWorker.default_worker_name(worker_id)
+
 BonitoWorker.connect_and_serve(;
     server_url    = server_url,
     secret        = secret,
-    name          = get(ENV, "BONITOTEAM_WORKER_NAME", gethostname()),
+    worker_id     = worker_id,
+    name          = get(ENV, "BONITOTEAM_WORKER_NAME", default_name),
     mcp_path      = get(ENV, "BONITOTEAM_MCP_BIN",
                         joinpath(get(ENV, "HOME", ""), ".local", "bin", "bonitoteam-mcp")),
     projects_root = get(ENV, "BONITOTEAM_PROJECTS_ROOT",

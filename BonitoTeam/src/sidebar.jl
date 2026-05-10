@@ -102,12 +102,15 @@ end
 # of each icon.
 const SidebarStyles = Bonito.Styles(
     CSS(".bt-sidebar",
-        "position" => "fixed", "top" => "0", "left" => "0", "bottom" => "0",
-        "width" => "200px",
+        # Normal flex child of `.bt-shell` rather than `position: fixed`. The
+        # old fixed positioning was relative to the viewport, so on wide
+        # monitors the sidebar pinned to viewport-left while the centered
+        # main panel floated far away — visually disconnecting them. Inside
+        # the shell flexbox, it sits flush against the main column.
+        "width" => "200px", "flex-shrink" => "0",
         "background" => "var(--bt-surface)",
         "border-right" => "1px solid var(--bt-border)",
         "overflow-y" => "auto", "overflow-x" => "hidden",
-        "z-index" => "10",
         "display" => "flex", "flex-direction" => "column",
         "padding" => "10px 0"),
     CSS(".bt-side-list",
@@ -169,19 +172,33 @@ const SidebarStyles = Bonito.Styles(
 const UnifiedShellStyles = Bonito.Styles(
     CSS("html, body",
         "height" => "100%", "margin" => "0", "padding" => "0",
-        "overflow" => "hidden"),
+        "overflow" => "hidden",
+        # Light off-white surrounding the centered shell on wide monitors —
+        # subtle, just enough that the app reads as a contained surface
+        # instead of dissolving into the page bg. Match the dashboard's bg
+        # variable so theming stays in one place.
+        "background" => "var(--bt-bg, #fafaf9)"),
+    # Centered application shell. On screens wider than `--bt-shell-max`
+    # (1280px default) the app is bounded and centered; on narrower screens
+    # `max-width` is a no-op and the shell fills the viewport. The 1px
+    # vertical borders give the contained app a subtle frame on wide
+    # monitors and disappear visually when the shell hits the viewport
+    # edges.
+    CSS(":root", "--bt-shell-max" => "1280px"),
     CSS(".bt-shell",
-        "position" => "fixed", "inset" => "0",
-        "display" => "flex", "flex-direction" => "row"),
+        "max-width" => "var(--bt-shell-max)",
+        "margin"    => "0 auto",
+        "height"    => "100vh",
+        "display"   => "flex", "flex-direction" => "row",
+        "border-left"  => "1px solid var(--bt-border)",
+        "border-right" => "1px solid var(--bt-border)",
+        "background"   => "var(--bt-bg)"),
     CSS(".bt-main",
         "flex" => "1 1 auto",
         "min-width" => "0",
         "position" => "relative",
         "display" => "flex", "flex-direction" => "column",
-        "overflow" => "hidden",
-        "margin-left" => "200px"),
-    CSS("@media (max-width: 640px)",
-        CSS(".bt-main", "margin-left" => "56px")),
+        "overflow" => "hidden"),
 )
 
 # Render the main panel given the current view + the bonito session. Pulled

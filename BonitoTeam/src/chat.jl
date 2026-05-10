@@ -428,7 +428,7 @@ function render_show_reference(state::ServerState, text::AbstractString,
     Base.errormonitor(@async begin
         try
             mkpath(dirname(server_local_path))
-            fetch_file_from_worker(state, p.worker_name, worker_path, server_local_path;
+            fetch_file_from_worker(state, p.worker_id, worker_path, server_local_path;
                                     handoff_timeout = 30.0)
             fetch_state[] = (:ready, read(server_local_path))
         catch e

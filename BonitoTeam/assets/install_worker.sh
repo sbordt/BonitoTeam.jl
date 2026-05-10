@@ -132,24 +132,28 @@ step "Wrappers + startup shim"
 ln -sf "$MCP_DIR/bin/bonitoteam-mcp"       "$BIN_DIR/bonitoteam-mcp"
 ln -sf "$WORKER_DIR/bin/bonitoteam-worker" "$BIN_DIR/bonitoteam-worker"
 
-cat > "$BIN_DIR/bonitoteam-worker-start" << 'STARTSCRIPT'
+# Strip any double-quote / backslash from the display name before baking
+# it into the shim — they would break the quoted string literal in the
+# output script. The Bonito UI rename (which goes through the server-side
+# `rename_worker!`) does its own validation; this is just paranoia for the
+# install-time path where the user typed something unusual at the prompt.
+WORKER_NAME_SAFE="$(printf '%s' "$WORKER_NAME" | tr -d '"\\')"
+
+# Unquoted heredoc delimiter expands $SECRET / $SERVER / $WORKER_NAME_SAFE /
+# $BIN_DIR / $PROJECTS_ROOT inline. Variables we want to remain literal in
+# the OUTPUT script (so they can be overridden at run time) are escaped
+# with a backslash. Avoids the sed-delimiter collision the previous
+# approach hit when WORKER_NAME contained an `@`.
+cat > "$BIN_DIR/bonitoteam-worker-start" << STARTSCRIPT
 #!/usr/bin/env sh
-export BONITOTEAM_WORKER_SECRET="__SECRET__"
-export BONITOTEAM_SERVER_URL="${BONITOTEAM_SERVER_URL:-__SERVER__}"
-export BONITOTEAM_WORKER_NAME="${BONITOTEAM_WORKER_NAME:-__WORKERNAME__}"
-export BONITOTEAM_MCP_BIN="${BONITOTEAM_MCP_BIN:-__BINDIR__/bonitoteam-mcp}"
-export BONITOTEAM_PROJECTS_ROOT="${BONITOTEAM_PROJECTS_ROOT:-__PROJROOT__}"
-export PATH="$HOME/.juliaup/bin:$PATH"
-exec "__BINDIR__/bonitoteam-worker"
+export BONITOTEAM_WORKER_SECRET="$SECRET"
+export BONITOTEAM_SERVER_URL="\${BONITOTEAM_SERVER_URL:-$SERVER}"
+export BONITOTEAM_WORKER_NAME="\${BONITOTEAM_WORKER_NAME:-$WORKER_NAME_SAFE}"
+export BONITOTEAM_MCP_BIN="\${BONITOTEAM_MCP_BIN:-$BIN_DIR/bonitoteam-mcp}"
+export BONITOTEAM_PROJECTS_ROOT="\${BONITOTEAM_PROJECTS_ROOT:-$PROJECTS_ROOT}"
+export PATH="\$HOME/.juliaup/bin:\$PATH"
+exec "$BIN_DIR/bonitoteam-worker"
 STARTSCRIPT
-sed -i.bak \
-    -e "s@__SECRET__@$SECRET@g" \
-    -e "s@__BINDIR__@$BIN_DIR@g" \
-    -e "s@__PROJROOT__@$PROJECTS_ROOT@g" \
-    -e "s@__SERVER__@$SERVER@g" \
-    -e "s@__WORKERNAME__@$WORKER_NAME@g" \
-    "$BIN_DIR/bonitoteam-worker-start"
-rm -f "$BIN_DIR/bonitoteam-worker-start.bak"
 chmod +x "$BIN_DIR/bonitoteam-worker-start"
 
 # ── systemd user service: enable + start ─────────────────────────────────────

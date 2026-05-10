@@ -127,8 +127,13 @@ end
 # Header info shipped to JS at message-create time. Full content is NOT
 # included — JS asks via requestToolRender(id), Julia loads the persisted
 # ACP params from disk and ships the rendered DOM via Bonito.dom_in_js.
-function tool_header_dict(m::ToolMsg)
-    Dict{String,Any}(
+#
+# Exception: edit tools embed a small "preview" HTML snippet in the header
+# itself so the user can skim what changed without expanding the body.
+# `cwd` is needed so we can read the persisted DiffContent from disk; pass
+# "" when no on-disk content is available (preview is then omitted).
+function tool_header_dict(m::ToolMsg, cwd::AbstractString = "")
+    d = Dict{String,Any}(
         "type"    => "tool",
         "id"      => m.id,
         "kind"    => m.kind,
@@ -137,35 +142,93 @@ function tool_header_dict(m::ToolMsg)
         "status"  => m.status,
         "summary" => m.summary,
     )
+    if m.kind == "edit" && !isempty(cwd)
+        prev = render_edit_preview(cwd, m.id)
+        prev === nothing || (d["preview"] = prev)
+    end
+    return d
 end
 
 # Same shape used by msg_to_dict so the JS virtual-scroll renderer treats
-# all messages uniformly.
-function msg_to_dict(m::UserMsg)
+# all messages uniformly. The `cwd` argument is only consulted for ToolMsg
+# (to render the edit preview); other variants ignore it.
+msg_to_dict(m::UserMsg, _cwd::AbstractString = "") =
     Dict{String,Any}("type" => "user", "text" => m.text)
-end
 
-function msg_to_dict(m::AgentMsg)
+function msg_to_dict(m::AgentMsg, _cwd::AbstractString = "")
     html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
     Dict{String,Any}("type" => "agent", "id" => m.id, "html" => html)
 end
 
-msg_to_dict(m::ToolMsg) = tool_header_dict(m)
+msg_to_dict(m::ToolMsg, cwd::AbstractString = "") = tool_header_dict(m, cwd)
 
 # Thoughts are lazy-loaded: header carries only id + a size hint. JS asks for
 # the body via requestThoughtRender(id) when the user expands the <details>.
 # Avoids shipping potentially huge thinking transcripts on every range fetch.
-function msg_to_dict(m::ThoughtMsg)
+function msg_to_dict(m::ThoughtMsg, _cwd::AbstractString = "")
     n = count('\n', m.text) + 1
     Dict{String,Any}("type" => "thought", "id" => m.id,
                      "summary" => "$n $(n == 1 ? "line" : "lines")")
 end
 
-function msg_to_dict(m::PlanMsg)
+function msg_to_dict(m::PlanMsg, _cwd::AbstractString = "")
     rows = join(["""<div class="bt-plan-entry">
         <span class="bt-plan-status">$(e.status == "completed" ? "✓" : e.status == "in_progress" ? "▶" : "○")</span>
         <span>$(e.content)</span></div>""" for e in m.entries])
     Dict{String,Any}("type" => "plan", "html" => rows)
+end
+
+# ── Edit preview ──────────────────────────────────────────────────────────────
+# Tiny inline diff shown above the lazy-loaded body so the user can skim
+# the change without expanding. Renders the FIRST diff hunk's removed +
+# added lines, capped at EDIT_PREVIEW_MAX_LINES. Multi-edit tools show a
+# "+ N more files" footnote when there's more than one DiffContent.
+const EDIT_PREVIEW_MAX_LINES = 8
+
+# Minimal HTML escape — same shape as the JS escapeHTML so the snippet
+# can be innerHTML'd directly without parse mismatches.
+preview_escape(s) = replace(String(s),
+    '&' => "&amp;", '<' => "&lt;", '>' => "&gt;", '"' => "&quot;")
+
+function render_edit_preview(cwd::AbstractString, tool_id::AbstractString)
+    content = load_tool_content(String(cwd), String(tool_id))
+    isempty(content) && return nothing
+    diffs = [c for c in content if c isa DiffContent]
+    isempty(diffs) && return nothing
+
+    d         = first(diffs)
+    old_lines = d.old_text === nothing ? String[] : split(String(d.old_text), '\n')
+    new_lines = split(String(d.new_text), '\n')
+
+    rows = String[]
+    push!(rows, """<div class="bt-edit-preview-path">$(preview_escape(d.path))</div>""")
+
+    # Trailing newline in old/new produces a phantom empty last element from
+    # `split`; pop it so the preview doesn't show an awkward "- " or "+ "
+    # blank row at the end of each side.
+    trim_trailing_blank!(xs) =
+        (!isempty(xs) && isempty(last(xs))) ? (pop!(xs); xs) : xs
+    trim_trailing_blank!(old_lines)
+    trim_trailing_blank!(new_lines)
+
+    n_used = 0
+    for line in old_lines
+        n_used >= EDIT_PREVIEW_MAX_LINES && break
+        push!(rows, """<div class="bt-edit-preview-line bt-edit-preview-del">- $(preview_escape(line))</div>""")
+        n_used += 1
+    end
+    for line in new_lines
+        n_used >= EDIT_PREVIEW_MAX_LINES && break
+        push!(rows, """<div class="bt-edit-preview-line bt-edit-preview-add">+ $(preview_escape(line))</div>""")
+        n_used += 1
+    end
+
+    if length(diffs) > 1
+        extra = length(diffs) - 1
+        push!(rows, """<div class="bt-edit-preview-more">+ $extra more file$(extra == 1 ? "" : "s") in this edit</div>""")
+    end
+
+    return join(rows)
 end
 
 # Tool-body rendering (Bonito DOM tree, includes BonitoBook MonacoEditor /
@@ -340,8 +403,12 @@ function render_show_reference(state::ServerState, text::AbstractString,
     p = state.projects[project_id]
     worker_path = joinpath(p.worker_path, relpath_str)
 
-    state = Observable{Any}(:loading)
-    body  = map(state) do s
+    # NOTE: keep this Observable's binding distinct from the `state` parameter
+    # — earlier this was named `state`, which shadowed the ServerState and
+    # caused the @async branch to call fetch_file_from_worker with an
+    # Observable instead of the ServerState.
+    fetch_state = Observable{Any}(:loading)
+    body = map(fetch_state) do s
         if s === :loading
             DOM.div(
                 DOM.span(""; class = "bt-spinner"),
@@ -363,9 +430,9 @@ function render_show_reference(state::ServerState, text::AbstractString,
             mkpath(dirname(server_local_path))
             fetch_file_from_worker(state, p.worker_name, worker_path, server_local_path;
                                     handoff_timeout = 30.0)
-            state[] = (:ready, read(server_local_path))
+            fetch_state[] = (:ready, read(server_local_path))
         catch e
-            state[] = (:error, sprint(showerror, e))
+            fetch_state[] = (:error, sprint(showerror, e))
         end
     end)
 
@@ -387,21 +454,19 @@ function render_show_preview(bytes::AbstractVector{UInt8}, mime::AbstractString,
     elseif startswith(mime, "video/")
         b64 = Base64.base64encode(bytes)
         return DOM.div(
-            DOM.video(controls = "", style = "max-width:100%; display:block",
+            # Bonito enforces strict booleans for HTML boolean attrs —
+            # `controls = ""` (or any string) raises at render time.
+            DOM.video(controls = true, style = "max-width:100%; display:block",
                        DOM.source(src = "data:$mime;base64,$b64", type = mime)),
             DOM.div("$relpath_str · $size_str";
                     style = "font-size:11px;color:var(--bt-text-faint);margin-top:4px"))
-    elseif mime == "text/html"
-        # Sandbox the iframe so embedded scripts can't reach the chat
-        # session. Same-origin disabled; allow scripts so HTML widgets
-        # (DataFrames, Plots HTML output, simple SPAs) still render.
-        b64 = Base64.base64encode(bytes)
-        return DOM.div(
-            DOM.iframe(src = "data:text/html;base64,$b64",
-                        sandbox = "allow-scripts",
-                        style = "width:100%; min-height:400px; border:1px solid var(--bt-border); border-radius:6px"),
-            DOM.div("$relpath_str · $size_str";
-                    style = "font-size:11px;color:var(--bt-text-faint);margin-top:4px"))
+    # NOTE: text/html is intentionally NOT special-cased. Rendering arbitrary
+    # HTML inline would clobber chat styles + JS; iframes have their own
+    # downsides (Chromium opaque-origin churn for sandboxed data: URLs;
+    # duplicated runtime cost for every WGLMakie/Bonito blob). The proper
+    # fix is a serialize_bonito / deserialize_bonito pair that hooks into
+    # the chat's existing Bonito session — tracked separately. Until then,
+    # text/html falls through to the generic "binary" branch below.
     elseif startswith(mime, "text/")
         text = String(bytes)
         return monaco_readonly(text, mime == "text/julia" ? "julia" : "plaintext")
@@ -542,7 +607,7 @@ chat_emit(model::ChatModel, event::AbstractDict) =
 function chat_push_msg!(model::ChatModel, msg::ChatMsg)
     push!(model.msgs_store, msg)
     model.total_count[] = length(model.msgs_store)
-    model.new_msg_obs[] = JSON.json(msg_to_dict(msg))
+    model.new_msg_obs[] = JSON.json(msg_to_dict(msg, model.cwd))
     return nothing
 end
 
@@ -794,7 +859,7 @@ function chat_header(model::ChatModel)
     sync_button = DOM.button(map(s -> isempty(s) ? "Sync" : s, sync_status);
         class   = "bt-header-sync",
         title   = "Pull this project from the worker to the server",
-        onclick = js"event => Bonito.notify_observable($(sync_status), '__click__')")
+        onclick = js"event => $(sync_status).notify('__click__')")
     on(sync_status) do s
         s == "__click__" || return
         sync_status[] = ""
@@ -934,7 +999,7 @@ function wire_range_request!(model::ChatModel)
         n = length(model.msgs_store)
         s = clamp(s, 0, n - 1);  e = clamp(e, 0, n - 1)
         s > e && return
-        batch = [msg_to_dict(model.msgs_store[i]) for i in (s+1):(e+1)]
+        batch = [msg_to_dict(model.msgs_store[i], model.cwd) for i in (s+1):(e+1)]
         model.range_response[] = JSON.json(Dict{String,Any}(
             "start" => s, "messages" => batch))
     end

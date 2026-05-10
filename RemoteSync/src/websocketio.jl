@@ -3,12 +3,15 @@
 # protocol can use directly. We present a byte-stream view by buffering the
 # latest received frame and serving `read`/`readbytes!` requests out of it.
 #
-# We deliberately use the *parametric* type signature `WebSocketIO{WS}` so this
-# module compiles without a hard dep on HTTP.jl. Callers construct via
-# `WebSocketIO(ws)` where `ws` is anything implementing the small surface
-# `send_frame!(ws, bytes)` / `recv_frame(ws)::Vector{UInt8}` / `is_closed(ws)`.
-# The HTTP.WebSockets adapters live in ext/RemoteSyncHTTPExt.jl and are loaded
-# automatically by Julia's package-extension mechanism when HTTP is present.
+# `WebSocketIO{WS}` stays parametric so callers can plug in any frame-oriented
+# transport that implements `send_frame!` / `recv_frame` / `is_closed`. We
+# also ship adapters for HTTP.WebSockets.WebSocket inline below; those used to
+# live in a package extension, but the extension boundary added complexity
+# (load-order races, methods missing in some sessions) without buying us
+# anything — every consumer of RemoteSync also pulls in HTTP, so just depend
+# on it directly.
+
+using HTTP, HTTP.WebSockets
 
 mutable struct WebSocketIO{WS} <: IO
     ws        :: WS
@@ -21,11 +24,34 @@ end
 
 WebSocketIO(ws) = WebSocketIO{typeof(ws)}(ws, UInt8[], 1, IOBuffer(), false, false)
 
-# Receive the next frame. Returns `nothing` on close. Implementations
-# specialise on `WS` — see ext/RemoteSyncHTTPExt.jl for HTTP.WebSocket.
+# Transport surface: receive the next frame (returns `nothing` on close),
+# send one frame, and report whether the underlying transport is closed.
+# Generic stubs for non-HTTP transports; HTTP.WebSocket impls follow.
 function recv_frame end
 function send_frame! end
 function is_closed end
+
+function recv_frame(ws::HTTP.WebSockets.WebSocket)
+    try
+        HTTP.WebSockets.isclosed(ws) && return nothing
+        frame = HTTP.WebSockets.receive(ws)
+        return frame isa AbstractVector{UInt8} ?
+            Vector{UInt8}(frame) :
+            Vector{UInt8}(codeunits(String(frame)))
+    catch e
+        e isa HTTP.WebSockets.WebSocketError && return nothing
+        e isa Base.IOError                   && return nothing
+        e isa EOFError                       && return nothing
+        rethrow()
+    end
+end
+
+function send_frame!(ws::HTTP.WebSockets.WebSocket, bytes::AbstractVector{UInt8})
+    HTTP.WebSockets.send(ws, bytes)
+    return nothing
+end
+
+is_closed(ws::HTTP.WebSockets.WebSocket) = HTTP.WebSockets.isclosed(ws)
 
 # ── IO interface ───────────────────────────────────────────────────────────
 function _refill!(io::WebSocketIO)

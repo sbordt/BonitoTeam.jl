@@ -73,13 +73,13 @@ new/deleted projects show up live, and on `current_view` so the active
 highlight tracks the user's selection.
 """
 function project_sidebar(state::ServerState, current_view::Observable{String})
-    # House icon centered in a 32px tile colored with the muted text color.
-    # The img inside fixes its own size so a fallback alt-text doesn't
-    # blow out the icon's footprint.
+    # The home glyph isn't a project — it's nav. Renders as a borderless
+    # 32px slot so it visually reads as "go home" instead of competing
+    # with the colored project tiles below it.
     home_icon = DOM.div(
         DOM.img(src = HOME_ICON, alt = "Home", draggable = "false",
-                style = "width:20px;height:20px;display:block;pointer-events:none");
-        class = "bt-proj-icon bt-side-home-icon",
+                style = "width:18px;height:18px;display:block;pointer-events:none");
+        class = "bt-side-home-icon",
         title = "Dashboard")
 
     # `state.version` triggers a re-render whenever workers/projects mutate;
@@ -134,8 +134,19 @@ const SidebarStyles = Bonito.Styles(
         # middle. For initials we still use line-height (set inline by
         # `project_icon`) which falls into the same flex box gracefully.
         "display" => "flex", "align-items" => "center", "justify-content" => "center"),
+    # Home icon: borderless 32px slot, glyph in muted text color so it sits
+    # quietly above the colorful project tiles. The SVG ships with white
+    # strokes, so we recolor it via a CSS filter.
     CSS(".bt-side-home-icon",
-        "background" => "var(--bt-text-muted)"),
+        "width" => "32px", "height" => "32px",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center",
+        "flex-shrink" => "0"),
+    # invert+sepia+rotate is the standard trick for tinting a white SVG via
+    # CSS without per-color SVG variants. Lands close to --bt-text-muted (#64748b).
+    CSS(".bt-side-home-icon img",
+        "filter" => "invert(48%) sepia(13%) saturate(540%) hue-rotate(176deg) brightness(92%) contrast(86%)"),
+    CSS(".bt-side-active .bt-side-home-icon img",
+        "filter" => "invert(38%) sepia(86%) saturate(2400%) hue-rotate(212deg) brightness(99%) contrast(95%)"),
     CSS(".bt-side-name",
         "font-size" => "13px",
         "color" => "var(--bt-text)",
@@ -171,12 +182,6 @@ const UnifiedShellStyles = Bonito.Styles(
         "margin-left" => "200px"),
     CSS("@media (max-width: 640px)",
         CSS(".bt-main", "margin-left" => "56px")),
-    # Keep the chat shell respecting the sidebar instead of laying itself
-    # out as a position:fixed full-viewport block (which would cover the
-    # sidebar). Inside the unified app the chat occupies the .bt-main column.
-    CSS(".bt-shell .bt-app",
-        "position" => "static",
-        "flex" => "1 1 auto"),
 )
 
 # Render the main panel given the current view + the bonito session. Pulled

@@ -1,0 +1,489 @@
+# Shared scaffolding for the electron-based end-to-end tests.
+#
+# Every test file:
+#   include("helpers.jl")           # brings in TH alias + utilities
+#   state = TH.make_state(; ...)
+#   ctx   = TH.open_window(state)   # Electron window + live unified_app
+#   ...assertions via TH.eval_js / TH.dom_count / TH.wait_for...
+#   TH.shutdown(ctx)
+
+module TestHelpers
+
+using Bonito, BonitoTeam, AgentClientProtocol, Dates, JSON
+using Electron  # ensures use_electron_display works
+import HTTP
+
+# A few aliases so test files can stay terse.
+const ACP = AgentClientProtocol
+
+# ── Test fixtures ─────────────────────────────────────────────────────────────
+
+"""
+    make_state(; n_projects=0, n_workers=0)
+
+Build a self-contained ServerState backed by tempdirs. Optionally seed with
+N stub projects and/or workers so the dashboard / sidebar have content to
+render. Project ids are `p-1`..`p-N`; worker names are `w-1`..`w-N`.
+"""
+function make_state(; n_projects::Int = 0, n_workers::Int = 0)
+    state = BonitoTeam.ServerState(;
+        state_dir     = mktempdir(),
+        working_dir   = mktempdir(),
+        worker_secret = "test-secret")
+
+    for i in 1:n_workers
+        name = "w-$i"
+        w = BonitoTeam.WorkerInfo(
+            name,
+            "ws://localhost:$(8100+i)",
+            "test-secret",
+            nothing,                          # ssh_target
+            "host-$i",                        # hostname
+            "/home/agent",                    # home
+            "/usr/local/bin/bonitoteam-mcp",  # mcp_path
+            "/tmp/worker-$i-projects",        # projects_root
+            :offline,                         # status
+            now(UTC))                         # last_check
+        state.workers[name] = w
+    end
+
+    for i in 1:n_projects
+        id = "p-$i"
+        proj = BonitoTeam.ProjectInfo(
+            id, "Project$i",
+            n_workers > 0 ? "w-$((i-1) % n_workers + 1)" : "",
+            mktempdir(),         # server_path (real dir, so chat persistence works)
+            "/tmp/worker-side-$i",
+            now())
+        state.projects[id] = proj
+    end
+
+    return state
+end
+
+# ── Mock ACP client ───────────────────────────────────────────────────────────
+
+"""
+    mock_factory(; scripted::Vector = [])
+
+Return a client_factory closure suitable for `ChatModel(...; client_factory=...)`.
+
+The mock ACP client is backed by a loopback Connection: outgoing JSON-RPC
+lines route through an in-memory channel and a tiny dispatcher that auto-
+responds to `initialize`, `session/new`, `session/prompt`, and `session/cancel`.
+
+`scripted` is a vector of `(delay_seconds, update_dict)` tuples. After a
+`session/prompt` request lands, the mock spawns a task that emits each
+update in order via the connection's `update_handler`, then completes the
+prompt request. Use this to simulate streaming agent / thought / tool
+events without a real claude subprocess.
+"""
+function mock_factory(; scripted::Vector = Tuple{Float64,Dict}[],
+                        prompt_error::Union{AbstractString,Nothing} = nothing)
+    return function(on_update::Function)
+        outgoing = Channel{String}(64)
+        incoming = Channel{String}(64)
+
+        # Process outgoing JSON-RPC lines from the BonitoTeam side. Auto-
+        # respond to the bring-up trio (initialize / session/new) plus the
+        # interactive ones (session/prompt streams scripted updates;
+        # session/cancel is a fire-and-forget notification).
+        Base.errormonitor(@async try
+            for line in outgoing
+                msg = JSON.parse(line)
+                method = get(msg, "method", "")
+                id     = get(msg, "id", nothing)
+
+                if method == "initialize" && id !== nothing
+                    put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
+                                                   "result"=>Dict())))
+                elseif method == "session/new" && id !== nothing
+                    put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
+                                                   "result"=>Dict("sessionId"=>"mock-sess-1"))))
+                elseif method == "session/prompt" && id !== nothing
+                    # Stream scripted updates, then complete the request —
+                    # unless `prompt_error` is set, in which case we
+                    # respond with a JSON-RPC error so the client side's
+                    # send_request raises (lets us cover send_prompt_async!'s
+                    # banner-vs-inline-bubble error split).
+                    @async try
+                        for (delay, upd) in scripted
+                            delay > 0 && sleep(delay)
+                            put!(incoming, JSON.json(Dict(
+                                "jsonrpc" => "2.0",
+                                "method"  => "session/update",
+                                "params"  => Dict("sessionId" => "mock-sess-1",
+                                                   "update"    => upd))))
+                        end
+                        if prompt_error === nothing
+                            put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
+                                                           "result"=>Dict("stopReason"=>"end_turn"))))
+                        else
+                            put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
+                                "error"=>Dict("code"=>-32000, "message"=>String(prompt_error)))))
+                        end
+                    catch e
+                        @warn "mock prompt streamer failed" exception=e
+                    end
+                elseif id !== nothing
+                    # Any other request: empty success response.
+                    put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
+                                                   "result"=>nothing)))
+                end
+                # Notifications (no id) — `session/cancel` etc. — just drop.
+            end
+        catch e
+            e isa InvalidStateException || @warn "mock responder failed" exception=e
+        end)
+
+        send_line = line -> put!(outgoing, line)
+        read_line = ()   -> take!(incoming)
+        on_close  = ()   -> (close(outgoing); close(incoming))
+
+        conn = ACP.Connection(send_line, read_line, on_close;
+                               update_handler = on_update)
+
+        ACP.send_request(conn, "initialize", Dict("protocolVersion" => 1))
+        result = ACP.send_request(conn, "session/new",
+                                   Dict("cwd" => "/tmp", "mcpServers" => []))
+        return ACP.Client(conn, result["sessionId"], "/tmp")
+    end
+end
+
+# Helper: build the four update payloads we care about. Shape mirrors what
+# claude-agent-acp emits, so `parse_session_update` in AgentClientProtocol
+# accepts them unchanged.
+agent_chunk_update(text) = Dict(
+    "sessionUpdate" => "agent_message_chunk",
+    "content" => Dict("type" => "text", "text" => text))
+
+thought_chunk_update(text) = Dict(
+    "sessionUpdate" => "agent_thought_chunk",
+    "content" => Dict("type" => "text", "text" => text))
+
+# Initial tool announcement (sessionUpdate=tool_call). Despite its
+# `tool_call_update` name (kept for backwards compat with existing tests),
+# this produces the FIRST event for a given toolCallId. Use `tool_update`
+# below for the partial-update follow-ups.
+tool_call_update(; id="t1", kind="execute", title="ls", status="completed",
+                   content=[]) = Dict(
+    "sessionUpdate" => "tool_call",
+    "toolCallId" => id, "kind" => kind, "title" => title, "status" => status,
+    "content" => content)
+
+# Partial update for an already-emitted toolCallId — re-renders the header
+# in place. Pass only the fields you want to change.
+function tool_update(; id, kind=nothing, title=nothing, status=nothing,
+                       content=nothing)
+    d = Dict{String,Any}(
+        "sessionUpdate" => "tool_call_update",
+        "toolCallId"    => id)
+    kind    === nothing || (d["kind"]    = kind)
+    title   === nothing || (d["title"]   = title)
+    status  === nothing || (d["status"]  = status)
+    content === nothing || (d["content"] = content)
+    return d
+end
+
+# Wrap a text block in the ACP envelope expected by parse_tool_content_item.
+tool_text(text::AbstractString) = Dict(
+    "type" => "content",
+    "content" => Dict("type" => "text", "text" => text))
+
+# Wrap a diff in the ACP envelope. Used to test the `edit` tool kind which
+# renders DiffEditor stacks instead of plain text.
+tool_diff(; path, old_text, new_text) = Dict(
+    "type"    => "diff",
+    "path"    => path,
+    "oldText" => old_text,
+    "newText" => new_text)
+
+plan_update(entries::Vector) = Dict(
+    "sessionUpdate" => "plan",
+    "entries" => [Dict("content"=>e.content, "status"=>e.status,
+                        "priority"=>get(e, :priority, "medium"))
+                   for e in entries])
+
+# ── Electron window lifecycle ─────────────────────────────────────────────────
+
+"""
+    open_window(state) -> ctx
+
+Boot a Bonito Electron window pointed at `unified_app(state)`. Returns a
+NamedTuple `(disp, app, session, state)` to pass to the rest of the helpers.
+"""
+function open_window(state::BonitoTeam.ServerState; devtools::Bool = false)
+    disp    = Bonito.use_electron_display(; devtools)
+    app     = BonitoTeam.unified_app(state)
+    display(disp, app)
+    session = app.session[]
+    # Install a JS error sink so individual tests can assert "no errors fired".
+    run(disp.window, """
+        window.__errs = [];
+        window.addEventListener('error', e => window.__errs.push(String(e.message)));
+    """)
+    return (; disp, app, session, state)
+end
+
+shutdown(ctx) = (try close(ctx.disp) catch end; nothing)
+
+"""
+    set_window_size(ctx, w, h)
+
+Resize the Electron window from the main process. Uses
+`BrowserWindow.fromId(...).setSize(...)` so the renderer's viewport
+actually changes — needed to exercise `@media (max-width: ...)` CSS rules.
+"""
+function set_window_size(ctx, w::Int, h::Int)
+    win_id = ctx.disp.window.window.id
+    run(ctx.disp.window.app, """
+        const win = electron.BrowserWindow.fromId($win_id);
+        win.setSize($w, $h);
+        null
+    """)
+    # Resize is async; wait for the renderer's reported size to catch up.
+    deadline = time() + 2
+    while time() < deadline
+        try
+            iw = run(ctx.disp.window, "window.innerWidth")
+            iw isa Number && abs(iw - w) < 30 && break
+        catch end
+        sleep(0.05)
+    end
+end
+
+"""
+    seed_chat_history!(model, n; user_text="hi", agent_text="ok")
+
+Push `n` (UserMsg, AgentMsg) pairs into `model.msgs_store` directly,
+without going through the ACP path. Useful for virtual-scroll tests that
+need a populated history at mount time.
+"""
+function seed_chat_history!(model, n::Int;
+                              user_text::AbstractString = "hi",
+                              agent_text::AbstractString = "ok")
+    for i in 1:n
+        push!(model.msgs_store, BonitoTeam.UserMsg("$user_text $i"))
+        push!(model.msgs_store, BonitoTeam.AgentMsg("agent-$i", "$agent_text $i"))
+    end
+    model.total_count[] = length(model.msgs_store)
+    return model
+end
+
+# ── JS evaluation / DOM probes ────────────────────────────────────────────────
+
+"""
+    eval_js(ctx, code) -> any
+
+Run a JS expression in the renderer; return the value (must be JSON-able).
+"""
+eval_js(ctx, code::AbstractString) = run(ctx.disp.window, code)
+
+"Number of elements matching `selector`."
+dom_count(ctx, selector::AbstractString) =
+    eval_js(ctx, "document.querySelectorAll($(JSON.json(selector))).length")
+
+"Truthy iff at least one element matches `selector`."
+dom_exists(ctx, selector::AbstractString) =
+    eval_js(ctx, "document.querySelector($(JSON.json(selector))) !== null")
+
+"BoundingClientRect of the first element matching `selector`, as Dict."
+dom_rect(ctx, selector::AbstractString) = eval_js(ctx, """
+    (() => {
+        const el = document.querySelector($(JSON.json(selector)));
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return {x: r.x, y: r.y, w: r.width, h: r.height,
+                top: r.top, bottom: r.bottom, left: r.left, right: r.right};
+    })()
+""")
+
+"Inner text of the first element matching `selector` (or null)."
+dom_text(ctx, selector::AbstractString) = eval_js(ctx, """
+    (() => {
+        const el = document.querySelector($(JSON.json(selector)));
+        return el ? el.innerText : null;
+    })()
+""")
+
+"Click the first element matching `selector`. No-op if absent."
+dom_click(ctx, selector::AbstractString) = eval_js(ctx, """
+    (() => { const el = document.querySelector($(JSON.json(selector)));
+              if (el) el.click(); return el !== null; })()
+""")
+
+"""
+    type_into(ctx, selector, text)
+
+Set `.value` on the first input/textarea matching `selector` and dispatch
+an `input` event so Bonito-side oninput handlers fire.
+"""
+function type_into(ctx, selector::AbstractString, text::AbstractString)
+    eval_js(ctx, """
+        (() => {
+            const el = document.querySelector($(JSON.json(selector)));
+            if (!el) return false;
+            el.value = $(JSON.json(text));
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            return true;
+        })()
+    """)
+end
+
+"""
+    press_key(ctx, selector, key; shift=false, ctrl=false)
+
+Dispatch a `keydown` event on the matched element.
+"""
+function press_key(ctx, selector::AbstractString, key::AbstractString;
+                    shift::Bool=false, ctrl::Bool=false)
+    eval_js(ctx, """
+        (() => {
+            const el = document.querySelector($(JSON.json(selector)));
+            if (!el) return false;
+            el.dispatchEvent(new KeyboardEvent('keydown', {
+                key: $(JSON.json(key)), shiftKey: $(shift), ctrlKey: $(ctrl), bubbles: true}));
+            return true;
+        })()
+    """)
+end
+
+"""
+    wait_for(ctx, predicate_js; timeout=3.0, interval=0.05) -> Bool
+
+Poll a JS expression that returns boolean; return true once it does, false
+on timeout. Avoids hard-coded sleeps in tests.
+"""
+function wait_for(ctx, predicate_js::AbstractString;
+                   timeout::Float64 = 3.0, interval::Float64 = 0.05)
+    deadline = time() + timeout
+    while time() < deadline
+        try
+            eval_js(ctx, "(() => { return ($predicate_js); })()") === true && return true
+        catch
+            # JS may throw mid-render; just keep polling.
+        end
+        sleep(interval)
+    end
+    return false
+end
+
+"Returns the JS error sink contents (empty if no errors fired)."
+js_errors(ctx) = eval_js(ctx, "window.__errs || []")
+
+# ── Screenshots ──────────────────────────────────────────────────────────────
+
+"""
+    screenshot(ctx; path=auto)
+
+Capture the current Electron window contents to a PNG file. Returns the path.
+Uses the main-process `webContents.capturePage()` API.
+"""
+function screenshot(ctx; path::AbstractString = tempname() * ".png")
+    win_id = ctx.disp.window.window.id
+    flag   = path * ".done"
+    run(ctx.disp.window.app, """
+        const win = electron.BrowserWindow.fromId($win_id);
+        win.webContents.capturePage().then(img => {
+            require('fs').writeFileSync($(JSON.json(path)), img.toPNG());
+            require('fs').writeFileSync($(JSON.json(flag)), '1');
+        });
+        null
+    """)
+    deadline = time() + 5
+    while !isfile(flag) && time() < deadline
+        sleep(0.05)
+    end
+    isfile(path) || error("screenshot timed out: $path")
+    return path
+end
+
+"""
+    emit_screenshot(ctx; label = "")
+
+Capture a PNG of the current Electron window, save it to a tempfile, and
+print the path. Returns the path so callers can do whatever they want
+with it (open in an image viewer, attach to a CI artifact, etc.).
+"""
+function emit_screenshot(ctx; label::AbstractString = "")
+    path = screenshot(ctx)
+    println("--- ", isempty(label) ? "screenshot" : label, " saved → ", path, " ---")
+    return path
+end
+
+# ── Test driver ──────────────────────────────────────────────────────────────
+
+"""
+    @test_eq actual expected
+
+Print a PASS / FAIL line. Doesn't raise; we want every assertion to run so
+one failure doesn't mask the rest.
+"""
+macro test_eq(actual, expected)
+    actual_str  = string(actual)
+    expected_str = string(expected)
+    quote
+        local a = $(esc(actual))
+        local e = $(esc(expected))
+        if isequal(a, e)
+            println("  PASS  $($(actual_str)) == $($(expected_str))  ($(repr(a)))")
+            true
+        else
+            println("  FAIL  $($(actual_str)) == $($(expected_str))")
+            println("        actual:   $(repr(a))")
+            println("        expected: $(repr(e))")
+            false
+        end
+    end
+end
+
+"As above, but checks `actual` is truthy."
+macro test_true(actual)
+    actual_str = string(actual)
+    quote
+        local a = $(esc(actual))
+        if a === true || (a isa Number && a > 0)
+            println("  PASS  $($(actual_str))  ($(repr(a)))")
+            true
+        else
+            println("  FAIL  $($(actual_str))")
+            println("        actual: $(repr(a))")
+            false
+        end
+    end
+end
+
+"Run a function under a banner. Use as `TH.section(\"label\") do ... end`."
+function section(f, label::AbstractString)
+    println("\n==> $label")
+    f()
+end
+
+# The runtests.jl harness peeks at this after each include() to build a
+# cross-tier summary. Test files call `TH.report!("Tier X — ...", results)`
+# from their finally block; that pushes one entry per call.
+const TIER_RESULTS = Tuple{String,Int,Int}[]   # (label, pass, fail)
+
+"""
+    report!(label, results)
+
+Print the per-tier summary + per-failure breakdown, and append the tally
+to `TH.TIER_RESULTS` so the harness can produce a cross-tier roll-up.
+Test files call this from their `finally` block instead of hand-rolling
+the summary section.
+"""
+function report!(label::AbstractString, results::AbstractVector)
+    println("\n", "="^60)
+    pass = count(p -> p.second, results)
+    fail = length(results) - pass
+    println("$label: $pass passed, $fail failed")
+    for (name, ok) in results
+        ok || println("  FAIL  $name")
+    end
+    push!(TIER_RESULTS, (String(label), pass, fail))
+    return (pass, fail)
+end
+
+end # module TestHelpers
+
+const TH = TestHelpers

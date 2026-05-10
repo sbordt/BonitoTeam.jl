@@ -21,28 +21,45 @@ class BonitoChat {
         this.OVERSCAN        = 8;
         this.wasAtBottom     = true;
         this.initialLoad     = false;  // true while waiting for first range response
+        this.chasingBottom   = false;  // see onRange — pin to bottom across a few
+                                       // re-layouts after the initial load until
+                                       // the user touches the scrollbar.
 
         this.spacerTop    = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
         this.busyEl       = container.parentElement.querySelector('.bt-busy');
 
-        // Julia → JS. Each callback short-circuits if `destroyed` and returns
-        // `false` so Bonito splices it out of the observable's callback list
-        // (see Observable.notify in Bonito.bundled.js — `false` self-deregisters).
-        // This lets the unified app re-init the chat for a different project
-        // without leaking subscriptions from the previous mount.
+        // Julia → JS. We just no-op when destroyed instead of returning
+        // `false` — Bonito's Observable.notify uses Array.forEach + splice
+        // during iteration, so when the old callback de-registers itself,
+        // forEach skips the *next* callback in the snapshot. That meant the
+        // new BonitoChat (registered right after the old one was destroyed)
+        // would silently miss the very response it had just requested. The
+        // small cost is that dead callbacks accumulate across re-mounts, but
+        // they short-circuit immediately on `destroyed` so the overhead is
+        // negligible until the page is reloaded.
         obs.totalCount.on((n) => {
-            if (this.destroyed) return false;
+            if (this.destroyed) return;
             this.totalCount = n; this.refresh();
         });
         obs.newMsg.on((str) => {
-            if (this.destroyed) return false;
+            if (this.destroyed) return;
             if (str) this.handleNewMsg(JSON.parse(str));
         });
         obs.rangeResponse.on((str) => {
-            if (this.destroyed) return false;
+            if (this.destroyed) return;
             if (str) this.onRange(JSON.parse(str));
         });
+
+        // Bootstrap from any previously-cached rangeResponse before the
+        // initial refresh. On a re-mount the observable still holds the last
+        // range Julia sent, but our .on() callbacks above only fire on
+        // *future* changes — without this, the same range request would be
+        // ignored and history would never re-render.
+        if (obs.rangeResponse.value) {
+            try { this.onRange(JSON.parse(obs.rangeResponse.value)); }
+            catch (_) {}
+        }
 
         // Bootstrap history on page load — totalCount.on only fires on future changes
         if (obs.initialCount > 0) {
@@ -54,6 +71,11 @@ class BonitoChat {
         // Scroll + viewport listeners — saved as bound functions so destroy()
         // can remove them via removeEventListener (anonymous arrows can't).
         this._onScroll = () => {
+            // If the user is interacting with the scrollbar, give up the
+            // initial-load bottom chase. atBottom() distinguishes "we just
+            // pinned to bottom" (true → keep chasing) from "user scrolled
+            // away" (false → release).
+            if (this.chasingBottom && !this.atBottom()) this.chasingBottom = false;
             this.wasAtBottom = this.atBottom();
             this.refresh();
         };
@@ -127,8 +149,34 @@ class BonitoChat {
         });
         this.updateDOM(...this.visibleRange());
         if (this.initialLoad) {
+            // First range arrived: jump to the bottom so we see the latest
+            // message. The first jump uses EST_HEIGHT for unmeasured cells,
+            // which over-estimates scrollHeight; once ResizeObserver delivers
+            // real (smaller) heights and a follow-up range brings in the
+            // actual tail messages, scrollHeight shrinks and the browser
+            // clamps us above the bottom. Re-jump a few times to converge.
+            // Bookkeeping flag so the chase doesn't outlive the user
+            // touching the scroll wheel.
+            this.initialLoad   = false;
+            this.chasingBottom = true;
             this.scrollToBottom();
-            this.initialLoad = false;
+            // 1) next animation frame — DOM has laid out the new bubbles.
+            requestAnimationFrame(() => {
+                if (!this.destroyed && this.chasingBottom) this.scrollToBottom();
+            });
+            // 2) 100/300ms — ResizeObserver has fired + the secondary range
+            //    request triggered by step (1) has come back with real bubbles.
+            setTimeout(() => {
+                if (!this.destroyed && this.chasingBottom) this.scrollToBottom();
+            }, 100);
+            setTimeout(() => {
+                if (!this.destroyed && this.chasingBottom) this.scrollToBottom();
+                this.chasingBottom = false;
+            }, 300);
+        } else if (this.chasingBottom) {
+            // A subsequent range came in while we were still chasing — keep
+            // pinning to the bottom until the chase window expires.
+            this.scrollToBottom();
         }
     }
 
@@ -321,9 +369,15 @@ class BonitoChat {
         });
     }
 
-    // Tool block: header + empty placeholder. Body is fetched lazily on expand.
+    // Tool block: header + optional inline preview + empty body placeholder.
+    // The preview is server-rendered (msg.preview) and only sent for kinds
+    // that benefit from skim-without-expand — `edit` today. CSS caps the
+    // preview height + fades the bottom; clicking the header still reveals
+    // the full DiffEditor body.
     toolHTML(msg) {
         const statusCls = `bt-tool-status bt-status-${msg.status || 'pending'}`;
+        const preview   = msg.preview ?
+            `<div class="bt-edit-preview">${msg.preview}</div>` : '';
         return `
             <div class="bt-tool-header" data-expanded="false">
                 <span class="bt-tool-toggle">▶</span>
@@ -332,6 +386,7 @@ class BonitoChat {
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
             </div>
+            ${preview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
     }
 

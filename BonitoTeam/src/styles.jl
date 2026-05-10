@@ -24,12 +24,13 @@ const ChatStyles = Bonito.Styles(
         "height" => "100%", "margin" => "0", "padding" => "0",
         "overflow" => "hidden"),
 
-    # ── App shell — full-viewport flex column ────────────────────────────────
-    # `position: fixed; inset: 0` decouples the chat from any Bonito wrapper
-    # element above us; without it a slightly-too-tall ancestor produces a
-    # spurious page-level scrollbar even though `body` is overflow:hidden.
+    # ── App shell — flex column that fills its container ────────────────────
+    # The chat is always mounted inside the unified shell's `.bt-main` slot
+    # (a flex column with defined height). `width/height: 100%` + `min-height: 0`
+    # makes us a well-behaved flex child: we fill the slot, and `.bt-messages`
+    # below can shrink past content height to enable its internal scroll.
     CSS(".bt-app",
-        "position" => "fixed", "inset" => "0",
+        "width" => "100%", "height" => "100%", "min-height" => "0",
         "display" => "flex", "flex-direction" => "column",
         "font-family" => "'Inter', system-ui, -apple-system, sans-serif",
         "font-size" => "14px",
@@ -303,6 +304,51 @@ const ChatStyles = Bonito.Styles(
         "margin-top" => "4px"),
     CSS(".bt-eval-section:first-child .bt-section-label",
         "margin-top" => "8px"),
+
+    # ── Edit-tool inline preview ─────────────────────────────────────────────
+    # Server-rendered diff snippet between the tool header and the lazy body.
+    # Capped at ~100px (~7-8 lines) with a fade gradient at the bottom so
+    # there's a visual hint that "more lives in the expanded body".
+    CSS(".bt-edit-preview",
+        "max-height" => "100px",
+        "overflow"   => "hidden",
+        "position"   => "relative",
+        "padding"    => "6px 12px 8px",
+        # border-box so the 100px cap is the actual rendered height — keeps
+        # the lightweight contract honest no matter what padding lands here.
+        "box-sizing" => "border-box",
+        "border-top" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface-2)",
+        "font-family" => "ui-monospace, monospace",
+        "font-size"  => "11.5px",
+        "line-height" => "1.4"),
+    # Bottom fade so the truncation is intentional-looking rather than
+    # an awkward hard cut.
+    CSS(".bt-edit-preview::after",
+        "content" => "''",
+        "position" => "absolute",
+        "left" => "0", "right" => "0", "bottom" => "0",
+        "height" => "20px",
+        "background" => "linear-gradient(to bottom, rgba(248,250,252,0), var(--bt-surface-2))",
+        "pointer-events" => "none"),
+    CSS(".bt-edit-preview-path",
+        "color" => "var(--bt-text-muted)",
+        "font-weight" => "600",
+        "padding-bottom" => "2px"),
+    CSS(".bt-edit-preview-line",
+        "white-space" => "pre",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis"),
+    CSS(".bt-edit-preview-del",
+        "color" => "#b91c1c",
+        "background" => "rgba(239,68,68,0.06)"),
+    CSS(".bt-edit-preview-add",
+        "color" => "#047857",
+        "background" => "rgba(16,185,129,0.08)"),
+    CSS(".bt-edit-preview-more",
+        "color" => "var(--bt-text-faint)",
+        "font-style" => "italic",
+        "padding-top" => "2px"),
 
     # ── Diff blocks (multi-edit) ─────────────────────────────────────────────
     # Single-diff body just shows the editor; multi-edit bodies stack diffs

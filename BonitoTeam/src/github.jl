@@ -114,7 +114,7 @@ function create_project_from_github!(state::ServerState, url::AbstractString;
     if existing !== nothing
         @info "create_project_from_github!: reusing existing project" id=existing.id name=existing.name
         if ref.kind != :repo
-            progress === nothing || progress("Fetching $(ref.kind) #$(ref.number) metadata…")
+            notify_progress(progress, :phase, (msg = "Fetching $(ref.kind) #$(ref.number) metadata…",))
             meta = fetch_github_issue(ref.owner, ref.repo, ref.number)
             existing.auto_prompt = github_issue_prompt(ref, meta.title, meta.body)
             save_projects!(state)
@@ -127,13 +127,13 @@ function create_project_from_github!(state::ServerState, url::AbstractString;
     clone_url   = "https://github.com/$(ref.owner)/$(ref.repo).git"
     pr_number   = ref.kind == :pull ? ref.number : nothing
 
-    progress === nothing || progress("Cloning $(ref.owner)/$(ref.repo) on worker…")
+    notify_progress(progress, :phase, (msg = "Cloning $(ref.owner)/$(ref.repo) on worker…",))
     clone_repo_on_worker(state, worker_name, clone_url, worker_path; pr_number = pr_number)
 
     auto_prompt = if ref.kind == :repo
         nothing
     else
-        progress === nothing || progress("Fetching $(ref.kind) #$(ref.number) metadata…")
+        notify_progress(progress, :phase, (msg = "Fetching $(ref.kind) #$(ref.number) metadata…",))
         meta = fetch_github_issue(ref.owner, ref.repo, ref.number)
         github_issue_prompt(ref, meta.title, meta.body)
     end
@@ -146,7 +146,7 @@ function create_project_from_github!(state::ServerState, url::AbstractString;
     end
     safe_notify!(state.projects)
 
-    progress === nothing || progress("Starting chat session…")
+    notify_progress(progress, :phase, (msg = "Starting chat session…",))
     ensure_project_session!(state, p)
     return p
 end

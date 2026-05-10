@@ -23,6 +23,7 @@ import BonitoMCP        # shipped to workers, also used by the bundle build
 import BonitoWorker     # ditto
 
 include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
+include("progress.jl")         # notify_progress / format_progress_string — shared by sync + import
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
 include("transport.jl")        # ChatTransport + LocalTransport / WorkerTransport / MockTransport
 include("styles.jl")

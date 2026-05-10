@@ -87,7 +87,7 @@ function create_project!(state::ServerState, name::String, src_path::String,
     # 1. Seed the canonical server-side copy from the picked source (local
     # rsync; this is always on the server box, no SSH).
     if abspath(src_path) != abspath(server_path)
-        progress === nothing || progress("Seeding server-side mirror…")
+        notify_progress(progress, :phase, (msg = "Seeding server-side mirror…",))
         @info "Seeding server-side mirror" src_path server_path
         mkpath(state.working_dir)
         run(`rsync -az $(rstrip(src_path, '/'))/ $(rstrip(server_path, '/'))/`)
@@ -105,7 +105,7 @@ function create_project!(state::ServerState, name::String, src_path::String,
     safe_notify!(state.projects)
 
     # 3 + 4: build the chat app + register the route.
-    progress === nothing || progress("Starting chat session…")
+    notify_progress(progress, :phase, (msg = "Starting chat session…",))
     ensure_project_session!(state, p)
     return p
 end
@@ -150,7 +150,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
             existing.resume_session_id = resume_session_id
             save_projects!(state)
         end
-        progress === nothing || progress("Reusing existing project…")
+        notify_progress(progress, :phase, (msg = "Reusing existing project…",))
         ensure_project_session!(state, existing)
         return existing
     end
@@ -176,6 +176,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
             rethrow(e)
         end
     else
+        notify_progress(progress, :phase, (msg = "Registered (no sync)",))
         @info "Registering project from worker (no sync)" worker=worker_name worker_path
     end
 
@@ -184,7 +185,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     end
     safe_notify!(state.projects)
 
-    progress === nothing || progress("Starting chat session…")
+    notify_progress(progress, :phase, (msg = "Starting chat session…",))
     ensure_project_session!(state, p)
     return p
 end
@@ -202,7 +203,8 @@ function handle_chat_sync_click(state::ServerState, project_id::AbstractString,
     @async begin
         try
             sync_project_to_server!(state, p;
-                on_progress = msg -> safe_set!(sync_status, msg))
+                on_progress = (stage, info) ->
+                    safe_set!(sync_status, format_progress_string(stage, info)))
             safe_set!(sync_status,
                 "✓ synced $(Dates.format(p.last_sync_at, "HH:MM:SS")) UTC")
         catch e
@@ -284,6 +286,155 @@ function ensure_project_session!(state::ServerState, p::ProjectInfo)
     start_chat_client!(model)        # also caches into state.chat_models
     fire_auto_prompt!(model)
     return model
+end
+
+# Short alias used by the move/copy plumbing below + the "Sync to server"
+# button. `sync_project_to_server!` is the long, explicit name; both refer
+# to the same operation: pull the worker's current state into the server's
+# canonical mirror.
+sync!(state::ServerState, p::ProjectInfo; progress = nothing) =
+    sync_project_to_server!(state, p; on_progress = progress)
+
+"""
+    stop_session!(state, p)
+
+Tear down the active ACP session for `p`: close the WorkerTransport (the
+worker sees the WS drop and reaps the claude subprocess), evict the
+ChatModel from `state.chat_models`, and release the project lock. Safe to
+call when no session is active — it just no-ops.
+"""
+function stop_session!(state::ServerState, p::ProjectInfo)
+    model = lock(state.lock) do
+        m = get(state.chat_models, p.id, nothing)
+        m === nothing || delete!(state.chat_models, p.id)
+        m
+    end
+    if model !== nothing
+        try
+            AgentClientProtocol.close!(model.transport)
+        catch e
+            @warn "stop_session!: transport close failed" project=p.name exception=e
+        end
+    end
+    release_project!(state, p)
+    return nothing
+end
+
+"""
+    start!(state, p, worker_id; progress=nothing) → ChatModel
+
+Bring up `p`'s chat session on `worker_id`. If `worker_id == p.worker_id`
+this is just `ensure_project_session!`. Otherwise it re-binds: stops any
+active session on the current worker, pushes the server-side mirror to the
+target worker (the source of truth — call `sync!(p)` first if you need the
+current worker's latest changes captured server-side), swaps `worker_id` /
+`worker_path` / clears `resume_session_id` (claude's per-session jsonl
+lives on the old worker's filesystem and can't be loaded elsewhere), then
+brings up a fresh session on the new worker.
+"""
+function start!(state::ServerState, p::ProjectInfo, worker_id::AbstractString;
+                progress = nothing)
+    target_id = String(worker_id)
+    haskey(state.workers[], target_id) ||
+        error("Unknown worker: $target_id")
+    target_w = state.workers[][target_id]
+    target_w.status === :online ||
+        error("Worker '$(target_w.name)' is offline")
+
+    if target_id == p.worker_id
+        return ensure_project_session!(state, p)
+    end
+
+    target_path = joinpath(target_w.projects_root, p.name)
+    notify_progress(progress, :phase,
+        (msg = "Stopping session on $(p.worker_id)…",))
+    stop_session!(state, p)
+
+    notify_progress(progress, :phase,
+        (msg = "Pushing $(p.name) → $(target_w.name)…",))
+    sync_dir_to_worker!(state, target_id, p.server_path, target_path;
+                         on_progress = progress)
+
+    # Re-bind. resume_session_id cleared because claude's jsonl lives on
+    # the old worker's fs and isn't transportable.
+    p.worker_id          = target_id
+    p.worker_path        = target_path
+    p.resume_session_id  = nothing
+    save_projects!(state)
+    safe_notify!(state.projects)
+
+    notify_progress(progress, :phase, (msg = "Starting chat on $(target_w.name)…",))
+    return ensure_project_session!(state, p)
+end
+
+"""
+    copy_to!(state, p, target_worker_id; name=p.name, progress=nothing) → ProjectInfo
+
+Snapshot `p` to a new project on `target_worker_id` via the server. Source
+project is left untouched. Steps: (1) `sync!(p)` so the server has the
+latest of the source, (2) seed a fresh server-side mirror at
+`working_dir/<name>` (collision-free via `-<id>` suffix if needed), (3)
+push that mirror to `target_worker_id:projects_root/<name>`, (4) register
+a new ProjectInfo. The new project starts un-resumed (fresh claude session
+when the user opens its chat).
+"""
+function copy_to!(state::ServerState, p::ProjectInfo, target_worker_id::AbstractString;
+                  name::AbstractString = p.name,
+                  progress = nothing)
+    target_id = String(target_worker_id)
+    haskey(state.workers[], target_id) ||
+        error("Unknown worker: $target_id")
+    target_w = state.workers[][target_id]
+    occursin(r"^[a-zA-Z0-9_\-]+$", String(name)) ||
+        error("Project name must be alphanumeric/_/- only — got '$name'")
+
+    target_path = joinpath(target_w.projects_root, String(name))
+    existing = find_project_by_location(state, target_id, target_path)
+    existing === nothing ||
+        error("$(target_w.name) already has a project at $(target_path)")
+
+    # 1. Pull source worker → server, so server has latest. Safe to skip
+    # if source worker is offline — we still copy from whatever's on disk.
+    if haskey(state.workers[], p.worker_id) &&
+       state.workers[][p.worker_id].status === :online
+        notify_progress(progress, :phase,
+            (msg = "Pulling latest from $(p.worker_id)…",))
+        sync!(state, p; progress = progress)
+    else
+        notify_progress(progress, :phase,
+            (msg = "Source worker offline — copying server snapshot…",))
+    end
+
+    # 2. Fresh server-side mirror under the target's name. Collision-free
+    # via short id suffix if working_dir already has a folder by that name.
+    new_id = string(uuid4())[1:8]
+    base_server_path = joinpath(state.working_dir, String(name))
+    new_server_path  = ispath(base_server_path) ?
+        "$(base_server_path)-$(new_id)" : base_server_path
+    mkpath(dirname(new_server_path))
+    if isdir(p.server_path)
+        run(`rsync -a $(rstrip(p.server_path, '/'))/ $(rstrip(new_server_path, '/'))/`)
+    else
+        mkpath(new_server_path)
+    end
+
+    # 3. Push server → target worker.
+    notify_progress(progress, :phase,
+        (msg = "Pushing copy → $(target_w.name)…",))
+    sync_dir_to_worker!(state, target_id, new_server_path, target_path;
+                         on_progress = progress)
+
+    # 4. Register the new project.
+    new_p = ProjectInfo(new_id, String(name), target_id,
+                         new_server_path, target_path, now(UTC))
+    new_p.backup_status = :synced
+    new_p.last_sync_at  = now(UTC)
+    lock(state.lock) do
+        state.projects[][new_id] = new_p
+        save_projects!(state)
+    end
+    safe_notify!(state.projects)
+    return new_p
 end
 
 # Dashboard styles — modern surface + spacing system, status dots, smooth transitions
@@ -700,28 +851,77 @@ const DashboardStyles = Bonito.Styles(
         CSS("100%", "background" => "transparent",
                     "color"      => "var(--bt-accent)")),
 
-    # ── Global busy toast ────────────────────────────────────────────────────
-    # Fixed top-right (left of the connection LED). Shown whenever any
-    # handler has set busy_msg, regardless of which form is open. Live
-    # progress messages from push/pull file transfers flow in here.
-    CSS(".bt-busy-toast",
+    # "Open chat on <worker>" — link styled wrapper containing a label and a
+    # native <select>. Dropdown stays inline so the whole control reads as a
+    # single button. Default-selected option is the project's current worker;
+    # picking a different one → click handler runs the move sequence.
+    CSS(".bt-open-on", "gap" => "4px"),
+    CSS(".bt-open-on-label",
+        "color" => "var(--bt-accent)",
+        "font-weight" => "500"),
+    CSS(".bt-open-on-select",
+        "background"     => "transparent",
+        "border"         => "1px solid var(--bt-border)",
+        "border-radius"  => "var(--bt-radius-sm)",
+        "color"          => "var(--bt-accent)",
+        "font-weight"    => "500",
+        "font-size"      => "13px",
+        "padding"        => "2px 4px",
+        "cursor"         => "pointer"),
+    CSS(".bt-open-on-select:hover",
+        "background" => "rgba(59,130,246,0.06)"),
+
+    # ── Global busy progress pill ────────────────────────────────────────────
+    # Fixed top-centered, single text line. One UI for every long-running op
+    # (sync, project import, GitHub clone). Hidden via class toggle so the
+    # wrapper stays mounted; child <span>s bind to derived Observable{String}s
+    # which hit Bonito's innerText fast-path — no DOM swap, no flash, even
+    # when librsync fires hundreds of file events per second.
+    CSS(".bt-busy-card",
         "position" => "fixed",
-        "top" => "10px", "right" => "44px",
+        "top" => "12px",
+        "left" => "50%",
+        "transform" => "translateX(-50%)",
+        "max-width" => "min(720px, 92vw)",
         "background" => "var(--bt-surface)",
         "border" => "1px solid var(--bt-accent)",
-        "border-radius" => "var(--bt-radius)",
-        "padding" => "10px 14px",
+        "border-radius" => "999px",
+        "padding" => "5px 14px",
         "box-shadow" => "var(--bt-shadow-md)",
-        "display" => "flex", "align-items" => "center", "gap" => "10px",
         "z-index" => "9998",
         "font-size" => "13px",
+        "line-height" => "1.4",
         "color" => "var(--bt-text)",
-        "max-width" => "min(80vw, 480px)"),
+        "display" => "flex",
+        "align-items" => "center",
+        "gap" => "10px",
+        "white-space" => "nowrap",
+        "overflow" => "hidden"),
+    CSS(".bt-busy-card.bt-busy-hidden",
+        "display" => "none"),
+    CSS(".bt-busy-title",
+        "font-weight" => "600",
+        "color" => "var(--bt-text)",
+        "flex" => "0 0 auto"),
+    CSS(".bt-busy-pct",
+        "font-variant-numeric" => "tabular-nums",
+        "color" => "var(--bt-text-muted)",
+        "min-width" => "32px",
+        "text-align" => "right",
+        "flex" => "0 0 auto"),
+    CSS(".bt-busy-msg",
+        "color" => "var(--bt-text-muted)",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "12.5px",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis",
+        "flex" => "1 1 auto",
+        "min-width" => "0"),
 
     # ── Inline "loading" state for click-fired DOM buttons ───────────────────
     # Used by the Discover Import button — JS flips this class on click for
-    # instant visual feedback (the WS round-trip to set busy_msg can take
-    # tens of ms; the click should respond immediately).
+    # instant visual feedback (the WS round-trip to surface the busy card
+    # can take tens of ms; the click should respond immediately).
     CSS(".bt-btn.bt-clicked",
         "opacity" => "0.55", "cursor" => "wait",
         "pointer-events" => "none"),
@@ -1157,6 +1357,7 @@ end
 function project_card(state::ServerState, p::ProjectInfo,
                        error_obs::Observable{String},
                        sync_request::Observable{String},
+                       open_request::Observable{Dict{String,Any}},
                        current_view::Union{Observable{String},Nothing} = nothing)
     badge = p.locked_by === nothing ? DOM.span() :
         DOM.span("active";
@@ -1164,14 +1365,33 @@ function project_card(state::ServerState, p::ProjectInfo,
                  style = Styles("margin-left" => "6px"),
                  title = "active session on $(p.locked_by)")
 
-    open_link = if current_view === nothing
+    # Worker dropdown next to the "Open chat on" button. Picking a
+    # different worker than the one the project is currently bound to
+    # → the click triggers a `start!(state, p, picked)` re-bind on the
+    # server side (= move via the server-side mirror, with sync first).
+    online_workers = [w for w in values(state.workers[]) if w.status === :online]
+    open_link = if current_view === nothing || isempty(online_workers)
         DOM.span("(no chat available)";
             class = "bt-link", style = Styles("color" => "var(--bt-text-muted)"))
     else
-        DOM.span("Open chat →";
-            class   = "bt-link",
+        worker_select = DOM.select(
+            (DOM.option(w.name; value = w.worker_id,
+                        selected = (w.worker_id == p.worker_id))
+             for w in online_workers)...;
+            class = "bt-open-on-select",
+            # Stop the parent's onclick from firing when the user is
+            # interacting with the <select>; click-on-button is the only
+            # action surface.
+            onclick = js"event => event.stopPropagation()")
+        DOM.div(
+            DOM.span("Open chat on "; class = "bt-open-on-label"),
+            worker_select;
+            class   = "bt-link bt-open-on",
             style   = Styles("cursor" => "pointer"),
-            onclick = js"event => $(current_view).notify($(p.id))")
+            onclick = js"""event => {
+                const sel = event.currentTarget.querySelector('select');
+                $(open_request).notify({project: $(p.id), worker: sel.value});
+            }""")
     end
 
     sync_btn = if p.backup_status === :syncing
@@ -1232,7 +1452,10 @@ function dashboard_dom(state::ServerState;
     # mutually exclusive; one enum is clearer than two booleans that always
     # have to be kept opposite.
     which_form = Observable(:none)
-    busy_msg   = Observable("")        # "" = idle; non-empty = operation in progress
+    # Single source of truth for the global progress card (sync, project
+    # import, GitHub clone). `BUSY_IDLE` ⇒ card hidden; non-idle snapshot ⇒
+    # card visible with title + progress + recent files. See progress.jl.
+    busy = Observable(BUSY_IDLE)
 
     # Form fields
     np_name   = Observable("")
@@ -1248,8 +1471,8 @@ function dashboard_dom(state::ServerState;
 
     # ── Sync-to-server click handler ─────────────────────────────────────────
     # Fired by the project card's "Sync to server" / "Re-sync" button. The
-    # actual transfer runs in the background; we update busy_msg + notify(state.projects)
-    # so the UI shows the syncing state on the card.
+    # actual transfer runs in the background; we update `busy` + notify(state.projects)
+    # so the global progress card and the project card both reflect the syncing state.
     sync_request = Observable("")
     on(sync_request) do pid
         isempty(pid) && return
@@ -1259,10 +1482,11 @@ function dashboard_dom(state::ServerState;
         p.backup_status === :syncing && return    # already in flight
         @async begin
             try
-                # safe_set! on busy_msg: a JS hiccup updating the toast must
-                # not abort the in-flight transfer.
+                # busy_event!/busy_start! are best-effort (safe_set!): a JS
+                # hiccup updating the card must not abort the in-flight transfer.
+                busy_start!(busy, "Syncing $(p.name)")
                 sync_project_to_server!(state, p;
-                    on_progress = msg -> safe_set!(busy_msg, "Syncing $(p.name): $(msg)"))
+                    on_progress = (stage, info) -> busy_event!(busy, stage, info))
                 safe_set!(error_obs, "")
             catch e
                 bt = catch_backtrace()
@@ -1270,7 +1494,51 @@ function dashboard_dom(state::ServerState;
                 safe_set!(error_obs,
                     "Failed to sync $(p.name): $(sprint(showerror, e))")
             finally
-                safe_set!(busy_msg, "")
+                busy_clear!(busy)
+            end
+        end
+    end
+
+    # ── "Open chat on <worker>" click handler ────────────────────────────────
+    # JS sends a {project, worker} payload. Same worker → just swap the
+    # main-panel view. Different worker → run the move sequence
+    # (sync! current → server, start! re-binds + pushes server → target),
+    # then swap the view. Long-running so it goes through the busy card.
+    open_request = Observable(Dict{String,Any}())
+    on(open_request) do payload
+        isempty(payload) && return
+        pid    = String(get(payload, "project", ""))
+        target = String(get(payload, "worker",  ""))
+        open_request[] = Dict{String,Any}()   # reset
+        (isempty(pid) || isempty(target)) && return
+        haskey(state.projects[], pid) || return
+        p = state.projects[][pid]
+
+        if target == p.worker_id
+            current_view !== nothing && (current_view[] = p.id)
+            return
+        end
+
+        haskey(state.workers[], target) || return
+        is_busy_idle(busy[]) || return   # don't pile up moves
+        target_w = state.workers[][target]
+        @async begin
+            try
+                busy_start!(busy, "Moving $(p.name) → $(target_w.name)")
+                cb = (stage, info) -> busy_event!(busy, stage, info)
+                # sync! source → server first so the move carries the
+                # latest worker-side state. start! does the push to target.
+                sync!(state, p; progress = cb)
+                start!(state, p, target; progress = cb)
+                safe_set!(error_obs, "")
+                current_view !== nothing && (current_view[] = p.id)
+            catch e
+                bt = catch_backtrace()
+                @warn "move failed" project=p.name target=target exception=(e, bt)
+                safe_set!(error_obs,
+                    "Failed to move $(p.name) to $(target_w.name): $(sprint(showerror, e))")
+            finally
+                busy_clear!(busy)
             end
         end
     end
@@ -1280,15 +1548,15 @@ function dashboard_dom(state::ServerState;
 
     on(np_submit.value) do clicked
         clicked || return
-        isempty(busy_msg[]) || return   # guard: ignore clicks while busy
+        is_busy_idle(busy[]) || return   # guard: ignore clicks while busy
         nm = String(strip(np_name[]))
-        busy_msg[] = "Creating $(nm)…"
+        busy_start!(busy, "Creating $(nm)")
         @async begin
             try
                 p = create_project!(state, nm,
                                  String(strip(np_picker.selected[])),
                                  String(strip(np_worker[]));
-                                 progress = msg -> (busy_msg[] = "Creating $(nm): $(msg)"))
+                                 progress = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[] = ""
                 which_form[] = :none
                 np_name[] = ""; np_picker.selected[] = ""; np_worker[] = ""
@@ -1296,13 +1564,13 @@ function dashboard_dom(state::ServerState;
             catch e
                 error_obs[] = "Failed to create project: $e"
             finally
-                busy_msg[] = ""
+                busy_clear!(busy)
             end
         end
     end
     on(np_cancel.value) do clicked
         clicked || return
-        isempty(busy_msg[]) || return   # don't cancel mid-create
+        is_busy_idle(busy[]) || return   # don't cancel mid-create
         which_form[] = :none
         error_obs[] = ""
     end
@@ -1324,17 +1592,17 @@ function dashboard_dom(state::ServerState;
 
     on(gh_submit.value) do clicked
         clicked || return
-        isempty(busy_msg[]) || return
+        is_busy_idle(busy[]) || return
         url = String(strip(gh_url[]))
         worker_name = String(strip(gh_worker[]))
         isempty(url) && (error_obs[] = "GitHub URL required."; return)
         isempty(worker_name) && (error_obs[] = "Pick a worker."; return)
-        busy_msg[] = "Opening from GitHub…"
+        busy_start!(busy, "Opening from GitHub")
         @async begin
             try
                 p = create_project_from_github!(state, url;
                     worker_name = worker_name,
-                    progress    = msg -> (busy_msg[] = "From GitHub: $(msg)"))
+                    progress    = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[]  = ""
                 which_form[] = :none
                 gh_url[]     = ""
@@ -1342,13 +1610,13 @@ function dashboard_dom(state::ServerState;
             catch e
                 error_obs[] = "Failed to open from GitHub: $(sprint(showerror, e))"
             finally
-                busy_msg[] = ""
+                busy_clear!(busy)
             end
         end
     end
     on(gh_cancel.value) do clicked
         clicked || return
-        isempty(busy_msg[]) || return
+        is_busy_idle(busy[]) || return
         which_form[] = :none
         error_obs[]  = ""
     end
@@ -1406,27 +1674,28 @@ function dashboard_dom(state::ServerState;
         resume_session_id = (sid_raw === nothing || isempty(String(sid_raw))) ?
                                 nothing : String(sid_raw)
         import_path[] = Dict{String,Any}()    # reset so the same path can re-fire
-        isempty(busy_msg[]) || return
+        is_busy_idle(busy[]) || return
         w_name = discover_state[]
         isempty(w_name) && return
         proj_name = replace(basename(rstrip(path, '/')), r"[^a-zA-Z0-9_\-]" => "_")
         isempty(proj_name) && (proj_name = "project")
-        busy_msg[] = resume_session_id === nothing ?
-            "Importing $(proj_name)…" :
+        title = resume_session_id === nothing ?
+            "Importing $(proj_name)" :
             "Resuming $(proj_name) (session $(resume_session_id[1:8])…)"
+        busy_start!(busy, title)
         @async begin
             try
                 p = create_project_from_worker!(state, w_name, path;
                                              name = proj_name,
                                              resume_session_id = resume_session_id,
-                                             progress = msg -> (busy_msg[] = "Importing $(proj_name): $(msg)"))
+                                             progress = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[]      = ""
                 discover_state[] = ""
                 current_view !== nothing && (current_view[] = p.id)
             catch e
                 error_obs[] = "Failed to import: $(sprint(showerror, e))"
             finally
-                busy_msg[] = ""
+                busy_clear!(busy)
             end
         end
     end
@@ -1466,7 +1735,7 @@ function dashboard_dom(state::ServerState;
                 style   = Styles("cursor" => "pointer", "flex-shrink" => "0"),
                 # Instant visual feedback: flip the button to a loading
                 # state synchronously on click, before the WS round-trip
-                # that sets busy_msg server-side has a chance to land.
+                # that surfaces the busy card has a chance to land.
                 onclick = js"""event => {
                     const btn = event.currentTarget;
                     btn.classList.add('bt-clicked');
@@ -1526,7 +1795,7 @@ function dashboard_dom(state::ServerState;
     end
 
     function submit_remote_pick(w_name::String)
-        isempty(busy_msg[]) || return   # guard: ignore if already creating
+        is_busy_idle(busy[]) || return   # guard: ignore if already creating
         rp = get_remote_picker(w_name)
         chosen = String(strip(rp.selected[]))
         if isempty(chosen)
@@ -1534,11 +1803,11 @@ function dashboard_dom(state::ServerState;
             return
         end
         nm = basename(rstrip(chosen, '/'))
-        busy_msg[] = "Importing $(nm)…"
+        busy_start!(busy, "Importing $(nm)")
         @async begin
             try
                 p = create_project_from_worker!(state, w_name, chosen;
-                    progress = msg -> (busy_msg[] = "Importing $(nm): $(msg)"))
+                    progress = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[] = ""
                 picker_state[] = ""
                 rp.selected[] = ""
@@ -1546,7 +1815,7 @@ function dashboard_dom(state::ServerState;
             catch e
                 error_obs[] = "Failed to create project from worker: $e"
             finally
-                busy_msg[] = ""
+                busy_clear!(busy)
             end
         end
     end
@@ -1578,11 +1847,9 @@ function dashboard_dom(state::ServerState;
             # (stable UUID, the dict key into state.workers).
             (DOM.option(w.name; value=w.worker_id) for w in values(state.workers[]))...;
             onchange = js"event => $(np_worker).notify(event.target.value)"),
-        map(busy_msg) do msg
-            isempty(msg) ?
-                DOM.div(np_cancel, np_submit, class = "bt-form-actions") :
-                DOM.div(spinner_row(msg), class = "bt-form-actions")
-        end,
+        # Form action row — the global progress card is the visual feedback
+        # for the in-flight submit; click handlers guard against double-fire.
+        DOM.div(np_cancel, np_submit, class = "bt-form-actions"),
         class = "bt-form")
 
     gh_form() = DOM.div(
@@ -1597,11 +1864,7 @@ function dashboard_dom(state::ServerState;
         DOM.select(
             (DOM.option(w.name; value=w.worker_id) for w in values(state.workers[]))...;
             onchange = js"event => $(gh_worker).notify(event.target.value)"),
-        map(busy_msg) do msg
-            isempty(msg) ?
-                DOM.div(gh_cancel, gh_submit, class = "bt-form-actions") :
-                DOM.div(spinner_row(msg), class = "bt-form-actions")
-        end,
+        DOM.div(gh_cancel, gh_submit, class = "bt-form-actions"),
         class = "bt-form")
 
     # `wid` is the worker_id (UUID), not the display name. Display label
@@ -1617,7 +1880,7 @@ function dashboard_dom(state::ServerState;
         end
         on(cancel_btn.value) do clicked
             clicked || return
-            isempty(busy_msg[]) || return   # don't cancel mid-create
+            is_busy_idle(busy[]) || return   # don't cancel mid-create
             picker_state[] = ""; error_obs[] = ""
         end
         display_name = haskey(state.workers[], wid) ? state.workers[][wid].name : wid
@@ -1631,11 +1894,7 @@ function dashboard_dom(state::ServerState;
                                            "font-size" => "12px",
                                            "margin-top" => "4px"))
                     end),
-            map(busy_msg) do msg
-                isempty(msg) ?
-                    DOM.div(cancel_btn, create_btn, class = "bt-form-actions") :
-                    DOM.div(spinner_row(msg), class = "bt-form-actions")
-            end,
+            DOM.div(cancel_btn, create_btn, class = "bt-form-actions"),
             class = "bt-form")
     end
 
@@ -1710,7 +1969,7 @@ function dashboard_dom(state::ServerState;
         isempty(projects) ?
             DOM.div("No projects yet — pick a worker above and click + Project, or import an existing Claude session via Discover.";
                     class = "bt-empty") :
-            DOM.div((project_card(state, p, error_obs, sync_request, current_view)
+            DOM.div((project_card(state, p, error_obs, sync_request, open_request, current_view)
                      for p in values(projects))...;
                     class = "bt-cards")
     end
@@ -1729,23 +1988,30 @@ function dashboard_dom(state::ServerState;
         isempty(msg) ? DOM.div() : DOM.div(msg; class = "bt-error")
     end
 
-    # Global busy toast — fixed top-right, shown whenever any handler has set
-    # busy_msg. Used by Import (discover panel), Create project (form), and
-    # Create from worker (per-worker picker form). Stage updates from
-    # push_dir_to_worker! / pull_dir_from_worker! flow into busy_msg via the
-    # progress callback so the toast updates live during transfers.
-    busy_toast = map(busy_msg) do msg
-        isempty(msg) ? DOM.div() :
-            DOM.div(
-                DOM.div(class = "bt-spinner"),
-                DOM.span(msg),
-                class = "bt-busy-toast bt-slide-in")
+    # Global busy progress pill — fixed top-centered, single text line.
+    # Wrapper stays mounted; visibility flips via class toggle (instant
+    # attribute update). The three text spans bind to derived
+    # Observable{String}s so they hit Bonito's innerText fast-path — no
+    # wrapper re-render and no DOM swap during the thousands of file
+    # events that a librsync transfer fires.
+    title_obs = map(s -> s.title, busy)
+    pct_obs   = map(busy) do s
+        s.total > 0 ? "$(round(Int, 100 * s.done / max(s.total, 1)))%" : ""
     end
+    msg_obs   = map(s -> s.msg, busy)
+    visibility_class = map(busy) do s
+        is_busy_idle(s) ? "bt-busy-card bt-busy-hidden" : "bt-busy-card"
+    end
+    busy_card = DOM.div(
+        DOM.span(title_obs; class = "bt-busy-title"),
+        DOM.span(pct_obs;   class = "bt-busy-pct"),
+        DOM.span(msg_obs;   class = "bt-busy-msg");
+        class = visibility_class)
 
     # Layout — DOM only; the App() wrapper + global assets (DashboardStyles,
     # ConnectionIndicator) live in the caller (unified_app or dashboard_app).
     DOM.div(
-        busy_toast,
+        busy_card,
         DOM.div(
             DOM.h1("BonitoTeam"),
             DOM.div("Multi-host orchestrator for agentic coding sessions";

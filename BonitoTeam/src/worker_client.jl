@@ -315,7 +315,7 @@ function sync_dir_to_worker!(state::ServerState, worker_name::String,
 
     sync_id, ch = register_rpc!(state)
 
-    notify_str(on_progress, "Connecting to worker…")
+    notify_progress(on_progress, :phase, (msg = "Connecting to worker…",))
     send_command(state, worker_name, Dict(
         "type"      => "open_transfer",
         "sync_id"   => sync_id,
@@ -326,11 +326,10 @@ function sync_dir_to_worker!(state::ServerState, worker_name::String,
     ws = take_pending!(state, ch, sync_id, handoff_timeout,
                       "sync to '$worker_name'")
     try
-        notify_str(on_progress, "Streaming via librsync…")
+        notify_progress(on_progress, :phase, (msg = "Streaming via librsync…",))
         wsio = RemoteSync.WebSocketIO(ws)
-        RemoteSync.send_directory(src, wsio;
-            on_progress = (stage, info) -> remotesync_progress(on_progress, stage, info))
-        notify_str(on_progress, "Done")
+        RemoteSync.send_directory(src, wsio; on_progress = on_progress)
+        notify_progress(on_progress, :phase, (msg = "Done",))
     finally
         try close(ws) catch end
     end
@@ -353,7 +352,7 @@ function sync_dir_from_worker!(state::ServerState, worker_name::String,
 
     sync_id, ch = register_rpc!(state)
 
-    notify_str(on_progress, "Connecting to worker…")
+    notify_progress(on_progress, :phase, (msg = "Connecting to worker…",))
     send_command(state, worker_name, Dict(
         "type"      => "open_transfer",
         "sync_id"   => sync_id,
@@ -364,44 +363,15 @@ function sync_dir_from_worker!(state::ServerState, worker_name::String,
     ws = take_pending!(state, ch, sync_id, handoff_timeout,
                       "sync from '$worker_name'")
     try
-        notify_str(on_progress, "Streaming via librsync…")
+        notify_progress(on_progress, :phase, (msg = "Streaming via librsync…",))
         wsio = RemoteSync.WebSocketIO(ws)
-        RemoteSync.receive_directory(dst, wsio;
-            on_progress = (stage, info) -> remotesync_progress(on_progress, stage, info))
-        notify_str(on_progress, "Done")
+        RemoteSync.receive_directory(dst, wsio; on_progress = on_progress)
+        notify_progress(on_progress, :phase, (msg = "Done",))
     finally
         try close(ws) catch end
     end
     return nothing
 end
-
-# Translate RemoteSync's structured progress events into the human-readable
-# strings the dashboard busy_msg observable shows.
-function remotesync_progress(cb, stage::Symbol, info)
-    cb === nothing && return
-    msg = if stage === :walk_done
-        "Scanning files: $(info.count) found"
-    elseif stage === :manifest_received
-        "Receiving manifest: $(info.count) files"
-    elseif stage === :plan_received
-        "Planning: $(info.work) of $(info.planned) need transfer"
-    elseif stage === :file_start
-        "Sending $(info.idx)/$(info.total): $(info.rel)"
-    elseif stage === :apply_start
-        "Receiving $(info.idx)/$(info.total): $(info.rel)"
-    elseif stage === :transfer_done
-        haskey(info, :written) ?
-            "Transfer complete: $(info.written) wrote, $(info.deleted) deleted, $(info.skipped) skipped" :
-            "Transfer complete: $(info.files) files"
-    else
-        nothing
-    end
-    msg === nothing || notify_str(cb, msg)
-    return
-end
-
-notify_str(::Nothing, _msg::AbstractString) = nothing
-notify_str(cb, msg::AbstractString) = (try cb(msg) catch end; nothing)
 
 # Human-readable byte counts used by the progress callbacks above.
 function format_bytes(n::Integer)

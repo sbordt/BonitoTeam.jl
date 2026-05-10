@@ -1,35 +1,27 @@
 # End-to-end regression for the Key-N-not-found / null-Observable race
 # the user hit when clicking "Resume" on a discovered claude session.
 #
-# Architecture-side fix landed in:
-#   - src/sidebar.jl   (sidebar `map(state.projects)` only; no re-render
-#                       on `current_view` change → no subsession churn
-#                       → no GLOBAL_OBJECT_CACHE refcount race)
-#   - src/state.jl     (`state.projects` is itself the Observable)
+# Real stack (no mocks):
+#   - BonitoTeam.serve()                 (production URL)
+#   - BonitoWorker.connect_and_serve()    (real /worker-ws handshake)
+#   - Electron BrowserWindow at the served URL
+#   - Chromium console-message + renderer-side patch capture
 #
-# This test reproduces the user's clicked path:
-#   1. real `BonitoTeam.serve()` (NOT a mock Server — the URL is the same
-#      one production prints).
-#   2. real `BonitoWorker` connected over its actual control WS.
-#   3. real Electron window pointed at `Bonito.online_url(state.srv, "")`.
-#   4. capture every Chromium console message via the BrowserWindow event.
-#   5. drive the navigation that Resume does at the very end:
-#      `current_view[] = project_id` — by clicking the sidebar entry
-#      exactly the way the user does.
-#   6. assert ZERO occurrences of any of:
-#        - "Key <N> not found"
-#        - "TrackingOnly: Key <N> not found"
-#        - "Trying to delete object <N>"
-#        - "Cannot read properties of null (reading 'notify')"
-#
-# The session fires `current_view[] = …` repeatedly across this run; if
-# the race were still present each navigation would dump dozens of
-# warnings (matching the user's screenshot).
+# What it actually checks (per the user's complaint that I previously
+# only watched a log and called it green):
+#   1. Dashboard's "Home" entry rendered
+#   2. After adding a project + notify, the project's sidebar entry and
+#      the project's dashboard card are both visible in the DOM
+#   3. Clicking the sidebar entry actually navigates (chat panel mounts
+#      OR a "Starting chat for X…" placeholder shows up)
+#   4. Zero "Key N not found" / "TrackingOnly" / null-Observable warnings
+#      across the run
+#   5. Final-state screenshot saved so we can see what the user sees
 
 using BonitoTeam, Bonito, HTTP, JSON
 import Electron, BonitoWorker
 
-# ── Boot the server ──────────────────────────────────────────────────────
+# ── 1. server + worker ───────────────────────────────────────────────────
 state = BonitoTeam.serve(;
     host          = "127.0.0.1",
     port          = 0,
@@ -39,7 +31,6 @@ state = BonitoTeam.serve(;
 url = Bonito.online_url(state.srv, "")
 @info "Server up" url
 
-# ── Spawn a real local worker against it ─────────────────────────────────
 worker_proj_root = mktempdir()
 worker_task = Base.errormonitor(@async try
     BonitoWorker.connect_and_serve(;
@@ -53,7 +44,6 @@ catch e
     @warn "worker task ended" exception=e
 end)
 
-# Wait until the worker handshake completes.
 deadline = time() + 15
 while time() < deadline
     haskey(state.workers[], "resume-test-worker-id") &&
@@ -63,24 +53,7 @@ end
 @assert haskey(state.workers[], "resume-test-worker-id") "worker never connected"
 @info "Worker connected"
 
-# ── Seed two projects so the sidebar has multiple entries to navigate
-#    between. This exactly mirrors what `create_project_from_worker!`
-#    does at the end of the Resume handler: `state.projects[][id] = p;
-#    notify(state.projects); current_view[] = p.id`.
-for (pid, name) in (("alpha", "Alpha"), ("beta", "Beta"))
-    p = BonitoTeam.ProjectInfo(pid, name, "resume-test-worker-id",
-                                joinpath(state.working_dir, name),
-                                joinpath(worker_proj_root, name),
-                                BonitoTeam.now(BonitoTeam.UTC))
-    mkpath(p.server_path); mkpath(p.worker_path)
-    state.projects[][pid] = p
-end
-notify(state.projects)
-@info "Projects seeded" ids=collect(keys(state.projects[]))
-
-# ── Open Electron + install a console capture that records EVERYTHING
-#    Chromium's renderer prints. `console-message` fires on the main-
-#    process side for every `console.log/warn/error/etc.` in the page.
+# ── 2. open Electron + capture both main-process and renderer console
 app = Electron.Application()
 win = Electron.Window(app, Electron.URI(url);
                       options = Dict{String,Any}("show"=>false, "focusOnWebView"=>false))
@@ -91,30 +64,54 @@ win_id = win.id
 Electron.run(app, """
     const win = electron.BrowserWindow.fromId($win_id);
     const fs  = require('fs');
-    win.webContents.on('console-message', (event, level, message, line, source) => {
+    const log_path = $(JSON.json(console_log));
+    win.webContents.on('console-message', (...args) => {
         try {
-            fs.appendFileSync($(JSON.json(console_log)),
-                JSON.stringify({level, message, source, line}) + '\\n');
+            let level, message, line, source;
+            if (args.length === 1 && typeof args[0] === 'object') {
+                ({level, message, lineNumber: line, sourceId: source} = args[0]);
+            } else {
+                [, level, message, line, source] = args;
+            }
+            fs.appendFileSync(log_path,
+                JSON.stringify({src:'main', level, message, source, line}) + '\\n');
         } catch(e) {}
     });
     null
 """)
-@info "Console capture armed" path=console_log
 
-# Helper: click the sidebar entry whose data-project-id matches `pid`.
-# Empty `pid` selects the Home / dashboard entry.
-function navigate_to(win, pid::AbstractString)
-    Electron.run(win, """
-        (() => {
-            const el = document.querySelector(
-                '.bt-side-item[data-project-id=$(JSON.json(pid))]');
-            if (el) { el.click(); return true; }
-            return false;
-        })()
-    """)
-end
+Electron.run(win, """
+    (() => {
+        window.__bt_console = [];
+        for (const lvl of ['log','warn','error']) {
+            const orig = console[lvl];
+            console[lvl] = function(...args) {
+                try {
+                    window.__bt_console.push({lvl, msg: args.map(a => {
+                        try { return typeof a === 'string' ? a : JSON.stringify(a); }
+                        catch(e) { return String(a); }
+                    }).join(' ')});
+                } catch(e) {}
+                return orig.apply(this, args);
+            };
+        }
+        window.addEventListener('error', e =>
+            window.__bt_console.push({lvl:'error', msg: 'uncaught: ' + (e.message||String(e))}));
+        window.addEventListener('unhandledrejection', e =>
+            window.__bt_console.push({lvl:'error', msg: 'unhandled: ' + String(e.reason)}));
+    })()
+""")
+@info "Console capture armed" console_log
+# Verify the patch took:
+diag = Electron.run(win, """JSON.stringify({
+    has_arr: Array.isArray(window.__bt_console),
+    arr_len: (window.__bt_console || []).length,
+    typeof_warn: typeof console.warn,
+    test_call: (() => { console.warn('TEST_PATCH_PROBE'); return (window.__bt_console || []).length; })(),
+})""")
+@info "Patch verification" diag
 
-wait_for(win, predicate; timeout=5.0) = begin
+wait_for(predicate; timeout=5.0) = begin
     deadline = time() + timeout
     while time() < deadline
         try
@@ -125,36 +122,115 @@ wait_for(win, predicate; timeout=5.0) = begin
     false
 end
 
-# ── Drive navigation. Each click changes `current_view`. Pre-fix this is
-#    where Bonito would spam GLOBAL_OBJECT_CACHE warnings.
-@assert wait_for(win,
-    "document.querySelector('.bt-side-item[data-project-id=\"alpha\"]') !== null";
-    timeout=10) "sidebar didn't render projects"
+screenshot(label) = begin
+    path = tempname() * ".png"
+    flag = path * ".done"
+    Electron.run(app, """
+        const win = electron.BrowserWindow.fromId($win_id);
+        win.webContents.capturePage().then(img => {
+            require('fs').writeFileSync($(JSON.json(path)), img.toPNG());
+            require('fs').writeFileSync($(JSON.json(flag)), '1');
+        });
+        null
+    """)
+    t0 = time()
+    while !isfile(flag) && time() - t0 < 5; sleep(0.1); end
+    println("--- screenshot[$label] → $path ---")
+    return path
+end
 
 results = Pair{String,Bool}[]
-record(name, ok) = push!(results, name => ok)
+record(name, ok) = (push!(results, name => ok); println("  $(ok ? "PASS" : "FAIL")  $name"))
 
 try
-    for cycle in 1:5
-        navigate_to(win, "alpha"); sleep(0.4)
-        navigate_to(win, "beta");  sleep(0.4)
-        navigate_to(win, "");      sleep(0.3)
-    end
-    sleep(1.0)   # let any deferred warnings flush
+    # 3. dashboard rendered
+    record("Home sidebar entry visible",
+           wait_for("document.querySelector('.bt-side-item[data-project-id=\"\"]') !== null"; timeout=10))
+    record("Worker card visible (ResumeTestWorker)",
+           wait_for("document.body.innerText.indexOf('ResumeTestWorker') !== -1"; timeout=5))
+    sleep(0.5)
+    screenshot("01_empty_dashboard")
 
-    # ── Read the captured console and grep for the specific bug
-    #    signatures. Render-time warnings, "Key not found",
-    #    "TrackingOnly", "Trying to delete object", and the
-    #    null-Observable TypeError were all part of the user's
-    #    screenshot.
-    lines = isfile(console_log) ? readlines(console_log) : String[]
-    msgs  = String[]
-    for line in lines
+    # 4. add alpha (real Resume sequence: state.projects[][id]=p; notify)
+    p_alpha = BonitoTeam.ProjectInfo("alpha", "Alpha", "resume-test-worker-id",
+                joinpath(state.working_dir, "Alpha"),
+                joinpath(worker_proj_root, "Alpha"),
+                BonitoTeam.now(BonitoTeam.UTC))
+    mkpath(p_alpha.server_path); mkpath(p_alpha.worker_path)
+    state.projects[]["alpha"] = p_alpha
+    notify(state.projects)
+
+    record("Alpha sidebar entry appears after notify",
+           wait_for("document.querySelector('.bt-side-item[data-project-id=\"alpha\"]') !== null"; timeout=5))
+    record("Alpha project card appears in dashboard",
+           wait_for("Array.from(document.querySelectorAll('.bt-card-name')).some(e => e.innerText==='Alpha')"; timeout=5))
+    sleep(0.5)
+
+    # 5. add beta — this is where project_list re-renders, the OLD
+    #    project_card subsession (holding current_view via interpolated
+    #    onclick) closes, and the bug fires WITHOUT the Bonito root-
+    #    session-counts-as-reference patch.
+    p_beta = BonitoTeam.ProjectInfo("beta", "Beta", "resume-test-worker-id",
+                joinpath(state.working_dir, "Beta"),
+                joinpath(worker_proj_root, "Beta"),
+                BonitoTeam.now(BonitoTeam.UTC))
+    mkpath(p_beta.server_path); mkpath(p_beta.worker_path)
+    state.projects[]["beta"] = p_beta
+    notify(state.projects)
+
+    record("Beta sidebar entry appears after second notify",
+           wait_for("document.querySelector('.bt-side-item[data-project-id=\"beta\"]') !== null"; timeout=5))
+    sleep(0.5)
+    screenshot("02_two_projects")
+
+    # 6. click sidebar entries to drive current_view changes (this is
+    #    where the user's click handler dereferences null in the buggy
+    #    case — it executes $(current_view).notify(...) and current_view
+    #    has been freed from GLOBAL_OBJECT_CACHE).
+    Electron.run(win, """document.querySelector('.bt-side-item[data-project-id="alpha"]').click()""")
+    sleep(0.6)
+    record("Click alpha → main panel shows Alpha",
+           wait_for("document.body.innerText.indexOf('Starting chat for Alpha') !== -1 || document.querySelector('.bt-app') !== null"; timeout=5))
+    screenshot("03_alpha_clicked")
+    println("    [console after alpha click] ",
+        Electron.run(win, "JSON.stringify((window.__bt_console||[]).slice(-15))"))
+
+    Electron.run(win, """document.querySelector('.bt-side-item[data-project-id="beta"]').click()""")
+    sleep(0.6)
+    record("Click beta → main panel updates",
+           wait_for("document.body.innerText.indexOf('Starting chat for Beta') !== -1 || document.querySelector('.bt-app') !== null"; timeout=5))
+    screenshot("04_beta_clicked")
+    println("    [console after beta click] ",
+        Electron.run(win, "JSON.stringify((window.__bt_console||[]).slice(-15))"))
+    println("    [main panel HTML snippet] ",
+        Electron.run(win, "document.querySelector('.bt-main')?.innerText?.slice(0,200) ?? '(no main)'"))
+
+    Electron.run(win, """document.querySelector('.bt-side-item[data-project-id=""]').click()""")
+    sleep(0.6)
+    record("Click home → dashboard returns",
+           wait_for("document.body.innerText.indexOf('ResumeTestWorker') !== -1"; timeout=5))
+    screenshot("05_home_clicked")
+
+    sleep(1.0)
+
+    # 7. drain console
+    main_lines = isfile(console_log) ? readlines(console_log) : String[]
+    main_msgs = String[]
+    for line in main_lines
+        try; push!(main_msgs, get(JSON.parse(line), "message", "")); catch end
+    end
+    rendered = Electron.run(win, "JSON.stringify(window.__bt_console || [])")
+    rend_msgs = String[]
+    if rendered isa AbstractString
         try
-            push!(msgs, JSON.parse(line)["message"])
+            for entry in JSON.parse(rendered)
+                push!(rend_msgs, get(entry, "msg", ""))
+            end
         catch end
     end
+    @info "console totals" main=length(main_msgs) renderer=length(rend_msgs)
 
+    all_msgs = vcat(main_msgs, rend_msgs)
     bug_patterns = [
         r"Key \d+ not found",
         r"TrackingOnly: Key \d+ not found",
@@ -162,28 +238,21 @@ try
         r"Cannot read properties of null \(reading 'notify'\)",
     ]
     offenders = String[]
-    for m in msgs, pat in bug_patterns
+    for m in all_msgs, pat in bug_patterns
         occursin(pat, m) && push!(offenders, m)
     end
+    record("zero Key-not-found / null-Observable messages", isempty(offenders))
+    if !isempty(offenders)
+        for o in first(offenders, min(10, length(offenders)))
+            println("    OFFENDER: ", o)
+        end
+    end
 
-    record("zero Key-not-found warnings during 15 navigations",
-           isempty(offenders))
-    isempty(offenders) ||
-        @info "offending console messages" first_few=first(offenders, min(5, length(offenders)))
-
-    record("alpha entry was reachable",
-           Electron.run(win, """
-               document.querySelector('.bt-side-item[data-project-id="alpha"]') !== null
-           """) === true)
 finally
     println("\n", "="^60)
     pass = count(p -> p.second, results)
     fail = length(results) - pass
-    println("Resume-flow no-JS-errors: $pass passed, $fail failed")
-    for (name, ok) in results
-        ok || println("  FAIL  $name")
-    end
-
+    println("Resume-flow regression: $pass passed, $fail failed")
     try close(win) catch end
     try close(app) catch end
     try close(state.srv) catch end

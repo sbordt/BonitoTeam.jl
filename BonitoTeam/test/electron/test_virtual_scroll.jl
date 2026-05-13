@@ -4,6 +4,9 @@
 # evicts off-screen nodes.
 isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
+# `JSON.json(...)` is interpolated into the test's eval_js strings at Main scope.
+using JSON
+
 const N_HISTORY = 200    # 100 user + 100 agent pairs
 
 state = TH.make_state(; n_workers = 1, n_projects = 1)
@@ -46,8 +49,11 @@ try
         # is ~15-20 bubbles + overscan.
         record("virtual-scroll caps DOM well below total ($n_in_dom < 100)",
                @TH.test_true (n_in_dom < 100))
-        # bonitochat.totalCount should reflect all 200.
-        total = TH.eval_js(ctx, "window.bonitochat.totalCount")
+        # The chat object is hung off the .bt-messages node by
+        # `connect(node, comm)` in bonitoteam.js as `node.__bt_chat = chat`.
+        # totalCount should reflect all 200.
+        total = TH.eval_js(ctx,
+            "document.querySelector('.bt-messages').__bt_chat.totalCount")
         record("totalCount mirrors model", @TH.test_eq Int(total) N_HISTORY)
     end
 

@@ -5,6 +5,9 @@
 # don't accidentally hide the rendered content.
 isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
+# `JSON.json(...)` is interpolated into the test's eval_js strings at Main scope.
+using JSON
+
 state = TH.make_state(; n_workers = 1, n_projects = 1)
 
 # One big agent message exercising several markdown constructs at once.

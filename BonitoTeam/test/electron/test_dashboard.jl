@@ -74,11 +74,27 @@ try
     end
 
     TH.section("Open chat → swaps to chat panel via current_view") do
-        # Click the first Open chat link.
-        TH.eval_js(ctx, """
-            const link = Array.from(document.querySelectorAll('.bt-link')).find(e => e.innerText.indexOf('Open chat') !== -1);
+        # Click *Project1*'s Open chat link. Project1 is bound to w-1 (online)
+        # so the click hits the same-worker branch in the on(open_request)
+        # handler (view swap). Project2 is bound to w-2 (offline) — clicking
+        # its link would route through the cross-worker move path (added in
+        # commit 92c40c4) and fail with "Worker 'w-2' is not connected"
+        # instead of swapping views, which is not what this assertion is
+        # checking.
+        # IIFE-wrap: top-level `const` from `eval_js` lands in Electron's
+        # shared script scope, and the next `eval_js` that uses the same
+        # name (the Discover section's `const cards = …`) blows up with
+        # SyntaxError "Identifier 'cards' has already been declared".
+        TH.eval_js(ctx, """(() => {
+            const cards = Array.from(document.querySelectorAll('.bt-card'));
+            const card = cards.find(c => {
+                const n = c.querySelector('.bt-card-name');
+                return n && n.innerText === 'Project1';
+            });
+            const link = card && Array.from(card.querySelectorAll('.bt-link'))
+                                      .find(e => e.innerText.indexOf('Open chat') !== -1);
             if (link) link.click();
-        """)
+        })()""")
         # No ChatModel was seeded, so we hit the placeholder branch ("Starting
         # chat for ..."). That's still proof navigation worked.
         record("dashboard hidden, chat placeholder shown",

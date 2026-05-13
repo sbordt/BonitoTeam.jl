@@ -377,6 +377,7 @@ class BonitoChat {
     }
     scrollToBottom() {
         this.container.scrollTop = this.container.scrollHeight;
+        this.refresh();
     }
     onViewportResize() {
         const vv = window.visualViewport;

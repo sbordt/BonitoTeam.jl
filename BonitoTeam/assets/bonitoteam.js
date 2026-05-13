@@ -414,6 +414,13 @@ class BonitoChat {
 
     scrollToBottom() {
         this.container.scrollTop = this.container.scrollHeight;
+        // Don't rely on the `scroll` event to drive the post-scroll range
+        // fetch — Electron's offscreen renderer (and a few other headless
+        // browser configs) doesn't fire scroll events for programmatic
+        // scrollTop changes, which leaves the chasing-bottom loop fetching
+        // nothing past the initial range. `refresh()` is idempotent and
+        // cheap, so call it explicitly.
+        this.refresh();
     }
 
     onViewportResize() {

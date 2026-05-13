@@ -92,10 +92,17 @@ try
             })()
         """)
         # Jump to scrollTop = 0 (top of the messages container) to force a
-        # range request for index 0.
+        # range request for index 0. Dispatch a synthetic 'scroll' event
+        # after the assignment: in Electron's offscreen renderer (and some
+        # other headless browser setups), programmatic `scrollTop = N`
+        # changes the value but doesn't fire a 'scroll' event, so the chat's
+        # _onScroll listener would never see the jump.
         TH.eval_js(ctx, """
             const c = document.querySelector('.bt-messages');
-            if (c) c.scrollTop = 0;
+            if (c) {
+                c.scrollTop = 0;
+                c.dispatchEvent(new Event('scroll'));
+            }
         """)
         # Give the scroll listener + range round-trip a moment.
         record("a different top bubble appears after scrolling up",

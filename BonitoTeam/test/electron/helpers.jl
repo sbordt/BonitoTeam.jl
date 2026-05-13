@@ -198,7 +198,17 @@ Boot a Bonito Electron window pointed at `unified_app(state)`. Returns a
 NamedTuple `(disp, app, session, state)` to pass to the rest of the helpers.
 """
 function open_window(state::BonitoTeam.ServerState; devtools::Bool = false)
-    disp    = Bonito.use_electron_display(; devtools)
+    # Pass explicit `show: true` + an initial size to BrowserWindow. Without
+    # these, on offscreen-rendering setups (CI / Linux without a real
+    # compositor) the renderer's viewport doesn't follow `setSize` calls
+    # later — `window.innerWidth` stays at whatever Electron's default
+    # offscreen width is (often 1280) regardless of the outer frame size,
+    # which kills the @media-query-based mobile breakpoint test.
+    disp    = Bonito.use_electron_display(; devtools, options = Dict{String,Any}(
+        "show"   => true,
+        "width"  => 1280,
+        "height" => 800,
+    ))
     app     = BonitoTeam.unified_app(state)
     display(disp, app)
     session = app.session[]
@@ -215,15 +225,35 @@ shutdown(ctx) = (try close(ctx.disp) catch end; nothing)
 """
     set_window_size(ctx, w, h)
 
-Resize the Electron window from the main process. Uses
-`BrowserWindow.fromId(...).setSize(...)` so the renderer's viewport
-actually changes — needed to exercise `@media (max-width: ...)` CSS rules.
+Resize the Electron window's renderer viewport. Uses Chromium's device-
+emulation API rather than `BrowserWindow.setSize` — the latter only
+shrinks the viewport on this Linux/offscreen setup (a 480→1280 resize-
+back leaves `window.innerWidth` stuck at 480) and is generally subject
+to OS / window-manager minimum-size constraints. Device emulation goes
+straight to the compositor, so the renderer sees the exact viewport we
+ask for regardless of frame state, which is what the CSS @media queries
+read anyway.
 """
 function set_window_size(ctx, w::Int, h::Int)
     win_id = ctx.disp.window.window.id
     run(ctx.disp.window.app, """
         const win = electron.BrowserWindow.fromId($win_id);
+        // Force the renderer's reported viewport via device emulation —
+        // bypasses the OS window-manager constraints that pin
+        // `BrowserWindow.setSize` after a shrink.
+        win.webContents.enableDeviceEmulation({
+            screenPosition: 'desktop',
+            screenSize:  { width: $w, height: $h },
+            viewSize:    { width: $w, height: $h },
+            deviceScaleFactor: 0,
+            scale: 1,
+        });
+        // Keep the outer frame in sync (some tests read getBoundingClientRect
+        // against the document; the frame size shouldn't be larger than
+        // the viewport we just claimed).
+        win.setMinimumSize(0, 0);
         win.setSize($w, $h);
+        win.setContentSize($w, $h);
         null
     """)
     # Resize is async; wait for the renderer's reported size to catch up.

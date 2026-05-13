@@ -19,7 +19,7 @@
 #   5. Final-state screenshot saved so we can see what the user sees
 
 using BonitoTeam, Bonito, HTTP, JSON
-import Electron, BonitoWorker
+import ElectronCall, BonitoWorker
 
 # ── 1. server + worker ───────────────────────────────────────────────────
 state = BonitoTeam.serve(;
@@ -54,14 +54,14 @@ end
 @info "Worker connected"
 
 # ── 2. open Electron + capture both main-process and renderer console
-app = Electron.Application()
-win = Electron.Window(app, Electron.URI(url);
+app = ElectronCall.Application()
+win = ElectronCall.Window(app, ElectronCall.URI(url);
                       options = Dict{String,Any}("show"=>false, "focusOnWebView"=>false))
 sleep(2.5)
 
 console_log = tempname() * ".jsonl"
 win_id = win.id
-Electron.run(app, """
+ElectronCall.run(app, """
     const win = electron.BrowserWindow.fromId($win_id);
     const fs  = require('fs');
     const log_path = $(JSON.json(console_log));
@@ -80,7 +80,7 @@ Electron.run(app, """
     null
 """)
 
-Electron.run(win, """
+ElectronCall.run(win, """
     (() => {
         window.__bt_console = [];
         for (const lvl of ['log','warn','error']) {
@@ -103,7 +103,7 @@ Electron.run(win, """
 """)
 @info "Console capture armed" console_log
 # Verify the patch took:
-diag = Electron.run(win, """JSON.stringify({
+diag = ElectronCall.run(win, """JSON.stringify({
     has_arr: Array.isArray(window.__bt_console),
     arr_len: (window.__bt_console || []).length,
     typeof_warn: typeof console.warn,
@@ -115,7 +115,7 @@ wait_for(predicate; timeout=5.0) = begin
     deadline = time() + timeout
     while time() < deadline
         try
-            Electron.run(win, "(() => { return ($predicate); })()") === true && return true
+            ElectronCall.run(win, "(() => { return ($predicate); })()") === true && return true
         catch end
         sleep(0.1)
     end
@@ -125,7 +125,7 @@ end
 screenshot(label) = begin
     path = tempname() * ".png"
     flag = path * ".done"
-    Electron.run(app, """
+    ElectronCall.run(app, """
         const win = electron.BrowserWindow.fromId($win_id);
         win.webContents.capturePage().then(img => {
             require('fs').writeFileSync($(JSON.json(path)), img.toPNG());
@@ -187,25 +187,25 @@ try
     #    where the user's click handler dereferences null in the buggy
     #    case — it executes $(current_view).notify(...) and current_view
     #    has been freed from GLOBAL_OBJECT_CACHE).
-    Electron.run(win, """document.querySelector('.bt-side-item[data-project-id="alpha"]').click()""")
+    ElectronCall.run(win, """document.querySelector('.bt-side-item[data-project-id="alpha"]').click()""")
     sleep(0.6)
     record("Click alpha → main panel shows Alpha",
            wait_for("document.body.innerText.indexOf('Starting chat for Alpha') !== -1 || document.querySelector('.bt-app') !== null"; timeout=5))
     screenshot("03_alpha_clicked")
     println("    [console after alpha click] ",
-        Electron.run(win, "JSON.stringify((window.__bt_console||[]).slice(-15))"))
+        ElectronCall.run(win, "JSON.stringify((window.__bt_console||[]).slice(-15))"))
 
-    Electron.run(win, """document.querySelector('.bt-side-item[data-project-id="beta"]').click()""")
+    ElectronCall.run(win, """document.querySelector('.bt-side-item[data-project-id="beta"]').click()""")
     sleep(0.6)
     record("Click beta → main panel updates",
            wait_for("document.body.innerText.indexOf('Starting chat for Beta') !== -1 || document.querySelector('.bt-app') !== null"; timeout=5))
     screenshot("04_beta_clicked")
     println("    [console after beta click] ",
-        Electron.run(win, "JSON.stringify((window.__bt_console||[]).slice(-15))"))
+        ElectronCall.run(win, "JSON.stringify((window.__bt_console||[]).slice(-15))"))
     println("    [main panel HTML snippet] ",
-        Electron.run(win, "document.querySelector('.bt-main')?.innerText?.slice(0,200) ?? '(no main)'"))
+        ElectronCall.run(win, "document.querySelector('.bt-main')?.innerText?.slice(0,200) ?? '(no main)'"))
 
-    Electron.run(win, """document.querySelector('.bt-side-item[data-project-id=""]').click()""")
+    ElectronCall.run(win, """document.querySelector('.bt-side-item[data-project-id=""]').click()""")
     sleep(0.6)
     record("Click home → dashboard returns",
            wait_for("document.body.innerText.indexOf('ResumeTestWorker') !== -1"; timeout=5))
@@ -219,7 +219,7 @@ try
     for line in main_lines
         try; push!(main_msgs, get(JSON.parse(line), "message", "")); catch end
     end
-    rendered = Electron.run(win, "JSON.stringify(window.__bt_console || [])")
+    rendered = ElectronCall.run(win, "JSON.stringify(window.__bt_console || [])")
     rend_msgs = String[]
     if rendered isa AbstractString
         try

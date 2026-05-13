@@ -30,7 +30,7 @@
 include(joinpath(@__DIR__, "helpers.jl"))
 
 using Test, Bonito, BonitoTeam, JSON, Dates
-import Electron
+import ElectronCall
 
 const RESULTS = Pair{String,Bool}[]
 
@@ -44,8 +44,8 @@ const RESULTS = Pair{String,Bool}[]
 # open/close cycles on the same `state`; only the window is per-test.
 function open_window(state; opts = Dict{String,Any}("show"=>false,
                                                      "focusOnWebView"=>false))
-    app = Electron.Application()
-    win = Electron.Window(app, Electron.URI(Bonito.online_url(state.srv, ""));
+    app = ElectronCall.Application()
+    win = ElectronCall.Window(app, ElectronCall.URI(Bonito.online_url(state.srv, ""));
                            options = opts)
     sleep(2.5)
     return (; app, win)
@@ -58,7 +58,7 @@ function wait_for_js(win, predicate; timeout = 5.0, interval = 0.1)
     deadline = time() + timeout
     while time() < deadline
         try
-            v = Electron.run(win, "(() => { return ($predicate); })()")
+            v = ElectronCall.run(win, "(() => { return ($predicate); })()")
             v === true && return true
         catch
         end
@@ -74,7 +74,7 @@ function navigate_to(win, pid::AbstractString)
     wait_for_js(win,
         "document.querySelector('.bt-side-item[data-project-id=$(JSON.json(pid))]') !== null";
         timeout = 5)
-    Electron.run(win, """
+    ElectronCall.run(win, """
         (() => {
             const el = document.querySelector('.bt-side-item[data-project-id=$(JSON.json(pid))]');
             if (el) { el.click(); return true; }
@@ -111,7 +111,7 @@ function fresh_state(project_ids::Vector{String})
 end
 
 function chat_total(win)
-    Electron.run(win,
+    ElectronCall.run(win,
         "document.querySelector('.bt-messages')?.__bt_chat?.totalCount ?? -1")
 end
 
@@ -139,14 +139,14 @@ TH.section("Stress 1: 1000 messages, virtual scroll integrity") do
             "document.querySelector('.bt-messages')?.__bt_chat?.atBottom() === true";
             timeout = 10)
 
-        last_user = Electron.run(w.win, """
+        last_user = ElectronCall.run(w.win, """
             (() => {
                 const us = document.querySelectorAll('.bt-user-msg');
                 return us.length ? us[us.length-1].textContent : null;
             })()
         """)
         push!(RESULTS, "1k: last user bubble is final pair" => (last_user == "hi 500"))
-        rendered = Electron.run(w.win,
+        rendered = ElectronCall.run(w.win,
             "document.querySelectorAll('.bt-messages > .bt-user-msg, .bt-messages > .bt-agent-msg').length")
         push!(RESULTS, "1k: window bounded (< 60 visible)" => (rendered isa Number && rendered < 60))
     finally
@@ -186,12 +186,12 @@ TH.section("Stress 3: two tabs of the same serve(), same project") do
     TH.seed_chat_history!(model, 3)
 
     url = Bonito.online_url(state.srv, "")
-    a1 = Electron.Application(); a2 = Electron.Application()
-    w1 = Electron.Window(a1, Electron.URI(url); options=Dict{String,Any}("show"=>false))
-    w2 = Electron.Window(a2, Electron.URI(url); options=Dict{String,Any}("show"=>false))
+    a1 = ElectronCall.Application(); a2 = ElectronCall.Application()
+    w1 = ElectronCall.Window(a1, ElectronCall.URI(url); options=Dict{String,Any}("show"=>false))
+    w2 = ElectronCall.Window(a2, ElectronCall.URI(url); options=Dict{String,Any}("show"=>false))
     sleep(3.0)
     try
-        nav = w -> Electron.run(w, """
+        nav = w -> ElectronCall.run(w, """
             (() => {
                 const el = document.querySelector('.bt-side-item[data-project-id="stress-multitab"]');
                 el && el.click();
@@ -203,7 +203,7 @@ TH.section("Stress 3: two tabs of the same serve(), same project") do
             deadline = time() + tmo
             while time() < deadline
                 try
-                    Electron.run(w, "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === $n") === true && return true
+                    ElectronCall.run(w, "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === $n") === true && return true
                 catch end
                 sleep(0.1)
             end
@@ -319,7 +319,7 @@ TH.section("Stress 6: streaming agent chunks via unified_app") do
         """; timeout = 20)
         push!(RESULTS, "stream: last agent bubble has accumulated chunks" => ok)
         push!(RESULTS, "stream: still pinned to bottom after stream" =>
-              Electron.run(w.win,
+              ElectronCall.run(w.win,
                   "document.querySelector('.bt-messages')?.__bt_chat?.atBottom() === true"))
     finally
         close_window(w); close_state(state)

@@ -10,7 +10,7 @@
 module TestHelpers
 
 using Bonito, BonitoTeam, AgentClientProtocol, Dates, JSON
-using Electron  # ensures use_electron_display works
+using ElectronCall  # ensures use_electron_display works
 import HTTP
 
 # A few aliases so test files can stay terse.

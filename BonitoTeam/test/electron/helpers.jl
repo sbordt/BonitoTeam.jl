@@ -198,14 +198,16 @@ Boot a Bonito Electron window pointed at `unified_app(state)`. Returns a
 NamedTuple `(disp, app, session, state)` to pass to the rest of the helpers.
 """
 function open_window(state::BonitoTeam.ServerState; devtools::Bool = false)
-    # Pass explicit `show: true` + an initial size to BrowserWindow. Without
-    # these, on offscreen-rendering setups (CI / Linux without a real
-    # compositor) the renderer's viewport doesn't follow `setSize` calls
-    # later — `window.innerWidth` stays at whatever Electron's default
-    # offscreen width is (often 1280) regardless of the outer frame size,
-    # which kills the @media-query-based mobile breakpoint test.
+    # `show: false` keeps the suite headless — important so the local dev
+    # session isn't interrupted by a flurry of windows, and so CI doesn't
+    # need a compositor. Width/height are still set explicitly so layout
+    # behaves the same as the visible case (without these, on
+    # offscreen-rendering setups the renderer's viewport doesn't follow
+    # `setSize` calls later — `window.innerWidth` stays at whatever
+    # Electron's default offscreen width is, breaking the @media-query
+    # based mobile breakpoint test).
     disp    = Bonito.use_electron_display(; devtools, options = Dict{String,Any}(
-        "show"   => true,
+        "show"   => false,
         "width"  => 1280,
         "height" => 800,
     ))

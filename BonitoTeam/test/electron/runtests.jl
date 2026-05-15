@@ -79,9 +79,18 @@ for f in FILES
     end
     if length(TH.TIER_RESULTS) > pre
         label, p, fl = TH.TIER_RESULTS[end]
-        push!(RESULTS, (f, label, p, fl))
+        if crashed !== nothing
+            # Test reported its assertions but then errored (e.g. screenshot
+            # timeout, cleanup error, or anything in `finally`). Surface it
+            # as a failure so the suite summary doesn't lie.
+            push!(RESULTS, (f, label * " — crashed after report: " *
+                                    sprint(showerror, crashed), p, fl + 1))
+        else
+            push!(RESULTS, (f, label, p, fl))
+        end
     elseif crashed !== nothing
-        push!(RESULTS, (f, "(crashed before report)", 0, 1))
+        push!(RESULTS, (f, "(crashed before report) — " *
+                            sprint(showerror, crashed), 0, 1))
     else
         push!(RESULTS, (f, "(no report)", 0, 1))
     end

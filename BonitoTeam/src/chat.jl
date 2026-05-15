@@ -582,6 +582,13 @@ mutable struct ChatModel
     thought_id     :: Ref{String}
     user_streaming :: Ref{Bool}
 
+    # One-shot flag: when chat starts on a worker that doesn't have claude's
+    # session jsonl (project moved, fresh sync, etc.), claude has no memory
+    # of the prior conversation but `msgs_store` does. The next user prompt
+    # gets a transcript prelude so claude can pick up where we left off.
+    # See `start_chat_client!` (arms it) and `send_prompt_async!` (consumes).
+    pending_history_replay :: Ref{Bool}
+
     # Single bidirectional channel between Julia and the browser-side BonitoChat.
     # Wire format is a tagged dict; see chat_emit / chat_dispatch! below for
     # the message types. Bonito's `update_nocycle!` prevents JS-originated
@@ -620,6 +627,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         collect(AgentClientProtocol.MCPServer, mcp_servers),
         actual_transport,
         Ref(""), Ref(""), Ref(false),
+        Ref(false),                 # pending_history_replay
         Observable(Dict{String,Any}()),
         Observable(true),
         Observable(""),
@@ -642,6 +650,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.chat_session, m.msgs_store,
             m.client, m.mcp_servers, m.transport,
             m.agent_id, m.thought_id, m.user_streaming,
+            m.pending_history_replay,
             map(identity, session, m.comm),
             map(identity, session, m.session_alive),
             map(identity, session, m.last_error),
@@ -844,8 +853,20 @@ function start_chat_client!(model::ChatModel)
     # All transport-specific bring-up (subprocess spawn / worker WS dial /
     # mock channel setup) lives in `start_session(::ChatTransport, on_update)`
     # — see src/transport.jl.
+    #
+    # Capture the recorded session id BEFORE start_session so we can detect
+    # "fresh session, not a resume" afterwards. A mismatch means claude has
+    # no memory of `msgs_store` (e.g. the project was just synced to a
+    # different worker), so we arm a one-shot history prelude that
+    # `send_prompt_async!` will fold into the next user prompt.
+    prev_session_id = model.chat_session.session_id
     model.client[] = start_session(model.transport, on_update)
-    update_session_id!(model.chat_session, model.client[].session_id)
+    new_session_id = model.client[].session_id
+    if !isempty(model.msgs_store) && prev_session_id != new_session_id
+        model.pending_history_replay[] = true
+        @info "chat history replay armed" project_id=model.project_id n_msgs=length(model.msgs_store)
+    end
+    update_session_id!(model.chat_session, new_session_id)
 
     # Browser-side handlers (range requests + lazy tool/thought renders) are
     # wired in `Bonito.jsrender(::Session, ::ChatModel)` — once per mount,
@@ -921,12 +942,59 @@ function fire_auto_prompt!(model::ChatModel)
     return nothing
 end
 
+# Build a transcript prelude from `msgs_store` to feed into claude's first
+# prompt after a session change (project synced to a new worker, restart
+# without a usable resume_id, etc.). User + agent turns only — tool calls
+# and thoughts are claude-internal artifacts and don't belong in the
+# conversation context. Capped at the last 60 turns to keep the prompt
+# size sane on long histories.
+function build_history_prelude(model::ChatModel)::String
+    relevant = ChatMsg[]
+    lock(model.lock) do
+        for m in model.msgs_store
+            (m isa UserMsg || m isa AgentMsg) && push!(relevant, m)
+        end
+    end
+    if length(relevant) > 60
+        relevant = relevant[end - 59 : end]
+    end
+    io = IOBuffer()
+    println(io, "Below is a transcript of our previous conversation on this project. ",
+                "I'm continuing where we left off — please read it for context, then respond ",
+                "to my new message after the divider.")
+    println(io)
+    println(io, "--- PREVIOUS CONVERSATION ---")
+    for m in relevant
+        if m isa UserMsg
+            println(io, "USER: ", m.text)
+        elseif m isa AgentMsg
+            println(io, "ASSISTANT: ", m.text)
+        end
+        println(io)
+    end
+    println(io, "--- END OF PREVIOUS CONVERSATION ---")
+    println(io)
+    println(io, "My new message:")
+    println(io)
+    return String(take!(io))
+end
+
 # Common send-and-handle for both auto_prompt and user-typed prompts. Splits
 # transient ACP errors (which we surface inline as a chat bubble) from
 # session-death errors (which flip the banner so the user can restart).
 function send_prompt_async!(model::ChatModel, text::AbstractString)
+    full_text = String(text)
+    # One-shot: if `start_chat_client!` armed the replay flag (fresh claude
+    # session that has no memory of prior chat.md content), prepend the
+    # transcript so claude picks up where we left off. The user-visible
+    # bubble already shows their actual question — only what goes to claude
+    # over ACP includes the prelude.
+    if model.pending_history_replay[]
+        full_text = build_history_prelude(model) * full_text
+        model.pending_history_replay[] = false
+    end
     try
-        AgentClientProtocol.prompt!(model.client[], String(text))
+        AgentClientProtocol.prompt!(model.client[], full_text)
         chat_finalize_streaming!(model)
     catch e
         msg = sprint(showerror, e)

@@ -12,6 +12,7 @@ module TestHelpers
 using Bonito, BonitoTeam, AgentClientProtocol, Dates, JSON
 using ElectronCall  # ensures use_electron_display works
 import HTTP
+import Base64
 
 # A few aliases so test files can stay terse.
 const ACP = AgentClientProtocol
@@ -206,11 +207,21 @@ function open_window(state::BonitoTeam.ServerState; devtools::Bool = false)
     # `setSize` calls later — `window.innerWidth` stays at whatever
     # Electron's default offscreen width is, breaking the @media-query
     # based mobile breakpoint test).
-    disp    = Bonito.use_electron_display(; devtools, options = Dict{String,Any}(
-        "show"   => false,
-        "width"  => 1280,
-        "height" => 800,
-    ))
+    # `--ozone-platform=x11`: Electron 28+ defaults to native Wayland in a
+    # Wayland session, but `capturePage` on a `show:false` window only works
+    # for the *first* call on Wayland — subsequent calls return a Promise
+    # that never resolves (no persistent offscreen surface for hidden
+    # windows). Forcing X11 (via XWayland when needed) gives a consistent
+    # offscreen render path and repeat captures work fine.
+    disp    = Bonito.use_electron_display(;
+        devtools,
+        options = Dict{String,Any}(
+            "show"   => false,
+            "width"  => 1280,
+            "height" => 800,
+        ),
+        electron_args = ["--ozone-platform=x11"],
+    )
     app     = BonitoTeam.unified_app(state)
     display(disp, app)
     session = app.session[]
@@ -399,20 +410,18 @@ Uses the main-process `webContents.capturePage()` API.
 """
 function screenshot(ctx; path::AbstractString = tempname() * ".png")
     win_id = ctx.disp.window.window.id
-    flag   = path * ".done"
-    run(ctx.disp.window.app, """
-        const win = electron.BrowserWindow.fromId($win_id);
-        win.webContents.capturePage().then(img => {
-            require('fs').writeFileSync($(JSON.json(path)), img.toPNG());
-            require('fs').writeFileSync($(JSON.json(flag)), '1');
-        });
-        null
+    # `run(app, ...)` awaits Promises (since ElectronCall's main.js handles
+    # async results in `runcode` target=`app`). Return the PNG base64 directly
+    # so we don't have to round-trip through a flag file + polling.
+    b64 = run(ctx.disp.window.app, """
+        (async () => {
+            const win = electron.BrowserWindow.fromId($win_id);
+            const img = await win.webContents.capturePage();
+            return img.toPNG().toString('base64');
+        })()
     """)
-    deadline = time() + 5
-    while !isfile(flag) && time() < deadline
-        sleep(0.05)
-    end
-    isfile(path) || error("screenshot timed out: $path")
+    b64 isa AbstractString || error("screenshot returned non-string: \$(typeof(b64))")
+    write(path, Base64.base64decode(b64))
     return path
 end
 

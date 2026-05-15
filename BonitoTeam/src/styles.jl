@@ -82,6 +82,18 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "12px", "padding" => "4px 10px",
         "border-radius" => "6px",
         "cursor" => "pointer",
+        # Stable width: per-file progress labels can be long ("Sending
+        # 137/999: src/some/long/path/file.jl"); without a min-width the
+        # header reflows on every file. min-width pins the steady-state
+        # idle "Sync" label area, max-width caps so a wildly long path
+        # gets truncated rather than blowing out the header. tabular-nums
+        # keeps digit columns the same width so the counter doesn't dance.
+        "min-width" => "260px", "max-width" => "360px",
+        "text-align" => "left",
+        "white-space" => "nowrap",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis",
+        "font-variant-numeric" => "tabular-nums",
         "transition" => "background 80ms"),
     CSS(".bt-header-sync:hover",
         "background" => "var(--bt-surface-2)"),

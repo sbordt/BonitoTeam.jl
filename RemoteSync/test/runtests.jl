@@ -291,15 +291,38 @@ end
         end
     end
 
-    @testset "ignores .git/" begin
+    @testset "syncs .git/ (project history must round-trip)" begin
         src = mktempdir(); dst = mktempdir()
         try
-            mkpath(joinpath(src, ".git"))
+            # Representative .git layout: a ref, an object, an info file.
+            mkpath(joinpath(src, ".git", "refs", "heads"))
+            mkpath(joinpath(src, ".git", "objects", "ab"))
             write(joinpath(src, ".git", "HEAD"), "ref: refs/heads/main")
+            write(joinpath(src, ".git", "refs", "heads", "main"), "deadbeef\n")
+            write(joinpath(src, ".git", "objects", "ab", "cdef1234"), "\x78\x01" * "blob")
             write(joinpath(src, "real.txt"), "kept")
             run_sync(src, dst)
             @test isfile(joinpath(dst, "real.txt"))
-            @test !isdir(joinpath(dst, ".git"))
+            @test isdir(joinpath(dst, ".git"))
+            @test read(joinpath(dst, ".git", "HEAD"), String) == "ref: refs/heads/main"
+            @test read(joinpath(dst, ".git", "refs", "heads", "main"), String) == "deadbeef\n"
+            @test read(joinpath(dst, ".git", "objects", "ab", "cdef1234")) ==
+                  Vector{UInt8}("\x78\x01" * "blob")
+        finally
+            rm(src; recursive=true, force=true)
+            rm(dst; recursive=true, force=true)
+        end
+    end
+
+    @testset "still ignores .bonitoTeam/" begin
+        src = mktempdir(); dst = mktempdir()
+        try
+            mkpath(joinpath(src, ".bonitoTeam"))
+            write(joinpath(src, ".bonitoTeam", "chat.md"), "worker-local mirror")
+            write(joinpath(src, "real.txt"), "kept")
+            run_sync(src, dst)
+            @test isfile(joinpath(dst, "real.txt"))
+            @test !isdir(joinpath(dst, ".bonitoTeam"))
         finally
             rm(src; recursive=true, force=true)
             rm(dst; recursive=true, force=true)

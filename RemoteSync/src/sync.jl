@@ -4,14 +4,21 @@
 # (a single bidirectional IO; can be a Pipe, a WebSocketIO, an IOBuffer pair
 # bridged with a background task, anything).
 
-const SNAPSHOT_IGNORE_DIRS = Set([".git", ".bonitoTeam"])
+# `.bonitoTeam/` is server-side chat persistence (chat.md + tools/) — workers
+# don't have one, so syncing FROM a worker would only ever overwrite the
+# server's real history with the worker's empty mirror. `.git/` is NOT
+# skipped: development on a synced project needs commit history, branch
+# refs, etc. Lock files (index.lock, HEAD.lock, ...) sometimes show up
+# mid-git-operation and may cause a transient sync failure; that's
+# acceptable since the next sync retry succeeds once git releases them.
+const SNAPSHOT_IGNORE_DIRS = Set([".bonitoTeam"])
 
 """
     walk_directory(root) → Vector{ManifestEntry}
 
-Walk `root` and produce a stable, sorted manifest. Skips `.git/` and
-`.bonitoTeam/`. Paths in the manifest use forward slashes regardless of the
-host OS so the wire protocol is portable.
+Walk `root` and produce a stable, sorted manifest. Skips `.bonitoTeam/`
+(server-side chat persistence). Paths in the manifest use forward slashes
+regardless of the host OS so the wire protocol is portable.
 """
 function walk_directory(root::AbstractString)
     out = ManifestEntry[]

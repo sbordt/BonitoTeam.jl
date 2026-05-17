@@ -60,6 +60,7 @@ const FILES = [
     "test_remotesync.jl",
     "test_worker_handshake.jl",
     "test_worker_disconnect.jl",
+    "test_worker_move.jl",
 ]
 
 # (file, label, pass, fail) — populated as each test runs.

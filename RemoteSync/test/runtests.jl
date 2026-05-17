@@ -193,7 +193,9 @@ end
 # adapter regressions.
 @testset "WebSocketIO over loopback HTTP.WebSocket" begin
     using HTTP, HTTP.WebSockets
-    RemoteSync.register_http_websockets!(HTTP.WebSockets)
+    # No registration call needed — the HTTP.WebSockets adapter for
+    # WebSocketIO lives directly in src/websocketio.jl (used to be a
+    # package extension; was inlined in b1bf51b).
 
     server_done = Channel{Any}(1)
     # Pick a likely-free high port; HTTP.WebSockets.listen! returns a Server

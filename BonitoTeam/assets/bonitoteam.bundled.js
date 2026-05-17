@@ -42,6 +42,13 @@ class BonitoChat {
         container.addEventListener('scroll', this._onScroll, {
             passive: true
         });
+        this._containerRO = new ResizeObserver(()=>{
+            if (this.destroyed) return;
+            if (this.wasAtBottom || this.chasingBottom) {
+                this._queueScrollToBottom();
+            }
+        });
+        this._containerRO.observe(this.container);
         if (window.visualViewport) {
             this._onVPResize = ()=>this.onViewportResize();
             window.visualViewport.addEventListener('resize', this._onVPResize);
@@ -54,6 +61,9 @@ class BonitoChat {
         }
         if (this._onVPResize && window.visualViewport) {
             window.visualViewport.removeEventListener('resize', this._onVPResize);
+        }
+        if (this._containerRO) {
+            this._containerRO.disconnect();
         }
         this.ros.forEach((ro)=>ro.disconnect());
         this.ros.clear();
@@ -68,9 +78,13 @@ class BonitoChat {
             case 'msgs.range':
                 return this.onRange(msg);
             case 'busy_start':
-                return this.busyEl?.classList.add('bt-busy-active');
+                this.busyEl?.classList.add('bt-busy-active');
+                if (this.wasAtBottom) this._queueScrollToBottom();
+                return;
             case 'busy_end':
-                return this.busyEl?.classList.remove('bt-busy-active');
+                this.busyEl?.classList.remove('bt-busy-active');
+                if (this.wasAtBottom) this._queueScrollToBottom();
+                return;
             case 'agent_final':
                 return this.onAgentFinal(msg);
             case 'thought_final':
@@ -168,7 +182,7 @@ class BonitoChat {
                 this.chasingBottom = false;
             }, 300);
         } else if (this.chasingBottom) {
-            this.scrollToBottom();
+            this._queueScrollToBottom();
         }
     }
     observe(idx, node) {
@@ -215,9 +229,14 @@ class BonitoChat {
             if (msg.id) this.nodeById.set(msg.id, node);
             this.observe(idx, node);
         }
-        if (this.wasAtBottom) {
+        const isOwnMessage = msg.type === 'user';
+        if (this.wasAtBottom || isOwnMessage) {
             this.updateDOM(...this.visibleRange());
-            this.scrollToBottom();
+            if (isOwnMessage) {
+                this.wasAtBottom = true;
+                this.chasingBottom = true;
+            }
+            this._queueScrollToBottom();
         }
     }
     appendChunk(id, text) {
@@ -225,14 +244,14 @@ class BonitoChat {
         if (!node) return;
         const t = node.querySelector('.bt-stream-text');
         if (t) t.textContent += text;
-        if (this.wasAtBottom) this.scrollToBottom();
+        if (this.wasAtBottom) this._queueScrollToBottom();
     }
     appendUserChunk(text) {
         const idx = this.totalCount - 1;
         const node = this.cache.get(idx);
         if (node && node.classList.contains('bt-user-msg')) {
             node.textContent += text;
-            if (this.wasAtBottom) this.scrollToBottom();
+            if (this.wasAtBottom) this._queueScrollToBottom();
         }
     }
     onAgentFinal(msg) {
@@ -373,17 +392,31 @@ class BonitoChat {
     }
     atBottom() {
         const { scrollTop , scrollHeight , clientHeight  } = this.container;
-        return scrollHeight - scrollTop - clientHeight < 60;
+        return scrollHeight - scrollTop - clientHeight < 200;
+    }
+    _queueScrollToBottom() {
+        if (this._scrollQueued || this.destroyed) return;
+        this._scrollQueued = true;
+        requestAnimationFrame(()=>{
+            this._scrollQueued = false;
+            if (!this.destroyed) this.scrollToBottom();
+        });
     }
     scrollToBottom() {
         this.container.scrollTop = this.container.scrollHeight;
+        if (this.spacerBottom) {
+            this.spacerBottom.scrollIntoView({
+                block: 'end',
+                behavior: 'auto'
+            });
+        }
         this.refresh();
     }
     onViewportResize() {
         const vv = window.visualViewport;
         const app = document.querySelector('.bt-app');
         if (app) app.style.height = vv.height + 'px';
-        if (this.wasAtBottom) this.scrollToBottom();
+        if (this.wasAtBottom) this._queueScrollToBottom();
     }
 }
 function escapeHTML(str) {

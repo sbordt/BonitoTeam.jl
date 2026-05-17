@@ -63,6 +63,20 @@ class BonitoChat {
         };
         container.addEventListener('scroll', this._onScroll, { passive: true });
 
+        // Re-scroll whenever the messages container changes size while
+        // we're in follow-tail mode. Covers: bt-busy 0↔28px transition
+        // on each agent turn, mobile soft-keyboard slide-in/out, the
+        // browser's address bar collapsing on scroll, window resize.
+        // Without this, the last message + input area can slide below
+        // the fold and the user has no way back without manual scroll.
+        this._containerRO = new ResizeObserver(() => {
+            if (this.destroyed) return;
+            if (this.wasAtBottom || this.chasingBottom) {
+                this._queueScrollToBottom();
+            }
+        });
+        this._containerRO.observe(this.container);
+
         if (window.visualViewport) {
             this._onVPResize = () => this.onViewportResize();
             window.visualViewport.addEventListener('resize', this._onVPResize);
@@ -76,6 +90,9 @@ class BonitoChat {
         }
         if (this._onVPResize && window.visualViewport) {
             window.visualViewport.removeEventListener('resize', this._onVPResize);
+        }
+        if (this._containerRO) {
+            this._containerRO.disconnect();
         }
         this.ros.forEach((ro) => ro.disconnect());
         this.ros.clear();
@@ -93,8 +110,17 @@ class BonitoChat {
         switch (msg.type) {
             case 'msgs.count':   return this.applyCount(msg.n);
             case 'msgs.range':   return this.onRange(msg);
-            case 'busy_start':   return this.busyEl?.classList.add('bt-busy-active');
-            case 'busy_end':     return this.busyEl?.classList.remove('bt-busy-active');
+            case 'busy_start':
+                this.busyEl?.classList.add('bt-busy-active');
+                // bt-busy grows from 0 to 28px over 150ms; the container
+                // ResizeObserver re-scrolls on each frame, but only if
+                // wasAtBottom — which it should be when a turn starts.
+                if (this.wasAtBottom) this._queueScrollToBottom();
+                return;
+            case 'busy_end':
+                this.busyEl?.classList.remove('bt-busy-active');
+                if (this.wasAtBottom) this._queueScrollToBottom();
+                return;
             case 'agent_final':  return this.onAgentFinal(msg);
             case 'thought_final':return this.onThoughtFinal(msg);
             case 'thought.body': return this.onThoughtBody(msg);
@@ -183,7 +209,7 @@ class BonitoChat {
                 this.chasingBottom = false;
             }, 300);
         } else if (this.chasingBottom) {
-            this.scrollToBottom();
+            this._queueScrollToBottom();
         }
     }
 
@@ -231,9 +257,19 @@ class BonitoChat {
             if (msg.id) this.nodeById.set(msg.id, node);
             this.observe(idx, node);
         }
-        if (this.wasAtBottom) {
+        // User-originated message ("user" type): ALWAYS scroll, even if
+        // wasAtBottom is stale-false. The user just hit Enter — they
+        // expect to see their own bubble. (For agent / tool / thought
+        // arriving from the worker, honour the user's scroll position.)
+        const isOwnMessage = msg.type === 'user';
+        if (this.wasAtBottom || isOwnMessage) {
             this.updateDOM(...this.visibleRange());
-            this.scrollToBottom();
+            if (isOwnMessage) {
+                // Re-engage chase for the agent's reply that will follow.
+                this.wasAtBottom   = true;
+                this.chasingBottom = true;
+            }
+            this._queueScrollToBottom();
         }
     }
 
@@ -245,8 +281,10 @@ class BonitoChat {
         // Streaming text grows the bubble downward; if the user was
         // following the tail, keep them at the tail. wasAtBottom is
         // refreshed by the scroll listener so a deliberate scroll-up
-        // releases the chase.
-        if (this.wasAtBottom) this.scrollToBottom();
+        // releases the chase. _queueScrollToBottom rAF-batches multiple
+        // chunks-per-frame so we only scroll AFTER the layout pass that
+        // includes the new text (avoids the stale-scrollHeight race).
+        if (this.wasAtBottom) this._queueScrollToBottom();
     }
 
     appendUserChunk(text) {
@@ -255,7 +293,7 @@ class BonitoChat {
         const node = this.cache.get(idx);
         if (node && node.classList.contains('bt-user-msg')) {
             node.textContent += text;
-            if (this.wasAtBottom) this.scrollToBottom();
+            if (this.wasAtBottom) this._queueScrollToBottom();
         }
     }
 
@@ -409,11 +447,37 @@ class BonitoChat {
 
     atBottom() {
         const { scrollTop, scrollHeight, clientHeight } = this.container;
-        return scrollHeight - scrollTop - clientHeight < 60;
+        // Generous threshold (was 60). On mobile a single new message
+        // bubble can be 80-120px tall — a tight threshold flips
+        // wasAtBottom=false on every new message, breaking auto-follow.
+        return scrollHeight - scrollTop - clientHeight < 200;
+    }
+
+    // rAF-batched scroll: multiple stream chunks arriving in the same
+    // frame (or a chunk + a ResizeObserver callback) coalesce into ONE
+    // scroll, run AFTER the browser has laid out the new content.
+    // Reading scrollHeight synchronously after a textContent write
+    // returns a stale value mid-layout; deferring to rAF guarantees
+    // we measure post-layout.
+    _queueScrollToBottom() {
+        if (this._scrollQueued || this.destroyed) return;
+        this._scrollQueued = true;
+        requestAnimationFrame(() => {
+            this._scrollQueued = false;
+            if (!this.destroyed) this.scrollToBottom();
+        });
     }
 
     scrollToBottom() {
+        // Belt + suspenders: set scrollTop AND scrollIntoView on the
+        // bottom spacer. scrollTop alone uses the container's reported
+        // scrollHeight which can be stale during streaming; scrollIntoView
+        // tells the browser "make this element's bottom edge visible"
+        // and lets it compute the right position from current layout.
         this.container.scrollTop = this.container.scrollHeight;
+        if (this.spacerBottom) {
+            this.spacerBottom.scrollIntoView({ block: 'end', behavior: 'auto' });
+        }
         // Don't rely on the `scroll` event to drive the post-scroll range
         // fetch — Electron's offscreen renderer (and a few other headless
         // browser configs) doesn't fire scroll events for programmatic
@@ -424,10 +488,15 @@ class BonitoChat {
     }
 
     onViewportResize() {
+        // Mobile keyboard or browser address bar changed the visual
+        // viewport. Resize bt-app so flex math has the right available
+        // height, then chase the tail across the keyboard's slide-in
+        // animation (~250ms on iOS; the container's ResizeObserver
+        // picks up each frame of it once .bt-app's height has changed).
         const vv  = window.visualViewport;
         const app = document.querySelector('.bt-app');
         if (app) app.style.height = vv.height + 'px';
-        if (this.wasAtBottom) this.scrollToBottom();
+        if (this.wasAtBottom) this._queueScrollToBottom();
     }
 }
 

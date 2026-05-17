@@ -52,6 +52,7 @@ const FILES = [
     "test_chat_show.jl",
     "test_chat_show_extras.jl",
     "test_auto_prompt.jl",
+    "test_scroll_chase.jl",
     # Dashboard
     "test_dashboard.jl",
     # Persistence (no UI)

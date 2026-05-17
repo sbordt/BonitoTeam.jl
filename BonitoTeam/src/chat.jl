@@ -134,9 +134,9 @@ end
 #
 # Exception: edit tools embed a small "preview" HTML snippet in the header
 # itself so the user can skim what changed without expanding the body.
-# `cwd` is needed so we can read the persisted DiffContent from disk; pass
-# "" when no on-disk content is available (preview is then omitted).
-function tool_header_dict(m::ToolMsg, cwd::AbstractString = "")
+# `chat_dir` is needed so we can read the persisted DiffContent from disk;
+# pass "" when no on-disk content is available (preview is then omitted).
+function tool_header_dict(m::ToolMsg, chat_dir::AbstractString = "")
     d = Dict{String,Any}(
         "type"    => "tool",
         "id"      => m.id,
@@ -146,8 +146,8 @@ function tool_header_dict(m::ToolMsg, cwd::AbstractString = "")
         "status"  => m.status,
         "summary" => m.summary,
     )
-    if m.kind == "edit" && !isempty(cwd)
-        prev = render_edit_preview(cwd, m.id)
+    if m.kind == "edit" && !isempty(chat_dir)
+        prev = render_edit_preview(chat_dir, m.id)
         prev === nothing || (d["preview"] = prev)
     end
     return d
@@ -156,26 +156,26 @@ end
 # Same shape used by msg_to_dict so the JS virtual-scroll renderer treats
 # all messages uniformly. The `cwd` argument is only consulted for ToolMsg
 # (to render the edit preview); other variants ignore it.
-msg_to_dict(m::UserMsg, _cwd::AbstractString = "") =
+msg_to_dict(m::UserMsg, _chat_dir::AbstractString = "") =
     Dict{String,Any}("type" => "user", "text" => m.text)
 
-function msg_to_dict(m::AgentMsg, _cwd::AbstractString = "")
+function msg_to_dict(m::AgentMsg, _chat_dir::AbstractString = "")
     html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
     Dict{String,Any}("type" => "agent", "id" => m.id, "html" => html)
 end
 
-msg_to_dict(m::ToolMsg, cwd::AbstractString = "") = tool_header_dict(m, cwd)
+msg_to_dict(m::ToolMsg, chat_dir::AbstractString = "") = tool_header_dict(m, chat_dir)
 
 # Thoughts are lazy-loaded: header carries only id + a size hint. JS asks for
 # the body via requestThoughtRender(id) when the user expands the <details>.
 # Avoids shipping potentially huge thinking transcripts on every range fetch.
-function msg_to_dict(m::ThoughtMsg, _cwd::AbstractString = "")
+function msg_to_dict(m::ThoughtMsg, _chat_dir::AbstractString = "")
     n = count('\n', m.text) + 1
     Dict{String,Any}("type" => "thought", "id" => m.id,
                      "summary" => "$n $(n == 1 ? "line" : "lines")")
 end
 
-function msg_to_dict(m::PlanMsg, _cwd::AbstractString = "")
+function msg_to_dict(m::PlanMsg, _chat_dir::AbstractString = "")
     rows = join(["""<div class="bt-plan-entry">
         <span class="bt-plan-status">$(e.status == "completed" ? "✓" : e.status == "in_progress" ? "▶" : "○")</span>
         <span>$(e.content)</span></div>""" for e in m.entries])
@@ -194,8 +194,8 @@ const EDIT_PREVIEW_MAX_LINES = 8
 preview_escape(s) = replace(String(s),
     '&' => "&amp;", '<' => "&lt;", '>' => "&gt;", '"' => "&quot;")
 
-function render_edit_preview(cwd::AbstractString, tool_id::AbstractString)
-    content = load_tool_content(String(cwd), String(tool_id))
+function render_edit_preview(chat_dir::AbstractString, tool_id::AbstractString)
+    content = load_tool_content(String(chat_dir), String(tool_id))
     isempty(content) && return nothing
     diffs = [c for c in content if c isa DiffContent]
     isempty(diffs) && return nothing
@@ -319,8 +319,8 @@ end
 # into TextContent / DiffContent / ImageContent. Returns an empty vector if
 # there's no saved snapshot (e.g. history loaded from chat.md but the tools/
 # directory was never created on this server).
-function load_tool_content(cwd::AbstractString, tool_id::AbstractString)
-    params = load_tool_file(String(cwd), String(tool_id))
+function load_tool_content(chat_dir::AbstractString, tool_id::AbstractString)
+    params = load_tool_file(String(chat_dir), String(tool_id))
     params === nothing && return Any[]
     raw = get(params, "content", nothing)
     raw === nothing && return Any[]
@@ -486,9 +486,10 @@ function render_show_preview(bytes::AbstractVector{UInt8}, mime::AbstractString,
     end
 end
 
-function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString;
+function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
+                           chat_dir::AbstractString = cwd;
                            project_id::AbstractString = "")
-    content = load_tool_content(cwd, m.id)
+    content = load_tool_content(chat_dir, m.id)
     isempty(content) &&
         return DOM.div("(no body — tool details not persisted for this entry)",
                        class = "bt-tool-empty")
@@ -565,6 +566,12 @@ mutable struct ChatModel
     cwd           :: String
     project_id    :: String
 
+    # Where chat.md + tools/<id>.json live. Resolved via `chat_storage_dir`
+    # — for projects with an id, that's `state.state_dir/chats/<id>` (outside
+    # the project tree, server-owned). Legacy fallback `<cwd>/.bonitoTeam`
+    # only for orphan chats (project_id == "").
+    chat_dir      :: String
+
     # Persistent state (loaded from disk on construction)
     chat_session  :: Any                    # ChatSession from persistence.jl
     msgs_store    :: Vector{ChatMsg}
@@ -613,7 +620,8 @@ function ChatModel(state::ServerState, cwd::AbstractString;
                     project_id::AbstractString = "",
                     mcp_servers = AgentClientProtocol.MCPServer[],
                     transport::Union{ChatTransport,Nothing} = nothing)
-    chat_session = load_session(cwd)
+    chat_dir     = chat_storage_dir(state, project_id, cwd)
+    chat_session = load_session(chat_dir, cwd)
     msgs_store   = load_history(chat_session)
     # Default transport: spawn claude-agent-acp locally for `cwd`.
     actual_transport = transport === nothing ?
@@ -622,6 +630,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     return ChatModel(
         ReentrantLock(),
         state, String(cwd), String(project_id),
+        chat_dir,
         chat_session, msgs_store,
         Ref{Union{AgentClientProtocol.Client,Nothing}}(nothing),
         collect(AgentClientProtocol.MCPServer, mcp_servers),
@@ -647,6 +656,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
         ChatModel(
             m.lock,
             m.state, m.cwd, m.project_id,
+            m.chat_dir,
             m.chat_session, m.msgs_store,
             m.client, m.mcp_servers, m.transport,
             m.agent_id, m.thought_id, m.user_streaming,
@@ -686,7 +696,7 @@ function chat_push_msg!(model::ChatModel, msg::ChatMsg)
     # Emit the typed dict directly (e.g. {type: "user", text, ...}) with the
     # new total count piggybacked. The JS `dispatch` routes by `type` and
     # bumps `totalCount` from the `n` field — no separate "msg.new" wrapper.
-    payload = msg_to_dict(msg, model.cwd)
+    payload = msg_to_dict(msg, model.chat_dir)
     payload["n"] = n
     chat_emit(model, payload)
 end
@@ -805,7 +815,7 @@ end
 
 function chat_on_tool!(model::ChatModel, upd::ToolCallNotif)
     chat_finalize_streaming!(model)
-    update_tool_file!(model.cwd, upd.tool_call_id, upd.raw)
+    update_tool_file!(model.chat_dir, upd.tool_call_id, upd.raw)
     summary = content_summary(upd.kind, upd.content)
     msg = ToolMsg(upd.tool_call_id, upd.kind, upd.title, upd.status, summary)
     chat_push_msg!(model, msg)
@@ -816,7 +826,7 @@ function chat_on_tool_update!(model::ChatModel, upd::ToolCallUpdateNotif)
     idx = findfirst(m -> m isa ToolMsg && m.id == upd.tool_call_id, model.msgs_store)
     idx === nothing && return
     m = model.msgs_store[idx]
-    update_tool_file!(model.cwd, upd.tool_call_id, upd.raw)
+    update_tool_file!(model.chat_dir, upd.tool_call_id, upd.raw)
     upd.status !== nothing && (m.status = upd.status)
     upd.title  !== nothing && (m.title  = upd.title)
     isempty(upd.content) || (m.summary = content_summary(m.kind, upd.content))
@@ -1157,7 +1167,7 @@ function chat_dispatch!(model::ChatModel, session::Session, msg::AbstractDict)
         n = length(store)
         s = clamp(s, 0, n - 1);  e = clamp(e, 0, n - 1)
         s > e && return
-        batch = [msg_to_dict(store[i], model.cwd) for i in (s+1):(e+1)]
+        batch = [msg_to_dict(store[i], model.chat_dir) for i in (s+1):(e+1)]
         chat_emit(model, Dict{String,Any}(
             "type" => "msgs.range", "start" => s, "msgs" => batch))
     elseif type == "tool.render"
@@ -1165,7 +1175,8 @@ function chat_dispatch!(model::ChatModel, session::Session, msg::AbstractDict)
         isempty(tool_id) && return
         idx = findfirst(m -> m isa ToolMsg && m.id == tool_id, model.msgs_store)
         idx === nothing && return
-        body = render_tool_body(model.state, model.msgs_store[idx], model.cwd;
+        body = render_tool_body(model.state, model.msgs_store[idx],
+                                 model.cwd, model.chat_dir;
                                  project_id = model.project_id)
         try
             Bonito.dom_in_js(session, body, js"""(elem) => {

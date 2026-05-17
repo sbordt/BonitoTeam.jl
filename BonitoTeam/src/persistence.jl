@@ -3,59 +3,97 @@ import CommonMark as CM
 # Session metadata + file path
 struct ChatSession
     session_id::String      # ACP session ID (for --resume)
-    cwd::String
+    cwd::String             # project working dir (for claude --cwd / display)
     created::DateTime
-    path::String            # absolute path to chat.md
+    path::String            # absolute path to chat.md (server-state-managed)
 end
 
-function session_dir(cwd::String)
+"""
+    chat_storage_dir(state, project_id, cwd) -> String
+
+Resolve the directory holding chat.md + tools/ for a project. Server-owned
+state, lives alongside `workers.json` / `projects.json` under
+`state.state_dir/chats/<project_id>/`. This deliberately sits OUTSIDE the
+project tree so:
+
+- Project sync never has to ignore it (the project tree is "code only")
+- Project rename / move / re-sync to another worker can't lose chat history
+- A worker without `.bonitoTeam` (which is every worker — chat is generated
+  server-side from ACP events) can't accidentally clobber the server's
+  chat by being the sync source
+
+Legacy fallback `<cwd>/.bonitoTeam/` is kept for project_id-less callers
+(tests, ad-hoc chats outside the project registry). A one-shot migration
+`mv`s any pre-existing `<cwd>/.bonitoTeam/` into the new home the first
+time a project loads under the new layout.
+"""
+function chat_storage_dir(state, project_id::AbstractString, cwd::AbstractString)
+    if !isempty(project_id)
+        new_dir = joinpath(state.state_dir, "chats", String(project_id))
+        old_dir = joinpath(cwd, ".bonitoTeam")
+        if isdir(old_dir) && !isdir(new_dir)
+            mkpath(dirname(new_dir))
+            try
+                mv(old_dir, new_dir)
+                @info "migrated chat storage to state_dir" project_id from=old_dir to=new_dir
+            catch e
+                # Cross-device mv fails on some setups; fall back to copy+rm.
+                @warn "mv failed during chat-storage migration, copying" exception=e
+                mkpath(new_dir)
+                cp(old_dir, new_dir; force=true)
+                rm(old_dir; recursive=true, force=true)
+            end
+        end
+        mkpath(new_dir)
+        return new_dir
+    end
+    # No project id: orphan chat, keep legacy in-tree storage.
     d = joinpath(cwd, ".bonitoTeam")
     mkpath(d)
     return d
 end
 
-function session_file(cwd::String)
-    joinpath(session_dir(cwd), "chat.md")
-end
+session_file(chat_dir::AbstractString) = joinpath(String(chat_dir), "chat.md")
 
 # Per-tool JSON snapshot of the latest ACP params (the wire format itself), so
 # tool bodies survive restarts and don't have to live in process memory.
-function tools_dir(cwd::String)
-    d = joinpath(session_dir(cwd), "tools")
+function tools_dir(chat_dir::AbstractString)
+    d = joinpath(String(chat_dir), "tools")
     mkpath(d)
     return d
 end
 
-function tool_file(cwd::String, tool_id::String)
-    joinpath(tools_dir(cwd), tool_id * ".json")
-end
+tool_file(chat_dir::AbstractString, tool_id::AbstractString) =
+    joinpath(tools_dir(chat_dir), String(tool_id) * ".json")
 
 # ACP sends either a full snapshot (initial notif + final update with content)
 # or status-only updates with `content: []`. We only persist when there's real
 # content; status/title transitions live in memory on ToolMsg.
-function update_tool_file!(cwd::String, tool_id::String, params::AbstractDict)
+function update_tool_file!(chat_dir::AbstractString, tool_id::AbstractString, params::AbstractDict)
     content = get(params, "content", nothing)
     (content === nothing || isempty(content)) && return nothing
-    path = tool_file(cwd, tool_id)
+    path = tool_file(chat_dir, tool_id)
     open(io -> JSON.print(io, params), path, "w")
     return params
 end
 
-function load_tool_file(cwd::String, tool_id::String)::Union{AbstractDict,Nothing}
-    path = tool_file(cwd, tool_id)
+function load_tool_file(chat_dir::AbstractString, tool_id::AbstractString)::Union{AbstractDict,Nothing}
+    path = tool_file(chat_dir, tool_id)
     isfile(path) || return nothing
     return open(JSON.parse, path)
 end
 
-# Load or create a session
-function load_session(cwd::String)::ChatSession
-    path = session_file(cwd)
+# Load or create a session. `chat_dir` is where chat.md lives (resolved via
+# `chat_storage_dir`); `cwd` is the project's working dir (recorded on the
+# ChatSession for display + claude resume).
+function load_session(chat_dir::AbstractString, cwd::AbstractString)::ChatSession
+    path = session_file(chat_dir)
     if isfile(path)
-        session = parse_session_meta(path, cwd)
+        session = parse_session_meta(path, String(cwd))
         session !== nothing && return session
     end
     # Create fresh session
-    session = ChatSession("", cwd, now(UTC), path)
+    session = ChatSession("", String(cwd), now(UTC), path)
     write_session_header(session)
     return session
 end
@@ -147,7 +185,7 @@ function append_tool(session::ChatSession, msg::ToolMsg)
         println(io, "!!! tool \"$meta\"")
         println(io, "    `$(msg.title)`")
         # Brief summary on the collapsed header; full ACP body lives in
-        # .bonitoTeam/tools/<id>.json (see update_tool_file!).
+        # the chat-storage `tools/<id>.json` (see update_tool_file!).
         if !isempty(msg.summary)
             println(io, "")
             println(io, "    $(msg.summary)")

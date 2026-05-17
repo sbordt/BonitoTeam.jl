@@ -316,15 +316,22 @@ end
         end
     end
 
-    @testset "still ignores .bonitoTeam/" begin
+    @testset "no directories excluded (mirrors the project tree verbatim)" begin
+        # `.bonitoTeam/` used to be skipped to protect the server's chat
+        # history from being wiped during a worker→server pull. Chat
+        # storage now lives under `<state_dir>/chats/<project_id>/`,
+        # outside any project tree, so the sync is plain mirror.
         src = mktempdir(); dst = mktempdir()
         try
             mkpath(joinpath(src, ".bonitoTeam"))
-            write(joinpath(src, ".bonitoTeam", "chat.md"), "worker-local mirror")
+            write(joinpath(src, ".bonitoTeam", "chat.md"), "if present, sync it")
+            mkpath(joinpath(src, ".cache"))
+            write(joinpath(src, ".cache", "x"), "anything goes")
             write(joinpath(src, "real.txt"), "kept")
             run_sync(src, dst)
-            @test isfile(joinpath(dst, "real.txt"))
-            @test !isdir(joinpath(dst, ".bonitoTeam"))
+            @test read(joinpath(dst, ".bonitoTeam", "chat.md"), String) == "if present, sync it"
+            @test read(joinpath(dst, ".cache", "x"), String) == "anything goes"
+            @test read(joinpath(dst, "real.txt"), String) == "kept"
         finally
             rm(src; recursive=true, force=true)
             rm(dst; recursive=true, force=true)

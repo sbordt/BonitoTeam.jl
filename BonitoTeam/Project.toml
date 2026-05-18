@@ -30,7 +30,7 @@ RemoteSync          = {path = "../RemoteSync"}
 # Pinned to the branch where the proxy_url="." fix lives (relative_url emits
 # server-absolute paths so sub-route /p/<id> assets resolve correctly).
 # Drop this once the branch is merged + tagged.
-Bonito     = {url = "https://github.com/SimonDanisch/Bonito.jl.git",     rev = "sd/terminal-output"}
+Bonito = {url = "https://github.com/SimonDanisch/Bonito.jl.git", rev = "sd/v5"}
 BonitoBook = {url = "https://github.com/SimonDanisch/BonitoBook.jl.git", rev = "sd/llm-improvements"}
 
 [compat]

@@ -31,6 +31,9 @@ const ChatStyles = Bonito.Styles(
     # below can shrink past content height to enable its internal scroll.
     CSS(".bt-app",
         "width" => "100%", "height" => "100%", "min-height" => "0",
+        # position:relative so the absolutely-positioned new-message
+        # pill (below) anchors to .bt-app rather than the document.
+        "position" => "relative",
         "display" => "flex", "flex-direction" => "column",
         "font-family" => "'Inter', system-ui, -apple-system, sans-serif",
         "font-size" => "14px",
@@ -474,19 +477,113 @@ const ChatStyles = Bonito.Styles(
         CSS("0%, 100%", "opacity" => "0.3", "transform" => "scale(0.8)"),
         CSS("50%",      "opacity" => "1",   "transform" => "scale(1.2)")),
 
+    # ── New-messages pill ────────────────────────────────────────────────────
+    # Floats above the input area when followMode is off and new content
+    # arrived in scrollback. Click → re-engage follow + scroll to bottom.
+    # Hidden by default; .bt-new-msg-pill-visible toggles display. The slow
+    # 2.5s pulse is via box-shadow so the button geometry doesn't shift.
+    CSS(".bt-new-msg-pill",
+        "display" => "none",
+        "position" => "absolute",
+        "left" => "50%",
+        # Bottom offset sits above the input area; chosen large enough
+        # that on mobile (where the input area can grow to ~120px with
+        # an expanded textarea + attachments strip) the pill stays clear.
+        "bottom" => "92px",
+        "transform" => "translateX(-50%)",
+        "z-index" => "20",
+        "align-items" => "center", "gap" => "8px",
+        "padding" => "8px 16px",
+        "border" => "none", "border-radius" => "999px",
+        "background" => "linear-gradient(135deg, #10b981 0%, #059669 100%)",
+        "color" => "#fff",
+        "font-family" => "inherit", "font-size" => "13px",
+        "font-weight" => "500",
+        "cursor" => "pointer",
+        "box-shadow" => "0 4px 14px rgba(16, 185, 129, 0.45)",
+        "animation" => "bt-new-msg-pulse 2.5s ease-in-out infinite"),
+    CSS(".bt-new-msg-pill.bt-new-msg-pill-visible",
+        "display" => "inline-flex"),
+    CSS(".bt-new-msg-pill:hover",
+        "filter" => "brightness(1.08)"),
+    CSS(".bt-new-msg-pill:active",
+        "transform" => "translateX(-50%) scale(0.96)"),
+    CSS(".bt-new-msg-pill-arrow",
+        "font-size" => "16px", "line-height" => "1"),
+    CSS("@keyframes bt-new-msg-pulse",
+        CSS("0%, 100%",
+            "box-shadow" => "0 4px 14px rgba(16, 185, 129, 0.45)"),
+        CSS("50%",
+            "box-shadow" => "0 4px 28px rgba(16, 185, 129, 0.85)")),
+
     # ── Input area ───────────────────────────────────────────────────────────
     # Outer area spans full width (so the top border + background look right);
     # inner row is centered with the same max-width as the messages column.
+    # Column flex so the thumbnail strip (.bt-attachments) sits above the
+    # input row when an attachment is queued.
     CSS(".bt-input-area",
         "flex-shrink" => "0",
         "border-top" => "1px solid var(--bt-border)",
         "padding" => "12px 14px",
         "padding-bottom" => "max(12px, env(safe-area-inset-bottom))",
-        "display" => "flex", "justify-content" => "center",
+        "display" => "flex", "flex-direction" => "column", "align-items" => "center",
+        "gap" => "8px",
         "background" => "var(--bt-surface)"),
     CSS(".bt-input-row",
         "display" => "flex", "gap" => "8px", "align-items" => "flex-end",
         "width" => "100%", "max-width" => "880px"),
+
+    # ── Attachment thumbnail strip ──────────────────────────────────────────
+    # Sits above .bt-input-row. Hidden (display:none) when there's nothing
+    # queued so the empty div doesn't add stray spacing. Thumbnails scroll
+    # horizontally on overflow rather than wrapping — keeps the input row
+    # in the same screen position regardless of attachment count.
+    CSS(".bt-attachments",
+        "display" => "none",
+        "width" => "100%", "max-width" => "880px"),
+    CSS(".bt-attachments.bt-attachments-active",
+        "display" => "flex",
+        "gap" => "8px",
+        "flex-wrap" => "wrap",
+        "align-items" => "flex-start"),
+    CSS(".bt-attachment-thumb",
+        "position" => "relative",
+        "width" => "64px", "height" => "64px",
+        "border" => "1px solid var(--bt-border-strong)",
+        "border-radius" => "8px",
+        "overflow" => "hidden",
+        "background" => "var(--bt-bg)",
+        "flex-shrink" => "0"),
+    CSS(".bt-attachment-thumb img",
+        "width" => "100%", "height" => "100%",
+        "object-fit" => "cover",
+        "display" => "block"),
+    CSS(".bt-attachment-remove",
+        "position" => "absolute",
+        "top" => "2px", "right" => "2px",
+        "width" => "20px", "height" => "20px",
+        "border" => "none", "border-radius" => "50%",
+        "background" => "rgba(0,0,0,0.6)", "color" => "#fff",
+        "font-size" => "16px", "line-height" => "20px",
+        "padding" => "0", "cursor" => "pointer",
+        "display" => "flex", "align-items" => "center",
+        "justify-content" => "center"),
+    CSS(".bt-attachment-remove:hover",
+        "background" => "rgba(220,38,38,0.85)"),
+    CSS(".bt-attach-error",
+        "color" => "var(--bt-error)",
+        "font-size" => "12px",
+        "padding" => "4px 8px",
+        "border-radius" => "6px",
+        "background" => "rgba(239,68,68,0.08)",
+        "border" => "1px solid rgba(239,68,68,0.3)",
+        "flex-basis" => "100%",
+        "box-sizing" => "border-box"),
+
+    # Drag-over highlight on .bt-app: subtle inset ring so it's clear the
+    # drop zone is "the whole chat", not just one nested element.
+    CSS(".bt-app.bt-drag-over",
+        "box-shadow" => "inset 0 0 0 3px var(--bt-accent)"),
     CSS(".bt-text-input",
         "flex" => "1 1 auto", "min-width" => "0",
         "border" => "1px solid var(--bt-border-strong)",

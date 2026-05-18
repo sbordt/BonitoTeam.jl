@@ -925,12 +925,18 @@ end
 # auto-prompt template, future scripted hooks — goes through here. That
 # guarantees the same four steps happen in the same order: store push,
 # MD persist, busy banner, async dispatch to the agent.
-function send_message!(model::ChatModel, msg::UserMsg)
+#
+# `images` are sent to the agent as multimodal content blocks; the caller is
+# responsible for already having embedded any file-path reference into
+# `msg.text` so the display + replay see the same thing claude does.
+function send_message!(model::ChatModel, msg::UserMsg;
+                       images::Vector{AgentClientProtocol.ImageAttachment} =
+                              AgentClientProtocol.ImageAttachment[])
     chat_push_msg!(model, msg)
     append_user(model.chat_session, msg)
     model.agent_id[] = ""    # any in-flight agent stream is over once the user sends
     chat_emit(model, Dict{String,Any}("type" => "busy_start"))
-    Base.errormonitor(@async send_prompt_async!(model, msg.text))
+    Base.errormonitor(@async send_prompt_async!(model, msg.text; images))
     return nothing
 end
 
@@ -992,7 +998,9 @@ end
 # Common send-and-handle for both auto_prompt and user-typed prompts. Splits
 # transient ACP errors (which we surface inline as a chat bubble) from
 # session-death errors (which flip the banner so the user can restart).
-function send_prompt_async!(model::ChatModel, text::AbstractString)
+function send_prompt_async!(model::ChatModel, text::AbstractString;
+                            images::Vector{AgentClientProtocol.ImageAttachment} =
+                                   AgentClientProtocol.ImageAttachment[])
     full_text = String(text)
     # One-shot: if `start_chat_client!` armed the replay flag (fresh claude
     # session that has no memory of prior chat.md content), prepend the
@@ -1004,7 +1012,7 @@ function send_prompt_async!(model::ChatModel, text::AbstractString)
         model.pending_history_replay[] = false
     end
     try
-        AgentClientProtocol.prompt!(model.client[], full_text)
+        AgentClientProtocol.prompt!(model.client[], full_text; images)
         chat_finalize_streaming!(model)
     catch e
         msg = sprint(showerror, e)
@@ -1143,6 +1151,105 @@ end
 # `jsrender(::ChatModel)` below — same pattern as BonitoBook's MonacoEditor.
 const ChatLib = Bonito.ES6Module(joinpath(@__DIR__, "..", "assets", "bonitoteam.js"))
 
+# ── Image attachments ─────────────────────────────────────────────────────
+# The JS input area collects pasted / dropped images locally and ships them
+# as a base64 + mime payload in the "send" comm event. This helper saves
+# each one to `<cwd>/.bt-attachments/<ts>-<short>.<ext>` so:
+#   1. The bubble's UserMsg text carries a `[attached: …]` reference that
+#      survives chat.md replay (claude can `Read` the file on resume).
+#   2. The worker mirror has the same file when send_file_to_worker! lands.
+#   3. The multimodal blocks let claude see the image *right now* without
+#      doing an extra Read tool call.
+const ATTACHMENT_DIR_NAME = ".bt-attachments"
+
+# Map mime types to the canonical file extension we save under. Anything
+# not in this table is rejected (caller raises) — silently saving foreign
+# blobs as `.bin` would surprise users on replay.
+const ATTACHMENT_EXTENSIONS = Dict(
+    "image/png"     => "png",
+    "image/jpeg"    => "jpg",
+    "image/jpg"     => "jpg",
+    "image/gif"     => "gif",
+    "image/webp"    => "webp",
+    "image/svg+xml" => "svg",
+)
+
+# 5 MB per image. ACP / claude will balk much later than this, but we want
+# a clear error path before we burn bandwidth sending bytes downstream.
+const ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024
+
+function attachment_ext(mime::AbstractString)
+    ext = get(ATTACHMENT_EXTENSIONS, lowercase(String(mime)), nothing)
+    ext === nothing || return ext
+    allowed = join(sort(collect(keys(ATTACHMENT_EXTENSIONS))), ", ")
+    error("Unsupported attachment mime type: $mime (allowed: $allowed)")
+end
+
+# Save one attachment to disk under the project's `.bt-attachments/` dir.
+# Returns the path RELATIVE to `model.cwd` so it round-trips into the
+# UserMsg text as a portable reference. The absolute path is the second
+# return value (used by the worker push).
+function save_attachment(model::ChatModel,
+                          mime::AbstractString,
+                          bytes::AbstractVector{UInt8})
+    length(bytes) <= ATTACHMENT_MAX_BYTES ||
+        error("Attachment too large: $(length(bytes)) bytes > $(ATTACHMENT_MAX_BYTES)")
+    ext       = attachment_ext(mime)
+    ts        = Dates.format(now(UTC), "yyyy-mm-dd_HHMMSS")
+    short     = string(uuid4())[1:8]
+    rel       = joinpath(ATTACHMENT_DIR_NAME, "$(ts)_$(short).$(ext)")
+    abs       = joinpath(model.cwd, rel)
+    mkpath(dirname(abs))
+    write(abs, bytes)
+    return rel, abs
+end
+
+# Best-effort push of an attachment from the server mirror to the worker
+# mirror. Failure here doesn't abort the send — the file still exists on
+# the server, so a subsequent full sync (or move) will replicate it. We
+# only push when there's a project bound and the worker is connected.
+function push_attachment_to_worker(model::ChatModel, rel_path::AbstractString)
+    pid = model.project_id
+    isempty(pid) && return
+    proj = get(model.state.projects[], pid, nothing)
+    proj === nothing && return
+    haskey(model.state.worker_control_ws, proj.worker_id) || return
+    src = joinpath(model.cwd, rel_path)
+    dst = joinpath(proj.worker_path, rel_path)
+    try
+        send_file_to_worker!(model.state, proj.worker_id, src, dst;
+                              handoff_timeout = 15.0)
+    catch e
+        @warn "attachment push to worker failed" worker=proj.worker_id rel_path exception=e
+    end
+    return
+end
+
+# Parse JS-side attachment payloads ({mime, data, filename?}) into a
+# (display_text_suffix, [ImageAttachment]) pair. `attachments` may be
+# empty (no-op). Each entry's base64 `data` field is decoded once.
+function process_attachments!(model::ChatModel, attachments)
+    attachments isa AbstractVector || return ("", AgentClientProtocol.ImageAttachment[])
+    isempty(attachments) && return ("", AgentClientProtocol.ImageAttachment[])
+
+    suffix_lines = String[]
+    blocks = AgentClientProtocol.ImageAttachment[]
+    for a in attachments
+        a isa AbstractDict || continue
+        mime  = String(get(a, "mime",  ""))
+        b64   = String(get(a, "data",  ""))
+        (isempty(mime) || isempty(b64)) && continue
+        bytes = Base64.base64decode(b64)
+        rel, _ = save_attachment(model, mime, bytes)
+        push_attachment_to_worker(model, rel)
+        push!(blocks, AgentClientProtocol.ImageAttachment(bytes, mime))
+        push!(suffix_lines, "  - $(rel)")
+    end
+    suffix = isempty(suffix_lines) ? "" :
+        "\n\n[attached files in this message]\n" * join(suffix_lines, "\n")
+    return suffix, blocks
+end
+
 # Single dispatcher for all JS-originated commands. Reads `msg["type"]` and
 # routes to the appropriate Julia handler. Called from `jsrender(::ChatModel)`
 # on each session's `comm` Observable; session-scoped `Observables.on(f, session, …)`
@@ -1196,6 +1303,27 @@ function chat_dispatch!(model::ChatModel, session::Session, msg::AbstractDict)
                       Markdown.parse(model.msgs_store[idx].text))
         chat_emit(model, Dict{String,Any}("type" => "thought.body",
                                             "id" => thought_id, "html" => html))
+    elseif type == "send"
+        # Multimodal send path. JS uses this whenever there are attached
+        # images; pure-text sends still go through the Bonito.Button →
+        # `send_user_text!` chain so the existing electron tests stay green.
+        text  = String(get(msg, "text", ""))
+        attachments = get(msg, "attachments", [])
+        local suffix, blocks
+        try
+            suffix, blocks = process_attachments!(model, attachments)
+        catch e
+            chat_emit(model, Dict{String,Any}(
+                "type" => "attach_error", "error" => sprint(showerror, e)))
+            return
+        end
+        display_text = isempty(strip(text)) && !isempty(blocks) ?
+            "(image attached)" * suffix :
+            text * suffix
+        # Tell JS the attachments have been accepted so it can clear the
+        # thumbnail strip + textarea.
+        chat_emit(model, Dict{String,Any}("type" => "send_ack"))
+        send_message!(model, UserMsg(display_text); images = blocks)
     end
     return
 end

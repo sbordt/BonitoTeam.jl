@@ -126,11 +126,29 @@ function Client(cwd::String;
     return Client(conn, session_id, cwd)
 end
 
+# One attached image for a multimodal prompt.
+#   data:     raw bytes (will be base64-encoded for transport)
+#   mime:     e.g. "image/png", "image/jpeg"
+struct ImageAttachment
+    data::Vector{UInt8}
+    mime::String
+end
+
 # Send a user message; blocks until the agent signals end_turn / cancelled.
-function prompt!(client::Client, text::String)
+# `images` are appended after the text as ACP image content blocks.
+function prompt!(client::Client, text::String;
+                 images::Vector{ImageAttachment} = ImageAttachment[])
+    blocks = Any[Dict("type" => "text", "text" => text)]
+    for img in images
+        push!(blocks, Dict(
+            "type"     => "image",
+            "data"     => Base64.base64encode(img.data),
+            "mimeType" => img.mime,
+        ))
+    end
     send_request(client.conn, "session/prompt", Dict(
         "sessionId" => client.session_id,
-        "prompt"    => [Dict("type" => "text", "text" => text)]
+        "prompt"    => blocks,
     ))
     return nothing
 end

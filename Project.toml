@@ -24,6 +24,3 @@ RemoteSync          = {path = "RemoteSync"}
 #  - Bonito sd/terminal-output: proxy_url="." emits server-absolute asset URLs
 Bonito              = {url = "https://github.com/SimonDanisch/Bonito.jl.git",     rev = "sd/terminal-output"}
 BonitoBook          = {url = "https://github.com/SimonDanisch/BonitoBook.jl.git", rev = "sd/llm-improvements"}
-
-[compat]
-julia = "1.11"

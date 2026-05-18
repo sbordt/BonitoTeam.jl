@@ -15,9 +15,10 @@ class BonitoChat {
         this.totalCount = 0;
         this.EST_HEIGHT = 80;
         this.OVERSCAN = 8;
-        this.wasAtBottom = true;
         this.initialLoad = false;
-        this.chasingBottom = false;
+        this.followMode = true;
+        this.unreadCount = 0;
+        this.AT_BOTTOM_PX = 20;
         this.spacerTop = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
         this.busyEl = container.parentElement.querySelector('.bt-busy');
@@ -34,9 +35,32 @@ class BonitoChat {
         comm.notify({
             type: 'init'
         });
+        this._lastUserInputT = 0;
+        const markUserInput = ()=>{
+            this._lastUserInputT = performance.now();
+        };
+        container.addEventListener('wheel', markUserInput, {
+            passive: true
+        });
+        container.addEventListener('touchstart', markUserInput, {
+            passive: true
+        });
+        container.addEventListener('touchmove', markUserInput, {
+            passive: true
+        });
+        container.addEventListener('keydown', markUserInput, {
+            passive: true
+        });
+        this._markUserInput = markUserInput;
         this._onScroll = ()=>{
-            if (this.chasingBottom && !this.atBottom()) this.chasingBottom = false;
-            this.wasAtBottom = this.atBottom();
+            const userDriven = performance.now() - this._lastUserInputT < 400;
+            const atBot = this.atBottom();
+            if (userDriven) {
+                this.setFollowMode(atBot);
+                if (!atBot) this._cancelPendingScroll();
+            } else if (this.followMode && !atBot) {
+                this._queueScrollToBottom();
+            }
             this.refresh();
         };
         container.addEventListener('scroll', this._onScroll, {
@@ -44,20 +68,28 @@ class BonitoChat {
         });
         this._containerRO = new ResizeObserver(()=>{
             if (this.destroyed) return;
-            if (this.wasAtBottom || this.chasingBottom) {
-                this._queueScrollToBottom();
-            }
+            if (this.followMode) this._queueScrollToBottom();
         });
         this._containerRO.observe(this.container);
         if (window.visualViewport) {
             this._onVPResize = ()=>this.onViewportResize();
             window.visualViewport.addEventListener('resize', this._onVPResize);
         }
+        Promise.resolve().then(()=>this._setupAttachments());
     }
     destroy() {
         this.destroyed = true;
         if (this._onScroll) {
             this.container.removeEventListener('scroll', this._onScroll);
+        }
+        if (this._markUserInput) {
+            this.container.removeEventListener('wheel', this._markUserInput);
+            this.container.removeEventListener('touchstart', this._markUserInput);
+            this.container.removeEventListener('touchmove', this._markUserInput);
+            this.container.removeEventListener('keydown', this._markUserInput);
+        }
+        if (this._scrollRafId !== null && this._scrollRafId !== undefined) {
+            cancelAnimationFrame(this._scrollRafId);
         }
         if (this._onVPResize && window.visualViewport) {
             window.visualViewport.removeEventListener('resize', this._onVPResize);
@@ -67,6 +99,21 @@ class BonitoChat {
         }
         this.ros.forEach((ro)=>ro.disconnect());
         this.ros.clear();
+        if (this._onPaste && this.textInput) {
+            this.textInput.removeEventListener('paste', this._onPaste);
+        }
+        if (this._onTextInputKeyCapture && this.textInput) {
+            this.textInput.removeEventListener('keydown', this._onTextInputKeyCapture, true);
+        }
+        if (this._onSendClickCapture && this.sendBtn) {
+            this.sendBtn.removeEventListener('click', this._onSendClickCapture, true);
+        }
+        if (this.app) {
+            this._onDragOver && this.app.removeEventListener('dragover', this._onDragOver);
+            this._onDragLeave && this.app.removeEventListener('dragleave', this._onDragLeave);
+            this._onDrop && this.app.removeEventListener('drop', this._onDrop);
+        }
+        clearTimeout(this._attachErrorTimer);
     }
     dispatch(msg) {
         if (typeof msg.n === 'number' && msg.n > this.totalCount) {
@@ -79,11 +126,11 @@ class BonitoChat {
                 return this.onRange(msg);
             case 'busy_start':
                 this.busyEl?.classList.add('bt-busy-active');
-                if (this.wasAtBottom) this._queueScrollToBottom();
+                if (this.followMode) this._queueScrollToBottom();
                 return;
             case 'busy_end':
                 this.busyEl?.classList.remove('bt-busy-active');
-                if (this.wasAtBottom) this._queueScrollToBottom();
+                if (this.followMode) this._queueScrollToBottom();
                 return;
             case 'agent_final':
                 return this.onAgentFinal(msg);
@@ -99,6 +146,10 @@ class BonitoChat {
                 return this.appendChunk(msg.id, msg.text);
             case 'user_chunk':
                 return this.appendUserChunk(msg.text);
+            case 'attach_error':
+                return this._showAttachError(msg.error || 'Attachment failed');
+            case 'send_ack':
+                return;
             case 'user':
             case 'agent':
             case 'thought':
@@ -168,20 +219,20 @@ class BonitoChat {
         });
         this.updateDOM(...this.visibleRange());
         if (this.initialLoad) {
-            this.initialLoad = false;
-            this.chasingBottom = true;
+            this.initialLoad = true;
+            this.setFollowMode(true);
             this.scrollToBottom();
             requestAnimationFrame(()=>{
-                if (!this.destroyed && this.chasingBottom) this.scrollToBottom();
+                if (!this.destroyed && this.followMode) this.scrollToBottom();
             });
             setTimeout(()=>{
-                if (!this.destroyed && this.chasingBottom) this.scrollToBottom();
+                if (!this.destroyed && this.followMode) this.scrollToBottom();
             }, 100);
             setTimeout(()=>{
-                if (!this.destroyed && this.chasingBottom) this.scrollToBottom();
-                this.chasingBottom = false;
+                if (!this.destroyed && this.followMode) this.scrollToBottom();
+                this.initialLoad = false;
             }, 300);
-        } else if (this.chasingBottom) {
+        } else if (this.followMode) {
             this._queueScrollToBottom();
         }
     }
@@ -229,14 +280,11 @@ class BonitoChat {
             if (msg.id) this.nodeById.set(msg.id, node);
             this.observe(idx, node);
         }
-        const isOwnMessage = msg.type === 'user';
-        if (this.wasAtBottom || isOwnMessage) {
+        if (this.followMode) {
             this.updateDOM(...this.visibleRange());
-            if (isOwnMessage) {
-                this.wasAtBottom = true;
-                this.chasingBottom = true;
-            }
             this._queueScrollToBottom();
+        } else {
+            this._registerUnread();
         }
     }
     appendChunk(id, text) {
@@ -244,14 +292,22 @@ class BonitoChat {
         if (!node) return;
         const t = node.querySelector('.bt-stream-text');
         if (t) t.textContent += text;
-        if (this.wasAtBottom) this._queueScrollToBottom();
+        if (this.followMode) {
+            this._queueScrollToBottom();
+        } else {
+            this._registerUnread();
+        }
     }
     appendUserChunk(text) {
         const idx = this.totalCount - 1;
         const node = this.cache.get(idx);
         if (node && node.classList.contains('bt-user-msg')) {
             node.textContent += text;
-            if (this.wasAtBottom) this._queueScrollToBottom();
+            if (this.followMode) {
+                this._queueScrollToBottom();
+            } else {
+                this._registerUnread();
+            }
         }
     }
     onAgentFinal(msg) {
@@ -392,13 +448,14 @@ class BonitoChat {
     }
     atBottom() {
         const { scrollTop , scrollHeight , clientHeight  } = this.container;
-        return scrollHeight - scrollTop - clientHeight < 200;
+        return scrollHeight - scrollTop - clientHeight < this.AT_BOTTOM_PX;
     }
     _queueScrollToBottom() {
         if (this._scrollQueued || this.destroyed) return;
         this._scrollQueued = true;
-        requestAnimationFrame(()=>{
+        this._scrollRafId = requestAnimationFrame(()=>{
             this._scrollQueued = false;
+            this._scrollRafId = null;
             if (!this.destroyed) this.scrollToBottom();
         });
     }
@@ -412,11 +469,227 @@ class BonitoChat {
         }
         this.refresh();
     }
+    _setupAttachments() {
+        if (this.destroyed) return;
+        const app = this.container?.parentElement;
+        if (!app) return;
+        this.app = app;
+        this.inputArea = app.querySelector('.bt-input-area');
+        this.textInput = app.querySelector('.bt-text-input');
+        this.sendBtn = app.querySelector('.bt-send-btn');
+        if (!this.inputArea || !this.textInput || !this.sendBtn) return;
+        this.attachBar = document.createElement('div');
+        this.attachBar.className = 'bt-attachments';
+        this.inputArea.insertBefore(this.attachBar, this.inputArea.firstChild);
+        this.attachments = new Map();
+        this._attachIdCounter = 0;
+        this.ATTACH_MAX_BYTES = 5 * 1024 * 1024;
+        this._onPaste = (e)=>{
+            const items = e.clipboardData?.items;
+            if (!items) return;
+            for (const it of items){
+                if (it.kind === 'file' && it.type && it.type.startsWith('image/')) {
+                    const blob = it.getAsFile();
+                    if (blob) this._attachAddBlob(blob, blob.type || it.type, blob.name || `pasted-${Date.now()}.png`);
+                }
+            }
+        };
+        this.textInput.addEventListener('paste', this._onPaste);
+        this._onDragOver = (e)=>{
+            if (!this._dragHasImage(e)) return;
+            e.preventDefault();
+            this.app.classList.add('bt-drag-over');
+        };
+        this._onDragLeave = (e)=>{
+            if (e.relatedTarget && this.app.contains(e.relatedTarget)) return;
+            this.app.classList.remove('bt-drag-over');
+        };
+        this._onDrop = (e)=>{
+            e.preventDefault();
+            this.app.classList.remove('bt-drag-over');
+            const files = e.dataTransfer?.files;
+            if (!files) return;
+            for (const f of files){
+                if (f.type && f.type.startsWith('image/')) {
+                    this._attachAddBlob(f, f.type, f.name || `dropped-${Date.now()}.png`);
+                }
+            }
+        };
+        this.app.addEventListener('dragover', this._onDragOver);
+        this.app.addEventListener('dragleave', this._onDragLeave);
+        this.app.addEventListener('drop', this._onDrop);
+        this._onSendClickCapture = (e)=>{
+            if (this.attachments.size === 0) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            this._submitWithAttachments();
+        };
+        this.sendBtn.addEventListener('click', this._onSendClickCapture, true);
+        this._onTextInputKeyCapture = (e)=>{
+            if (e.key !== 'Enter' || e.shiftKey) return;
+            if (this.attachments.size === 0) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            this._submitWithAttachments();
+        };
+        this.textInput.addEventListener('keydown', this._onTextInputKeyCapture, true);
+    }
+    _dragHasImage(e) {
+        const dt = e.dataTransfer;
+        if (!dt) return false;
+        if (dt.types) {
+            for (const t of dt.types)if (t === 'Files') return true;
+        }
+        return false;
+    }
+    _attachAddBlob(blob, mime, filename) {
+        if (blob.size > this.ATTACH_MAX_BYTES) {
+            this._showAttachError(`Image too large (${(blob.size / 1024 / 1024).toFixed(1)} MB, ` + `max ${this.ATTACH_MAX_BYTES / 1024 / 1024} MB)`);
+            return;
+        }
+        const id = `att-${++this._attachIdCounter}`;
+        const reader = new FileReader();
+        reader.onload = ()=>{
+            if (this.destroyed) return;
+            this.attachments.set(id, {
+                blob,
+                mime,
+                filename,
+                dataUrl: reader.result
+            });
+            this._renderAttachments();
+        };
+        reader.onerror = ()=>this._showAttachError('Failed to read image');
+        reader.readAsDataURL(blob);
+    }
+    _attachRemove(id) {
+        this.attachments.delete(id);
+        this._renderAttachments();
+    }
+    _attachClear() {
+        this.attachments.clear();
+        this._renderAttachments();
+    }
+    _renderAttachments() {
+        if (!this.attachBar) return;
+        const err = this.attachBar.querySelector('.bt-attach-error');
+        this.attachBar.innerHTML = '';
+        if (this.attachments.size === 0) {
+            this.attachBar.classList.remove('bt-attachments-active');
+        } else {
+            this.attachBar.classList.add('bt-attachments-active');
+            for (const [id, item] of this.attachments){
+                const wrap = document.createElement('div');
+                wrap.className = 'bt-attachment-thumb';
+                wrap.dataset.attachId = id;
+                const img = document.createElement('img');
+                img.src = item.dataUrl;
+                img.alt = item.filename || 'image';
+                img.title = item.filename || 'image';
+                wrap.appendChild(img);
+                const rm = document.createElement('button');
+                rm.type = 'button';
+                rm.className = 'bt-attachment-remove';
+                rm.title = 'Remove';
+                rm.textContent = '×';
+                rm.addEventListener('click', (e)=>{
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this._attachRemove(id);
+                });
+                wrap.appendChild(rm);
+                this.attachBar.appendChild(wrap);
+            }
+        }
+        if (err) this.attachBar.appendChild(err);
+    }
+    _showAttachError(message) {
+        if (!this.attachBar) return;
+        let chip = this.attachBar.querySelector('.bt-attach-error');
+        if (!chip) {
+            chip = document.createElement('div');
+            chip.className = 'bt-attach-error';
+            this.attachBar.appendChild(chip);
+            this.attachBar.classList.add('bt-attachments-active');
+        }
+        chip.textContent = message;
+        clearTimeout(this._attachErrorTimer);
+        this._attachErrorTimer = setTimeout(()=>{
+            chip.remove();
+            if (this.attachments.size === 0) {
+                this.attachBar.classList.remove('bt-attachments-active');
+            }
+        }, 4500);
+    }
+    async _submitWithAttachments() {
+        if (this.attachments.size === 0) return;
+        const text = this.textInput.value;
+        const payload = [];
+        for (const item of this.attachments.values()){
+            const buf = await item.blob.arrayBuffer();
+            payload.push({
+                mime: item.mime,
+                filename: item.filename || '',
+                data: arrayBufferToBase64(buf)
+            });
+        }
+        this.comm.notify({
+            type: 'send',
+            text,
+            attachments: payload
+        });
+        this.textInput.value = '';
+        this.textInput.dispatchEvent(new Event('input', {
+            bubbles: true
+        }));
+        this._attachClear();
+    }
     onViewportResize() {
         const vv = window.visualViewport;
         const app = document.querySelector('.bt-app');
         if (app) app.style.height = vv.height + 'px';
-        if (this.wasAtBottom) this._queueScrollToBottom();
+        if (this.followMode) this._queueScrollToBottom();
+    }
+    setFollowMode(on) {
+        if (this.followMode === on) return;
+        this.followMode = on;
+        if (on) {
+            this.unreadCount = 0;
+            this._hideNewMessagePill();
+        }
+    }
+    _cancelPendingScroll() {
+        if (this._scrollRafId !== null && this._scrollRafId !== undefined) {
+            cancelAnimationFrame(this._scrollRafId);
+            this._scrollRafId = null;
+            this._scrollQueued = false;
+        }
+    }
+    _registerUnread() {
+        this.unreadCount++;
+        this._showNewMessagePill();
+    }
+    _showNewMessagePill() {
+        if (!this._pillEl) this._createNewMessagePill();
+        if (this._pillEl) this._pillEl.classList.add('bt-new-msg-pill-visible');
+    }
+    _hideNewMessagePill() {
+        if (this._pillEl) this._pillEl.classList.remove('bt-new-msg-pill-visible');
+    }
+    _createNewMessagePill() {
+        const app = this.container?.parentElement;
+        if (!app) return;
+        const pill = document.createElement('button');
+        pill.type = 'button';
+        pill.className = 'bt-new-msg-pill';
+        pill.innerHTML = '<span class="bt-new-msg-pill-arrow">↓</span>' + '<span>New messages</span>';
+        pill.addEventListener('click', (e)=>{
+            e.preventDefault();
+            this.setFollowMode(true);
+            this.scrollToBottom();
+        });
+        app.appendChild(pill);
+        this._pillEl = pill;
     }
 }
 function escapeHTML(str) {
@@ -424,6 +697,15 @@ function escapeHTML(str) {
 }
 function escapeAttr(str) {
     return escapeHTML(str).replace(/"/g, '&quot;');
+}
+function arrayBufferToBase64(buf) {
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    const CHUNK = 0x8000;
+    for(let i = 0; i < bytes.length; i += CHUNK){
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
 }
 function connect(node, comm) {
     const chat = new BonitoChat(node, comm);

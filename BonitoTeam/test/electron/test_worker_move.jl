@@ -102,6 +102,14 @@ function handle_mock_transfer(mw::MockWorker, cmd::AbstractDict)
             src = String(cmd["src_path"])
             isdir(src) || error("src_path is not a directory: $src")
             RemoteSync.send_directory(src, wsio)
+        elseif direction == "file_to_worker"
+            dst = String(cmd["dst_path"])
+            mkpath(dirname(dst))
+            RemoteSync.receive_file(dst, wsio)
+        elseif direction == "file_from_worker"
+            src = String(cmd["src_path"])
+            isfile(src) || error("src_path is not a file: $src")
+            RemoteSync.send_file(src, wsio)
         end
     end
 end
@@ -237,6 +245,46 @@ try
                @TH.test_true !isfile(joinpath(p.worker_path, "newfile.txt")))
         record("server mirror matches A",
                @TH.test_eq project_files(server_dir) project_files(p.worker_path))
+    end
+
+    # ── send_file_to_worker!: single-file push (no full project walk) ────
+    # Used by image paste, single-shot tool captures, ad-hoc Julia
+    # outputs. Verifies: bytes round-trip, nested parent dirs are
+    # created on the worker side, overwrite of an existing file works,
+    # and the source-file-missing case errors instead of silent skip.
+    TH.section("send_file_to_worker! pushes one file without walking the tree") do
+        # Project is currently on worker-a after the B→A round-trip
+        # above. Push a new file straight into a deep dir that doesn't
+        # exist on the worker yet — receive_file must mkpath.
+        src_path = joinpath(server_state.working_dir, "_single_push.png")
+        # Plausible PNG-shaped binary blob: 4-byte header + random bytes.
+        write(src_path, vcat(UInt8[0x89, 0x50, 0x4E, 0x47], rand(UInt8, 4096)))
+        dst_path = joinpath(p.worker_path, "subdir", "nested", "single.png")
+
+        BonitoTeam.send_file_to_worker!(server_state, "worker-a", src_path, dst_path)
+
+        record("dst exists on worker",
+               @TH.test_true isfile(dst_path))
+        record("nested parent dir was created by receive_file",
+               @TH.test_true isdir(dirname(dst_path)))
+        record("bytes round-trip exactly",
+               @TH.test_eq read(dst_path) read(src_path))
+
+        # Overwrite with different bytes — must replace, not append/fail.
+        write(src_path, rand(UInt8, 1024))
+        BonitoTeam.send_file_to_worker!(server_state, "worker-a", src_path, dst_path)
+        record("overwrite replaces content",
+               @TH.test_eq read(dst_path) read(src_path))
+
+        # Missing source must error (not silently transfer 0 bytes).
+        threw = false
+        try
+            BonitoTeam.send_file_to_worker!(server_state, "worker-a",
+                                             "/nonexistent/file.png", dst_path)
+        catch e
+            threw = true
+        end
+        record("missing source errors", @TH.test_true threw)
     end
 
     # ── Source-offline fallback: pre-pull skipped, server's mirror used ──

@@ -30,10 +30,14 @@ include("styles.jl")
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("persistence.jl")
 include("dashboard.jl")        # dashboard_app
+include("worker_widget.jl")    # WorkerCard widget (stable per worker_id, used by KeyedList)
+include("session_widget.jl")   # SessionRow widget (one row per discovered Claude Code session)
+include("project_widget.jl")   # ProjectCard widget (stable per project_id, used by KeyedList)
 include("sidebar.jl")          # project_sidebar + auto-generated icons
 include("github.jl")           # "From GitHub" project template
 include("server.jl")           # serve()
+include("dev.jl")              # dev_server() — self-contained dev rig
 
-export serve
+export serve, dev_server
 
 end # module BonitoTeam

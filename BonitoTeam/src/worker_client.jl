@@ -173,6 +173,8 @@ function handle_worker_control(state::ServerState, ws)
                     deliver_rpc_response!(state, rid, sessions)
                 elseif t == "clone_repo_response"
                     deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                elseif t == "inspect_path_response"
+                    deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                 end
             catch e
                 @warn "Worker control frame error" exception=e
@@ -410,6 +412,86 @@ function list_worker_dir(state::ServerState, worker_name::String, path::Abstract
 end
 
 """
+    inspect_worker_path(state, worker_name, path; timeout=30.0) -> Dict
+
+Ask the worker for a "what's in this directory" summary used by the
+collision-aware import flow: file count, total bytes, latest mtime,
+top-N most-recently-modified files, and a per-subrepo git block.
+Path must exist and be a directory on the worker. Raises on missing
+worker / timeout / worker-side error.
+
+Returned dict shape:
+
+    Dict("total_files"  => Int,
+         "total_bytes"  => Int,
+         "latest_mtime" => Float64,       # Unix seconds
+         "recent_files" => Vector{Dict},  # {path,size,mtime}
+         "git_subrepos" => Vector{Dict})  # {path,head_sha,head_time,
+                                          #  dirty_count,branch}
+"""
+function inspect_worker_path(state::ServerState, worker_name::String,
+                              path::AbstractString;
+                              timeout::Real = 30.0)
+    haskey(state.worker_control_ws, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+    rid, ch = register_rpc!(state)
+    send_command(state, worker_name, Dict(
+        "type"       => "inspect_path",
+        "request_id" => rid,
+        "path"       => String(path),
+    ))
+    resp = take_pending!(state, ch, rid, timeout, "inspect_path on '$worker_name'")
+    resp isa AbstractDict || error("inspect_path: unexpected response shape")
+    haskey(resp, "error") && error("inspect_path on '$worker_name': $(resp["error"])")
+    summary = get(resp, "summary", nothing)
+    summary isa AbstractDict || error("inspect_path: missing summary")
+    return Dict{String,Any}(summary)
+end
+
+"""
+    inspect_path_local(path) -> Dict
+
+Same shape as `inspect_worker_path` but walks a directory on the SERVER
+(used as a fallback when the project's current owner-worker is offline
+— the server mirror is the best info we have in that case). Defers to
+BonitoWorker's helper so the two sides always agree.
+"""
+function inspect_path_local(path::AbstractString)
+    isdir(path) || error("not a directory: $path")
+    return BonitoWorker.inspect_path_summary(String(path))
+end
+
+"""
+    compare_for_collision(state, existing_project, candidate_worker_name,
+                           candidate_worker_path; timeout=30.0) -> NamedTuple
+
+Build the side-by-side summary used by the import-collision UI. Returns
+`(existing = summary_dict, existing_source = :worker|:mirror,
+   candidate = summary_dict)`. The existing-side summary is preferred
+from the project's bound worker (live state); falls back to the server
+mirror if the worker is offline.
+"""
+function compare_for_collision(state::ServerState, p::ProjectInfo,
+                                candidate_worker_name::String,
+                                candidate_worker_path::String;
+                                timeout::Real = 30.0)
+    candidate = inspect_worker_path(state, candidate_worker_name,
+                                     candidate_worker_path; timeout = timeout)
+    existing, source = if haskey(state.worker_control_ws, p.worker_id)
+        try
+            inspect_worker_path(state, p.worker_id, p.worker_path; timeout = timeout),
+                :worker
+        catch e
+            @warn "compare_for_collision: live inspect failed, falling back to mirror" exception=e
+            inspect_path_local(p.server_path), :mirror
+        end
+    else
+        inspect_path_local(p.server_path), :mirror
+    end
+    return (existing = existing, existing_source = source, candidate = candidate)
+end
+
+"""
     scan_worker_sessions(state, worker_name; timeout=15.0) → Vector{Dict{String,Any}}
 
 Ask the named worker to scan for existing Claude Code sessions (running processes
@@ -493,6 +575,49 @@ function fetch_file_from_worker(state::ServerState, worker_name::String,
     try
         wsio = RemoteSync.WebSocketIO(ws)
         RemoteSync.receive_file(String(dst_path), wsio; on_progress)
+    finally
+        try close(ws) catch end
+    end
+    return String(dst_path)
+end
+
+"""
+    send_file_to_worker!(state, worker_name, src_path, dst_path;
+                          handoff_timeout = 15.0, on_progress = nothing)
+
+Inverse of `fetch_file_from_worker`: push a single file from the
+server-side `src_path` to the worker-side `dst_path`. No directory
+walking — used when only one file changed (image paste, single tool
+output, Julia eval artifact) and a full project sync would be
+overkill on a large project tree.
+
+Worker writes the bytes via `RemoteSync.receive_file`, which writes
+straight to disk in bounded chunks (memory-safe regardless of size)
+and creates any missing parent directories.
+"""
+function send_file_to_worker!(state::ServerState, worker_name::String,
+                                src_path::AbstractString,
+                                dst_path::AbstractString;
+                                handoff_timeout::Real = 15.0,
+                                on_progress = nothing)
+    isfile(src_path) || error("Source path is not a file: $src_path")
+    haskey(state.worker_control_ws, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+
+    sync_id, ch = register_rpc!(state)
+
+    send_command(state, worker_name, Dict(
+        "type"      => "open_transfer",
+        "sync_id"   => sync_id,
+        "direction" => "file_to_worker",
+        "dst_path"  => String(dst_path),
+    ))
+
+    ws = take_pending!(state, ch, sync_id, handoff_timeout,
+                      "send_file to '$worker_name'")
+    try
+        wsio = RemoteSync.WebSocketIO(ws)
+        RemoteSync.send_file(String(src_path), wsio; on_progress)
     finally
         try close(ws) catch end
     end

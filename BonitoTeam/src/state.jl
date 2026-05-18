@@ -363,6 +363,23 @@ function find_project_by_location(state::ServerState,
     return nothing
 end
 
+"""
+    find_project_by_name(state, name) -> Union{ProjectInfo,Nothing}
+
+Look up a project by its display/dir name. Used by the import-collision
+flow: two projects with the same `name` would land at the same
+`server_path` (`<working_dir>/<name>`), so the second import has to
+either reassign the existing one to the new worker, keep it, or be
+imported under a different name.
+"""
+function find_project_by_name(state::ServerState, name::AbstractString)
+    target = String(name)
+    for p in values(state.projects[])
+        p.name == target && return p
+    end
+    return nothing
+end
+
 # Collapse projects.json entries that share `(worker_id, worker_path)`.
 # Same coordinates means the same on-disk folder — and since the project
 # name is derived from `basename(worker_path)`, both copies actually share

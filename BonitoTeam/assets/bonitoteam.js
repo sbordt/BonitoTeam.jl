@@ -27,9 +27,29 @@ class BonitoChat {
         this.totalCount    = 0;
         this.EST_HEIGHT    = 80;
         this.OVERSCAN      = 8;
-        this.wasAtBottom   = true;
         this.initialLoad   = false;
-        this.chasingBottom = false;
+
+        // ── Scroll UX state ────────────────────────────────────────────
+        // followMode: when true, new messages auto-scroll the viewport
+        // to the bottom. When false, the viewport stays where the user
+        // left it and an "↓ New messages" pill appears that jumps them
+        // back when clicked. Toggled by:
+        //   - user scrolls away from bottom → followMode = false
+        //   - user scrolls to the bottom (within AT_BOTTOM_PX) → true
+        //   - user sends a message → true
+        //   - user clicks the pill → true
+        // We do NOT toggle followMode from a layout-induced scroll: if
+        // a viewport resize shifts the geometry, we stay in whatever
+        // mode the user last chose.
+        this.followMode = true;
+        this.unreadCount = 0;
+        // "At bottom" is intentionally tight here (20px) — the loose
+        // 200px threshold the old code used was a workaround for
+        // chunked-text-during-burst race conditions. With explicit
+        // followMode there's no race: chase scrolls to scrollHeight
+        // unconditionally, so being "at the bottom" means actually
+        // there, not "near enough".
+        this.AT_BOTTOM_PX = 20;
 
         this.spacerTop    = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
@@ -56,24 +76,49 @@ class BonitoChat {
         }
         comm.notify({type: 'init'});
 
+        // Track the last user input on the container. A scroll event
+        // within ~400ms of a wheel/touch/keydown is treated as
+        // user-initiated; outside that window, it's a layout shift
+        // (viewport resize, container RO re-render, attachment-bar
+        // pop-in). Only user-initiated scrolls toggle followMode —
+        // a layout shift never disengages chase.
+        this._lastUserInputT = 0;
+        const markUserInput = () => { this._lastUserInputT = performance.now(); };
+        container.addEventListener('wheel',      markUserInput, { passive: true });
+        container.addEventListener('touchstart', markUserInput, { passive: true });
+        container.addEventListener('touchmove',  markUserInput, { passive: true });
+        container.addEventListener('keydown',    markUserInput, { passive: true });
+        this._markUserInput = markUserInput;
+
         this._onScroll = () => {
-            if (this.chasingBottom && !this.atBottom()) this.chasingBottom = false;
-            this.wasAtBottom = this.atBottom();
+            const userDriven = (performance.now() - this._lastUserInputT) < 400;
+            const atBot      = this.atBottom();
+            if (userDriven) {
+                // User-driven scroll → followMode reflects whether
+                // they landed at the bottom. Scrolling up → false,
+                // scrolling all the way back down → true.
+                this.setFollowMode(atBot);
+                if (!atBot) this._cancelPendingScroll();
+            } else if (this.followMode && !atBot) {
+                // Layout shift moved us off the bottom while in
+                // follow mode (viewport resize / attachment-bar
+                // pop-in). Re-anchor.
+                this._queueScrollToBottom();
+            }
             this.refresh();
         };
         container.addEventListener('scroll', this._onScroll, { passive: true });
 
-        // Re-scroll whenever the messages container changes size while
-        // we're in follow-tail mode. Covers: bt-busy 0↔28px transition
-        // on each agent turn, mobile soft-keyboard slide-in/out, the
-        // browser's address bar collapsing on scroll, window resize.
-        // Without this, the last message + input area can slide below
-        // the fold and the user has no way back without manual scroll.
+        // Re-scroll whenever the messages container changes size
+        // while in follow mode. Covers: bt-busy 0↔28px transition
+        // on each agent turn, mobile soft-keyboard slide-in/out,
+        // browser address bar collapse, window resize, attachment
+        // bar growing. Without this, the last message + input area
+        // slide below the fold and the user has no way back without
+        // manual scroll.
         this._containerRO = new ResizeObserver(() => {
             if (this.destroyed) return;
-            if (this.wasAtBottom || this.chasingBottom) {
-                this._queueScrollToBottom();
-            }
+            if (this.followMode) this._queueScrollToBottom();
         });
         this._containerRO.observe(this.container);
 
@@ -81,12 +126,25 @@ class BonitoChat {
             this._onVPResize = () => this.onViewportResize();
             window.visualViewport.addEventListener('resize', this._onVPResize);
         }
+
+        // Image attachments (paste / drag-drop). Wired AFTER the input area
+        // is in the DOM, on a microtask so .bt-app's children are queryable.
+        Promise.resolve().then(() => this._setupAttachments());
     }
 
     destroy() {
         this.destroyed = true;
         if (this._onScroll) {
             this.container.removeEventListener('scroll', this._onScroll);
+        }
+        if (this._markUserInput) {
+            this.container.removeEventListener('wheel',    this._markUserInput);
+            this.container.removeEventListener('touchstart', this._markUserInput);
+            this.container.removeEventListener('touchmove',  this._markUserInput);
+            this.container.removeEventListener('keydown',  this._markUserInput);
+        }
+        if (this._scrollRafId !== null && this._scrollRafId !== undefined) {
+            cancelAnimationFrame(this._scrollRafId);
         }
         if (this._onVPResize && window.visualViewport) {
             window.visualViewport.removeEventListener('resize', this._onVPResize);
@@ -96,6 +154,21 @@ class BonitoChat {
         }
         this.ros.forEach((ro) => ro.disconnect());
         this.ros.clear();
+        if (this._onPaste && this.textInput) {
+            this.textInput.removeEventListener('paste', this._onPaste);
+        }
+        if (this._onTextInputKeyCapture && this.textInput) {
+            this.textInput.removeEventListener('keydown', this._onTextInputKeyCapture, true);
+        }
+        if (this._onSendClickCapture && this.sendBtn) {
+            this.sendBtn.removeEventListener('click', this._onSendClickCapture, true);
+        }
+        if (this.app) {
+            this._onDragOver  && this.app.removeEventListener('dragover',  this._onDragOver);
+            this._onDragLeave && this.app.removeEventListener('dragleave', this._onDragLeave);
+            this._onDrop      && this.app.removeEventListener('drop',      this._onDrop);
+        }
+        clearTimeout(this._attachErrorTimer);
     }
 
     // Single dispatch table. Julia sends `{type, ...}`; we route here.
@@ -114,12 +187,12 @@ class BonitoChat {
                 this.busyEl?.classList.add('bt-busy-active');
                 // bt-busy grows from 0 to 28px over 150ms; the container
                 // ResizeObserver re-scrolls on each frame, but only if
-                // wasAtBottom — which it should be when a turn starts.
-                if (this.wasAtBottom) this._queueScrollToBottom();
+                // followMode is on — which it should be when a turn starts.
+                if (this.followMode) this._queueScrollToBottom();
                 return;
             case 'busy_end':
                 this.busyEl?.classList.remove('bt-busy-active');
-                if (this.wasAtBottom) this._queueScrollToBottom();
+                if (this.followMode) this._queueScrollToBottom();
                 return;
             case 'agent_final':  return this.onAgentFinal(msg);
             case 'thought_final':return this.onThoughtFinal(msg);
@@ -128,6 +201,10 @@ class BonitoChat {
             case 'chunk':        return this.appendChunk(msg.id, msg.text);
             case 'thought_chunk':return this.appendChunk(msg.id, msg.text);
             case 'user_chunk':   return this.appendUserChunk(msg.text);
+            case 'attach_error':
+                return this._showAttachError(msg.error || 'Attachment failed');
+            case 'send_ack':
+                return; // server accepted the multimodal send; nothing more to do
             case 'user':
             case 'agent':
             case 'thought':
@@ -195,20 +272,24 @@ class BonitoChat {
         });
         this.updateDOM(...this.visibleRange());
         if (this.initialLoad) {
-            this.initialLoad   = false;
-            this.chasingBottom = true;
+            // Initial mount: scroll to bottom and lock follow mode on.
+            // Multiple scroll attempts cover the period during which
+            // child Monaco editors / images are still laying out and
+            // pushing scrollHeight around.
+            this.initialLoad = true; // cleared below after the last scroll
+            this.setFollowMode(true);
             this.scrollToBottom();
             requestAnimationFrame(() => {
-                if (!this.destroyed && this.chasingBottom) this.scrollToBottom();
+                if (!this.destroyed && this.followMode) this.scrollToBottom();
             });
             setTimeout(() => {
-                if (!this.destroyed && this.chasingBottom) this.scrollToBottom();
+                if (!this.destroyed && this.followMode) this.scrollToBottom();
             }, 100);
             setTimeout(() => {
-                if (!this.destroyed && this.chasingBottom) this.scrollToBottom();
-                this.chasingBottom = false;
+                if (!this.destroyed && this.followMode) this.scrollToBottom();
+                this.initialLoad = false;
             }, 300);
-        } else if (this.chasingBottom) {
+        } else if (this.followMode) {
             this._queueScrollToBottom();
         }
     }
@@ -257,19 +338,18 @@ class BonitoChat {
             if (msg.id) this.nodeById.set(msg.id, node);
             this.observe(idx, node);
         }
-        // User-originated message ("user" type): ALWAYS scroll, even if
-        // wasAtBottom is stale-false. The user just hit Enter — they
-        // expect to see their own bubble. (For agent / tool / thought
-        // arriving from the worker, honour the user's scroll position.)
-        const isOwnMessage = msg.type === 'user';
-        if (this.wasAtBottom || isOwnMessage) {
+        // Strict no-yank semantics: any new message (including the
+        // user's own) auto-scrolls ONLY while followMode is on.
+        // When the user is reading scrollback we just register unread
+        // and surface the pill — sending their own message doesn't
+        // re-engage follow either; they have to click the pill or
+        // scroll to the bottom to come back. This matches the spec
+        // "always stay at the position the user scrolls to".
+        if (this.followMode) {
             this.updateDOM(...this.visibleRange());
-            if (isOwnMessage) {
-                // Re-engage chase for the agent's reply that will follow.
-                this.wasAtBottom   = true;
-                this.chasingBottom = true;
-            }
             this._queueScrollToBottom();
+        } else {
+            this._registerUnread();
         }
     }
 
@@ -278,13 +358,18 @@ class BonitoChat {
         if (!node) return;
         const t = node.querySelector('.bt-stream-text');
         if (t) t.textContent += text;
-        // Streaming text grows the bubble downward; if the user was
-        // following the tail, keep them at the tail. wasAtBottom is
-        // refreshed by the scroll listener so a deliberate scroll-up
-        // releases the chase. _queueScrollToBottom rAF-batches multiple
-        // chunks-per-frame so we only scroll AFTER the layout pass that
-        // includes the new text (avoids the stale-scrollHeight race).
-        if (this.wasAtBottom) this._queueScrollToBottom();
+        // _queueScrollToBottom rAF-batches multiple chunks per frame so
+        // we only scroll AFTER the layout pass that includes the new
+        // text (avoids the stale-scrollHeight race).
+        if (this.followMode) {
+            this._queueScrollToBottom();
+        } else {
+            // Streaming bubble is being extended while user is reading
+            // scrollback. _registerUnread is idempotent for repeated
+            // chunks of the same bubble — the pill stays visible once
+            // shown.
+            this._registerUnread();
+        }
     }
 
     appendUserChunk(text) {
@@ -293,7 +378,11 @@ class BonitoChat {
         const node = this.cache.get(idx);
         if (node && node.classList.contains('bt-user-msg')) {
             node.textContent += text;
-            if (this.wasAtBottom) this._queueScrollToBottom();
+            if (this.followMode) {
+                this._queueScrollToBottom();
+            } else {
+                this._registerUnread();
+            }
         }
     }
 
@@ -447,10 +536,12 @@ class BonitoChat {
 
     atBottom() {
         const { scrollTop, scrollHeight, clientHeight } = this.container;
-        // Generous threshold (was 60). On mobile a single new message
-        // bubble can be 80-120px tall — a tight threshold flips
-        // wasAtBottom=false on every new message, breaking auto-follow.
-        return scrollHeight - scrollTop - clientHeight < 200;
+        // Tight (AT_BOTTOM_PX = 20) so "user manually scrolled to the
+        // very bottom" re-engages follow mode while merely-near doesn't.
+        // The chase always scrolls to scrollHeight so streaming content
+        // doesn't bounce in and out of this threshold — the worry the
+        // old generous 200px window was guarding against.
+        return scrollHeight - scrollTop - clientHeight < this.AT_BOTTOM_PX;
     }
 
     // rAF-batched scroll: multiple stream chunks arriving in the same
@@ -462,8 +553,9 @@ class BonitoChat {
     _queueScrollToBottom() {
         if (this._scrollQueued || this.destroyed) return;
         this._scrollQueued = true;
-        requestAnimationFrame(() => {
+        this._scrollRafId = requestAnimationFrame(() => {
             this._scrollQueued = false;
+            this._scrollRafId = null;
             if (!this.destroyed) this.scrollToBottom();
         });
     }
@@ -487,6 +579,219 @@ class BonitoChat {
         this.refresh();
     }
 
+    // ── Image attachments ────────────────────────────────────────────────
+    // Paste / drag-drop images into the chat input. Each attachment lives
+    // locally in `this.attachments` (Map<id, {blob, mime, filename, dataUrl}>)
+    // and shows a thumbnail above the input row. On submit, JS posts a
+    // `{type: 'send', text, attachments}` comm event — Julia stores the
+    // bytes under `<cwd>/.bt-attachments/<ts>.<ext>`, pushes to the worker
+    // mirror (via send_file_to_worker!), and forwards the multimodal blocks
+    // to claude via ACP.
+    //
+    // For text-only sends, we leave the existing Bonito.Button → Julia
+    // `text_val` path untouched (the JS hijack only fires when there's at
+    // least one attachment queued). That preserves every test that drives
+    // the chat by typing + clicking the send button.
+    _setupAttachments() {
+        if (this.destroyed) return;
+        const app = this.container?.parentElement;
+        if (!app) return;
+        this.app       = app;
+        this.inputArea = app.querySelector('.bt-input-area');
+        this.textInput = app.querySelector('.bt-text-input');
+        this.sendBtn   = app.querySelector('.bt-send-btn');
+        if (!this.inputArea || !this.textInput || !this.sendBtn) return;
+
+        // Thumbnail strip lives ABOVE the input row inside .bt-input-area.
+        this.attachBar = document.createElement('div');
+        this.attachBar.className = 'bt-attachments';
+        this.inputArea.insertBefore(this.attachBar, this.inputArea.firstChild);
+
+        this.attachments = new Map();
+        this._attachIdCounter = 0;
+        this.ATTACH_MAX_BYTES = 5 * 1024 * 1024;
+
+        // Paste — clipboardData.items carries File entries for images.
+        this._onPaste = (e) => {
+            const items = e.clipboardData?.items;
+            if (!items) return;
+            for (const it of items) {
+                if (it.kind === 'file' && it.type && it.type.startsWith('image/')) {
+                    const blob = it.getAsFile();
+                    if (blob) this._attachAddBlob(blob, blob.type || it.type,
+                                                  blob.name || `pasted-${Date.now()}.png`);
+                }
+            }
+        };
+        this.textInput.addEventListener('paste', this._onPaste);
+
+        // Drag-drop — listen on the whole .bt-app so a drop anywhere in
+        // the chat counts. dragover MUST preventDefault to enable drop.
+        this._onDragOver = (e) => {
+            if (!this._dragHasImage(e)) return;
+            e.preventDefault();
+            this.app.classList.add('bt-drag-over');
+        };
+        this._onDragLeave = (e) => {
+            // Only clear when leaving the .bt-app envelope itself, not
+            // when crossing between nested children (relatedTarget inside app).
+            if (e.relatedTarget && this.app.contains(e.relatedTarget)) return;
+            this.app.classList.remove('bt-drag-over');
+        };
+        this._onDrop = (e) => {
+            e.preventDefault();
+            this.app.classList.remove('bt-drag-over');
+            const files = e.dataTransfer?.files;
+            if (!files) return;
+            for (const f of files) {
+                if (f.type && f.type.startsWith('image/')) {
+                    this._attachAddBlob(f, f.type, f.name || `dropped-${Date.now()}.png`);
+                }
+            }
+        };
+        this.app.addEventListener('dragover',  this._onDragOver);
+        this.app.addEventListener('dragleave', this._onDragLeave);
+        this.app.addEventListener('drop',      this._onDrop);
+
+        // Send hijack — capture phase + stopImmediatePropagation so neither
+        // Bonito's Button click nor the textarea's inline onkeydown fire
+        // when we intercept. We only intercept when there's something to
+        // attach; pure-text sends go through the existing path unchanged.
+        this._onSendClickCapture = (e) => {
+            if (this.attachments.size === 0) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            this._submitWithAttachments();
+        };
+        this.sendBtn.addEventListener('click', this._onSendClickCapture, true);
+
+        this._onTextInputKeyCapture = (e) => {
+            if (e.key !== 'Enter' || e.shiftKey) return;
+            if (this.attachments.size === 0) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            this._submitWithAttachments();
+        };
+        this.textInput.addEventListener('keydown', this._onTextInputKeyCapture, true);
+    }
+
+    _dragHasImage(e) {
+        const dt = e.dataTransfer;
+        if (!dt) return false;
+        if (dt.types) {
+            // 'Files' is the type when the user drags from the OS file picker.
+            // Browsers don't expose individual MIME types during dragover, so
+            // we accept any Files drag here and filter image/* on drop.
+            for (const t of dt.types) if (t === 'Files') return true;
+        }
+        return false;
+    }
+
+    _attachAddBlob(blob, mime, filename) {
+        if (blob.size > this.ATTACH_MAX_BYTES) {
+            this._showAttachError(
+                `Image too large (${(blob.size / 1024 / 1024).toFixed(1)} MB, ` +
+                `max ${this.ATTACH_MAX_BYTES / 1024 / 1024} MB)`);
+            return;
+        }
+        const id = `att-${++this._attachIdCounter}`;
+        const reader = new FileReader();
+        reader.onload = () => {
+            if (this.destroyed) return;
+            this.attachments.set(id, {
+                blob, mime, filename,
+                dataUrl: reader.result,
+            });
+            this._renderAttachments();
+        };
+        reader.onerror = () => this._showAttachError('Failed to read image');
+        reader.readAsDataURL(blob);
+    }
+
+    _attachRemove(id) {
+        this.attachments.delete(id);
+        this._renderAttachments();
+    }
+
+    _attachClear() {
+        this.attachments.clear();
+        this._renderAttachments();
+    }
+
+    _renderAttachments() {
+        if (!this.attachBar) return;
+        // Preserve any transient error chip across re-renders.
+        const err = this.attachBar.querySelector('.bt-attach-error');
+        this.attachBar.innerHTML = '';
+        if (this.attachments.size === 0) {
+            this.attachBar.classList.remove('bt-attachments-active');
+        } else {
+            this.attachBar.classList.add('bt-attachments-active');
+            for (const [id, item] of this.attachments) {
+                const wrap = document.createElement('div');
+                wrap.className = 'bt-attachment-thumb';
+                wrap.dataset.attachId = id;
+                const img = document.createElement('img');
+                img.src   = item.dataUrl;
+                img.alt   = item.filename || 'image';
+                img.title = item.filename || 'image';
+                wrap.appendChild(img);
+                const rm = document.createElement('button');
+                rm.type = 'button';
+                rm.className = 'bt-attachment-remove';
+                rm.title = 'Remove';
+                rm.textContent = '×';
+                rm.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this._attachRemove(id);
+                });
+                wrap.appendChild(rm);
+                this.attachBar.appendChild(wrap);
+            }
+        }
+        if (err) this.attachBar.appendChild(err);
+    }
+
+    _showAttachError(message) {
+        if (!this.attachBar) return;
+        let chip = this.attachBar.querySelector('.bt-attach-error');
+        if (!chip) {
+            chip = document.createElement('div');
+            chip.className = 'bt-attach-error';
+            this.attachBar.appendChild(chip);
+            this.attachBar.classList.add('bt-attachments-active');
+        }
+        chip.textContent = message;
+        clearTimeout(this._attachErrorTimer);
+        this._attachErrorTimer = setTimeout(() => {
+            chip.remove();
+            if (this.attachments.size === 0) {
+                this.attachBar.classList.remove('bt-attachments-active');
+            }
+        }, 4500);
+    }
+
+    async _submitWithAttachments() {
+        if (this.attachments.size === 0) return;
+        const text = this.textInput.value;
+        const payload = [];
+        for (const item of this.attachments.values()) {
+            const buf = await item.blob.arrayBuffer();
+            payload.push({
+                mime:     item.mime,
+                filename: item.filename || '',
+                data:     arrayBufferToBase64(buf),
+            });
+        }
+        this.comm.notify({type: 'send', text, attachments: payload});
+        // Optimistic clear — server confirms via send_ack but we don't
+        // want the user re-clicking send while the bytes are in flight.
+        this.textInput.value = '';
+        this.textInput.dispatchEvent(new Event('input', {bubbles: true}));
+        this._attachClear();
+    }
+
     onViewportResize() {
         // Mobile keyboard or browser address bar changed the visual
         // viewport. Resize bt-app so flex math has the right available
@@ -496,7 +801,66 @@ class BonitoChat {
         const vv  = window.visualViewport;
         const app = document.querySelector('.bt-app');
         if (app) app.style.height = vv.height + 'px';
-        if (this.wasAtBottom) this._queueScrollToBottom();
+        if (this.followMode) this._queueScrollToBottom();
+    }
+
+    // ── Follow mode + unread pill ────────────────────────────────────────
+    // followMode is the one-bit "should new content auto-scroll" state.
+    // It's set true when the user is at the bottom (within AT_BOTTOM_PX)
+    // and the chat starts in this mode. Scrolling away → false. Sending
+    // a message, clicking the pill, or scrolling back to the bottom →
+    // true. Layout shifts never toggle it.
+    setFollowMode(on) {
+        if (this.followMode === on) return;
+        this.followMode = on;
+        if (on) {
+            this.unreadCount = 0;
+            this._hideNewMessagePill();
+        }
+    }
+
+    _cancelPendingScroll() {
+        if (this._scrollRafId !== null && this._scrollRafId !== undefined) {
+            cancelAnimationFrame(this._scrollRafId);
+            this._scrollRafId = null;
+            this._scrollQueued = false;
+        }
+    }
+
+    // Bump unread + show pill. Called from appendNewMessage and
+    // appendChunk when followMode is off.
+    _registerUnread() {
+        this.unreadCount++;
+        this._showNewMessagePill();
+    }
+
+    _showNewMessagePill() {
+        if (!this._pillEl) this._createNewMessagePill();
+        if (this._pillEl) this._pillEl.classList.add('bt-new-msg-pill-visible');
+    }
+
+    _hideNewMessagePill() {
+        if (this._pillEl) this._pillEl.classList.remove('bt-new-msg-pill-visible');
+    }
+
+    // Pill lives inside .bt-app, absolutely positioned above the input
+    // area. We append it once and toggle its visibility class. Click →
+    // re-engage follow mode and scroll to the bottom.
+    _createNewMessagePill() {
+        const app = this.container?.parentElement;
+        if (!app) return;
+        const pill = document.createElement('button');
+        pill.type = 'button';
+        pill.className = 'bt-new-msg-pill';
+        pill.innerHTML = '<span class="bt-new-msg-pill-arrow">↓</span>' +
+                          '<span>New messages</span>';
+        pill.addEventListener('click', (e) => {
+            e.preventDefault();
+            this.setFollowMode(true);
+            this.scrollToBottom();
+        });
+        app.appendChild(pill);
+        this._pillEl = pill;
     }
 }
 
@@ -505,6 +869,19 @@ function escapeHTML(str) {
 }
 function escapeAttr(str) {
     return escapeHTML(str).replace(/"/g, '&quot;');
+}
+
+// Chunked base64 encoder. `btoa(String.fromCharCode(...new Uint8Array(buf)))`
+// breaks on large buffers (browser arg-count limit, ~64k); we chunk through
+// 32k bytes at a time.
+function arrayBufferToBase64(buf) {
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
 }
 
 // ── ES6 module exports ─────────────────────────────────────────────────────

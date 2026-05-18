@@ -127,12 +127,37 @@ basename in `~/.claude/projects/<encoded>/`), the chat will use ACP's
 chat UI and the agent regains full context. The ID persists across server
 restarts.
 """
+# Raised by `create_project_from_worker!` when a project with the same
+# `name` is already registered under a DIFFERENT `(worker_id, worker_path)`.
+# The UI catches this, shows the `comparison` summaries, and re-invokes
+# the import with an explicit `on_collision` directive (`:take_candidate`,
+# `:keep_existing`, or a renamed import via `name = "..."`).
+struct ProjectCollisionError <: Exception
+    existing::ProjectInfo
+    candidate_worker_name::String
+    candidate_worker_path::String
+    comparison::NamedTuple    # from compare_for_collision
+end
+
+Base.showerror(io::IO, e::ProjectCollisionError) = print(io,
+    "project name '", e.existing.name, "' already bound to worker '",
+    e.existing.worker_id, "' (path: ", e.existing.worker_path, "); ",
+    "candidate is worker '", e.candidate_worker_name, "' at ",
+    e.candidate_worker_path)
+
 function create_project_from_worker!(state::ServerState, worker_name::String,
                                       worker_path::String;
                                       name::String = basename(rstrip(worker_path, '/')),
                                       sync::Bool = false,
                                       resume_session_id::Union{String,Nothing} = nothing,
+                                      on_collision::Symbol = :detect,
+                                      start_session::Bool = true,
                                       progress = nothing)
+    # `start_session=false` skips the post-registration ACP session
+    # bring-up. Used by tests that exercise the import logic without
+    # needing a real worker subprocess; production callers always want
+    # the chat ready, so the default stays `true`.
+    maybe_start = p -> start_session && ensure_project_session!(state, p)
     haskey(state.workers[], worker_name) || error("Unknown worker: $worker_name")
     isempty(name) && error("Project name must not be empty (folder has no basename?)")
     occursin(r"^[a-zA-Z0-9_\-]+$", name) ||
@@ -151,8 +176,39 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
             save_projects!(state)
         end
         notify_progress(progress, :phase, (msg = "Reusing existing project…",))
-        ensure_project_session!(state, existing)
+        maybe_start(existing)
         return existing
+    end
+
+    # Name collision: a different (worker, path) pair already owns this name.
+    # `on_collision` controls the behaviour:
+    #   :detect          (default) raise ProjectCollisionError with both
+    #                    sides' summaries — the UI catches this and shows
+    #                    the compare panel so the user picks.
+    #   :take_candidate  reassign the existing project to this worker/path
+    #                    (effectively a move; uses transfer_project!).
+    #   :keep_existing   no-op; returns the existing project unchanged.
+    # A renamed import (pass `name = "different"`) skips the collision
+    # check entirely because the names no longer match.
+    name_collider = find_project_by_name(state, name)
+    if name_collider !== nothing
+        if on_collision === :keep_existing
+            @info "create_project_from_worker!: name collision; keeping existing" name id=name_collider.id
+            maybe_start(name_collider)
+            return name_collider
+        elseif on_collision === :take_candidate
+            @info "create_project_from_worker!: name collision; reassigning to candidate" name from=name_collider.worker_id to=worker_name
+            name_collider.worker_id   = worker_name
+            name_collider.worker_path = worker_path
+            name_collider.backup_status = :stale
+            save_projects!(state)
+            safe_notify!(state.projects)
+            maybe_start(name_collider)
+            return name_collider
+        else  # :detect
+            cmp = compare_for_collision(state, name_collider, worker_name, worker_path)
+            throw(ProjectCollisionError(name_collider, worker_name, worker_path, cmp))
+        end
     end
 
     id = string(uuid4())[1:8]
@@ -186,7 +242,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     safe_notify!(state.projects)
 
     notify_progress(progress, :phase, (msg = "Starting chat session…",))
-    ensure_project_session!(state, p)
+    maybe_start(p)
     return p
 end
 
@@ -546,6 +602,32 @@ const DashboardStyles = Bonito.Styles(
     # / projects lists grow long.
     CSS(".bt-cards",
         "display" => "flex", "flex-direction" => "column", "gap" => "8px"),
+    # Per-worker cell: the card + its (toggled-visible) picker form and
+    # discover panel. Stacks vertically; toggled siblings collapse via
+    # `bt-hidden`.
+    CSS(".bt-worker-cell",
+        "display" => "flex", "flex-direction" => "column", "gap" => "8px"),
+    # Class-toggle helper used by WorkerCard for picker / discover / install
+    # blocks: collapses the element without removing it from the DOM, so
+    # interactive state (folder selection, scan results, focus) survives.
+    CSS(".bt-hidden", "display" => "none !important"),
+    # Wrappers around the toggled blocks; semantic class for the test
+    # suite to query.
+    CSS(".bt-form-wrapper", "display" => "block"),
+    CSS(".bt-discover-wrapper", "display" => "block"),
+    CSS(".bt-install-wrap", "display" => "block"),
+    CSS(".bt-empty-wrap", "display" => "block"),
+    # Per-project cell — sibling to the card slot, currently a thin pass-
+    # through. Reserved for future per-project annexes (collision detail,
+    # transfer progress, etc.) so the card itself stays compact.
+    CSS(".bt-project-cell",
+        "display" => "flex", "flex-direction" => "column", "gap" => "8px"),
+    # Discover panel internals — section wrappers for the active /
+    # historical KeyedLists, plus the errors-list block.
+    CSS(".bt-discover-section",
+        "display" => "flex", "flex-direction" => "column", "gap" => "6px"),
+    CSS(".bt-errors-list",
+        "display" => "flex", "flex-direction" => "column", "gap" => "4px"),
 
     # ── Header + tagline ─────────────────────────────────────────────────────
     CSS(".bt-header",
@@ -1048,6 +1130,134 @@ const DashboardStyles = Bonito.Styles(
         CSS(".bt-session-path", "max-width" => "100%"),
         # stats: tighter gap, smaller separators
         CSS(".bt-stats", "gap" => "12px")),
+
+    # ── Collision-resolution modal ───────────────────────────────────────────
+    CSS(".bt-collision-overlay",
+        "position" => "fixed",
+        "top" => "0", "left" => "0", "right" => "0", "bottom" => "0",
+        "background" => "rgba(0,0,0,0.55)",
+        "z-index" => "1000",
+        "display" => "flex",
+        "align-items" => "center",
+        "justify-content" => "center",
+        "padding" => "16px"),
+    CSS(".bt-collision-card",
+        "background" => "var(--bt-bg, #fff)",
+        "color" => "var(--bt-text, #111)",
+        "border-radius" => "12px",
+        "max-width" => "900px", "width" => "100%",
+        "max-height" => "85vh", "overflow-y" => "auto",
+        "padding" => "20px",
+        "box-shadow" => "0 8px 32px rgba(0,0,0,0.25)",
+        "display" => "flex", "flex-direction" => "column",
+        "gap" => "16px"),
+    CSS(".bt-collision-card h3",
+        "margin" => "0",
+        "font-size" => "18px"),
+    CSS(".bt-collision-card h5",
+        "margin" => "8px 0 4px 0",
+        "font-size" => "12px",
+        "text-transform" => "uppercase",
+        "color" => "var(--bt-text-muted)"),
+    CSS(".bt-collision-sub",
+        "color" => "var(--bt-text-muted)",
+        "font-size" => "13px",
+        "margin-top" => "4px"),
+
+    CSS(".bt-collision-sides",
+        "display" => "grid",
+        "grid-template-columns" => "1fr 1fr",
+        "gap" => "12px"),
+    CSS("@media (max-width: 720px)",
+        CSS(".bt-collision-sides",
+            "grid-template-columns" => "1fr")),
+
+    CSS(".bt-collision-side",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "8px",
+        "padding" => "12px",
+        "display" => "flex", "flex-direction" => "column",
+        "gap" => "8px",
+        "min-width" => "0"),
+    # Highlight the side that's been touched more recently.
+    CSS(".bt-collision-newer .bt-collision-side",
+        "border-color" => "var(--bt-accent)",
+        "box-shadow" => "0 0 0 2px rgba(59,130,246,0.18)"),
+    CSS(".bt-collision-side-title",
+        "font-weight" => "600",
+        "font-size" => "14px"),
+    CSS(".bt-collision-side-path",
+        "font-family" => "monospace",
+        "font-size" => "11px",
+        "color" => "var(--bt-text-muted)",
+        "white-space" => "nowrap",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis"),
+
+    CSS(".bt-collision-stats",
+        "display" => "flex", "flex-direction" => "column",
+        "gap" => "2px",
+        "font-size" => "13px"),
+    CSS(".bt-collision-label",
+        "color" => "var(--bt-text-muted)"),
+    CSS(".bt-collision-value",
+        "font-weight" => "600"),
+    CSS(".bt-collision-value-faint",
+        "color" => "var(--bt-text-muted)"),
+
+    CSS(".bt-collision-recent, .bt-collision-git",
+        "font-size" => "12px"),
+    CSS(".bt-collision-file-row, .bt-collision-git-row",
+        "display" => "flex",
+        "justify-content" => "space-between",
+        "gap" => "8px",
+        "padding" => "2px 0",
+        "white-space" => "nowrap",
+        "overflow" => "hidden"),
+    CSS(".bt-collision-file-path",
+        "font-family" => "monospace",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis",
+        "flex" => "1 1 auto",
+        "min-width" => "0"),
+    CSS(".bt-collision-file-age",
+        "color" => "var(--bt-text-muted)",
+        "flex-shrink" => "0"),
+    CSS(".bt-collision-empty",
+        "color" => "var(--bt-text-muted)",
+        "font-style" => "italic",
+        "font-size" => "12px"),
+
+    CSS(".bt-collision-git-row",
+        "flex-direction" => "column",
+        "gap" => "2px",
+        "padding-bottom" => "6px"),
+    CSS(".bt-collision-git-path",
+        "font-family" => "monospace",
+        "font-size" => "12px"),
+    CSS(".bt-collision-git-ref",
+        "font-family" => "monospace",
+        "color" => "var(--bt-text-muted)",
+        "font-size" => "11px"),
+    CSS(".bt-collision-git-clean",
+        "color" => "#065f46",
+        "font-size" => "11px",
+        "margin-left" => "8px"),
+    CSS(".bt-collision-git-dirty",
+        "color" => "var(--bt-error, #b91c1c)",
+        "font-size" => "11px",
+        "margin-left" => "8px"),
+    CSS(".bt-collision-git-age",
+        "color" => "var(--bt-text-muted)",
+        "font-size" => "11px",
+        "margin-left" => "8px"),
+
+    CSS(".bt-collision-actions",
+        "display" => "flex",
+        "justify-content" => "flex-end",
+        "gap" => "8px",
+        "padding-top" => "8px",
+        "border-top" => "1px solid var(--bt-border)"),
 )
 
 # Windows-style address bar: clickable breadcrumb segments by default;
@@ -1298,6 +1508,13 @@ end
 status_dot(s::Symbol) = DOM.span(""; class = "bt-dot bt-dot-$s",
     title = string(s))   # native tooltip
 
+# Small inline "doing work" indicator: a spinner + label, used for the
+# discover-panel "scanning…" state and other in-flight ops.
+spinner_row(msg) = DOM.div(
+    DOM.div(class = "bt-spinner"),
+    DOM.span(msg),
+    class = "bt-spinner-row")
+
 # Pull a likely username out of $HOME (e.g. "/home/simon" → "simon"). Returns
 # "" if we can't find one.
 function _user_from_home(home::AbstractString)
@@ -1325,72 +1542,9 @@ function worker_subtitle(w::WorkerInfo)
     return isempty(parts) ? "(no metadata)" : join(parts, " · ")
 end
 
-function worker_card(state::ServerState, w::WorkerInfo,
-                     error_obs::Observable{String}, picker_state::Observable{String},
-                     discover_state::Observable{String})
-    new_proj_btn  = Bonito.Button("+ Project"; style=nothing, class = "bt-btn bt-btn-secondary")
-    discover_btn  = Bonito.Button("Discover";  style=nothing, class = "bt-btn bt-btn-secondary")
-    is_online     = w.status == :online
-
-    on(new_proj_btn.value) do clicked
-        clicked || return
-        picker_state[]   = picker_state[]   == w.worker_id ? "" : w.worker_id
-        discover_state[] = ""
-        error_obs[]      = ""
-    end
-    on(discover_btn.value) do clicked
-        clicked || return
-        discover_state[] = discover_state[] == w.worker_id ? "" : w.worker_id
-        picker_state[]   = ""
-        error_obs[]      = ""
-    end
-
-    # Inline-editable display name. Plain `<input>` styled like static text
-    # until you focus it; commits on Enter / blur, reverts on Escape. The
-    # observable holds the in-progress value; the actual rename runs through
-    # rename_worker! which persists to workers.json. Errors flow into
-    # `error_obs` so the dashboard's error block surfaces them.
-    name_obs = Observable(w.name)
-    function commit_rename(v)
-        new = strip(String(v))
-        isempty(new) && (name_obs[] = w.name; return)
-        new == w.name && return
-        try
-            rename_worker!(state, w.worker_id, new)
-            error_obs[] = ""
-        catch e
-            error_obs[] = "Rename failed: $(sprint(showerror, e))"
-            name_obs[]  = w.name
-        end
-    end
-    name_input = DOM.input(
-        type  = "text",
-        value = name_obs,
-        class = "bt-card-name bt-card-name-edit",
-        title = "Click to rename — Enter to save, Esc to cancel",
-        onblur    = js"event => $(name_obs).notify(event.target.value)",
-        onkeydown = js"""event => {
-            if (event.key === 'Enter')  { event.target.blur(); }
-            if (event.key === 'Escape') { event.target.value = $(w.name); event.target.blur(); }
-        }""")
-    on(name_obs) do v
-        commit_rename(v)
-    end
-
-    DOM.div(
-        DOM.div(
-            DOM.div(status_dot(w.status),
-                    name_input;
-                    class = "bt-card-title"),
-            DOM.div(worker_subtitle(w); class = "bt-card-meta",
-                    title = "$(w.hostname) · home: $(w.home)"),
-            class = "bt-card-body"),
-        DOM.div(
-            is_online ? discover_btn   : DOM.span(),
-            is_online ? new_proj_btn   : DOM.span("offline"; class = "bt-pill bt-pill-muted"),
-            class = "bt-card-actions"),
-        class = "bt-card")
-end
+# worker_card replaced by the `WorkerCard` widget (see worker_widget.jl),
+# which holds stable per-worker_id identity so KeyedList can diff the
+# worker list without remounting every card on every state.workers notify.
 
 # Render a small pill describing the project's backup status. Read at card-
 # render time; the dashboard re-renders on `notify(state.projects)` whenever sync state
@@ -1419,90 +1573,9 @@ function backup_pill(p::ProjectInfo)
     end
 end
 
-# Build a project card. "Open chat" notifies the unified app's current_view
-# observable to swap the main panel to this project's chat — no navigation,
-# no new tab. Falls back to a no-op if no current_view was provided (e.g.
-# when project_card is rendered standalone in tests).
-# `sync_request` is notified with the project id when the user clicks
-# "Sync to server"; the dashboard handler runs the actual transfer.
-function project_card(state::ServerState, p::ProjectInfo,
-                       error_obs::Observable{String},
-                       sync_request::Observable{String},
-                       open_request::Observable{Dict{String,Any}},
-                       current_view::Union{Observable{String},Nothing} = nothing)
-    badge = p.locked_by === nothing ? DOM.span() :
-        DOM.span("active";
-                 class = "bt-pill bt-pill-active",
-                 style = Styles("margin-left" => "6px"),
-                 title = "active session on $(p.locked_by)")
-
-    # Worker dropdown next to the "Open chat on" button. Picking a
-    # different worker than the one the project is currently bound to
-    # → the click triggers a `start!(state, p, picked)` re-bind on the
-    # server side (= move via the server-side mirror, with sync first).
-    online_workers = [w for w in values(state.workers[]) if w.status === :online]
-    open_link = if current_view === nothing || isempty(online_workers)
-        DOM.span("(no chat available)";
-            class = "bt-link", style = Styles("color" => "var(--bt-text-muted)"))
-    else
-        worker_select = DOM.select(
-            (DOM.option(w.name; value = w.worker_id,
-                        selected = (w.worker_id == p.worker_id))
-             for w in online_workers)...;
-            class = "bt-open-on-select",
-            # Stop the parent's onclick from firing when the user is
-            # interacting with the <select>; click-on-button is the only
-            # action surface.
-            onclick = js"event => event.stopPropagation()")
-        DOM.div(
-            DOM.span("Open chat on "; class = "bt-open-on-label"),
-            worker_select;
-            class   = "bt-link bt-open-on",
-            style   = Styles("cursor" => "pointer"),
-            onclick = js"""event => {
-                const sel = event.currentTarget.querySelector('select');
-                $(open_request).notify({project: $(p.id), worker: sel.value});
-            }""")
-    end
-
-    sync_btn = if p.backup_status === :syncing
-        DOM.span()   # already syncing — pill shows the spinner
-    else
-        label = p.backup_status === :synced ? "Re-sync" : "Sync to server"
-        DOM.span(label;
-            class   = "bt-btn bt-btn-secondary bt-btn-sm",
-            style   = Styles("cursor" => "pointer", "margin-right" => "8px"),
-            # Instant feedback before the WS round-trip lands.
-            onclick = js"""event => {
-                const btn = event.currentTarget;
-                btn.classList.add('bt-clicked');
-                btn.textContent = 'Syncing…';
-                $(sync_request).notify($(p.id));
-            }""")
-    end
-
-    DOM.div(
-        DOM.div(
-            DOM.div(DOM.span(p.name; class = "bt-card-name"),
-                    badge, backup_pill(p);
-                    class = "bt-card-title"),
-            DOM.div(
-                # Show the worker's *display* name (mutable, user-renameable),
-                # not the raw UUID. Falls back to a short prefix of the
-                # worker_id if the worker is unknown to state right now
-                # (offline + never connected since the last server start).
-                DOM.span(haskey(state.workers[], p.worker_id) ?
-                         state.workers[][p.worker_id].name :
-                         "worker:$(first(p.worker_id, 8))"),
-                DOM.span("·"; class = "bt-stat-sep"),
-                DOM.span(p.worker_path; class = "bt-mono",
-                         title = "server: $(p.server_path)\nworker: $(p.worker_path)");
-                class = "bt-card-meta");
-            class = "bt-card-body"),
-        DOM.div(sync_btn, open_link;
-                class = "bt-card-actions"),
-        class = "bt-card")
-end
+# project_card replaced by the `ProjectCard` widget (see project_widget.jl),
+# which holds stable per-project_id identity so KeyedList can diff the
+# project list without remounting every card on every state.projects notify.
 
 """
     dashboard_dom(state; current_view = nothing) → DOM
@@ -1515,6 +1588,11 @@ just leaves the user on the dashboard.
 function dashboard_dom(state::ServerState;
                         current_view::Union{Observable{String},Nothing} = nothing)
     error_obs = Observable("")
+
+    # Collision modal state. `nothing` ⇒ no modal; otherwise carries the
+    # comparison + the args needed to re-invoke create_project_from_worker!
+    # with an explicit on_collision directive (when the user picks a side).
+    collision_state = Observable{Union{Nothing,NamedTuple}}(nothing)
 
     # Workers self-register over WS — no manual "Add worker" form.
 
@@ -1702,12 +1780,10 @@ function dashboard_dom(state::ServerState;
         error_obs[]  = ""
     end
 
-    # Per-worker remote-folder pickers (persistent across re-renders so the
-    # current path / expanded state survives notify(state.workers) triggers). The
-    # `picker_state` observable holds the name of the worker whose picker
-    # form is currently visible (""  → none).
+    # `picker_state` holds the worker_id whose picker form is currently
+    # visible (""  → none). The folder-picker instances themselves live on
+    # each WorkerCard (stable across re-renders because the card is stable).
     picker_state = Observable("")
-    remote_pickers = Dict{String,RemoteFolderPicker}()
 
     # Discover panel — scan a worker for existing Claude Code sessions
     discover_state   = Observable("")                       # worker name whose panel is open
@@ -1735,6 +1811,53 @@ function dashboard_dom(state::ServerState;
         isempty(w_name) || trigger_scan!(w_name)
     end
 
+    # Shared import path used by both the "discovered sessions" panel and
+    # the remote-folder picker. Catches ProjectCollisionError and routes
+    # the comparison into the modal Observable; the user picks a side,
+    # and the modal re-invokes this same helper with the explicit
+    # on_collision directive baked in.
+    function do_import(w_name::String, path::String;
+                        name::Union{Nothing,String} = nothing,
+                        resume_session_id::Union{Nothing,String} = nothing,
+                        on_collision::Symbol = :detect)
+        proj_name = name !== nothing ? name :
+            let n = replace(basename(rstrip(path, '/')), r"[^a-zA-Z0-9_\-]" => "_")
+                isempty(n) ? "project" : n
+            end
+        title = resume_session_id === nothing ?
+            "Importing $(proj_name)" :
+            "Resuming $(proj_name) (session $(resume_session_id[1:8])…)"
+        busy_start!(busy, title)
+        @async begin
+            try
+                p = create_project_from_worker!(state, w_name, path;
+                    name = proj_name,
+                    resume_session_id = resume_session_id,
+                    on_collision = on_collision,
+                    progress = (stage, info) -> busy_event!(busy, stage, info))
+                error_obs[]      = ""
+                discover_state[] = ""
+                picker_state[]   = ""
+                collision_state[] = nothing
+                current_view !== nothing && (current_view[] = p.id)
+            catch e
+                if e isa ProjectCollisionError
+                    collision_state[] = (
+                        existing         = e.existing,
+                        candidate_worker = w_name,
+                        candidate_path   = path,
+                        candidate_name   = proj_name,
+                        comparison       = e.comparison,
+                    )
+                else
+                    error_obs[] = "Failed to import: $(sprint(showerror, e))"
+                end
+            finally
+                busy_clear!(busy)
+            end
+        end
+    end
+
     on(import_path) do payload
         isempty(payload) && return
         path = String(get(payload, "path", ""))
@@ -1746,158 +1869,18 @@ function dashboard_dom(state::ServerState;
         is_busy_idle(busy[]) || return
         w_name = discover_state[]
         isempty(w_name) && return
-        proj_name = replace(basename(rstrip(path, '/')), r"[^a-zA-Z0-9_\-]" => "_")
-        isempty(proj_name) && (proj_name = "project")
-        title = resume_session_id === nothing ?
-            "Importing $(proj_name)" :
-            "Resuming $(proj_name) (session $(resume_session_id[1:8])…)"
-        busy_start!(busy, title)
-        @async begin
-            try
-                p = create_project_from_worker!(state, w_name, path;
-                                             name = proj_name,
-                                             resume_session_id = resume_session_id,
-                                             progress = (stage, info) -> busy_event!(busy, stage, info))
-                error_obs[]      = ""
-                discover_state[] = ""
-                current_view !== nothing && (current_view[] = p.id)
-            catch e
-                error_obs[] = "Failed to import: $(sprint(showerror, e))"
-            finally
-                busy_clear!(busy)
-            end
-        end
+        do_import(w_name, path; resume_session_id = resume_session_id)
     end
 
-    function session_row(r::AbstractDict)
-        path      = String(get(r, "path", ""))
-        isempty(path) && return DOM.div()
-        name      = String(get(r, "name", basename(path)))
-        is_active = get(r, "active", false) === true
-        # session_id is the .jsonl basename of the most-recent claude session
-        # at this cwd. When set, the import flow uses ACP's session/load to
-        # resume that conversation instead of starting fresh.
-        sid_raw   = get(r, "session_id", nothing)
-        session_id = sid_raw === nothing ? "" : String(sid_raw)
-        meta = if is_active
-            "PID $(get(r, "pid", "?"))"
-        elseif haskey(r, "last_used")
-            ts = get(r, "last_used", 0.0)
-            dt = Dates.unix2datetime(ts isa Number ? Float64(ts) : 0.0)
-            "Last used $(Dates.format(dt, "yyyy-mm-dd HH:MM"))"
-        else
-            ""
-        end
-        badge = is_active ?
-            DOM.span("active"; class = "bt-pill bt-pill-active") : DOM.span()
-        # Show whether resume is available, so the user knows what they're
-        # getting. Plain "Import" looks the same as before for sessions we
-        # didn't find a jsonl for.
-        btn_label = isempty(session_id) ? "Import" : "Resume"
-        DOM.div(
-            DOM.div(
-                DOM.div(name, badge; class = "bt-session-name"),
-                DOM.div(path; class = "bt-session-path"),
-                isempty(meta) ? DOM.span() : DOM.div(meta; class = "bt-session-meta")),
-            DOM.div(btn_label;
-                class   = "bt-btn bt-btn-secondary",
-                style   = Styles("cursor" => "pointer", "flex-shrink" => "0"),
-                # Instant visual feedback: flip the button to a loading
-                # state synchronously on click, before the WS round-trip
-                # that surfaces the busy card has a chance to land.
-                onclick = js"""event => {
-                    const btn = event.currentTarget;
-                    btn.classList.add('bt-clicked');
-                    btn.textContent = $(btn_label) === 'Resume' ? 'Resuming…' : 'Importing…';
-                    $(import_path).notify({path: $path, session_id: $session_id});
-                }"""),
-            class = is_active ? "bt-session-row bt-session-active" : "bt-session-row")
-    end
-
-    function discover_panel(wid::String)
-        close_btn  = Bonito.Button("✕"; style=nothing, class = "bt-btn bt-btn-ghost")
-        rescan_btn = Bonito.Button("↻ Rescan"; style=nothing, class = "bt-btn bt-btn-secondary")
-        on(close_btn.value)  do clicked; clicked && (discover_state[] = ""); end
-        on(rescan_btn.value) do clicked; clicked && trigger_scan!(wid); end
-
-        # Display label = worker.name (mutable); fallback to wid if the
-        # worker has gone offline since the panel was opened.
-        display_name = haskey(state.workers[], wid) ? state.workers[][wid].name : wid
-        panel_content = map(discover_busy, discover_results) do busy, results
-            if busy
-                spinner_row("Scanning $display_name for Claude Code sessions…")
-            elseif isempty(results)
-                DOM.div("No Claude Code sessions found on $display_name."; class = "bt-empty")
-            else
-                # Surface errors first, then split active vs historical.
-                errors = [DOM.div("Error: $(r["error"])"; class = "bt-error")
-                          for r in results if haskey(r, "error")]
-                clean       = filter(r -> !haskey(r, "error"), results)
-                active      = filter(r -> get(r, "active", false) === true, clean)
-                historical  = filter(r -> get(r, "active", false) !== true, clean)
-                blocks = []
-                append!(blocks, errors)
-                if !isempty(active)
-                    push!(blocks, DOM.div("Active"; class = "bt-section-label"))
-                    append!(blocks, [session_row(r) for r in active])
-                end
-                if !isempty(historical)
-                    push!(blocks, DOM.div("Historical"; class = "bt-section-label"))
-                    append!(blocks, [session_row(r) for r in historical])
-                end
-                DOM.div(blocks...; class = "bt-slide-in")
-            end
-        end
-
-        DOM.div(
-            DOM.div(
-                DOM.span("Claude Code sessions on $display_name"; class = "bt-discover-title"),
-                DOM.div(rescan_btn, close_btn; class = "bt-discover-actions");
-                class = "bt-discover-header"),
-            panel_content;
-            class = "bt-discover-panel bt-slide-in")
-    end
-
-    function get_remote_picker(name)
-        haskey(remote_pickers, name) || (remote_pickers[name] = RemoteFolderPicker(name))
-        remote_pickers[name]
-    end
-
-    function submit_remote_pick(w_name::String)
-        is_busy_idle(busy[]) || return   # guard: ignore if already creating
-        rp = get_remote_picker(w_name)
-        chosen = String(strip(rp.selected[]))
-        if isempty(chosen)
-            error_obs[] = "Pick a folder on the worker first (Browse → Choose)."
-            return
-        end
-        nm = basename(rstrip(chosen, '/'))
-        busy_start!(busy, "Importing $(nm)")
-        @async begin
-            try
-                p = create_project_from_worker!(state, w_name, chosen;
-                    progress = (stage, info) -> busy_event!(busy, stage, info))
-                error_obs[] = ""
-                picker_state[] = ""
-                rp.selected[] = ""
-                current_view !== nothing && (current_view[] = p.id)
-            catch e
-                error_obs[] = "Failed to create project from worker: $e"
-            finally
-                busy_clear!(busy)
-            end
-        end
-    end
+    # session_row + discover_panel are now rendered inside WorkerCard
+    # (see worker_widget.jl) — each worker's card owns its discover panel
+    # toggled by `discover_state`, and the rows reference `import_path`
+    # directly from the card's captured fields.
 
     text_input(obs::Observable, ph::String) = DOM.input(
         type = "text", placeholder = ph,
         value = obs,    # Julia → JS: pushed back when obs changes (e.g. auto-fill)
         oninput = js"event => $(obs).notify(event.target.value)")
-
-    spinner_row(msg) = DOM.div(
-        DOM.div(class = "bt-spinner"),
-        DOM.span(msg),
-        class = "bt-spinner-row")
 
     new_proj_form() = DOM.div(
         DOM.label("Name"),   text_input(np_name, "e.g. my-project"),
@@ -1936,36 +1919,10 @@ function dashboard_dom(state::ServerState;
         DOM.div(gh_cancel, gh_submit, class = "bt-form-actions"),
         class = "bt-form")
 
-    # `wid` is the worker_id (UUID), not the display name. Display label
-    # resolves it via state.workers; the dispatch helpers
-    # (submit_remote_pick / get_remote_picker) accept the wid as their
-    # dict key.
-    function remote_picker_form(wid::String)
-        rp = get_remote_picker(wid)
-        create_btn = Bonito.Button("Create"; style=nothing, class = "bt-btn")
-        cancel_btn = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
-        on(create_btn.value) do clicked
-            clicked && submit_remote_pick(wid)
-        end
-        on(cancel_btn.value) do clicked
-            clicked || return
-            is_busy_idle(busy[]) || return   # don't cancel mid-create
-            picker_state[] = ""; error_obs[] = ""
-        end
-        display_name = haskey(state.workers[], wid) ? state.workers[][wid].name : wid
-        DOM.div(
-            DOM.label("Folder on $(display_name)"),
-            DOM.div(remote_folder_picker_render(rp),
-                    map(rp.selected) do sel
-                        isempty(sel) ? DOM.div() :
-                            DOM.div("✓ selected: $sel",
-                                    style = Styles("color" => "#065f46",
-                                           "font-size" => "12px",
-                                           "margin-top" => "4px"))
-                    end),
-            DOM.div(cancel_btn, create_btn, class = "bt-form-actions"),
-            class = "bt-form")
-    end
+    # The per-worker picker form and discover panel are now rendered inside
+    # WorkerCard (see worker_widget.jl) and toggled via class binding —
+    # which means each card owns its own RemoteFolderPicker, persistent
+    # across re-renders without any dashboard-level dict.
 
     # ── Stats strip ──────────────────────────────────────────────────────────
     # Stats touch both worker counts and project counts → listen to both.
@@ -1994,54 +1951,92 @@ function dashboard_dom(state::ServerState;
             class = "bt-stats")
     end
 
-    # ── Worker / project lists ───────────────────────────────────────────────
-    # Worker cards: re-render on worker churn or open form state. Adding a
-    # project does NOT redraw worker cards.
-    worker_list = map(state.workers, picker_state, discover_state) do workers, picked, discovered
-        if isempty(workers)
-            install_url = "$(public_url_or_default())/install.sh"
-            install_cmd = "curl -fsSL $install_url | sh"
-            return DOM.div(
-                DOM.div("No workers connected yet.";
-                        style = Styles("color" => "var(--bt-text-muted)",
-                                       "font-size" => "13px")),
-                DOM.div("Run on each agent machine:";
-                        style = Styles("color" => "var(--bt-text-faint)",
-                                       "font-size" => "12px",
-                                       "margin-top" => "8px")),
-                DOM.div(
-                    DOM.span(install_cmd),
-                    DOM.span("Copy";
-                        class   = "bt-install-copy",
-                        onclick = js"""event => {
-                            navigator.clipboard.writeText($install_cmd);
-                            event.target.textContent = 'Copied';
-                            setTimeout(() => event.target.textContent = 'Copy', 1200);
-                        }"""),
-                    class = "bt-install-cmd");
-                class = "bt-install-block")
+    # ── Worker list ──────────────────────────────────────────────────────────
+    # Per-worker WorkerCard widgets, kept stable in `worker_cards` and fed to
+    # a KeyedList keyed on `worker_id`. Adding/removing workers diffs
+    # cleanly — only the affected cards mount/unmount. Worker info changes
+    # (status, name, subtitle) flow through derived Observables inside each
+    # card, so neighbours don't see any DOM churn.
+    worker_cards = Dict{String,WorkerCard}()
+    function get_worker_card(wid::AbstractString)
+        get!(worker_cards, String(wid)) do
+            WorkerCard(state, wid;
+                error_obs        = error_obs,
+                picker_state     = picker_state,
+                discover_state   = discover_state,
+                busy             = busy,
+                discover_busy    = discover_busy,
+                discover_results = discover_results,
+                import_path      = import_path,
+                do_import        = do_import,
+                trigger_scan     = trigger_scan!)
         end
-        rows = []
-        for w in values(workers)
-            push!(rows, worker_card(state, w, error_obs, picker_state, discover_state))
-            # picker_state / discover_state hold the worker_id (UUID), not the
-            # display name, so we compare against w.worker_id and pass it
-            # through to the form helpers (they look up the display name from
-            # state.workers when they need it).
-            picked     == w.worker_id && push!(rows, remote_picker_form(w.worker_id))
-            discovered == w.worker_id && push!(rows, discover_panel(w.worker_id))
-        end
-        DOM.div(rows...; class = "bt-cards")
     end
+    # The "no workers" install-instructions block lives as a sibling that
+    # toggles visibility based on workers-empty. Keeps the install snippet
+    # out of every render's hot path.
+    install_url   = "$(public_url_or_default())/install.sh"
+    install_cmd   = "curl -fsSL $install_url | sh"
+    no_workers_block = DOM.div(
+        DOM.div("No workers connected yet.";
+                style = Styles("color" => "var(--bt-text-muted)",
+                                "font-size" => "13px")),
+        DOM.div("Run on each agent machine:";
+                style = Styles("color" => "var(--bt-text-faint)",
+                                "font-size" => "12px",
+                                "margin-top" => "8px")),
+        DOM.div(
+            DOM.span(install_cmd),
+            DOM.span("Copy";
+                class   = "bt-install-copy",
+                onclick = js"""event => {
+                    navigator.clipboard.writeText($install_cmd);
+                    event.target.textContent = 'Copied';
+                    setTimeout(() => event.target.textContent = 'Copy', 1200);
+                }"""),
+            class = "bt-install-cmd");
+        class = "bt-install-block")
+    no_workers_class = map(state.workers) do workers
+        isempty(workers) ? "bt-install-wrap" : "bt-install-wrap bt-hidden"
+    end
+    # Drive the KeyedList off a derived Observable that yields a stable
+    # vector of WorkerCard instances (same widget objects across renders →
+    # same hash → no spurious unmount/remount).
+    worker_widgets_obs = map(state.workers) do workers
+        WorkerCard[get_worker_card(w.worker_id) for w in values(workers)]
+    end
+    worker_keyed_list = KeyedList(worker_widgets_obs;
+                                    key = c -> c.worker_id)
+    worker_list = DOM.div(
+        DOM.div(no_workers_block; class = no_workers_class),
+        DOM.div(worker_keyed_list; class = "bt-cards"))
 
-    project_list = map(state.projects) do projects
-        isempty(projects) ?
-            DOM.div("No projects yet — pick a worker above and click + Project, or import an existing Claude session via Discover.";
-                    class = "bt-empty") :
-            DOM.div((project_card(state, p, error_obs, sync_request, open_request, current_view)
-                     for p in values(projects))...;
-                    class = "bt-cards")
+    # ── Project list ────────────────────────────────────────────────────────
+    # Per-project ProjectCard widgets, stable in `project_cards`, fed to a
+    # KeyedList keyed on `project_id`. A sync starting on one project only
+    # re-renders THAT card's body — the other cards' DOM (and their
+    # in-flight click handlers, open-chat dropdowns) stay mounted.
+    project_cards = Dict{String,ProjectCard}()
+    function get_project_card(pid::AbstractString)
+        get!(project_cards, String(pid)) do
+            ProjectCard(state, String(pid), error_obs, sync_request,
+                         open_request, current_view)
+        end
     end
+    empty_projects_block = DOM.div(
+        "No projects yet — pick a worker above and click + Project, or import an existing Claude session via Discover.";
+        class = "bt-empty")
+    empty_projects_class = map(state.projects) do projects
+        isempty(projects) ? "bt-empty-wrap" : "bt-empty-wrap bt-hidden"
+    end
+    project_widgets_obs = map(state.projects) do projects
+        ProjectCard[get_project_card(p.id) for p in values(projects)]
+    end
+    project_keyed_list = KeyedList(project_widgets_obs;
+                                    key = c -> c.project_id)
+    project_list = DOM.div(
+        DOM.div(empty_projects_block; class = empty_projects_class),
+        DOM.div(project_keyed_list; class = "bt-cards"))
 
     # Two slide-in forms, one source of truth: which one is open right now.
     form_block = map(which_form) do which
@@ -2077,10 +2072,13 @@ function dashboard_dom(state::ServerState;
         DOM.span(msg_obs;   class = "bt-busy-msg");
         class = visibility_class)
 
+    collision_overlay = render_collision_modal(state, collision_state, do_import)
+
     # Layout — DOM only; the App() wrapper + global assets (DashboardStyles,
     # ConnectionIndicator) live in the caller (unified_app or dashboard_app).
     DOM.div(
         busy_card,
+        collision_overlay,
         DOM.div(
             DOM.h1("BonitoTeam"),
             DOM.div("Multi-host orchestrator for agentic coding sessions";
@@ -2101,6 +2099,173 @@ function dashboard_dom(state::ServerState;
         form_block;
 
         class = "bt-dash")
+end
+
+# ── Collision-resolution modal ──────────────────────────────────────────────
+# When `create_project_from_worker!` raises ProjectCollisionError, the
+# dashboard's import handler stuffs the comparison + retry info into the
+# `collision_state` Observable. This renderer turns that into a fixed
+# overlay with side-by-side summaries and three actions:
+#   - Keep existing  → :keep_existing (no reassignment)
+#   - Use candidate  → :take_candidate (reassign to the candidate worker)
+#   - Cancel         → close modal, do nothing
+function render_collision_modal(state::ServerState,
+                                  collision_state::Observable,
+                                  do_import_fn::Function)
+    map(collision_state) do c
+        c === nothing && return DOM.div()
+        existing_worker_name = haskey(state.workers[], c.existing.worker_id) ?
+            state.workers[][c.existing.worker_id].name : c.existing.worker_id
+        candidate_worker_name = haskey(state.workers[], c.candidate_worker) ?
+            state.workers[][c.candidate_worker].name : c.candidate_worker
+
+        existing_side  = collision_side_panel(
+            "Existing — $(existing_worker_name)",
+            c.existing.worker_path,
+            c.comparison.existing,
+            c.comparison.existing_source === :worker ? "live" : "server mirror")
+        candidate_side = collision_side_panel(
+            "Candidate — $(candidate_worker_name)",
+            c.candidate_path,
+            c.comparison.candidate,
+            "live")
+
+        # Highlight the side that's been edited more recently.
+        ex_mt = Float64(c.comparison.existing["latest_mtime"])
+        ca_mt = Float64(c.comparison.candidate["latest_mtime"])
+        newer = ex_mt > ca_mt ? :existing : (ca_mt > ex_mt ? :candidate : :tie)
+        if newer === :existing
+            existing_side = DOM.div(existing_side; class = "bt-collision-newer")
+        elseif newer === :candidate
+            candidate_side = DOM.div(candidate_side; class = "bt-collision-newer")
+        end
+
+        keep_btn   = Bonito.Button("Keep existing"; style=nothing,
+                                    class = "bt-btn bt-btn-secondary",
+                                    title = "Leave the project bound to $existing_worker_name; do nothing")
+        take_btn   = Bonito.Button("Use candidate"; style=nothing,
+                                    class = "bt-btn bt-btn-primary",
+                                    title = "Reassign the project to $candidate_worker_name")
+        cancel_btn = Bonito.Button("Cancel"; style=nothing,
+                                    class = "bt-btn bt-btn-ghost")
+        on(keep_btn.value) do clicked
+            clicked || return
+            do_import_fn(c.candidate_worker, c.candidate_path;
+                          name = c.candidate_name,
+                          on_collision = :keep_existing)
+        end
+        on(take_btn.value) do clicked
+            clicked || return
+            do_import_fn(c.candidate_worker, c.candidate_path;
+                          name = c.candidate_name,
+                          on_collision = :take_candidate)
+        end
+        on(cancel_btn.value) do clicked
+            clicked || return
+            collision_state[] = nothing
+        end
+
+        DOM.div(
+            DOM.div(
+                DOM.div(
+                    DOM.h3("Project name '$(c.existing.name)' already exists"),
+                    DOM.div("This name is already bound to $existing_worker_name. " *
+                            "Compare the two sides and pick which one to keep.";
+                            class = "bt-collision-sub")),
+                DOM.div(existing_side, candidate_side;
+                        class = "bt-collision-sides"),
+                DOM.div(cancel_btn, keep_btn, take_btn;
+                        class = "bt-collision-actions");
+                class = "bt-collision-card");
+            class = "bt-collision-overlay")
+    end
+end
+
+# One column of the side-by-side compare. Top line is the headline
+# decision signal (last edit time), then file/byte counts, then a
+# short recent-files list and a per-subrepo git breakdown.
+function collision_side_panel(title::AbstractString,
+                                path::AbstractString,
+                                summary::AbstractDict,
+                                source_label::AbstractString)
+    age_str    = format_relative_age(Float64(summary["latest_mtime"]))
+    n_files    = Int(summary["total_files"])
+    total_kb   = round(Int(summary["total_bytes"]) / 1024; digits = 1)
+    recent     = summary["recent_files"]
+    subrepos   = summary["git_subrepos"]
+
+    recent_rows = if isempty(recent)
+        [DOM.div("(no files)"; class = "bt-collision-empty")]
+    else
+        [DOM.div(
+            DOM.span(String(r["path"]); class = "bt-collision-file-path"),
+            DOM.span(format_relative_age(Float64(r["mtime"]));
+                     class = "bt-collision-file-age");
+            class = "bt-collision-file-row") for r in recent]
+    end
+
+    git_rows = if isempty(subrepos)
+        [DOM.div("no git sub-repos found";
+                  class = "bt-collision-empty")]
+    else
+        [collision_git_row(g) for g in subrepos]
+    end
+
+    DOM.div(
+        DOM.div(title; class = "bt-collision-side-title"),
+        DOM.div(path; class = "bt-collision-side-path", title = String(path)),
+        DOM.div(
+            DOM.div(
+                DOM.span("Last edit: "; class = "bt-collision-label"),
+                DOM.span(age_str; class = "bt-collision-value")),
+            DOM.div(
+                DOM.span("Files: "; class = "bt-collision-label"),
+                DOM.span("$n_files ($(total_kb) KB)";
+                         class = "bt-collision-value")),
+            DOM.div(
+                DOM.span("Source: "; class = "bt-collision-label"),
+                DOM.span(source_label; class = "bt-collision-value-faint"));
+            class = "bt-collision-stats"),
+        DOM.div(
+            DOM.h5("Recent files"),
+            recent_rows...;
+            class = "bt-collision-recent"),
+        DOM.div(
+            DOM.h5("Git sub-repos"),
+            git_rows...;
+            class = "bt-collision-git");
+        class = "bt-collision-side")
+end
+
+function collision_git_row(g::AbstractDict)
+    head = String(get(g, "head_sha", ""))
+    short_sha = isempty(head) ? "(no head)" : (length(head) >= 7 ? head[1:7] : head)
+    dirty = Int(get(g, "dirty_count", 0))
+    branch = String(get(g, "branch", ""))
+    head_time = Float64(get(g, "head_time", 0.0))
+    dirty_str = dirty == 0 ? "clean" : "$dirty dirty"
+    DOM.div(
+        DOM.div(String(g["path"]); class = "bt-collision-git-path"),
+        DOM.div(
+            DOM.span("$branch @ $short_sha"; class = "bt-collision-git-ref"),
+            DOM.span(dirty_str; class = dirty == 0 ?
+                "bt-collision-git-clean" : "bt-collision-git-dirty"),
+            DOM.span(format_relative_age(head_time); class = "bt-collision-git-age"));
+        class = "bt-collision-git-row")
+end
+
+# "5m ago" / "3h ago" / "2d ago" — short, glanceable. Skips
+# fractional precision past the second decimal so big mtime
+# gaps don't render as "1.7892… days ago".
+function format_relative_age(t::Float64)
+    t <= 0 && return "—"
+    Δ = time() - t
+    Δ < 0    && return "in the future"
+    Δ < 60   && return "$(round(Int, Δ))s ago"
+    Δ < 3600 && return "$(round(Int, Δ / 60))m ago"
+    Δ < 86400 && return "$(round(Int, Δ / 3600))h ago"
+    Δ < 86400 * 30 && return "$(round(Int, Δ / 86400))d ago"
+    return "$(round(Int, Δ / (86400 * 30)))mo ago"
 end
 
 # Thin shim for callers that want a standalone dashboard App (tests, the

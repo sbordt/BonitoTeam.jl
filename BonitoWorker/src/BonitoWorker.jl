@@ -129,6 +129,8 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_path,
                 @async handle_open_transfer(server_url, secret, cmd)
             elseif t == "list_dir"
                 @async handle_list_dir(ws, cmd)
+            elseif t == "inspect_path"
+                @async handle_inspect_path(ws, cmd)
             elseif t == "scan_sessions"
                 @async handle_scan_sessions(ws, cmd)
             elseif t == "clone_repo"
@@ -239,6 +241,110 @@ function handle_list_dir(ws, cmd::AbstractDict)
     end
 end
 
+# Inspect a path for "which side is fresher" comparison on project-name
+# collision. Cheap walk: file count + total bytes + latest mtime + top-N
+# most-recently-modified files, plus per-subrepo git summary (HEAD, dirty
+# count, last commit time). Excludes the contents of .git/ from the file
+# walk so commit churn doesn't drown out source-edit recency; the git
+# summary block reports commit activity separately so nothing is lost.
+const INSPECT_RECENT_LIMIT = 10
+
+function handle_inspect_path(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    raw_path   = String(get(cmd, "path", ""))
+
+    response = try
+        isempty(raw_path) && error("path is empty")
+        isdir(raw_path)   || error("not a directory: $raw_path")
+        Dict("type"       => "inspect_path_response",
+             "request_id" => request_id,
+             "path"       => abspath(raw_path),
+             "summary"    => inspect_path_summary(raw_path))
+    catch e
+        Dict("type"       => "inspect_path_response",
+             "request_id" => request_id,
+             "error"      => sprint(showerror, e))
+    end
+    try
+        WebSockets.send(ws, JSON.json(response))
+    catch e
+        @warn "inspect_path response failed" exception=e
+    end
+end
+
+function inspect_path_summary(root::AbstractString)
+    total_files  = 0
+    total_bytes  = 0
+    latest_mtime = 0.0
+    # Collect (rel, size, mtime) so we can sort for the recent-files list.
+    files = NamedTuple{(:rel, :size, :mtime), Tuple{String, Int, Float64}}[]
+    git_dirs = String[]   # abs paths of directories that contain a .git entry
+    for (dir, dirs, names) in walkdir(String(root); topdown = true,
+                                       follow_symlinks = false)
+        if ".git" in dirs || ".git" in names
+            push!(git_dirs, dir)
+            # Don't recurse into .git/: counts huge object trees as "files
+            # the user edited", which would mask actual source-edit recency.
+            filter!(d -> d != ".git", dirs)
+        end
+        for n in names
+            full = joinpath(dir, n)
+            islink(full) && continue
+            st = try stat(full) catch; continue end
+            sz = Int(st.size)
+            mt = Float64(st.mtime)
+            total_files += 1
+            total_bytes += sz
+            mt > latest_mtime && (latest_mtime = mt)
+            push!(files, (rel = relpath(full, String(root)),
+                          size = sz, mtime = mt))
+        end
+    end
+    sort!(files; by = f -> f.mtime, rev = true)
+    n_recent = min(INSPECT_RECENT_LIMIT, length(files))
+    recent = [Dict("path"  => f.rel,
+                   "size"  => f.size,
+                   "mtime" => f.mtime) for f in files[1:n_recent]]
+    return Dict(
+        "total_files"  => total_files,
+        "total_bytes"  => total_bytes,
+        "latest_mtime" => latest_mtime,
+        "recent_files" => recent,
+        "git_subrepos" => [inspect_git_subrepo(d, String(root)) for d in git_dirs],
+    )
+end
+
+function inspect_git_subrepo(abs_dir::AbstractString, root::AbstractString)
+    rel        = relpath(String(abs_dir), String(root))
+    head_sha   = ""
+    head_time  = 0.0
+    dirty_count = 0
+    branch     = ""
+    try
+        head_sha = strip(read(Cmd(`git rev-parse HEAD`; dir = abs_dir), String))
+    catch end
+    try
+        # %ct is committer Unix time. Falls back to 0.0 if HEAD is unborn.
+        out = read(Cmd(`git log -1 --format=%ct HEAD`; dir = abs_dir), String)
+        head_time = parse(Float64, strip(out))
+    catch end
+    try
+        # `--porcelain` is line-per-change; count non-empty lines.
+        out = read(Cmd(`git status --porcelain`; dir = abs_dir), String)
+        dirty_count = count(!isempty, split(out, '\n'))
+    catch end
+    try
+        branch = strip(read(Cmd(`git rev-parse --abbrev-ref HEAD`; dir = abs_dir), String))
+    catch end
+    return Dict(
+        "path"        => rel,
+        "head_sha"    => head_sha,
+        "head_time"   => head_time,
+        "dirty_count" => dirty_count,
+        "branch"      => branch,
+    )
+end
+
 # Clone a GitHub repo into `dst_path` (must not exist yet). For PRs we then
 # fetch the PR head ref and check it out as a local branch `pr-<n>` so the
 # checkout uses a normal branch name. The server pre-derives `dst_path` so
@@ -327,6 +433,17 @@ function handle_open_transfer(server_url::String, secret::String,
                 isfile(src) || error("src_path is not a file: $src")
                 RemoteSync.send_file(src, wsio)
                 @info "BonitoWorker: file transfer complete" src
+            elseif direction == "file_to_worker"
+                # Server pushes a single file. We receive into `dst_path`,
+                # creating parent dirs as needed. Used for things that
+                # don't justify a full directory sync: pasted screenshots,
+                # tool-call captures, ad-hoc Julia eval outputs the server
+                # wants to land on the worker without re-walking the
+                # whole project tree.
+                dst = String(cmd["dst_path"])
+                mkpath(dirname(dst))
+                RemoteSync.receive_file(dst, wsio)
+                @info "BonitoWorker: file received" dst
             else
                 error("unknown transfer direction: $direction")
             end

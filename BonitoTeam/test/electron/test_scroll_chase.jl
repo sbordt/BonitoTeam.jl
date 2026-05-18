@@ -56,11 +56,16 @@ try
     function scroll_state()
         TH.eval_js(ctx, """(() => {
             const c = document.querySelector('.bt-messages');
+            // Math.round throughout — Chromium can return fractional
+            // pixel values for scrollHeight/clientHeight when subpixel
+            // layout is in play; the Julia side compares against
+            // integer thresholds with `Int(...)`, which would raise
+            // InexactError on a Float64 with a non-zero fractional part.
             return {
-                top:    c.scrollTop,
-                height: c.scrollHeight,
-                client: c.clientHeight,
-                gap:    c.scrollHeight - c.scrollTop - c.clientHeight,
+                top:    Math.round(c.scrollTop),
+                height: Math.round(c.scrollHeight),
+                client: Math.round(c.clientHeight),
+                gap:    Math.round(c.scrollHeight - c.scrollTop - c.clientHeight),
             };
         })()""")
     end
@@ -134,13 +139,26 @@ try
 
     # ── Scrolling up disengages chase ──────────────────────────────────
     TH.section("Scrolling far up disengages chase") do
-        TH.eval_js(ctx, """document.querySelector('.bt-messages').scrollTop = 0;""")
-        sleep(0.2)
-        was_bot = TH.eval_js(ctx, """
-            document.querySelector('.bt-messages').__bt_chat.wasAtBottom
+        # Synthetic 'scroll' dispatch alongside the programmatic
+        # scrollTop write — Electron throttles natural scroll events
+        # to ~1 Hz when the window is hidden, so the chat's scroll
+        # handler won't run in time off the natural event alone.
+        TH.eval_js(ctx, """(() => {
+            const c = document.querySelector('.bt-messages');
+            // Simulate a wheel event before the scrollTop write so the
+            // chat marks this as user-initiated. Otherwise the chat's
+            // scroll handler treats it as a layout shift and re-anchors.
+            c.dispatchEvent(new WheelEvent('wheel', {bubbles: true}));
+            c.scrollTop = 0;
+            c.dispatchEvent(new Event('scroll', {bubbles: true}));
+            return true;
+        })()""")
+        sleep(0.3)
+        follow = TH.eval_js(ctx, """
+            document.querySelector('.bt-messages').__bt_chat.followMode
         """)
-        record("wasAtBottom is false after scrolling to top",
-               @TH.test_eq was_bot false)
+        record("followMode is false after scrolling to top",
+               @TH.test_eq follow false)
     end
 
     # ── Mobile keyboard / viewport shrink ──────────────────────────────────
@@ -152,13 +170,13 @@ try
         TH.set_window_size(ctx, 480, 800)
         sleep(0.3)
         chat = state.chat_models["p-1"]
-        # Re-engage chase: any new message arriving while wasAtBottom is
-        # false won't auto-scroll. Force it by appending some new history
-        # then a chunk.
+        # Re-engage chase: any new message arriving while followMode is
+        # false won't auto-scroll, so the previous "scroll to top" test
+        # disengaged us. Use the public setFollowMode helper so we go
+        # through the same path the pill-click does.
         TH.eval_js(ctx, """(() => {
             const c = document.querySelector('.bt-messages');
-            c.__bt_chat.wasAtBottom = true;
-            c.__bt_chat.chasingBottom = true;
+            c.__bt_chat.setFollowMode(true);
             c.__bt_chat._queueScrollToBottom();
         })()""")
         sleep(0.3)

@@ -22,5 +22,5 @@ BonitoWorker        = {path = "BonitoWorker"}
 RemoteSync          = {path = "RemoteSync"}
 # Pinned to branches with our patches (drop once merged + tagged):
 #  - Bonito sd/terminal-output: proxy_url="." emits server-absolute asset URLs
-Bonito              = {url = "https://github.com/SimonDanisch/Bonito.jl.git",     rev = "sd/terminal-output"}
+Bonito              = {url = "https://github.com/SimonDanisch/Bonito.jl.git",     rev = "sd/v5"}
 BonitoBook          = {url = "https://github.com/SimonDanisch/BonitoBook.jl.git", rev = "sd/llm-improvements"}

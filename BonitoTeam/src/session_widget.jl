@@ -43,9 +43,16 @@ function Bonito.jsrender(session::Bonito.Session, s::SessionRow)
     btn_label = isempty(s.session_id) ? "Import" : "Resume"
     return Bonito.jsrender(session, DOM.div(
         DOM.div(
-            DOM.div(s.name, badge; class = "bt-session-name"),
+            DOM.div(
+                # Wrap the name text in a span so it can ellipsize when the
+                # row is narrow — otherwise on mobile the active badge gets
+                # pushed under the Resume button.
+                DOM.span(s.name; class = "bt-session-name-text"),
+                badge;
+                class = "bt-session-name"),
             DOM.div(s.path; class = "bt-session-path"),
-            isempty(s.meta) ? DOM.span() : DOM.div(s.meta; class = "bt-session-meta")),
+            isempty(s.meta) ? DOM.span() : DOM.div(s.meta; class = "bt-session-meta");
+            class = "bt-session-info"),
         DOM.div(btn_label;
             class   = "bt-btn bt-btn-secondary",
             style   = Styles("cursor" => "pointer", "flex-shrink" => "0"),

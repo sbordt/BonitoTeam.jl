@@ -72,11 +72,13 @@ function serve(; host::String        = "0.0.0.0",
     srv = Bonito.Server(unified_app(state), host, port; proxy_url = ".")
     state.srv = srv
 
-    base_url = something(public_url, "http://localhost:$port")
+    # online_url uses the post-start srv.port — handles port=0 → ephemeral
+    # AND EADDRINUSE → port+1 retry without us tracking the actual port.
+    base_url = something(public_url, Bonito.online_url(srv, ""))
     add_install_routes!(srv, base_url, worker_secret)
     add_worker_ws_routes!(srv, state)
 
-    @info "BonitoTeam dashboard running" url="http://localhost:$port" state=sd
+    @info "BonitoTeam dashboard running" url=Bonito.online_url(srv, "") state=sd
     @info "Worker install endpoint"      url="$base_url/install.sh"
     return state
 end

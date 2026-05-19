@@ -590,11 +590,16 @@ const DashboardStyles = Bonito.Styles(
     # sidebar.jl::UnifiedShellStyles). The dashboard fills whatever space the
     # main panel gives it, so the sidebar and the dashboard are visually
     # adjacent instead of being separated by an arbitrary gap.
+    # `.bt-main` clips overflow (chat owns its own scroll region), so
+    # `.bt-dash` becomes the dashboard's scroll container itself. Without
+    # this, a long worker / project / discovered-session list overflows
+    # the viewport with nowhere to scroll on mobile.
     CSS(".bt-dash",
         "font-family"  => "'Inter', system-ui, -apple-system, sans-serif",
         "font-size"    => "14px", "line-height" => "1.5",
         "color"        => "var(--bt-text)", "background" => "var(--bt-bg)",
-        "min-height"   => "100vh",
+        "flex"         => "1 1 auto", "min-height" => "0",
+        "overflow-y"   => "auto",
         "padding"      => "32px 24px",
         "-webkit-font-smoothing" => "antialiased"),
     # Wrapper for a list of `.bt-card` rows. Single column today; we can
@@ -742,7 +747,11 @@ const DashboardStyles = Bonito.Styles(
         "padding" => "1px 8px",
         "border-radius" => "999px",
         "font-size" => "11px", "font-weight" => "500",
-        "letter-spacing" => "0.02em"),
+        "letter-spacing" => "0.02em",
+        # Keep pill text on a single line and don't let the flex parent
+        # shrink the pill below its content width — otherwise "not backed
+        # up" wraps onto three lines inside the card title row on mobile.
+        "white-space" => "nowrap", "flex-shrink" => "0"),
     CSS(".bt-pill-active",
         "background" => "rgba(16,185,129,0.12)", "color" => "#047857"),
     CSS(".bt-pill-online",
@@ -763,6 +772,10 @@ const DashboardStyles = Bonito.Styles(
         "background" => "var(--bt-accent)", "color" => "#fff",
         "font-size" => "13px", "font-weight" => "500",
         "cursor" => "pointer",
+        # Never break the label across lines — on narrow viewports `.bt-section`
+        # / `.bt-card-actions` would otherwise let "+ New project" wrap to two
+        # lines inside the button.
+        "white-space" => "nowrap",
         "display" => "inline-flex", "align-items" => "center", "gap" => "6px",
         "transition" => "background 120ms ease, transform 80ms ease, opacity 120ms ease, color 120ms"),
     CSS(".bt-btn:hover",  "background" => "var(--bt-accent-hover)"),
@@ -940,23 +953,38 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-session-row",
         "display" => "flex", "align-items" => "center",
         "justify-content" => "space-between",
+        "gap" => "8px",
         "padding" => "10px 12px",
         "background" => "var(--bt-surface)",
         "border" => "1px solid var(--bt-border)",
         "border-radius" => "var(--bt-radius-sm)",
         "margin-bottom" => "6px",
         "transition" => "border-color 120ms"),
+    # `min-width: 0` lets the path ellipsize instead of pushing the
+    # Import/Resume button off the row's right edge.
+    CSS(".bt-session-info",
+        "min-width" => "0", "flex" => "1 1 auto"),
     CSS(".bt-session-row:hover",
         "border-color" => "var(--bt-border-strong)"),
     CSS(".bt-session-active",
         "border-left" => "3px solid var(--bt-success)"),
     CSS(".bt-session-name",
         "font-weight" => "600", "font-size" => "13px",
-        "display" => "flex", "align-items" => "center", "gap" => "6px"),
+        "display" => "flex", "align-items" => "center", "gap" => "6px",
+        "min-width" => "0"),
+    # The name string lives inside this span (rather than as a raw text
+    # node) so it can ellipsize when the parent row is narrow. Without
+    # this, a long name like "ClaudeExperiments" pushes the active badge
+    # under the Resume button on mobile.
+    CSS(".bt-session-name-text",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis",
+        "white-space" => "nowrap",
+        "min-width" => "0"),
     CSS(".bt-session-path",
         "font-family" => "ui-monospace, monospace", "font-size" => "11px",
         "color" => "var(--bt-text-muted)", "margin-top" => "2px",
-        "max-width" => "440px", "overflow" => "hidden",
+        "overflow" => "hidden",
         "text-overflow" => "ellipsis", "white-space" => "nowrap"),
     CSS(".bt-session-meta",
         "font-size" => "11px",
@@ -1109,26 +1137,56 @@ const DashboardStyles = Bonito.Styles(
         "background" => "rgba(255,255,255,0.12)"),
 
     # ── Responsive ───────────────────────────────────────────────────────────
-    # Header stacks below ~560px so the tagline doesn't squish
+    # Below ~560px is the "phone" branch. Each rule pairs with a non-mobile
+    # default; the comment names which layout we're switching FROM →
+    # so changes here aren't independent of the desktop styles above.
     CSS("@media (max-width: 560px)",
+        # Header: title + tagline stack instead of sitting on one row
         CSS(".bt-header",
             "flex-direction" => "column",
             "align-items" => "flex-start",
             "gap" => "4px"),
         CSS(".bt-tagline", "font-size" => "12px"),
-        # form labels above inputs (single column) for touch widths
+        # Section headings: h2 takes the full first row, action buttons
+        # wrap onto a second row right-aligned. Without this, the buttons
+        # squeeze in next to the tiny "PROJECTS" h2 and "+ New project"
+        # wraps its own text onto two lines.
+        CSS(".bt-section",
+            "flex-wrap" => "wrap", "gap" => "8px"),
+        CSS(".bt-section h2",
+            "flex" => "1 0 100%"),
+        # Form: label-above-input single-column layout for touch widths
         CSS(".bt-form",
             "grid-template-columns" => "minmax(0, 1fr)",
             "gap" => "8px"),
         CSS(".bt-form label",
             "padding-top" => "0", "font-size" => "12px"),
-        # cards may need to wrap their action cluster onto a second row
+        # Cards: body + actions stack instead of sitting on one row
         CSS(".bt-card", "flex-wrap" => "wrap"),
+        # Card title row (name + badges): if the natural widths don't all
+        # fit, let the pills wrap onto a second row below the name rather
+        # than shrinking the name to "Cl..." just to keep one row.
+        CSS(".bt-card-title",
+            "flex-wrap" => "wrap", "row-gap" => "4px"),
+        # The actions cluster takes the full card width so its children
+        # (Sync btn + "Open chat on <worker>") can wrap onto a second row
+        # instead of overflowing the card. `margin-left: 0` overrides
+        # the desktop `margin-left: auto`; without it the cluster sizes
+        # to its content and right-aligns, leaving `flex-wrap` no
+        # horizontal room to actually act on.
         CSS(".bt-card-actions",
-            "margin-left" => "auto", "flex-wrap" => "wrap"),
-        # session row max-path doesn't make sense at narrow widths
-        CSS(".bt-session-path", "max-width" => "100%"),
-        # stats: tighter gap, smaller separators
+            "width" => "100%", "margin-left" => "0",
+            "flex-wrap" => "wrap", "justify-content" => "flex-end"),
+        # Discover panel header: long title ("Claude Code sessions on
+        # <worker>") + Rescan + close button can't fit on one row at
+        # 360–390px. Stack title above the action row.
+        CSS(".bt-discover-header",
+            "flex-direction" => "column",
+            "align-items" => "stretch",
+            "gap" => "8px"),
+        CSS(".bt-discover-actions",
+            "justify-content" => "flex-end"),
+        # Stats strip: tighter gap so the inline pills don't overflow
         CSS(".bt-stats", "gap" => "12px")),
 
     # ── Collision-resolution modal ───────────────────────────────────────────

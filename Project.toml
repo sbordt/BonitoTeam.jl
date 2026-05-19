@@ -1,26 +1,19 @@
-# Top-level monorepo env. `julia --project=.` from this directory pulls in
-# every sibling package via [sources]. Use this on the SERVER.
-# Workers use the leaner BonitoWorker/ env directly.
-#
-# Note: [sources] entries in transitive deps are ignored by Pkg, so they
-# must be repeated here for the monorepo env to resolve correctly.
-
 [deps]
 AgentClientProtocol = "a1b2c3d4-1234-5678-abcd-a1b2c3d4e5f6"
-Bonito              = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
-BonitoBook          = "b416d416-7a6e-4336-8c1a-1f8a8cd59518"
-BonitoMCP           = "4a1c91af-1c90-46a4-8594-a3846516869d"
-BonitoTeam          = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
-BonitoWorker        = "98909ed9-6989-4829-81af-73688ee23085"
-RemoteSync          = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
+Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
+BonitoBook = "b416d416-7a6e-4336-8c1a-1f8a8cd59518"
+BonitoMCP = "4a1c91af-1c90-46a4-8594-a3846516869d"
+BonitoTeam = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
+BonitoWorker = "98909ed9-6989-4829-81af-73688ee23085"
+MsgPack = "99f44e22-a591-53d1-9472-aa23ef4bd671"
+RemoteSync = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
 
 [sources]
 AgentClientProtocol = {path = "AgentClientProtocol"}
-BonitoMCP           = {path = "BonitoMCP"}
-BonitoTeam          = {path = "BonitoTeam"}
-BonitoWorker        = {path = "BonitoWorker"}
-RemoteSync          = {path = "RemoteSync"}
-# Pinned to branches with our patches (drop once merged + tagged):
-#  - Bonito sd/terminal-output: proxy_url="." emits server-absolute asset URLs
-Bonito              = {url = "https://github.com/SimonDanisch/Bonito.jl.git",     rev = "sd/v5"}
-BonitoBook          = {url = "https://github.com/SimonDanisch/BonitoBook.jl.git", rev = "sd/llm-improvements"}
+Bonito = {rev = "sd/v5", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
+BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
+BonitoMCP = {path = "BonitoMCP"}
+BonitoTeam = {path = "BonitoTeam"}
+BonitoWorker = {path = "BonitoWorker"}
+RemoteSync = {path = "RemoteSync"}
+MsgPack = {url = "https://github.com/JuliaIO/MsgPack.jl", rev = "perf/write-be"}

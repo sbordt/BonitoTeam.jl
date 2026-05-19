@@ -232,7 +232,11 @@ const UnifiedShellStyles = Bonito.Styles(
     CSS(".bt-shell",
         "max-width" => "var(--bt-shell-max)",
         "margin"    => "0 auto",
-        "height"    => "100vh",
+        # 100dvh, not 100vh: on mobile 100vh is the LARGEST viewport (URL
+        # bar collapsed), so when the bar is showing our last flex child
+        # (chat input / dashboard bottom) falls below the visible area.
+        # 100dvh shrinks with the bar.
+        "height"    => "100dvh",
         "display"   => "flex", "flex-direction" => "row",
         "border-left"  => "1px solid var(--bt-border)",
         "border-right" => "1px solid var(--bt-border)",

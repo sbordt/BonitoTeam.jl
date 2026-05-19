@@ -14,7 +14,6 @@
 #   end
 
 using Random
-using Sockets
 
 mutable struct DevHandle
     url         :: String
@@ -25,18 +24,6 @@ mutable struct DevHandle
     working_dir :: String
     worker_root :: String
     closed      :: Threads.Atomic{Bool}
-end
-
-# Bind a port=0 listener and read which port the OS handed us, then
-# release it. Cheap, race-free for solo dev (the next bind grabs the
-# same number on Linux because the port is in TIME_WAIT for us). For
-# production-quality concurrent allocation you'd hold onto the socket,
-# but for `dev_server()` the gap doesn't matter.
-function pick_free_port()
-    sock = Sockets.listen(IPv4(0), 0)
-    port = Int(Sockets.getsockname(sock)[2])
-    close(sock)
-    return port
 end
 
 """
@@ -72,20 +59,21 @@ end
 function dev_server(; port::Union{Int,Nothing} = nothing,
                       name::String             = "dev",
                       auto_open::Bool          = false)
-    chosen_port = port === nothing ? pick_free_port() : port
+    # port=0 lets the kernel pick a free ephemeral port; Bonito.Server
+    # writes the real port back to srv.port after start.
+    chosen_port = port === nothing ? 0 : port
     secret      = randstring(64)
     state_dir   = mktempdir(; prefix = "bonitoteam-dev-state-")
     working_dir = mktempdir(; prefix = "bonitoteam-dev-work-")
     worker_root = mktempdir(; prefix = "bonitoteam-dev-worker-")
     worker_id   = "dev-" * randstring(8)
-    server_url  = "http://127.0.0.1:$chosen_port"
 
     state = serve(; host          = "127.0.0.1",
                     port          = chosen_port,
-                    public_url    = server_url,
                     worker_secret = secret,
                     state_dir     = state_dir,
                     working_dir   = working_dir)
+    server_url = "http://127.0.0.1:$(state.srv.port)"
 
     # Spawn the worker control loop in-process. errormonitor surfaces
     # any crash on stderr so dev workflows don't silently lose the

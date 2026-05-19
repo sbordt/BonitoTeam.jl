@@ -607,6 +607,11 @@ mutable struct ChatModel
     session_alive :: Observable{Bool}
     last_error    :: Observable{String}
 
+    # True while a user prompt is in flight (set by send_message!, cleared
+    # in send_prompt_async!'s finally). Stateful — survives chat remount,
+    # unlike the comm `busy_start`/`busy_end` events.
+    busy_active   :: Observable{Bool}
+
     # Backreference for per-session copies. `nothing` for the shared
     # parent (the one in `state.chat_models[pid]`); points back to that
     # parent for any `copy(model, session)` view. Handlers use
@@ -640,6 +645,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(Dict{String,Any}()),
         Observable(true),
         Observable(""),
+        Observable(false),          # busy_active
         nothing,                    # parent: this is the shared instance itself
     )
 end
@@ -664,6 +670,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.comm),
             map(identity, session, m.session_alive),
             map(identity, session, m.last_error),
+            map(identity, session, m.busy_active),
             m,    # parent → the shared instance we copied from
         )
     end
@@ -935,6 +942,7 @@ function send_message!(model::ChatModel, msg::UserMsg;
     chat_push_msg!(model, msg)
     append_user(model.chat_session, msg)
     model.agent_id[] = ""    # any in-flight agent stream is over once the user sends
+    shared(model).busy_active[] = true
     chat_emit(model, Dict{String,Any}("type" => "busy_start"))
     Base.errormonitor(@async send_prompt_async!(model, msg.text; images))
     return nothing
@@ -1028,6 +1036,7 @@ function send_prompt_async!(model::ChatModel, text::AbstractString;
             finalize_agent(model.chat_session, err_msg)
         end
     finally
+        shared(model).busy_active[] = false
         chat_emit(model, Dict{String,Any}("type" => "busy_end"))
     end
 end
@@ -1359,6 +1368,11 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm)))
     """
 
+    # Spinner class follows the shared busy_active observable so the
+    # `bt-busy-active` class is set correctly on remount — the comm
+    # `busy_start` / `busy_end` events only forward to FUTURE bridges,
+    # so a tab that opens mid-prompt would otherwise miss the start.
+    busy_class = map(b -> b ? "bt-busy bt-busy-active" : "bt-busy", model.busy_active)
     Bonito.jsrender(session, DOM.div(
         chat_header(model),
         chat_session_banner(model),
@@ -1367,7 +1381,7 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         DOM.div(DOM.div(class="bt-busy-dot"),
                 DOM.div(class="bt-busy-dot"),
                 DOM.div(class="bt-busy-dot");
-                class="bt-busy"),
+                class = busy_class),
         chat_input_area(model),
         class = "bt-app"))
 end

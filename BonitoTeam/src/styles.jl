@@ -666,5 +666,16 @@ const ChatStyles = Bonito.Styles(
         CSS(".bt-tool-msg",                "max-width" => "100%"),
         CSS(".bt-plan-msg",                "max-width" => "100%"),
         # Hide the cwd path in the header — not enough room
-        CSS(".bt-header-cwd", "display" => "none")),
+        CSS(".bt-header-cwd", "display" => "none"),
+        # Title takes the available horizontal space and ellipsizes; the
+        # sync button shrinks to its content width. On desktop the sync
+        # button reserves 260px so per-file progress labels don't reflow
+        # the header, but on a 360-414px phone column that 260px reserve
+        # covers the project name. Drop it on mobile: long progress labels
+        # still truncate via `text-overflow: ellipsis` (declared on the
+        # base `.bt-header-sync` rule), so the row never overflows.
+        CSS(".bt-header-title", "flex" => "1 1 auto"),
+        CSS(".bt-header-sync",
+            "min-width" => "0", "max-width" => "none",
+            "flex" => "0 1 auto")),
 )

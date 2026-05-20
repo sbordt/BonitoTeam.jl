@@ -504,6 +504,64 @@ end
 # ── Claude session scanner ─────────────────────────────────────────────────────
 
 """
+    enumerate_claude_processes() → Vector{Tuple{Int,String}}
+
+Walk `/proc` and return `(pid, cwd)` for every running user-facing `claude`
+process. Skips MCP subprocesses (those invoked with `--mcp`) since they're
+internal to a parent claude. Linux-only — empty vector elsewhere.
+"""
+function enumerate_claude_processes()
+    out = Tuple{Int,String}[]
+    isdir("/proc") || return out
+    for pid_s in readdir("/proc"; join=false)
+        all(isdigit, pid_s) || continue
+        cmdline_path = "/proc/$pid_s/cmdline"
+        isfile(cmdline_path) || continue
+        cmdline_raw = try read(cmdline_path, String) catch; continue end
+        tokens = split(cmdline_raw, '\0'; keepempty=false)
+        isempty(tokens) && continue
+        basename(tokens[1]) == "claude" || continue
+        any(==(("--mcp")), tokens) && continue
+        cwd = try readlink("/proc/$pid_s/cwd") catch; continue end
+        isdir(cwd) || continue
+        push!(out, (parse(Int, pid_s), cwd))
+    end
+    return out
+end
+
+"""
+    collapse_processes_by_cwd(proc_entries, sid_by_cwd) → Vector{Dict{String,Any}}
+
+Collapse `(pid, cwd)` tuples into one Dict per unique cwd. Multiple concurrent
+claude processes for the same cwd are common — a claude-agent-acp child + a
+VS Code Claude Code extension + a different tool's claude can all share a
+directory without any being parent/child of the others — so we fold them into
+one row per project. `pid` is the lowest PID (typically the oldest); when
+N > 1, `process_count = N` is added so the UI can surface "PID X (N processes)".
+"""
+function collapse_processes_by_cwd(proc_entries::AbstractVector,
+                                     sid_by_cwd::AbstractDict{<:AbstractString,<:AbstractString})
+    by_cwd_pids = Dict{String,Vector{Int}}()
+    for (pid, cwd) in proc_entries
+        push!(get!(by_cwd_pids, String(cwd), Int[]), Int(pid))
+    end
+    out = Dict{String,Any}[]
+    for (cwd, pids) in by_cwd_pids
+        sort!(pids)
+        entry = Dict{String,Any}(
+            "path"   => cwd,
+            "name"   => basename(cwd),
+            "active" => true,
+            "pid"    => pids[1],
+        )
+        length(pids) > 1 && (entry["process_count"] = length(pids))
+        haskey(sid_by_cwd, cwd) && (entry["session_id"] = sid_by_cwd[cwd])
+        push!(out, entry)
+    end
+    return out
+end
+
+"""
     scan_claude_sessions(; home) → Vector{Dict{String,Any}}
 
 Scan the worker machine for existing Claude Code usage:
@@ -541,29 +599,11 @@ function scan_claude_sessions(; home::String = get(ENV, "HOME", ""))
         end
     end
 
-    # Running claude processes via /proc (Linux only)
-    if isdir("/proc")
-        for pid_s in readdir("/proc"; join=false)
-            all(isdigit, pid_s) || continue
-            cmdline_path = "/proc/$pid_s/cmdline"
-            isfile(cmdline_path) || continue
-            cmdline_raw = try read(cmdline_path, String) catch; continue end
-            tokens = split(cmdline_raw, '\0'; keepempty=false)
-            isempty(tokens) && continue
-            basename(tokens[1]) == "claude" || continue
-            any(==(("--mcp")), tokens) && continue   # skip MCP subprocesses
-            cwd = try readlink("/proc/$pid_s/cwd") catch; continue end
-            isdir(cwd) || continue
-            push!(active_paths, cwd)
-            entry = Dict{String,Any}(
-                "path"   => cwd,
-                "name"   => basename(cwd),
-                "active" => true,
-                "pid"    => parse(Int, pid_s),
-            )
-            haskey(sid_by_cwd, cwd) && (entry["session_id"] = sid_by_cwd[cwd])
-            push!(results, entry)
-        end
+    # Running claude processes via /proc (Linux only).
+    proc_entries = isdir("/proc") ? enumerate_claude_processes() : Tuple{Int,String}[]
+    for entry in collapse_processes_by_cwd(proc_entries, sid_by_cwd)
+        push!(active_paths, entry["path"])
+        push!(results, entry)
     end
 
     # Historical projects from ~/.claude/projects/

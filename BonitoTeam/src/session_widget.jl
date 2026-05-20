@@ -22,7 +22,13 @@ function SessionRow(c::WorkerCard, r::AbstractDict)
     sid_raw    = get(r, "session_id", nothing)
     session_id = sid_raw === nothing ? "" : String(sid_raw)
     meta = if is_active
-        "PID $(get(r, "pid", "?"))"
+        # scan_claude_sessions collapses N processes sharing a cwd into one
+        # row; `process_count` is set on the dict when N > 1. Surface that
+        # so the user knows there's more than one live claude in the dir.
+        n = get(r, "process_count", 1)
+        n isa Number && n > 1 ?
+            "PID $(get(r, "pid", "?")) ($(Int(n)) processes)" :
+            "PID $(get(r, "pid", "?"))"
     elseif haskey(r, "last_used")
         ts = get(r, "last_used", 0.0)
         dt = Dates.unix2datetime(ts isa Number ? Float64(ts) : 0.0)

@@ -1104,19 +1104,25 @@ icon_img(asset, alt) = DOM.img(src = asset, alt = alt, draggable = "false",
                                 style = Styles("pointer-events" => "none",
                                                "user-select" => "none"))
 
-function chat_input_area(model::ChatModel)
+function chat_input_area(session::Session, model::ChatModel)
     text_val = Observable("")
+    # Separate signal Observable for clearing the textarea from Julia.
+    # We deliberately don't use `value = text_val` two-way bind here:
+    # every JS keystroke notifies text_val, which triggers the implicit
+    # `map(session, text_val)` set up by attribute_render to echo the
+    # value back to JS. The echo arrives ~one WS round-trip later. If
+    # the user types more characters in between, the stale echo
+    # overwrites them — characters silently disappear. Instead, the
+    # input is JS-owned: `oninput` pushes JS → Julia (one-way), and
+    # `clear_signal` triggers an `onjs` handler when Julia wants to
+    # blank the field — Julia → JS, no echo back to overwrite typing.
+    clear_signal = Observable(0)
     send_btn = Bonito.Button(icon_img(SEND_ICON, "Send"); style=nothing,
                              class="bt-send-btn", title="Send (Enter)")
     stop_btn = Bonito.Button(icon_img(STOP_ICON, "Stop"); style=nothing,
                              class="bt-stop-btn", title="Stop generation")
 
-    # `value = text_val` is a two-way bind: oninput pushes JS → Julia
-    # below, and any Julia-side write to text_val[] propagates back to
-    # the DOM (so clearing text_val[] = "" after send empties the box,
-    # no separate evaljs needed). The JS height-adjust still rides on
-    # the same oninput event since CSS auto-grow on textareas needs JS.
-    text_input = DOM.textarea(value = text_val,
+    text_input = DOM.textarea(
         placeholder = "Message…",
         title = "Enter to send  ·  Shift+Enter for newline",
         class = "bt-text-input", rows = 1,
@@ -1132,9 +1138,17 @@ function chat_input_area(model::ChatModel)
             }
         }""")
 
+    # Julia → JS clear: fires when `clear_signal` is bumped. Resets the
+    # textarea's value and the auto-grown height.
+    Bonito.onjs(session, clear_signal, js"""(_) => {
+        const ta = $(text_input);
+        ta.value = '';
+        ta.style.height = 'auto';
+    }""")
+
     on(send_btn.value) do clicked
         clicked || return
-        send_user_text!(model, text_val)
+        send_user_text!(model, text_val, clear_signal)
     end
     on(stop_btn.value) do clicked
         clicked || return
@@ -1145,14 +1159,14 @@ function chat_input_area(model::ChatModel)
             class = "bt-input-area")
 end
 
-function send_user_text!(model::ChatModel, text_val)
+function send_user_text!(model::ChatModel, text_val, clear_signal)
     text = strip(text_val[])
     isempty(text) && return
-    # `value=text_val` on the textarea (chat_input_area) is a two-way bind,
-    # so this single assignment empties the input on the JS side too. The
-    # height-reset is folded into the existing `oninput` handler — when
-    # value flips to "", oninput fires once and the auto-grow recomputes.
-    text_val[] = ""
+    # `text_val.val = ""` bypasses notify so we don't re-enter the
+    # JS → Julia → JS round-trip; the JS-side clear is the one we
+    # actually want, triggered explicitly below.
+    text_val.val = ""
+    clear_signal[] = clear_signal[] + 1
     send_message!(model, UserMsg(String(text)))
 end
 
@@ -1382,7 +1396,7 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
                 DOM.div(class="bt-busy-dot"),
                 DOM.div(class="bt-busy-dot");
                 class = busy_class),
-        chat_input_area(model),
+        chat_input_area(session, model),
         class = "bt-app"))
 end
 

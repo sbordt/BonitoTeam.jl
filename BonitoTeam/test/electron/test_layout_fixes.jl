@@ -201,6 +201,30 @@ try
                @TH.test_true (abs(layout["shell_height"] - layout["inner_height"]) < 4))
         record("input row bottom is inside the viewport",
                @TH.test_true (layout["input_bottom"] <= layout["inner_height"] + 1))
+
+        # Chat header: pre-fix `.bt-header-sync` had `min-width: 260px` so
+        # the Sync button covered the project name on phone-width viewports.
+        # Post-fix mobile rule sets `min-width: 0; flex: 0 1 auto`, and
+        # `.bt-header-title` gets `flex: 1 1 auto` so it takes the
+        # remaining row width.
+        header = TH.eval_js(ctx, """
+            (() => {
+                const t = document.querySelector('.bt-header-title');
+                const s = document.querySelector('.bt-header-sync');
+                if (!t || !s) return null;
+                const tR = t.getBoundingClientRect();
+                const sR = s.getBoundingClientRect();
+                return {title_w: tR.width, sync_w: sR.width,
+                        title_right: tR.right, sync_left: sR.left};
+            })()
+        """)
+        @assert header !== nothing "couldn't find chat header probe targets"
+        record("chat header title gets meaningful width (not crushed)",
+               @TH.test_true (header["title_w"] >= 80))
+        record("Sync button doesn't dominate the row",
+               @TH.test_true (header["sync_w"] <= 100))
+        record("title doesn't overlap Sync button",
+               @TH.test_true (header["title_right"] <= header["sync_left"] + 1))
     end
 
     TH.section("Spinner restored on chat remount mid-prompt") do

@@ -1,25 +1,13 @@
-# Path to the BonitoTeam package's assets/ (install_worker.sh, bonitoteam.js)
+# Path to the BonitoTeam package's assets/ (install.jl, bonitoteam.js)
 const ASSETS_DIR    = normpath(joinpath(@__DIR__, "..", "assets"))
 # Monorepo root (sibling of BonitoTeam/) — contains BonitoMCP/, BonitoWorker/, AgentClientProtocol/.
 const MONOREPO_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 
-const INSTALL_SCRIPT   = read(joinpath(ASSETS_DIR, "install_worker.sh"),   String)
-const UNINSTALL_SCRIPT = read(joinpath(ASSETS_DIR, "uninstall_worker.sh"), String)
-
-# Worker bundle: ships the lean packages a worker needs (BonitoMCP +
-# BonitoWorker + their RemoteSync dep). The installer extracts these alongside
-# a generated worker_project.toml at $INSTALL_ROOT and uses that as the SINGLE
-# operational env — never per-package Project.tomls. Rebuilt on every request
-# so local edits show up without restarting the server.
-const WORKER_BUNDLE_PATHS = ["BonitoMCP", "BonitoWorker", "RemoteSync"]
-
-function build_worker_bundle()::Vector{UInt8}
-    tmp = tempname() * ".tar.gz"
-    run(Cmd(`tar -czf $tmp $(WORKER_BUNDLE_PATHS)`; dir = MONOREPO_ROOT))
-    bytes = read(tmp)
-    rm(tmp; force=true)
-    return bytes
-end
+# The worker installer is a cross-platform Julia script (`curl … | julia -`).
+# It Pkg.add's BonitoWorker + BonitoMCP from the public GitHub repo into a
+# shared `@bonito-team` env — no tar bundle, no per-package source trees, runs
+# identically on Linux / macOS / Windows. See assets/install.jl.
+const INSTALL_SCRIPT = read(joinpath(ASSETS_DIR, "install.jl"), String)
 
 """
     serve(; host, port, public_url, worker_secret, state_dir, working_dir) → Bonito.Server
@@ -30,8 +18,7 @@ only port `port` (default 8038) needs to be open in the server's firewall.
 Routes:
   /                       — dashboard (workers + projects)
   /p/<project_id>         — chat UI for one project
-  /install.sh             — worker installer (curl-pipeable)
-  /worker/bundle.tar.gz   — package files the installer downloads
+  /install.jl             — cross-platform worker installer (`curl … | julia -`)
   /worker-ws    (WS)      — control channel each worker holds open after install
   /worker-acp   (WS)      — per-session ACP relay; one connection per project session
   /transfer-ws  (WS)      — librsync directional transfer; dialed on demand by a
@@ -79,30 +66,21 @@ function serve(; host::String        = "0.0.0.0",
     add_worker_ws_routes!(srv, state)
 
     @info "BonitoTeam dashboard running" url=Bonito.online_url(srv, "") state=sd
-    @info "Worker install endpoint"      url="$base_url/install.sh"
+    @info "Worker install endpoint"      url="$base_url/install.jl"
     return state
 end
 
 # HTTP routes
 function add_install_routes!(srv::Bonito.Server, public_url::String, worker_secret::String)
-    Bonito.route!(srv, "/install.sh" => function(context)
+    Bonito.route!(srv, "/install.jl" => function(context)
         script = render_install_script(public_url, worker_secret)
         HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], body=script)
     end)
-    # Worker uninstaller. Same shape as /install.sh (curl-pipeable). The
-    # template has no placeholders to substitute today, but we keep the
-    # rendering hook so future flags (e.g. server-pinned PROJECTS_ROOT)
-    # have an obvious place to land.
-    Bonito.route!(srv, "/uninstall.sh" => function(context)
-        HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"],
-                      body = UNINSTALL_SCRIPT)
-    end)
-    Bonito.route!(srv, "/worker/bundle.tar.gz" => function(context)
-        bytes = build_worker_bundle()
-        HTTP.Response(200, ["Content-Type" => "application/gzip"], body=bytes)
-    end)
 end
 
+# Substitute the server URL + shared secret into the install.jl template. The
+# script guards against being run with the `{{ }}` placeholders intact, so a
+# raw fetch of assets/install.jl (bypassing this route) fails loudly.
 function render_install_script(public_url::String, worker_secret::String)
     replace(INSTALL_SCRIPT,
         "{{SERVER_URL}}"    => public_url,

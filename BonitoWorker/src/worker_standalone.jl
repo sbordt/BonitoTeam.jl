@@ -1,5 +1,8 @@
 #!/usr/bin/env julia
-# Standalone worker entry point. Outbound-only: dials the BonitoTeam server.
+# Standalone worker entry point for dev / env-driven setups. Outbound-only:
+# dials the BonitoTeam server. The normal install path is `install.jl` →
+# `BonitoWorker.install!` → `BonitoWorker.start()` (config from a Scratch
+# space); this script is the env-var alternative for the monorepo dev loop.
 #
 #   julia --project=<path>/BonitoWorker worker_standalone.jl
 #
@@ -10,9 +13,10 @@
 #                              "localhost" we fall back to "$USER-<short-id>"
 #                              so two installs don't collide on the dashboard)
 #   BONITOTEAM_PROJECTS_ROOT   default: ~/bonitoteam-projects
-#   BONITOTEAM_MCP_BIN         path to bonitoteam-mcp; reported to server for
-#                              MCPServer config when spawning claude-agent-acp
 #   CLAUDE_AGENT_ACP           path to claude-agent-acp; auto-detected via PATH
+#
+# The BonitoMCP launch command is derived automatically (`julia` + args against
+# the active project) — no env var or wrapper script needed.
 
 using BonitoWorker
 
@@ -30,8 +34,6 @@ BonitoWorker.connect_and_serve(;
     secret        = secret,
     worker_id     = worker_id,
     name          = get(ENV, "BONITOTEAM_WORKER_NAME", default_name),
-    mcp_path      = get(ENV, "BONITOTEAM_MCP_BIN",
-                        joinpath(get(ENV, "HOME", ""), ".local", "bin", "bonitoteam-mcp")),
     projects_root = get(ENV, "BONITOTEAM_PROJECTS_ROOT",
                         joinpath(get(ENV, "HOME", ""), "bonitoteam-projects")),
 )

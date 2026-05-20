@@ -42,7 +42,8 @@ function make_state(; n_projects::Int = 0, n_workers::Int = 0)
             nothing,                          # ssh_target
             "host-$i",                        # hostname
             "/home/agent",                    # home
-            "/usr/local/bin/bonitoteam-mcp",  # mcp_path
+            "/usr/bin/julia",                 # mcp_path (the julia binary)
+            ["--project=@bonito-team", "-e", "using BonitoMCP"],  # mcp_args
             "/tmp/worker-$i-projects",        # projects_root
             :offline,                         # status
             now(UTC))                         # last_check

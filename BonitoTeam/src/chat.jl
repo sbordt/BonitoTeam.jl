@@ -48,6 +48,18 @@ const TOOL_ICONS = Dict(
 
 tool_icon(kind) = get(TOOL_ICONS, kind, "⚙")
 
+# claude-agent-acp labels MCP tool calls with their raw wire name,
+# `mcp__<server>__<tool>` (e.g. `mcp__bonitoteam__bt_julia_eval`). That's
+# noise in the chat header — strip the `mcp__<server>__` prefix so the
+# header reads `bt_julia_eval`. Returns `(pretty_title, server)`; `server`
+# is "" for non-MCP tools. The non-greedy server capture stops at the
+# first `__`, so tool names keeping single underscores survive intact.
+function pretty_tool_title(title::AbstractString)
+    m = match(r"^mcp__(.+?)__(.+)$", title)
+    m === nothing && return (String(title), "")
+    return (String(m.captures[2]), String(m.captures[1]))
+end
+
 # Short summary shown on the collapsed tool header (before expand).
 # Per-kind summaries are tuned for at-a-glance comprehension:
 #   edit:   one file → "name · ±N lines";  many → "K files · ±N lines"
@@ -137,12 +149,16 @@ end
 # `chat_dir` is needed so we can read the persisted DiffContent from disk;
 # pass "" when no on-disk content is available (preview is then omitted).
 function tool_header_dict(m::ToolMsg, chat_dir::AbstractString = "")
+    pretty_title, server = pretty_tool_title(m.title)
     d = Dict{String,Any}(
         "type"    => "tool",
         "id"      => m.id,
         "kind"    => m.kind,
         "icon"    => tool_icon(m.kind),
-        "title"   => m.title,
+        "title"   => pretty_title,
+        # "" for non-MCP tools; the MCP server name otherwise so the JS
+        # header can show it as a dim prefix badge.
+        "server"  => server,
         "status"  => m.status,
         "summary" => m.summary,
     )
@@ -285,13 +301,20 @@ function monaco_readonly(text::AbstractString, lang::AbstractString)
     )
 end
 
-# Render a single tool-content text block. Three recognised shapes:
+# Console output (captured stdout / stderr / error backtraces) → a
+# `Bonito.RichText` terminal block: ANSI escape codes become styled spans
+# instead of literal `\e[31m` garbage, and the `terminal-output` class gives
+# monospace `pre-wrap`. Wrapped in `.bt-console` so the chat can size it.
+console_block(body::AbstractString) = DOM.div(Bonito.RichText(body); class = "bt-console")
+
+# Render a single tool-content text block. Recognised shapes:
 #  1. Fenced code (```lang\n...\n```)   → Monaco read-only with that language
-#  2. Eval section (label:\n<body>)      → labeled card + Monaco; emitted by
-#     BonitoMCP's bt_julia_eval which prefixes blocks with "stdout", "result",
-#     "error" so the chat can show them as distinct sections instead of one
-#     concatenated text dump.
-#  3. Mixed prose                        → Markdown.parse fallback.
+#  2. Eval section (label:\n<body>)      → labeled card; `result` is a Julia
+#     value repr → Monaco julia, the rest is console output → RichText.
+#     Emitted by BonitoMCP's bt_julia_eval, which prefixes blocks with
+#     "stdout" / "result" / "error".
+#  3. ANSI-bearing prose                 → RichText (terminal block).
+#  4. Mixed prose                        → Markdown.parse fallback.
 const EVAL_SECTION_LABELS = ("stdout", "stderr", "result", "error")
 
 function render_text_block(text::AbstractString)
@@ -304,15 +327,79 @@ function render_text_block(text::AbstractString)
     if m !== nothing
         label = String(m.captures[1])
         body  = String(m.captures[2])
-        # Result is a Julia value's repr → julia highlighting; everything else
-        # is unstructured text (stack traces, captured stdout, etc).
-        lang = label == "result" ? "julia" : "plaintext"
+        # `result` is a Julia value's repr → julia syntax highlighting.
+        # stdout / stderr / error are unstructured console output (captured
+        # prints, stack traces) → RichText so ANSI colors survive and the
+        # block stays a lightweight monospace pane, not a full editor.
+        rendered = label == "result" ?
+            monaco_readonly(body, "julia") : console_block(body)
         return DOM.div(
             DOM.div(uppercase(label); class = "bt-section-label"),
-            monaco_readonly(body, lang);
+            rendered;
             class = "bt-eval-section")
     end
+    # Raw console dump that didn't match a section label but still carries
+    # ANSI — render as a terminal block rather than letting Markdown.parse
+    # mangle the escape codes.
+    Bonito.has_ansi_codes(text) && return console_block(text)
     return DOM.div(Markdown.parse(text), class = "bt-tool-md")
+end
+
+# A native <details> collapsible for tool-body sub-sections. `label` is the
+# always-visible heading; `preview` (optional) is dim text shown next to it
+# while collapsed-or-open; `body` is the content. Open by default — an
+# already-expanded tool card should show everything without extra clicks;
+# the collapsible just lets the user fold away a long code block or a noisy
+# output to focus on the other.
+function tool_subsection(label::AbstractString, body;
+                          preview::AbstractString = "", open::Bool = true)
+    summary_kids = Any[DOM.span(label; class = "bt-subsection-label")]
+    isempty(preview) || push!(summary_kids,
+        DOM.span(preview; class = "bt-subsection-preview"))
+    return DOM.details(
+        DOM.summary(summary_kids...; class = "bt-subsection-summary"),
+        DOM.div(body; class = "bt-subsection-body");
+        class = "bt-subsection",
+        open  = open ? true : nothing)
+end
+
+# bt_julia_eval tool bodies: a ```julia code echo followed by stdout / result
+# / error sections. Render as two collapsibles — "Code" (Monaco julia, same
+# read-only editor the `read` file tool uses) and "Output" (the eval-section
+# stack). Returns `nothing` if `content` isn't eval-shaped so the caller
+# falls through to the generic renderer.
+function render_eval_body(content)
+    isempty(content) && return nothing
+    code = nothing
+    rest = []
+    for c in content
+        if c isa TextContent && code === nothing
+            m = match(r"^\s*```julia\r?\n(.*?)\r?\n```\s*$"s, c.text)
+            if m !== nothing
+                code = String(m.captures[1])
+                continue
+            end
+        end
+        if c isa TextContent
+            push!(rest, render_text_block(c.text))
+        elseif c isa DiffContent
+            push!(rest, render_diff_block(c))
+        elseif c isa ImageContent
+            push!(rest, DOM.img(src = "data:$(c.mime_type);base64,$(c.data)",
+                                 style = Styles("max-width" => "100%")))
+        end
+    end
+    code === nothing && return nothing   # not eval-shaped — let caller handle it
+    # `split` always yields ≥1 element (even for ""), so `first` is safe.
+    first_line = strip(first(split(code, '\n')))
+    code_preview = length(first_line) > 60 ?
+        SubString(first_line, 1, prevind(first_line, 60)) * "…" : first_line
+    code_section = tool_subsection("Code", monaco_readonly(code, "julia");
+                                    preview = code_preview)
+    output_section = isempty(rest) ?
+        tool_subsection("Output", DOM.div("(no output)"; class = "bt-tool-empty")) :
+        tool_subsection("Output", DOM.div(rest...))
+    return DOM.div(code_section, output_section; class = "bt-eval-body")
 end
 
 # Load the persisted ACP params for `tool_id` and parse the content array back
@@ -504,6 +591,13 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
         body = render_show_reference(state, show_text, cwd, project_id)
         body === nothing || return body
     end
+
+    # bt_julia_eval: `\`\`\`julia` code echo + stdout/result/error sections →
+    # two collapsibles (Code / Output). Checked before the kind dispatch so
+    # it works regardless of what `kind` claude-agent-acp tagged the MCP
+    # tool with — the content shape is the reliable signal.
+    eval_body = render_eval_body(content)
+    eval_body === nothing || return eval_body
 
     if m.kind == "edit"
         # Render every diff (multi-edit calls used to silently drop all but
@@ -837,8 +931,10 @@ function chat_on_tool_update!(model::ChatModel, upd::ToolCallUpdateNotif)
     upd.status !== nothing && (m.status = upd.status)
     upd.title  !== nothing && (m.title  = upd.title)
     isempty(upd.content) || (m.summary = content_summary(m.kind, upd.content))
+    pretty_title, _ = pretty_tool_title(m.title)
     chat_emit(model, Dict{String,Any}("type" => "tool_update",
-        "id" => m.id, "status" => m.status, "title" => m.title, "summary" => m.summary))
+        "id" => m.id, "status" => m.status, "title" => pretty_title,
+        "summary" => m.summary))
     m.status in ("completed", "failed") && append_tool(model.chat_session, m)
 end
 

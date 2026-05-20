@@ -8,16 +8,23 @@ module BonitoWorker
 # Single port to open is on the server (8038), already needed for browsers.
 
 using HTTP, HTTP.WebSockets, JSON, RemoteSync
+using Scratch: @get_scratch!
 
-# Stable per-install identity for this worker. Generated once and persisted to
-# `~/.local/share/bonitoteam-worker/worker_id` so the server can recognise the
-# same physical install across hostname/IP changes (DHCP renew, VPN flip,
-# laptop carried between Wi-Fi networks). The display name is just a label —
-# this id is the dict key on the server.
-function worker_id_path()
-    base = get(ENV, "XDG_DATA_HOME", joinpath(get(ENV, "HOME", ""), ".local", "share"))
-    return joinpath(base, "bonitoteam-worker", "worker_id")
-end
+# Per-install config directory, managed by Scratch.jl. Resolves to
+# `~/.julia/scratchspaces/<BonitoWorker-uuid>/config/` on every OS, so we get
+# a writable, cross-platform location without poking at `XDG_DATA_HOME` /
+# `HOME` / `%APPDATA%` ourselves. Holds the stable `worker_id`, the install
+# `config.json`, and the detached worker's `worker.log`.
+config_dir() = @get_scratch!("config")
+
+# Stable per-install identity for this worker. Generated once and persisted so
+# the server can recognise the same physical install across hostname/IP
+# changes (DHCP renew, VPN flip, laptop carried between Wi-Fi networks). The
+# display name is just a label — this id is the dict key on the server.
+worker_id_path() = joinpath(config_dir(), "worker_id")
+
+# Install config written by `install!` and read back by `start`.
+config_path() = joinpath(config_dir(), "config.json")
 
 # UUIDv4-shaped identifier built from `hash(time_ns(), gethostname(), pid())`.
 # We deliberately avoid pulling in the Random or UUIDs stdlibs here — adding
@@ -66,10 +73,103 @@ function default_worker_name(worker_id::String)
     return "$(user)-$(first(worker_id, 4))"
 end
 
+# ── BonitoMCP launch config ────────────────────────────────────────────────────
+# The BonitoMCP stdio server is launched by claude-agent-acp as a plain
+# `julia <args…>` process — no shell wrapper script. That's what makes it
+# cross-platform: a `.sh`/`.cmd` wrapper would need an OS-specific variant,
+# but `julia` + an argv array runs identically on Linux/macOS/Windows.
+#
+# `julia_bin()` resolves the current interpreter; `Base.active_project()` is
+# whatever env this worker itself runs in (the shared `@bonito-team` after a
+# normal install, or the monorepo project in dev) — BonitoMCP is co-installed
+# there, so the MCP process resolves it without any extra setup.
+julia_bin() = joinpath(Sys.BINDIR::String, Base.julia_exename())
+
+function mcp_args()
+    project = something(Base.active_project(), "@bonito-team")
+    return String[
+        "--project=$(project)",
+        "--startup-file=no",
+        "--threads=auto",
+        "-e", "using BonitoMCP; BonitoMCP.run_stdio()",
+    ]
+end
+
+# ── Install / start ────────────────────────────────────────────────────────────
+"""
+    BonitoWorker.install!(; server_url, secret, projects_root = pwd())
+
+Persist the worker config into the Scratch config space and launch the worker
+process detached. Called at the end of `install.jl`; also the entry point for
+re-pointing an existing install at a different server (just re-run it).
+"""
+function install!(; server_url::String,
+                    secret::String,
+                    projects_root::String = pwd())
+    worker_id = load_or_generate_worker_id()
+    config = Dict(
+        "server_url"    => server_url,
+        "secret"        => secret,
+        "name"          => default_worker_name(worker_id),
+        "projects_root" => abspath(projects_root),
+    )
+    cfg = config_path()
+    write(cfg, JSON.json(config))
+    @info "BonitoWorker: wrote config" path=cfg server_url projects_root=config["projects_root"]
+    proc, logfile = spawn_worker()
+    println()
+    println("==> BonitoTeam worker started (pid $(getpid(proc)))")
+    println("    config : ", cfg)
+    println("    log    : ", logfile)
+    println("    server : ", server_url)
+    println()
+    println("    The worker runs detached and survives this shell. To start it")
+    println("    again later (e.g. after a reboot), run:")
+    println()
+    println("      julia --project=@bonito-team -e \"using BonitoWorker; BonitoWorker.start()\"")
+    println()
+    return proc
+end
+
+# Launch `BonitoWorker.start()` as a detached background process so it outlives
+# the installer (the `curl … | julia -` pipe exits as soon as install.jl
+# returns). `detach` makes the child independent of the parent process group on
+# every OS; stdout+stderr append to `worker.log` in the config dir.
+function spawn_worker()
+    logfile = joinpath(config_dir(), "worker.log")
+    project = something(Base.active_project(), "@bonito-team")
+    cmd = `$(julia_bin()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`
+    proc = run(pipeline(detach(cmd); stdout = logfile, stderr = logfile, append = true);
+               wait = false)
+    return proc, logfile
+end
+
+"""
+    BonitoWorker.start()
+
+Read the install config written by `install!` and connect to the server.
+Blocks forever (reconnecting on drop). This is the worker process entry point.
+"""
+function start()
+    cfg = config_path()
+    isfile(cfg) || error("BonitoWorker: no config at $cfg — run the installer first " *
+                          "(`curl -fsSL <server-url>/install.jl | julia -`)")
+    config = JSON.parse(read(cfg, String))
+    worker_id = load_or_generate_worker_id()
+    connect_and_serve(;
+        server_url    = String(config["server_url"]),
+        secret        = String(config["secret"]),
+        worker_id     = worker_id,
+        name          = String(get(config, "name", default_worker_name(worker_id))),
+        projects_root = String(get(config, "projects_root", pwd())),
+    )
+end
+
 # Public entry
 """
-    BonitoWorker.connect_and_serve(; server_url, secret, name, mcp_path,
-                                   projects_root, agent_bin, retry_delay = 5.0)
+    BonitoWorker.connect_and_serve(; server_url, secret, name, projects_root,
+                                   mcp_command, mcp_args, agent_bin,
+                                   retry_delay = 5.0)
 
 Open a control WS to `server_url/worker-ws`, send the hello frame, then loop
 on commands. Reconnects with `retry_delay` between attempts. Blocks forever.
@@ -77,15 +177,16 @@ on commands. Reconnects with `retry_delay` between attempts. Blocks forever.
 function connect_and_serve(; server_url::String,
                             secret::String,
                             worker_id::String     = load_or_generate_worker_id(),
-                            name::String         = default_worker_name(worker_id),
-                            mcp_path::String     = "",
+                            name::String          = default_worker_name(worker_id),
+                            mcp_command::String   = julia_bin(),
+                            mcp_arguments::Vector{String} = mcp_args(),
                             projects_root::String = joinpath(get(ENV, "HOME", ""), "bonitoteam-projects"),
                             agent_bin::String     = find_agent_bin(),
                             retry_delay::Real     = 5.0)
     while true
         try
-            run_control_session(; server_url, secret, worker_id, name, mcp_path,
-                                  projects_root, agent_bin)
+            run_control_session(; server_url, secret, worker_id, name, mcp_command,
+                                  mcp_arguments, projects_root, agent_bin)
         catch e
             e isa InterruptException && rethrow()
             @error "BonitoWorker: control session crashed; reconnecting" exception=(e, catch_backtrace())
@@ -96,8 +197,8 @@ function connect_and_serve(; server_url::String,
 end
 
 # Control WS lifecycle
-function run_control_session(; server_url, secret, worker_id, name, mcp_path,
-                               projects_root, agent_bin)
+function run_control_session(; server_url, secret, worker_id, name, mcp_command,
+                               mcp_arguments, projects_root, agent_bin)
     control_url = ws_url(server_url, "/worker-ws")
     @info "BonitoWorker: connecting to control WS" control_url worker_id name
     WebSockets.open(control_url) do ws
@@ -109,7 +210,8 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_path,
             "hostname"      => gethostname(),
             "username"      => get(ENV, "USER", ""),
             "home"          => get(ENV, "HOME", ""),
-            "mcp_path"      => mcp_path,
+            "mcp_path"      => mcp_command,
+            "mcp_args"      => mcp_arguments,
             "projects_root" => projects_root,
         )))
 

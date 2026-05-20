@@ -5,14 +5,17 @@ isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
 state = TH.make_state(; n_workers = 1, n_projects = 1)
 
-# Script: three agent_message_chunk events ("Hello, ", "**world**", "!"), with
-# small delays so the JS side has time to apply each chunk before the next.
-# Final result should be a single agent bubble, with `<strong>world</strong>`
-# in the rendered HTML once the prompt completes.
+# Script: a markdown document streamed as agent_message_chunk events, split
+# at awkward boundaries (mid-word, mid-`\n\n`) so we exercise newline-safe
+# accumulation. The doc has a heading, two paragraphs, bold text, and a
+# table — finalize must turn this into STRUCTURED html (`<h2>`, `<p>`,
+# `<table>`), not a run-on blob.
 scripted = [
-    (0.05, TH.agent_chunk_update("Hello, ")),
-    (0.05, TH.agent_chunk_update("**world**")),
-    (0.05, TH.agent_chunk_update("!")),
+    (0.05, TH.agent_chunk_update("## Build sum")),
+    (0.05, TH.agent_chunk_update("mary\n\nThe pipeline ran with **bo")),
+    (0.05, TH.agent_chunk_update("ld** success.\n\nGenerated files:\n\n| File |")),
+    (0.05, TH.agent_chunk_update(" Size |\n|------|------|\n| a.png | 2.5 MB |")),
+    (0.05, TH.agent_chunk_update("\n| b.png | 1.9 MB |\n\nDone.")),
 ]
 
 let proj = state.projects[]["p-1"]
@@ -53,30 +56,65 @@ try
                @TH.test_true TH.wait_for(ctx,
                    "document.querySelectorAll('.bt-agent-msg').length >= 1";
                    timeout = 5.0))
-        # All three chunks accumulate into the SAME bubble — assert by waiting
-        # for the full text "Hello, **world**!" to be present (rendered as raw
-        # text during streaming, before the agent_final swap to markdown).
-        record("all three chunks landed in one bubble",
+        # All chunks accumulate into the SAME bubble — assert by waiting for
+        # text from the first and last chunk to coexist in one bubble.
+        record("all chunks landed in one bubble",
                @TH.test_true TH.wait_for(ctx, """
                    (() => {
                        const bubbles = document.querySelectorAll('.bt-agent-msg');
                        if (bubbles.length !== 1) return false;
                        const t = bubbles[0].innerText;
-                       return t.indexOf('Hello,') !== -1 && t.indexOf('world') !== -1 && t.indexOf('!') !== -1;
+                       return t.indexOf('Build summary') !== -1 && t.indexOf('Done.') !== -1;
                    })()
                """; timeout = 5.0))
+        # The streaming bubble's text span must preserve newlines — without
+        # `white-space: pre-wrap` on `.bt-stream-text` the markdown collapses
+        # to one run-on line until finalize. Check the CSS rule is live.
+        record("stream-text preserves newlines (white-space: pre-wrap)",
+               @TH.test_true TH.eval_js(ctx, """
+                   (() => {
+                       for (const sheet of document.styleSheets) {
+                           let rules; try { rules = sheet.cssRules; } catch(e) { continue; }
+                           if (!rules) continue;
+                           for (const r of rules) {
+                               if (r.selectorText === '.bt-stream-text' &&
+                                   /pre-wrap/.test(r.style.whiteSpace)) return true;
+                           }
+                       }
+                       return false;
+                   })()
+               """))
     end
 
-    TH.section("agent_final swaps in rendered markdown") do
-        # The final event runs Markdown.parse on the accumulated text, so
-        # `**world**` becomes `<strong>world</strong>`. Wait for it.
-        record("strong tag appears",
-               @TH.test_true TH.wait_for(ctx, """
-                   (() => {
-                       const b = document.querySelector('.bt-agent-msg');
-                       return b && b.innerHTML.indexOf('<strong>world</strong>') !== -1;
-                   })()
-               """; timeout = 5.0))
+    TH.section("agent_final swaps in STRUCTURED markdown") do
+        # finalize runs Markdown.parse on the accumulated text. The result
+        # must be real block structure — `<strong>`, `<h2>`, a `<table>`,
+        # and ≥2 `<p>` — NOT a run-on paragraph. This is the regression
+        # guard for "markdown sometimes has no line breaks".
+        @assert TH.wait_for(ctx, """
+            (() => {
+                const b = document.querySelector('.bt-agent-msg');
+                return b && b.innerHTML.indexOf('<strong>bold</strong>') !== -1;
+            })()
+        """; timeout = 5.0) "agent_final didn't render markdown"
+        structure = TH.eval_js(ctx, """
+            (() => {
+                const b = document.querySelector('.bt-agent-msg');
+                return {
+                    has_h2:     b.querySelector('h2') !== null,
+                    has_table:  b.querySelector('table') !== null,
+                    table_rows: b.querySelectorAll('table tr').length,
+                    n_paras:    b.querySelectorAll('p').length,
+                    has_strong: b.querySelector('strong') !== null,
+                };
+            })()
+        """)
+        record("heading rendered as <h2>",        @TH.test_true structure["has_h2"])
+        record("bold rendered as <strong>",       @TH.test_true structure["has_strong"])
+        record("table rendered as <table>",       @TH.test_true structure["has_table"])
+        record("table has 3 rows (header + 2)",   @TH.test_eq structure["table_rows"] 3)
+        record("paragraphs are separate blocks",
+               @TH.test_true (structure["n_paras"] >= 2))
     end
 
     TH.section("Busy indicator clears at end_turn") do

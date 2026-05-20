@@ -338,8 +338,11 @@ function ensure_project_session!(state::ServerState, p::ProjectInfo;
 
     claim_project!(state, p, w.worker_id)
 
+    # The worker reports its BonitoMCP launch as a `julia` binary (`mcp_path`)
+    # plus an argv array (`mcp_args`) — no shell wrapper, so it's identical on
+    # Windows. claude-agent-acp spawns `command + args` directly.
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
-        [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path)]
+        [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path; args = w.mcp_args)]
 
     # The transport carries everything start_session needs — including the
     # `resume_session_id` so the worker bring-up path uses session/load
@@ -2033,8 +2036,10 @@ function dashboard_dom(state::ServerState;
     # The "no workers" install-instructions block lives as a sibling that
     # toggles visibility based on workers-empty. Keeps the install snippet
     # out of every render's hot path.
-    install_url   = "$(public_url_or_default())/install.sh"
-    install_cmd   = "curl -fsSL $install_url | sh"
+    # Cross-platform: the installer is a Julia script piped into `julia`.
+    # Windows 10 1803+ ships curl.exe, so the exact one-liner works there too.
+    install_url   = "$(public_url_or_default())/install.jl"
+    install_cmd   = "curl -fsSL $install_url | julia -"
     no_workers_block = DOM.div(
         DOM.div("No workers connected yet.";
                 style = Styles("color" => "var(--bt-text-muted)",

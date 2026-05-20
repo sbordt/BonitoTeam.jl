@@ -7,6 +7,7 @@ version = "0.1.0"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 RemoteSync = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
+Scratch = "6c6a2e73-6563-6170-7368-637461726353"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 
 [sources]
@@ -15,4 +16,5 @@ RemoteSync = {path = "../RemoteSync"}
 [compat]
 HTTP = "1"
 JSON = "0.21, 1"
+Scratch = "1"
 julia = "1.10"

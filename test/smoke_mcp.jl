@@ -2,8 +2,8 @@
 #
 # Smoke test for the BonitoTeam.MCP server. Two layers:
 #   1. In-process: dispatch! against a IOBuffer, verify response shapes
-#   2. Subprocess: spawn `bin/bonitoteam-mcp`, drive it over stdio with JSON-RPC,
-#      verify a real round-trip works
+#   2. Subprocess: spawn `julia -e 'using BonitoMCP; BonitoMCP.run_stdio()'`,
+#      drive it over stdio with JSON-RPC, verify a real round-trip works
 #
 # Run via:
 #   julia_eval(include("BonitoTeam/test/smoke_mcp.jl"))
@@ -135,8 +135,11 @@ end
 
 # Test 9: subprocess end-to-end
 function test_subprocess()
-    bin = joinpath(@__DIR__, "..", "bin", "bonitoteam-mcp")
-    proc = open(`$bin`, "r+")
+    # Launch BonitoMCP the same way the worker does: a plain `julia` process
+    # with an argv array (no shell wrapper — cross-platform).
+    julia = joinpath(Sys.BINDIR, Base.julia_exename())
+    project = something(Base.active_project(), Base.load_path_expand("@bonito-team"))
+    proc = open(`$julia --project=$project --startup-file=no -e $("using BonitoMCP; BonitoMCP.run_stdio()")`, "r+")
     try
         # initialize
         write(proc.in, JSON.json(Dict("jsonrpc"=>"2.0", "id"=>1, "method"=>"initialize",

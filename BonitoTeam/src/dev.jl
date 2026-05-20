@@ -87,7 +87,8 @@ function dev_server(; port::Union{Int,Nothing} = nothing,
             secret        = secret,
             worker_id     = worker_id,
             name          = name,
-            mcp_path      = "",
+            mcp_command   = BonitoWorker.julia_bin(),
+            mcp_arguments = BonitoWorker.mcp_args(),
             projects_root = worker_root,
             agent_bin     = BonitoWorker.find_agent_bin())
     catch e

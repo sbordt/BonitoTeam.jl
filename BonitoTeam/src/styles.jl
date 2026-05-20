@@ -188,6 +188,12 @@ const ChatStyles = Bonito.Styles(
         "word-break" => "break-word",
         "box-shadow" => "var(--bt-shadow-sm)"),
 
+    # While a bubble streams we show the raw text (markdown isn't parsed
+    # until finalize). `pre-wrap` keeps the agent's newlines visible —
+    # without it `white-space: normal` collapses every `\n` to a space and
+    # the whole message renders as one run-on paragraph until finalize.
+    CSS(".bt-stream-text",
+        "white-space" => "pre-wrap", "word-break" => "break-word"),
     # Streaming cursor blink
     CSS(".bt-stream-text::after",
         "content" => "\"▋\"",
@@ -259,15 +265,24 @@ const ChatStyles = Bonito.Styles(
         "transition" => "background 80ms"),
     CSS(".bt-tool-header:hover",
         "background" => "var(--bt-surface-2)"),
+    # The expand/collapse glyph (`▶` / `▼`) is swapped directly in JS
+    # (wireToolToggle). No `transform: rotate()` here — rotating the
+    # already-swapped `▼` produced a sideways arrow.
     CSS(".bt-tool-toggle",
         "color" => "var(--bt-text-faint)", "font-size" => "11px",
-        "transition" => "transform 120ms",
         "flex-shrink" => "0",
         "width" => "10px"),
-    CSS(".bt-tool-header[data-expanded=\"true\"] .bt-tool-toggle",
-        "transform" => "rotate(90deg)"),
     CSS(".bt-tool-kind",
         "font-size" => "13px", "flex-shrink" => "0"),
+    # MCP server badge — dim pill before the tool name (e.g. "bonitoteam").
+    CSS(".bt-tool-server",
+        "flex-shrink" => "0",
+        "font-size" => "10.5px", "font-weight" => "600",
+        "letter-spacing" => "0.02em",
+        "color" => "var(--bt-text-faint)",
+        "background" => "var(--bt-surface-2)",
+        "border-radius" => "999px",
+        "padding" => "1px 7px"),
     CSS(".bt-tool-title",
         "flex" => "1 1 auto", "min-width" => "0",
         "font-family" => "ui-monospace, monospace", "font-size" => "12px",
@@ -319,6 +334,61 @@ const ChatStyles = Bonito.Styles(
         "margin-top" => "4px"),
     CSS(".bt-eval-section:first-child .bt-section-label",
         "margin-top" => "8px"),
+
+    # Tool-body sub-section collapsibles (`<details>`). Used by bt_julia_eval
+    # bodies to split Code / Output into two independently foldable blocks.
+    # The disclosure marker is a `::before` glyph swapped on `[open]` — a
+    # content swap, never a `transform: rotate()` (that compounds badly and
+    # is unreliable in the offscreen renderer; see the tool-toggle fix).
+    CSS(".bt-eval-body",
+        "display" => "flex", "flex-direction" => "column", "gap" => "6px",
+        "padding-top" => "4px"),
+    CSS(".bt-subsection",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "overflow" => "hidden"),
+    CSS(".bt-subsection-summary",
+        "display" => "flex", "align-items" => "baseline", "gap" => "8px",
+        "padding" => "6px 10px",
+        "cursor" => "pointer", "user-select" => "none",
+        "list-style" => "none",
+        "background" => "var(--bt-surface-2)"),
+    CSS(".bt-subsection-summary::-webkit-details-marker", "display" => "none"),
+    CSS(".bt-subsection-summary::before",
+        "content" => "\"▸\"",
+        "color" => "var(--bt-text-faint)", "font-size" => "10px",
+        "flex-shrink" => "0"),
+    CSS("details.bt-subsection[open] > .bt-subsection-summary::before",
+        "content" => "\"▾\""),
+    CSS(".bt-subsection-summary:hover",
+        "background" => "var(--bt-surface)"),
+    CSS(".bt-subsection-label",
+        "font-size" => "11px", "font-weight" => "600",
+        "letter-spacing" => "0.04em", "text-transform" => "uppercase",
+        "color" => "var(--bt-text-muted)", "flex-shrink" => "0"),
+    CSS(".bt-subsection-preview",
+        "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
+        "font-size" => "11.5px",
+        "color" => "var(--bt-text-faint)",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "white-space" => "nowrap", "min-width" => "0"),
+    CSS(".bt-subsection-body",
+        "padding" => "8px 10px"),
+
+    # Console block — wraps a `Bonito.RichText` terminal pane (ANSI → styled
+    # HTML). Captured stdout / stderr / error backtraces render here instead
+    # of in a Monaco editor: lighter, ANSI-aware, scrolls on overflow.
+    CSS(".bt-console",
+        "background" => "var(--bt-surface-2)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "padding" => "8px 10px",
+        "max-height" => "360px",
+        "overflow" => "auto"),
+    CSS(".bt-console .terminal-output",
+        "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
+        "font-size" => "12px", "line-height" => "1.5",
+        "margin" => "0"),
 
     # ── Edit-tool inline preview ─────────────────────────────────────────────
     # Server-rendered diff snippet between the tool header and the lazy body.

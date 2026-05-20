@@ -499,10 +499,15 @@ class BonitoChat {
         const statusCls = `bt-tool-status bt-status-${msg.status || 'pending'}`;
         const preview   = msg.preview ?
             `<div class="bt-edit-preview">${msg.preview}</div>` : '';
+        // MCP tools carry a `server` (e.g. "bonitoteam"); show it as a dim
+        // badge before the (already prefix-stripped) tool name.
+        const server = msg.server ?
+            `<span class="bt-tool-server">${escapeHTML(msg.server)}</span>` : '';
         return `
             <div class="bt-tool-header" data-expanded="false">
                 <span class="bt-tool-toggle">▶</span>
                 <span class="bt-tool-kind">${msg.icon || '⚙'}</span>
+                ${server}
                 <span class="bt-tool-title">${escapeHTML(msg.title || '')}</span>
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
@@ -518,6 +523,11 @@ class BonitoChat {
         if (!header || !body) return;
         header.style.cursor = 'pointer';
         header.addEventListener('click', () => {
+            // The glyph is swapped directly (`▶` ↔ `▼`) — a plain
+            // textContent change that works in every renderer. There is
+            // NO CSS `transform: rotate()` on `.bt-tool-toggle`: the old
+            // code rotated the glyph 90° *as well as* swapping it, so the
+            // expanded `▼` came out sideways (looked like a small `◀`).
             const expanded = header.dataset.expanded === 'true';
             if (expanded) {
                 body.innerHTML = '';

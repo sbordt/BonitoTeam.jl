@@ -21,15 +21,16 @@ let s = BonitoTeam.ServerState(;
         worker_secret = "rt-secret")
 
     # Two workers in distinct states. WorkerInfo: (worker_id, name, url,
-    # secret, ssh_target, hostname, home, mcp_path, projects_root, status,
-    # last_check) — worker_id is the stable UUID, name is the display label.
+    # secret, ssh_target, hostname, home, mcp_path, mcp_args, projects_root,
+    # status, last_check) — worker_id is the stable UUID, name is the label.
     s.workers[]["alpha"] = BonitoTeam.WorkerInfo(
         "alpha", "alpha", "ws://a.example", "rt-secret", nothing,
-        "alpha-host", "/home/agent", "/usr/local/bin/bonitoteam-mcp",
+        "alpha-host", "/home/agent", "/usr/local/bin/julia",
+        ["--project=@bonito-team", "-e", "using BonitoMCP"],
         "/var/projects", :online, now(UTC))
     s.workers[]["beta"] = BonitoTeam.WorkerInfo(
         "beta", "beta", "ws://b.example", "rt-secret", "agent@b.host",
-        "beta-host", "/home/sim",   "/opt/bin/bonitoteam-mcp",
+        "beta-host", "/home/sim",   "/opt/bin/julia", String[],
         "/srv/projects",            :offline, now(UTC))
 
     # Three projects covering the persisted backup_status variants. Locks
@@ -74,7 +75,8 @@ TH.section("Workers round-tripped") do
         a = s2.workers[]["alpha"]
         record("alpha hostname",      @TH.test_eq a.hostname      "alpha-host")
         record("alpha home",          @TH.test_eq a.home          "/home/agent")
-        record("alpha mcp_path",      @TH.test_eq a.mcp_path      "/usr/local/bin/bonitoteam-mcp")
+        record("alpha mcp_path",      @TH.test_eq a.mcp_path      "/usr/local/bin/julia")
+        record("alpha mcp_args",      @TH.test_eq a.mcp_args ["--project=@bonito-team", "-e", "using BonitoMCP"])
         record("alpha projects_root", @TH.test_eq a.projects_root "/var/projects")
         # status is runtime-only → load resets to :unknown.
         record("alpha status reset to :unknown on load",

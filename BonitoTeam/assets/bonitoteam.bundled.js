@@ -412,10 +412,12 @@ class BonitoChat {
     toolHTML(msg) {
         const statusCls = `bt-tool-status bt-status-${msg.status || 'pending'}`;
         const preview = msg.preview ? `<div class="bt-edit-preview">${msg.preview}</div>` : '';
+        const server = msg.server ? `<span class="bt-tool-server">${escapeHTML(msg.server)}</span>` : '';
         return `
             <div class="bt-tool-header" data-expanded="false">
                 <span class="bt-tool-toggle">▶</span>
                 <span class="bt-tool-kind">${msg.icon || '⚙'}</span>
+                ${server}
                 <span class="bt-tool-title">${escapeHTML(msg.title || '')}</span>
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>

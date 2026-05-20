@@ -5,10 +5,9 @@ module BonitoMCP
 # Protocol: Model Context Protocol 2025-06-18 over stdio with JSON-RPC 2.0.
 # Spec mirror: docs/external/mcp-spec-*.md
 #
-# Run:
-#   julia --project=BonitoMCP -e 'using BonitoMCP; BonitoMCP.run_stdio()'
-# or via the wrapper script:
-#   BonitoMCP/bin/bonitoteam-mcp
+# Run (this is exactly how the BonitoTeam worker launches it — a plain
+# `julia` process with an argv array, no shell wrapper, cross-platform):
+#   julia --project=@bonito-team -e 'using BonitoMCP; BonitoMCP.run_stdio()'
 
 using JSON
 

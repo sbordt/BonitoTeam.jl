@@ -289,7 +289,7 @@ Single-page app: sidebar on the left, dashboard or chat in the main area
 depending on `current_view`. Replaces the old per-project `/p/<id>` routes.
 """
 function unified_app(state::ServerState)
-    App() do session
+    App(; title = "BonitoTeam") do session
         # Per-session view of the shared state. `copy(state, session)` shares
         # the workers/projects/chat_models tables and the lock, but gives this
         # session its OWN connected child of each version Observable (via

@@ -11,8 +11,6 @@ Self-hosted multi-host orchestrator for agentic coding sessions. Architecture:
 BonitoTeam/
 ├── Project.toml                # Package deps
 ├── README.md                   # this file
-├── bin/
-│   └── bonitoteam-mcp          # standalone wrapper for Claude Code MCP config
 ├── src/
 │   ├── BonitoTeam.jl           # umbrella module
 │   └── MCP/                    # Julia stdio MCP server
@@ -46,11 +44,16 @@ After `Pkg.instantiate`, add this to Claude Code's MCP config (e.g. project-leve
 {
   "mcpServers": {
     "bonitoteam": {
-      "command": "/sim/Programmieren/ClaudeExperiments/BonitoTeam/bin/bonitoteam-mcp"
+      "command": "julia",
+      "args": ["--project=@bonito-team", "--startup-file=no",
+               "-e", "using BonitoMCP; BonitoMCP.run_stdio()"]
     }
   }
 }
 ```
+
+The server is a plain `julia` process with an argv array — no shell wrapper,
+so the same config works on Linux, macOS and Windows.
 
 Tools exposed (Milestone 2 set):
 

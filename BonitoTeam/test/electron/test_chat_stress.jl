@@ -96,7 +96,7 @@ function fresh_state(project_ids::Vector{String})
         working_dir   = mktempdir())
 
     state.workers[]["w1"] = BonitoTeam.WorkerInfo("w1", "Tester", "<inbound-ws>",
-        "x", nothing, "h", "/h", "", "/p", :online, now(UTC))
+        "x", nothing, "h", "/h", "", String[], "/p", :online, now(UTC))
     notify(state.workers)
     models = Dict{String, BonitoTeam.ChatModel}()
     for pid in project_ids

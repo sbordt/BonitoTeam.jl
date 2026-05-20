@@ -21,7 +21,8 @@ mutable struct WorkerInfo
     # discovered via probe
     hostname::String
     home::String
-    mcp_path::String                   # path on worker, used for MCPServer config
+    mcp_path::String                   # MCP launch command on worker (the julia binary)
+    mcp_args::Vector{String}           # MCP launch args on worker (--project=…, -e …)
     projects_root::String              # rsync destination root on worker
     # runtime
     status::Symbol                     # :unknown, :online, :offline
@@ -260,7 +261,8 @@ function save_workers!(s::ServerState)
                  "name" => w.name, "url" => w.url, "secret" => w.secret,
                  "ssh_target" => w.ssh_target,
                  "hostname" => w.hostname, "home" => w.home,
-                 "mcp_path" => w.mcp_path, "projects_root" => w.projects_root)
+                 "mcp_path" => w.mcp_path, "mcp_args" => w.mcp_args,
+                 "projects_root" => w.projects_root)
             for w in values(s.workers[])]
     atomic_write_json(workers_file(s), data)
 end
@@ -279,7 +281,9 @@ function load_workers!(s::ServerState)
             w = WorkerInfo(wid, d["name"], d["url"], d["secret"],
                            get(d, "ssh_target", nothing),
                            get(d, "hostname", ""), get(d, "home", ""),
-                           get(d, "mcp_path", ""), get(d, "projects_root", ""),
+                           get(d, "mcp_path", ""),
+                           Vector{String}(get(d, "mcp_args", String[])),
+                           get(d, "projects_root", ""),
                            :unknown, now(UTC))
             s.workers[][wid] = w
         catch e

@@ -121,6 +121,7 @@ function handle_worker_control(state::ServerState, ws)
             String(get(hello, "hostname", "")),
             String(get(hello, "home", "")),
             String(get(hello, "mcp_path", "")),
+            Vector{String}(get(hello, "mcp_args", String[])),
             String(get(hello, "projects_root", "")),
             :online,
             now(UTC),

@@ -206,70 +206,83 @@ function append_plan(session::ChatSession, msg::PlanMsg)
     end
 end
 
-# Load history from file
+# Load history from file.
+#
+# chat.md is hand-written by the `append_*` / `finalize_*` writers above in a
+# fixed shape: a `+++` TOML front-matter block, then a sequence of admonition
+# blocks — a `!!! <category> "<title>"` header followed by the body with every
+# line indented 4 spaces. We parse it BY HAND rather than via CommonMark:
+# CommonMark would re-parse each body as markdown, and reconstructing text
+# from that AST is lossy (paragraph breaks, headings and tables all collapse —
+# only inline `code` survives). The body is literally the message text + a
+# 4-space indent, so the faithful inverse is just to strip the indent.
 function load_history(session::ChatSession)::Vector{ChatMsg}
     isfile(session.path) || return ChatMsg[]
-    src = read(session.path, String)
+    lines = split(read(session.path, String), '\n')
+    n = length(lines)
 
-    parser = CM.Parser()
-    CM.enable!(parser, CM.FrontMatterRule(toml=TOML.parse))
-    CM.enable!(parser, CM.AdmonitionRule())
-    ast = parser(src)
+    i = 1
+    # Skip the +++ front-matter block (parsed separately by parse_session_meta).
+    if i <= n && strip(lines[i]) == "+++"
+        i += 1
+        while i <= n && strip(lines[i]) != "+++"
+            i += 1
+        end
+        i <= n && (i += 1)   # step past the closing +++
+    end
 
     msgs = ChatMsg[]
-    for (node, entering) in ast
-        (node.t isa CM.Admonition && entering) || continue
-        cat  = node.t.category   # "user", "assistant", "tool", "plan"
-        body = admonition_text(node)
+    # Admonition header: `!!! <category>` with an optional `"<title>"`.
+    header = r"^!!! (\w+)(?:\s+\"(.*)\")?\s*$"
+    while i <= n
+        h = match(header, lines[i])
+        if h === nothing
+            i += 1
+            continue
+        end
+        category = h.captures[1]
+        title    = h.captures[2] === nothing ? "" : String(h.captures[2])
+        i += 1
+        # Body runs until the next admonition header (or EOF). Indented lines
+        # are dedented by 4; blank lines are kept verbatim so paragraph breaks
+        # survive. `strip` at the end drops the trailing separator blank.
+        body_lines = String[]
+        while i <= n && match(header, lines[i]) === nothing
+            ln = lines[i]
+            push!(body_lines, startswith(ln, "    ") ? chop(ln; head = 4, tail = 0) : ln)
+            i += 1
+        end
+        body = strip(join(body_lines, '\n'))
 
-        if cat == "user"
-            push!(msgs, UserMsg(body))
-        elseif cat == "assistant"
-            push!(msgs, AgentMsg(string(length(msgs)), body))
-        elseif cat == "tool"
+        if category == "user"
+            push!(msgs, UserMsg(String(body)))
+        elseif category == "assistant"
+            push!(msgs, AgentMsg(string(length(msgs)), String(body)))
+        elseif category == "tool"
             # title encodes "kind · status · id"
-            parts = split(node.t.title, " · "; limit=3)
+            parts = split(title, " · "; limit = 3)
             kind, status, id = length(parts) == 3 ? parts : ("other", "completed", "")
-            # body is `<tool title>`\n\n<summary>; first backticked run is the
-            # title, anything after is the cached summary line.
+            # body is `` `<tool title>` `` then an optional summary line.
             title_line = match(r"`([^`]*)`", body)
-            title = title_line !== nothing ? title_line.captures[1] : ""
+            tool_title = title_line !== nothing ? String(title_line.captures[1]) : ""
             summary = ""
             if title_line !== nothing
-                tail = strip(body[nextind(body, title_line.offset + length(title_line.match) - 1):end])
+                tail = strip(body[nextind(body, title_line.offset + ncodeunits(title_line.match) - 1):end])
                 summary = String(tail)
             end
-            push!(msgs, ToolMsg(string(id), string(kind), string(title),
+            push!(msgs, ToolMsg(string(id), string(kind), tool_title,
                                 string(status), summary))
-        elseif cat == "plan"
+        elseif category == "plan"
             entries = PlanEntry[]
             for line in split(body, '\n')
                 m = match(r"\[( |x)\] (.+)", line)
                 m === nothing && continue
                 status = m.captures[1] == "x" ? "completed" : "pending"
-                push!(entries, PlanEntry(string(m.captures[2]), "", status))
+                push!(entries, PlanEntry(String(m.captures[2]), "", status))
             end
             isempty(entries) || push!(msgs, PlanMsg(entries))
         end
+        # `thought` admonitions are intentionally not reloaded (ephemeral).
     end
     return msgs
-end
-
-function admonition_text(admonition_node)::String
-    lines = String[]
-    for (n, entering) in admonition_node
-        n === admonition_node && continue   # skip the root itself
-        if n.t isa CM.Text && entering
-            push!(lines, n.literal)
-        elseif n.t isa CM.SoftBreak && entering
-            push!(lines, "\n")
-        elseif n.t isa CM.LineBreak && entering
-            push!(lines, "\n")
-        elseif n.t isa CM.CodeBlock && entering
-            push!(lines, "\n```$(n.t.info)\n$(n.literal)```\n")
-        elseif n.t isa CM.Code && entering
-            push!(lines, "`$(n.literal)`")
-        end
-    end
-    strip(join(lines))
 end

@@ -180,7 +180,7 @@ function connect_and_serve(; server_url::String,
                             name::String          = default_worker_name(worker_id),
                             mcp_command::String   = julia_bin(),
                             mcp_arguments::Vector{String} = mcp_args(),
-                            projects_root::String = joinpath(get(ENV, "HOME", ""), "bonitoteam-projects"),
+                            projects_root::String = joinpath(homedir(), "bonitoteam-projects"),
                             agent_bin::String     = find_agent_bin(),
                             retry_delay::Real     = 5.0)
     while true
@@ -208,8 +208,8 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             "worker_id"     => worker_id,
             "name"          => name,
             "hostname"      => gethostname(),
-            "username"      => get(ENV, "USER", ""),
-            "home"          => get(ENV, "HOME", ""),
+            "username"      => get(ENV, "USER", get(ENV, "USERNAME", "")),
+            "home"          => homedir(),
             "mcp_path"      => mcp_command,
             "mcp_args"      => mcp_arguments,
             "projects_root" => projects_root,
@@ -317,7 +317,7 @@ On error, returns `{type: "list_dir_response", request_id, error: "..."}`.
 function handle_list_dir(ws, cmd::AbstractDict)
     request_id = String(get(cmd, "request_id", ""))
     raw_path   = String(get(cmd, "path", ""))
-    path       = isempty(raw_path) ? get(ENV, "HOME", "/") : raw_path
+    path       = isempty(raw_path) ? homedir() : raw_path
 
     response = try
         isdir(path) || error("not a directory: $path")
@@ -604,153 +604,86 @@ function ws_url(http_url::AbstractString, path::AbstractString)
 end
 
 # ── Claude session scanner ─────────────────────────────────────────────────────
-
-"""
-    enumerate_claude_processes() → Vector{Tuple{Int,String}}
-
-Walk `/proc` and return `(pid, cwd)` for every running user-facing `claude`
-process. Skips MCP subprocesses (those invoked with `--mcp`) since they're
-internal to a parent claude. Linux-only — empty vector elsewhere.
-"""
-function enumerate_claude_processes()
-    out = Tuple{Int,String}[]
-    isdir("/proc") || return out
-    for pid_s in readdir("/proc"; join=false)
-        all(isdigit, pid_s) || continue
-        cmdline_path = "/proc/$pid_s/cmdline"
-        isfile(cmdline_path) || continue
-        cmdline_raw = try read(cmdline_path, String) catch; continue end
-        tokens = split(cmdline_raw, '\0'; keepempty=false)
-        isempty(tokens) && continue
-        basename(tokens[1]) == "claude" || continue
-        any(==(("--mcp")), tokens) && continue
-        cwd = try readlink("/proc/$pid_s/cwd") catch; continue end
-        isdir(cwd) || continue
-        push!(out, (parse(Int, pid_s), cwd))
-    end
-    return out
-end
-
-"""
-    collapse_processes_by_cwd(proc_entries, sid_by_cwd) → Vector{Dict{String,Any}}
-
-Collapse `(pid, cwd)` tuples into one Dict per unique cwd. Multiple concurrent
-claude processes for the same cwd are common — a claude-agent-acp child + a
-VS Code Claude Code extension + a different tool's claude can all share a
-directory without any being parent/child of the others — so we fold them into
-one row per project. `pid` is the lowest PID (typically the oldest); when
-N > 1, `process_count = N` is added so the UI can surface "PID X (N processes)".
-"""
-function collapse_processes_by_cwd(proc_entries::AbstractVector,
-                                     sid_by_cwd::AbstractDict{<:AbstractString,<:AbstractString})
-    by_cwd_pids = Dict{String,Vector{Int}}()
-    for (pid, cwd) in proc_entries
-        push!(get!(by_cwd_pids, String(cwd), Int[]), Int(pid))
-    end
-    out = Dict{String,Any}[]
-    for (cwd, pids) in by_cwd_pids
-        sort!(pids)
-        entry = Dict{String,Any}(
-            "path"   => cwd,
-            "name"   => basename(cwd),
-            "active" => true,
-            "pid"    => pids[1],
-        )
-        length(pids) > 1 && (entry["process_count"] = length(pids))
-        haskey(sid_by_cwd, cwd) && (entry["session_id"] = sid_by_cwd[cwd])
-        push!(out, entry)
-    end
-    return out
-end
+#
+# Discovers Claude Code projects from the on-disk session history under
+# `~/.claude/projects/<encoded>/*.jsonl`. We deliberately don't try to enumerate
+# *live* claude processes — Linux can do it via /proc but macOS/Windows can't
+# without OS-specific PEB-reading / libproc shenanigans, and the history walk
+# already surfaces any project a user has touched (active sessions write to a
+# jsonl in the same directory, so they're picked up too — just sorted by
+# `last_used` mtime instead of via process introspection).
+#
+# The only piece that's genuinely platform-specific is `decode_project_path`
+# (Unix vs Windows path encoding); everything else is one cross-platform impl.
 
 """
     scan_claude_sessions(; home) → Vector{Dict{String,Any}}
 
-Scan the worker machine for existing Claude Code usage:
-- Running `claude` processes (via /proc/PID/cwd) — exact cwd, marked active
-- Historical projects in ~/.claude/projects/ — decoded via filesystem DFS
-
-Returns sorted: active first, then by last-used time descending. Each entry has:
-- `path`, `name`, `active` (always)
-- `pid` (active only)
-- `last_used` (Unix timestamp, historical only)
-- `session_id` (jsonl basename, used by the import flow's `session/load` —
-  most-recently-modified jsonl wins for projects with multiple sessions; for
-  active sessions we look up the in-flight jsonl by its mtime too)
+Enumerate Claude Code projects from `~/.claude/projects/`. One entry per
+project, sorted by `last_used` descending. Each entry has:
+- `path`       — absolute project directory (decoded from the encoded dir name)
+- `name`       — basename of `path`
+- `session_id` — basename of the most-recently-modified jsonl in the project
+                 (used by the import flow's `session/load` to resume the session)
+- `last_used`  — Unix timestamp (latest jsonl mtime in the project)
 """
-function scan_claude_sessions(; home::String = get(ENV, "HOME", ""))
-    results  = Dict{String,Any}[]
-    active_paths = Set{String}()
-
-    # Pre-build cwd → latest_session_id map by walking ~/.claude/projects/
-    # once, so both active and historical entries can pick up an ID.
-    sid_by_cwd = Dict{String,String}()
+function scan_claude_sessions(; home::String = homedir())
+    results = Dict{String,Any}[]
     projects_dir = joinpath(home, ".claude", "projects")
-    if isdir(projects_dir)
-        for encoded in readdir(projects_dir)
-            proj_dir = joinpath(projects_dir, encoded)
-            isdir(proj_dir) || continue
-            jsonl_files = filter(f -> endswith(f, ".jsonl"),
-                                 readdir(proj_dir; join=true))
-            isempty(jsonl_files) && continue
-            decoded = decode_project_path(encoded)
-            decoded === nothing && continue
-            # Latest jsonl by mtime.
-            latest = jsonl_files[argmax(stat(f).mtime for f in jsonl_files)]
-            sid_by_cwd[decoded] = first(splitext(basename(latest)))
-        end
+    isdir(projects_dir) || return results
+    for encoded in readdir(projects_dir)
+        proj_dir = joinpath(projects_dir, encoded)
+        isdir(proj_dir) || continue
+        jsonl_files = filter(f -> endswith(f, ".jsonl"),
+                             readdir(proj_dir; join=true))
+        isempty(jsonl_files) && continue
+        decoded = decode_project_path(encoded)
+        decoded === nothing && continue
+        latest    = jsonl_files[argmax(stat(f).mtime for f in jsonl_files)]
+        last_used = stat(latest).mtime
+        push!(results, Dict{String,Any}(
+            "path"       => decoded,
+            "name"       => basename(decoded),
+            "session_id" => first(splitext(basename(latest))),
+            "last_used"  => last_used,
+        ))
     end
-
-    # Running claude processes via /proc (Linux only).
-    proc_entries = isdir("/proc") ? enumerate_claude_processes() : Tuple{Int,String}[]
-    for entry in collapse_processes_by_cwd(proc_entries, sid_by_cwd)
-        push!(active_paths, entry["path"])
-        push!(results, entry)
-    end
-
-    # Historical projects from ~/.claude/projects/
-    if isdir(projects_dir)
-        for encoded in sort!(readdir(projects_dir))
-            proj_dir = joinpath(projects_dir, encoded)
-            isdir(proj_dir) || continue
-            jsonl_files = filter(f -> endswith(f, ".jsonl"),
-                                 readdir(proj_dir; join=true))
-            isempty(jsonl_files) && continue
-            last_used = maximum(stat(f).mtime for f in jsonl_files)
-            decoded = decode_project_path(encoded)
-            decoded === nothing && continue
-            decoded in active_paths && continue
-            entry = Dict{String,Any}(
-                "path"      => decoded,
-                "name"      => basename(decoded),
-                "active"    => false,
-                "last_used" => last_used,
-            )
-            haskey(sid_by_cwd, decoded) && (entry["session_id"] = sid_by_cwd[decoded])
-            push!(results, entry)
-        end
-    end
-
-    sort!(results; by = r -> begin
-        is_active = get(r, "active", false) === true
-        last      = get(r, "last_used", 0.0)
-        last_f    = last isa Number ? -Float64(last) : 0.0
-        (is_active ? 0 : 1, last_f)
-    end)
+    sort!(results; by = r -> -Float64(get(r, "last_used", 0.0)))
     return results
 end
 
-# Decode ~/.claude/projects/<encoded> back to an absolute path.
-# Encoding: every '/' in the abs path is replaced by '-' (leading '/' → '-').
-# This is ambiguous when directory names contain '-'; we resolve by DFS against
-# the actual filesystem — only paths whose components physically exist are returned.
-function decode_project_path(encoded::String)
-    startswith(encoded, "-") || return nothing
-    candidates = reconstruct_path("/", encoded[2:end])
-    for c in candidates
-        isdir(c) && return c
+# Decode ~/.claude/projects/<encoded> back to an absolute path. Claude Code
+# encodes by replacing every path separator with `-`, so a `-` inside a folder
+# name is ambiguous — we DFS against the real filesystem and return the
+# variant whose components actually exist.
+#
+# Per-platform piece is just "what's the root and how is it encoded":
+#   Unix:    "/foo/bar"      → "-foo-bar"                  (leading '/' → '-')
+#   Windows: "C:\Users\foo"  → "C--Users-foo"              (':' → '-', '\' → '-')
+# `reconstruct_path` itself is platform-neutral because `joinpath`/`isdir`
+# already use the correct separators.
+@static if Sys.iswindows()
+    function decode_project_path(encoded::String)
+        # Layout: <drive-letter> '-' (':') '-' ('\\') <rest joined by '-'>.
+        length(encoded) >= 3                || return nothing
+        isletter(encoded[1])                || return nothing
+        encoded[2] == '-' && encoded[3] == '-' || return nothing
+        root = string(encoded[1], ":\\")
+        candidates = reconstruct_path(root, encoded[4:end])
+        for c in candidates
+            isdir(c) && return c
+        end
+        return nothing
     end
-    return nothing
+else
+    function decode_project_path(encoded::String)
+        startswith(encoded, "-") || return nothing
+        candidates = reconstruct_path("/", encoded[2:end])
+        for c in candidates
+            isdir(c) && return c
+        end
+        return nothing
+    end
 end
 
 function reconstruct_path(current::String, remaining::String)
@@ -790,10 +723,23 @@ function handle_scan_sessions(ws, cmd::AbstractDict)
     end
 end
 
+# Locate an executable on PATH. On Windows, `Sys.which` finds `.exe` but does
+# NOT walk PATHEXT for `.cmd`/`.bat` — and npm installs `claude-agent-acp` as
+# a `.cmd` shim — so we try those variants explicitly. Unix has no equivalent
+# concept, so `Sys.which` is sufficient.
+@static if Sys.iswindows()
+    which_executable(name) = something(Sys.which(name),
+                                       Sys.which(name * ".cmd"),
+                                       Sys.which(name * ".bat"),
+                                       Some(nothing))
+else
+    which_executable(name) = Sys.which(name)
+end
+
 function find_agent_bin()
     explicit = get(ENV, "CLAUDE_AGENT_ACP", "")
     !isempty(explicit) && return explicit
-    bin = Sys.which("claude-agent-acp")
+    bin = which_executable("claude-agent-acp")
     bin !== nothing && return bin
     return "claude-agent-acp"
 end

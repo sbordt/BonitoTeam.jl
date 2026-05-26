@@ -51,7 +51,9 @@ function Bonito.jsrender(session::Bonito.Session, s::SessionRow)
                 const btn = event.currentTarget;
                 btn.classList.add('bt-clicked');
                 btn.textContent = $(btn_label) === 'Resume' ? 'Resuming…' : 'Importing…';
-                $(s.import_path).notify({path: $(s.path), session_id: $(s.session_id)});
+                // js_path: backslashes are invalid JS string escapes; forward
+                // slashes round-trip cleanly and Julia accepts them on Windows.
+                $(s.import_path).notify({path: $(js_path(s.path)), session_id: $(s.session_id)});
             }""");
         class = "bt-session-row"))
 end

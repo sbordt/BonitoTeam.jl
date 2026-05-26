@@ -1335,28 +1335,38 @@ const DashboardStyles = Bonito.Styles(
 toggles between breadcrumb mode and text-input mode. Both are mutated in
 response to user clicks/keystrokes.
 """
+# Normalize a path for use inside the picker / for JS string interpolation.
+# Julia accepts forward slashes on Windows for all FS operations, while raw
+# backslashes are invalid escape sequences in JS string literals (`\U`, `\s`,
+# …) — embedding them produces either silent corruption or SyntaxErrors. By
+# routing every picker path through forward slashes we sidestep both issues
+# without losing Windows-correctness.
+js_path(p::AbstractString) = replace(String(p), '\\' => '/')
+
 function address_bar(cur::Observable{String}, editing::Observable{Bool})
     map(cur, editing) do path, edit
         if edit
             DOM.input(
                 type    = "text",
-                value   = path,
+                value   = js_path(path),
                 class   = "bt-addr-input",
                 autofocus = true,
                 onfocus = js"event => event.target.select()",
+                # Normalize user-typed backslashes to forward slashes in JS
+                # before notifying — same reason as `js_path` above.
                 onkeydown = js"""event => {
                     if (event.key === 'Enter') {
-                        $(cur).notify(event.target.value);
+                        $(cur).notify(event.target.value.replace(/\\/g, '/'));
                         $(editing).notify(false);
                     } else if (event.key === 'Escape') {
                         $(editing).notify(false);
                     }
                 }""")
         else
-            paths = breadcrumb_paths(String(path))
+            paths = breadcrumb_paths(js_path(path))
             nodes = []
             for (i, full) in enumerate(paths)
-                label = i == 1 ? "/" : basename(full)
+                label = i == 1 ? breadcrumb_root_label(full) : basename(full)
                 push!(nodes, DOM.span(label;
                     class   = i == 1 ? "bt-addr-seg bt-addr-seg-root" : "bt-addr-seg",
                     onclick = js"event => { event.stopPropagation(); $(cur).notify($full); }",
@@ -1382,20 +1392,40 @@ function address_bar(cur::Observable{String}, editing::Observable{Bool})
     end
 end
 
-# Build cumulative paths for breadcrumb rendering:
-# "/home/server/BonitoTeam" → ["/", "/home", "/home/server", "/home/server/BonitoTeam"]
+# Build cumulative paths for breadcrumb rendering. Cross-platform: input must
+# already be normalized to forward slashes (see `js_path`).
+#   Linux:   "/home/server/BonitoTeam" → ["/", "/home", "/home/server", "/home/server/BonitoTeam"]
+#   Windows: "C:/Users/sdani/Proj"     → ["C:/", "C:/Users", "C:/Users/sdani", "C:/Users/sdani/Proj"]
 function breadcrumb_paths(cur::String)::Vector{String}
-    isempty(cur) && return ["/"]
-    cur = startswith(cur, "/") ? cur : "/" * cur
+    isempty(cur)  && return ["/"]
     parts = split(cur, '/'; keepempty = false)
-    paths = String["/"]
-    acc = ""
-    for p in parts
-        acc *= "/" * String(p)
-        push!(paths, acc)
+    isempty(parts) && return ["/"]
+    # Detect a Windows-style drive prefix ("C:", "D:", …).
+    has_drive = length(parts[1]) == 2 && parts[1][2] == ':' &&
+                ('a' <= lowercase(parts[1][1]) <= 'z')
+    if has_drive
+        drive = String(parts[1])
+        paths = String[drive * "/"]
+        acc   = drive
+        for p in Iterators.drop(parts, 1)
+            acc *= "/" * String(p)
+            push!(paths, acc)
+        end
+        return paths
+    else
+        paths = String["/"]
+        acc   = ""
+        for p in parts
+            acc *= "/" * String(p)
+            push!(paths, acc)
+        end
+        return paths
     end
-    return paths
 end
+
+# Label shown on the leftmost breadcrumb segment (the filesystem root).
+breadcrumb_root_label(full::AbstractString) =
+    length(full) >= 3 && full[2] == ':' ? String(full[1:2]) : "/"
 
 # Folder picker component
 """
@@ -1411,7 +1441,7 @@ mutable struct FolderPicker
 end
 
 FolderPicker(start::String = pwd()) = FolderPicker(
-    Observable(abspath(start)), Observable(""), Observable(false), Observable(false))
+    Observable(js_path(abspath(start))), Observable(""), Observable(false), Observable(false))
 
 function folder_picker_render(p::FolderPicker)
     up_btn     = Bonito.Button("↑"; style=nothing, class = "bt-btn bt-btn-secondary",
@@ -1420,8 +1450,8 @@ function folder_picker_render(p::FolderPicker)
 
     on(up_btn.value) do clicked
         clicked || return
-        parent = dirname(rstrip(p.cur[], '/'))
-        isempty(parent) || (p.cur[] = parent)
+        parent = js_path(dirname(rstrip(p.cur[], '/')))
+        isempty(parent) || parent == p.cur[] || (p.cur[] = parent)
     end
     on(choose_btn.value) do clicked
         clicked || return
@@ -1443,7 +1473,7 @@ function folder_picker_render(p::FolderPicker)
                 class = "bt-picker-row", style = Styles("color" => "var(--bt-text-faint)"))] :
             [DOM.div("📁 $name";
                 class   = "bt-picker-row",
-                onclick = js"event => $(p.cur).notify($(joinpath(path, name)));")
+                onclick = js"event => $(p.cur).notify($(js_path(joinpath(path, name))));")
              for name in entries]
         DOM.div(rows...; class = "bt-picker")
     end
@@ -1529,7 +1559,7 @@ function remote_folder_picker_render(p::RemoteFolderPicker)
         clicked || return
         cur = p.cur[]
         isempty(cur) && return
-        parent = dirname(rstrip(cur, '/'))
+        parent = js_path(dirname(rstrip(cur, '/')))
         !isempty(parent) && parent != cur && (p.cur[] = parent)
     end
     on(choose_btn.value) do clicked
@@ -1556,7 +1586,7 @@ function remote_folder_picker_render(p::RemoteFolderPicker)
                 class = "bt-picker-row", style = Styles("color" => "var(--bt-text-faint)"))] :
             [DOM.div("📁 $(e.name)";
                 class   = "bt-picker-row",
-                onclick = js"event => $(p.cur).notify($(joinpath(cur, e.name)));")
+                onclick = js"event => $(p.cur).notify($(js_path(joinpath(cur, e.name))));")
              for e in entries]
         DOM.div(rows...; class = "bt-picker bt-slide-in")
     end

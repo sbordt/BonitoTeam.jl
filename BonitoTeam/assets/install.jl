@@ -1,9 +1,15 @@
 #!/usr/bin/env julia
 # BonitoTeam worker installer — cross-platform (Linux / macOS / Windows).
 #
-#   curl -fsSL {{SERVER_URL}}/install.jl | julia -
+#   Linux / macOS:  curl -fsSL {{SERVER_URL}}/install.jl | julia -
+#   Windows:        curl.exe -fsSL {{SERVER_URL}}/install.jl -o install.jl
+#                   julia install.jl
 #
-# Windows 10 1803+ ships curl.exe, so the same one-liner works everywhere.
+# Why Windows differs: in PowerShell `curl` is an alias for Invoke-WebRequest
+# (not curl.exe), and `|` pipes objects rather than a byte stream — so the
+# Unix one-liner can't work there. `curl.exe` + downloading to a file sidesteps
+# both; that form also works in cmd.exe.
+#
 # The server templates {{SERVER_URL}} / {{WORKER_SECRET}} into this file
 # before serving it from the /install.jl route.
 #

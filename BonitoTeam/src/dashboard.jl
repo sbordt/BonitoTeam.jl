@@ -1122,13 +1122,19 @@ const DashboardStyles = Bonito.Styles(
         "border" => "1px solid var(--bt-border)",
         "border-radius" => "var(--bt-radius)",
         "padding" => "16px 18px"),
+    CSS(".bt-install-os",
+        "color" => "var(--bt-text-faint)", "font-size" => "11px",
+        "font-weight" => "600", "letter-spacing" => "0.04em",
+        "text-transform" => "uppercase", "margin-top" => "12px"),
     CSS(".bt-install-cmd",
         "display" => "flex", "align-items" => "center",
         "justify-content" => "space-between", "gap" => "8px",
         "background" => "#0f172a", "color" => "#e2e8f0",
         "font-family" => "ui-monospace, monospace", "font-size" => "12.5px",
         "padding" => "10px 12px", "border-radius" => "var(--bt-radius-sm)",
-        "margin-top" => "8px"),
+        "margin-top" => "4px"),
+    CSS(".bt-install-cmd code",
+        "white-space" => "pre", "overflow-x" => "auto"),
     CSS(".bt-install-copy",
         "background" => "rgba(255,255,255,0.06)",
         "color" => "#e2e8f0",
@@ -2036,10 +2042,28 @@ function dashboard_dom(state::ServerState;
     # The "no workers" install-instructions block lives as a sibling that
     # toggles visibility based on workers-empty. Keeps the install snippet
     # out of every render's hot path.
-    # Cross-platform: the installer is a Julia script piped into `julia`.
-    # Windows 10 1803+ ships curl.exe, so the exact one-liner works there too.
-    install_url   = "$(public_url_or_default())/install.jl"
-    install_cmd   = "curl -fsSL $install_url | julia -"
+    #
+    # The installer is one cross-platform Julia script, but the *fetch* line
+    # differs by OS. On Linux/macOS `curl … | julia -` works as-is. On Windows
+    # PowerShell `curl` is an alias for `Invoke-WebRequest` (not curl.exe), and
+    # the `|` pipes objects rather than a byte stream — so we hand Windows the
+    # `curl.exe … -o install.jl` + `julia install.jl` form, which works in both
+    # PowerShell and cmd.exe.
+    install_url  = "$(public_url_or_default())/install.jl"
+    install_unix = "curl -fsSL $install_url | julia -"
+    install_win  = "curl.exe -fsSL $install_url -o install.jl\njulia install.jl"
+    install_row(label, cmd) = DOM.div(
+        DOM.div(label; class = "bt-install-os"),
+        DOM.div(
+            DOM.code(cmd),
+            DOM.span("Copy";
+                class   = "bt-install-copy",
+                onclick = js"""event => {
+                    navigator.clipboard.writeText($cmd);
+                    event.target.textContent = 'Copied';
+                    setTimeout(() => event.target.textContent = 'Copy', 1200);
+                }"""),
+            class = "bt-install-cmd"))
     no_workers_block = DOM.div(
         DOM.div("No workers connected yet.";
                 style = Styles("color" => "var(--bt-text-muted)",
@@ -2048,16 +2072,8 @@ function dashboard_dom(state::ServerState;
                 style = Styles("color" => "var(--bt-text-faint)",
                                 "font-size" => "12px",
                                 "margin-top" => "8px")),
-        DOM.div(
-            DOM.span(install_cmd),
-            DOM.span("Copy";
-                class   = "bt-install-copy",
-                onclick = js"""event => {
-                    navigator.clipboard.writeText($install_cmd);
-                    event.target.textContent = 'Copied';
-                    setTimeout(() => event.target.textContent = 'Copy', 1200);
-                }"""),
-            class = "bt-install-cmd");
+        install_row("Linux / macOS", install_unix),
+        install_row("Windows (PowerShell or cmd)", install_win);
         class = "bt-install-block")
     no_workers_class = map(state.workers) do workers
         isempty(workers) ? "bt-install-wrap" : "bt-install-wrap bt-hidden"

@@ -35,5 +35,5 @@ BonitoWorker.connect_and_serve(;
     worker_id     = worker_id,
     name          = get(ENV, "BONITOTEAM_WORKER_NAME", default_name),
     projects_root = get(ENV, "BONITOTEAM_PROJECTS_ROOT",
-                        joinpath(get(ENV, "HOME", ""), "bonitoteam-projects")),
+                        joinpath(homedir(), "bonitoteam-projects")),
 )

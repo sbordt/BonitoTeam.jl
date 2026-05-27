@@ -7,7 +7,14 @@ const MONOREPO_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 # It Pkg.add's BonitoWorker + BonitoMCP from the public GitHub repo into a
 # shared `@bonito-team` env — no tar bundle, no per-package source trees, runs
 # identically on Linux / macOS / Windows. See assets/install.jl.
+#
+# Around it sit two tiny per-shell bootstraps so the install one-liner mirrors
+# the familiar `curl URL | sh` shape on each OS. They only check that `julia`
+# is on PATH and then hand off to install.jl — they do NOT install juliaup
+# (Julia is a prerequisite the user installs separately).
 const INSTALL_SCRIPT = read(joinpath(ASSETS_DIR, "install.jl"), String)
+const INSTALL_SH     = read(joinpath(ASSETS_DIR, "install.sh"),  String)
+const INSTALL_PS1    = read(joinpath(ASSETS_DIR, "install.ps1"), String)
 
 """
     serve(; host, port, public_url, worker_secret, state_dir, working_dir) → Bonito.Server
@@ -18,7 +25,10 @@ only port `port` (default 8038) needs to be open in the server's firewall.
 Routes:
   /                       — dashboard (workers + projects)
   /p/<project_id>         — chat UI for one project
-  /install.jl             — cross-platform worker installer (`curl … | julia -`)
+  /install                — OS-sniffing bootstrap (`curl … | sh` / `irm … | iex`)
+  /install.sh             — bash wrapper (Linux / macOS)
+  /install.ps1            — PowerShell wrapper (Windows)
+  /install.jl             — cross-platform worker installer (used by the wrappers)
   /worker-ws    (WS)      — control channel each worker holds open after install
   /worker-acp   (WS)      — per-session ACP relay; one connection per project session
   /transfer-ws  (WS)      — librsync directional transfer; dialed on demand by a
@@ -66,23 +76,52 @@ function serve(; host::String        = "0.0.0.0",
     add_worker_ws_routes!(srv, state)
 
     @info "BonitoTeam dashboard running" url=Bonito.online_url(srv, "") state=sd
-    @info "Worker install endpoint"      url="$base_url/install.jl"
+    @info "Worker install — run on each agent machine" *
+          "\n    Linux / macOS  : curl -fsSL $base_url/install | sh" *
+          "\n    Windows (PS)   : irm $base_url/install | iex"
     return state
 end
 
 # HTTP routes
+#
+# /install        — sniffs `User-Agent` and serves either the bash or PS1
+#                   wrapper. PowerShell's Invoke-RestMethod sets a UA that
+#                   contains the literal "PowerShell"; curl/wget/everything
+#                   else falls through to the bash wrapper.
+# /install.sh     — always bash wrapper. Useful when /install's sniff guesses
+#                   wrong, or when fetched from a browser to inspect.
+# /install.ps1    — always PowerShell wrapper. Same.
+# /install.jl     — the cross-platform Julia installer the wrappers fetch.
 function add_install_routes!(srv::Bonito.Server, public_url::String, worker_secret::String)
     Bonito.route!(srv, "/install.jl" => function(context)
-        script = render_install_script(public_url, worker_secret)
+        script = render_install_script(INSTALL_SCRIPT, public_url, worker_secret)
         HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], body=script)
+    end)
+    Bonito.route!(srv, "/install.sh" => function(context)
+        body = render_install_script(INSTALL_SH, public_url, worker_secret)
+        HTTP.Response(200, ["Content-Type" => "text/x-shellscript; charset=utf-8"], body=body)
+    end)
+    Bonito.route!(srv, "/install.ps1" => function(context)
+        body = render_install_script(INSTALL_PS1, public_url, worker_secret)
+        HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], body=body)
+    end)
+    Bonito.route!(srv, "/install" => function(context)
+        ua   = String(HTTP.header(context.request, "User-Agent", ""))
+        is_ps = occursin("PowerShell", ua)
+        body = render_install_script(is_ps ? INSTALL_PS1 : INSTALL_SH,
+                                     public_url, worker_secret)
+        ctype = is_ps ? "text/plain; charset=utf-8" :
+                        "text/x-shellscript; charset=utf-8"
+        HTTP.Response(200, ["Content-Type" => ctype], body=body)
     end)
 end
 
-# Substitute the server URL + shared secret into the install.jl template. The
-# script guards against being run with the `{{ }}` placeholders intact, so a
-# raw fetch of assets/install.jl (bypassing this route) fails loudly.
-function render_install_script(public_url::String, worker_secret::String)
-    replace(INSTALL_SCRIPT,
+# Substitute the server URL + shared secret into a templated install script.
+# install.jl guards against being run with the `{{ }}` placeholders intact, so
+# a raw fetch of any asset (bypassing these routes) fails loudly.
+function render_install_script(template::AbstractString,
+                                 public_url::String, worker_secret::String)
+    replace(template,
         "{{SERVER_URL}}"    => public_url,
         "{{WORKER_SECRET}}" => worker_secret,
     )

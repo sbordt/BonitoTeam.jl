@@ -1,9 +1,10 @@
 name = "BonitoWorker"
 uuid = "98909ed9-6989-4829-81af-73688ee23085"
-authors = ["Simon Danisch <sdanisch@gmail.com>"]
 version = "0.1.0"
+authors = ["Simon Danisch <sdanisch@gmail.com>"]
 
 [deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 RemoteSync = "8d4f0e91-3a2b-4d6c-9e8f-1a2b3c4d5e6f"
@@ -14,7 +15,15 @@ Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 RemoteSync = {path = "../RemoteSync"}
 
 [compat]
+Dates = "1.11.0"
 HTTP = "1"
 JSON = "0.21, 1"
 Scratch = "1"
 julia = "1.10"
+
+[extras]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Dates", "Test"]

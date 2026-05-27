@@ -10,6 +10,7 @@ include("client.jl")
 export Client, MCPServer, ImageAttachment, prompt!, cancel!
 export Transport, SubprocessTransport
 export Handler, DiscardHandler
+export ConnectionClosed
 export SessionUpdate, AgentMessageChunk, UserMessageChunk, AgentThoughtChunk
 export ToolCallNotif, ToolCallUpdateNotif, PlanUpdate, UnknownUpdate
 export TextContent, ImageContent, DiffContent, ToolCallLocation, PlanEntry

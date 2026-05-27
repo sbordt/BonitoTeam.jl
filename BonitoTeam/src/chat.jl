@@ -1002,6 +1002,17 @@ function ingest!(model::ChatModel, state::StreamingState, upd::PlanUpdate)
     return NoStream()
 end
 
+# Fallback for `SessionUpdate` kinds we don't model — primarily
+# `UnknownUpdate`, which `parse_session_update` returns when claude-agent-acp
+# sends a `sessionUpdate` we haven't taught the chat layer about (protocol
+# evolution: new event types added upstream, we lag). Treating these as a
+# no-op preserves the current streaming state and lets the dispatcher
+# continue. Without this method, `do_apply!(::AgentUpdate)` would raise a
+# `MethodError`, which the outer dispatcher catches + logs — noisy in
+# production logs and a real risk if it ever fires mid-finalize before the
+# state could be committed.
+ingest!(::ChatModel, state::StreamingState, ::AgentClientProtocol.SessionUpdate) = state
+
 # ── ChatEvent: the only way to mutate ChatModel state ──────────────────────
 #
 # Every state change the chat undergoes — an agent chunk arrived, the user
@@ -1173,19 +1184,13 @@ function do_apply!(model::ChatModel, ::SessionRestarted)
     return nothing
 end
 
-# Off-lock prompt driver. Spawned by `do_apply!(UserSubmitted)`. Drives
-# `prompt!` to completion (or failure) and routes the outcome back
-# through `apply!` so the finalize / error-bubble logic is single-sourced.
-#
-# The `drain_updates` call before `PromptCompleted` is load-bearing:
-# end_turn arrives on the same WS as the chunk stream, but it's a
-# JSON-RPC response (unblocks `prompt!`) while chunks are notifications
-# (queued in the update inbox). Without the drain, `PromptCompleted`
-# could race the tail of the chunks — they'd ingest AFTER the streaming
-# state has been reset, starting a new AgentStream onto an orphaned
-# bubble. The drain enqueues a barrier in the same FIFO and blocks
-# until the dispatcher pops it, by which point every queued chunk has
-# been applied.
+# Off-lock prompt driver. Spawned by `do_apply!(UserSubmitted)`. Its job
+# is to bridge the blocking `prompt!` call (which we can't run under the
+# model lock) back into the ChatEvent pipeline: classify exceptions,
+# fire the matching event, always fire `PromptCompleted` on the way out.
+# The `drain_updates` synchronization is internal to `prompt!` now —
+# returning from `prompt!` already implies "every session/update for
+# this turn has been delivered to the handler".
 function drive_prompt!(model::ChatModel,
                        client::AgentClientProtocol.Client,
                        full_text::AbstractString,
@@ -1193,20 +1198,30 @@ function drive_prompt!(model::ChatModel,
     try
         AgentClientProtocol.prompt!(client, String(full_text); images)
     catch e
-        msg = sprint(showerror, e)
-        kind = is_session_dead_error(msg) ? :session_dead : :transient
-        apply!(model, PromptFailed(msg, kind))
+        kind = is_session_dead_error(e) ? :session_dead : :transient
+        apply!(model, PromptFailed(sprint(showerror, e), kind))
     finally
-        AgentClientProtocol.drain_updates(client.conn)
         apply!(model, PromptCompleted())
     end
     return nothing
 end
 
-is_session_dead_error(msg::AbstractString) =
-    occursin("connection closed", msg) ||
-    occursin("EOFError",          msg) ||
-    occursin("BrokenPipe",        msg)
+# Classify an exception from `prompt!`. "Session dead" = the transport is
+# torn down and the only path forward is a full reconnect (banner shown,
+# user clicks Restart). "Transient" = one bad turn, the session itself is
+# still live (rendered as an inline error bubble).
+#
+# We dispatch on the exception type — NOT on `sprint(showerror, e)` —
+# because string-matching is brittle (any wording change upstream breaks
+# the classifier silently). ACP raises a typed `ConnectionClosed` for
+# transport teardown; subprocess EOF and TCP errors surface as
+# `EOFError` / `Base.IOError` from `readline`/`write`; the WS transport
+# surfaces them as `HTTP.WebSockets.WebSocketError`.
+is_session_dead_error(::AgentClientProtocol.ConnectionClosed)     = true
+is_session_dead_error(::EOFError)                                 = true
+is_session_dead_error(::Base.IOError)                             = true
+is_session_dead_error(::HTTP.WebSockets.WebSocketError)           = true
+is_session_dead_error(::Exception)                                = false
 
 # ACP Handler: routes session/update notifications to per-update-type
 # methods via multiple dispatch (no `if upd isa ...` chain), and delegates

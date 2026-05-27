@@ -137,7 +137,20 @@ struct ImageAttachment
     mime::String
 end
 
-# Send a user message; blocks until the agent signals end_turn / cancelled.
+# Send a user message; blocks until the agent signals end_turn / cancelled
+# AND every session/update notification queued before that response has
+# been delivered to the handler. Returning this way means the caller can
+# treat "prompt! returned" as "the turn is fully observed" without having
+# to think about the inbox dispatcher running ahead/behind.
+#
+# Without the trailing `drain_updates`, this race exists: chunks are
+# queued in the update inbox (FIFO) while end_turn arrives on a different
+# JSON-RPC pending channel; the response can unblock send_request before
+# the dispatcher has finished applying the last chunks, and the caller's
+# "turn over" finalize can race the tail of the chunk stream into a
+# corrupted state. The barrier is invisible to callers — they just see
+# `prompt!` block until everything's settled.
+#
 # `images` are appended after the text as ACP image content blocks.
 function prompt!(client::Client, text::String;
                  images::Vector{ImageAttachment} = ImageAttachment[])
@@ -153,6 +166,7 @@ function prompt!(client::Client, text::String;
         "sessionId" => client.session_id,
         "prompt"    => blocks,
     ))
+    drain_updates(client.conn)
     return nothing
 end
 

@@ -349,8 +349,23 @@ class BonitoChat {
         // scroll to the bottom to come back. This matches the spec
         // "always stay at the position the user scrolls to".
         if (this.followMode) {
-            this.updateDOM(...this.visibleRange());
-            this._queueScrollToBottom();
+            // Scroll synchronously — `scrollToBottom` does the scroll +
+            // calls `refresh()` (which re-computes `visibleRange()` from
+            // the new scrollTop and calls `updateDOM`), so the new bubble
+            // lands in the DOM in one synchronous call. We deliberately
+            // do NOT route through `_queueScrollToBottom` here: rAF is
+            // paused in backgrounded tabs/windows, which means new
+            // messages would land in `cache` but never make it into the
+            // DOM until the user re-focuses the tab. That manifests as
+            // "I sent a message and 5 old messages appeared instantly" —
+            // they were already cached, the auto-scroll just couldn't
+            // fire while the tab was in the background. Synchronous
+            // scrollTop writes and DOM updates work regardless of tab
+            // visibility, so we land the bubble immediately. rAF batching
+            // is still used for `appendChunk` (50 chunks/s, batching is
+            // a real perf win; the streaming bubble itself is already in
+            // the DOM, only the scroll lags).
+            this.scrollToBottom();
         } else {
             this._registerUnread();
         }

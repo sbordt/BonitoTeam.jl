@@ -282,8 +282,7 @@ class BonitoChat {
             this.observe(idx, node);
         }
         if (this.followMode) {
-            this.updateDOM(...this.visibleRange());
-            this._queueScrollToBottom();
+            this.scrollToBottom();
         } else {
             this._registerUnread();
         }

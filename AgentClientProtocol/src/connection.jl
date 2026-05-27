@@ -12,6 +12,18 @@
 # struct. Adding a new transport (e.g. SSH-piped subprocess) is just a
 # new struct + three method definitions.
 
+# Raised on any pending `send_request` when the underlying `Connection`
+# tears down (transport EOF, peer hang-up, explicit `close(conn)`). The
+# typed form lets callers dispatch on `e isa ConnectionClosed` instead of
+# parsing `showerror` output.
+struct ConnectionClosed <: Exception
+    reason::String
+end
+ConnectionClosed() = ConnectionClosed("")
+Base.showerror(io::IO, e::ConnectionClosed) =
+    print(io, "ACP connection closed",
+              isempty(e.reason) ? "" : ": $(e.reason)")
+
 abstract type Transport end
 
 # Default fallback for transports that don't need extra teardown.
@@ -286,7 +298,7 @@ function reader_loop(conn::Connection)
         end
     finally
         for (_, ch) in conn.pending
-            put!(ch, ErrorException("ACP connection closed"))
+            put!(ch, ConnectionClosed())
         end
         empty!(conn.pending)
     end

@@ -151,10 +151,12 @@ function Base.close(h::DevHandle)
     # Bonito.Server.close blocks waiting for accept loops + WS handlers
     # to drain, which can take a few seconds when a worker is still
     # connected. Run it in a task so we can move on without it
-    # holding cleanup hostage in interactive use.
-    close_task = @async begin
-        try close(h.state.srv) catch end
-    end
+    # holding cleanup hostage in interactive use. Failures from inside
+    # the server's drain (Bonito has a known surface that occasionally
+    # throws on background route handlers) are surfaced via
+    # `errormonitor` rather than swallowed — they go to stderr, the
+    # main cleanup proceeds.
+    close_task = Base.errormonitor(@async close(h.state.srv))
     # Give the server a budget to close cleanly; if it doesn't make it,
     # cleanup proceeds anyway. The server's accept-listener is bound to
     # an ephemeral port that the OS reclaims on Julia exit either way.
@@ -168,8 +170,15 @@ function Base.close(h::DevHandle)
         istaskdone(h.worker_task) && break
         sleep(0.05)
     end
+    # `force = true` already makes "doesn't exist" a no-op, so the only
+    # remaining failure modes are permission / filesystem errors — those
+    # we DO want surfaced rather than silently dropping the tempdir.
     for d in (h.state_dir, h.working_dir, h.worker_root)
-        try rm(d; recursive = true, force = true) catch end
+        try
+            rm(d; recursive = true, force = true)
+        catch e
+            @warn "dev_server: cleanup rm failed" path=d exception=e
+        end
     end
     return h
 end
@@ -197,9 +206,16 @@ function open_in_browser(url::AbstractString)
     else
         `xdg-open $url`
     end
+    # `ignorestatus = true` already swallows non-zero exit codes from
+    # the launcher itself; the remaining failure mode is the launcher
+    # binary simply not being on PATH (Base.IOError "no such file").
+    # That's best-effort by design — the dev_server's banner printed
+    # the URL above, the user can still click it. Log at @debug for
+    # anyone investigating "why didn't my browser open".
     try
         run(pipeline(Cmd(cmd; ignorestatus = true), stdout = devnull, stderr = devnull))
-    catch
-        # Browser open is best-effort — user can still copy the URL.
+    catch e
+        e isa Base.IOError || rethrow()
+        @debug "open_in_browser: launcher not available" url exception=e
     end
 end

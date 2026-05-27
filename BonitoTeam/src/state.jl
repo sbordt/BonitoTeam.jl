@@ -250,7 +250,15 @@ function load_json_tolerant(path::String, label::String)
         return JSON.parsefile(path)
     catch e
         bad = path * ".bad-" * Dates.format(now(UTC), "yyyymmddTHHMMSS")
-        try mv(path, bad; force = true) catch end
+        # mv with force=true rarely fails; if it does (permission issue,
+        # cross-fs EXDEV), let the @warn cover both the parse-failure
+        # AND the mv-failure so we don't silently lose visibility.
+        try
+            mv(path, bad; force = true)
+        catch mv_e
+            @warn "$label: failed to move aside corrupted file" path bad exception=mv_e
+            bad = "(rename failed)"
+        end
         @warn "$label: failed to parse — moved aside, starting empty" path bad exception=e
         return nothing
     end

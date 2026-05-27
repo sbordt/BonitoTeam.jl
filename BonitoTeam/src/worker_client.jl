@@ -34,6 +34,34 @@ function send_command(state::ServerState, worker_name::String, payload::Abstract
     return nothing
 end
 
+# Push a JSON error frame to a peer whose request we just rejected
+# (unauthorized / missing id / unknown id). The peer may have hung up
+# before reading the response — that's the state we were going to leave
+# them in anyway, so an IOError / WebSocketError during the send is
+# expected and silently ignored. Anything else propagates.
+function send_ws_error(ws, payload::AbstractDict)
+    try
+        WebSockets.send(ws, JSON.json(payload))
+    catch e
+        e isa Union{Base.IOError, HTTP.WebSockets.WebSocketError} || rethrow()
+    end
+    return nothing
+end
+
+# Close a worker-side WebSocket that may have been torn down concurrently
+# by the peer (worker reboot, network drop, normal end-of-transfer cleanup).
+# A closed-WS exception during the close means the resource is already in
+# the state we wanted — silently ignored. Anything else propagates.
+function close_ws_safe(ws)
+    HTTP.WebSockets.isclosed(ws) && return nothing
+    try
+        close(ws)
+    catch e
+        e isa Union{Base.IOError, HTTP.WebSockets.WebSocketError} || rethrow()
+    end
+    return nothing
+end
+
 # Register a pending RPC: returns (request_id, channel). Caller sends the
 # command (with `request_id`/`sync_id`/`sid` set to the returned id) and waits
 # on the channel via `take_pending!`. The matching control-frame handler /
@@ -65,7 +93,17 @@ function take_pending!(state::ServerState, ch::Channel, key::String,
                 false
             end
         end
-        had && try put!(ch, nothing) catch end
+        if had
+            # The channel may have been closed by a peer-cleanup
+            # between the `had` check above and this put!. That's
+            # exactly the race this whole timeout dance handles —
+            # not a real error.
+            try
+                put!(ch, nothing)
+            catch e
+                e isa InvalidStateException || rethrow()
+            end
+        end
     end)
     val = take!(ch)
     val === nothing && error("$op_name timed out after $(timeout)s — worker may be offline or stuck")
@@ -79,7 +117,13 @@ function deliver_rpc_response!(state::ServerState, rid::AbstractString, value)
         haskey(state.pending_rpcs, rid) ? pop!(state.pending_rpcs, rid) : nothing
     end
     ch === nothing && return
-    try put!(ch, value) catch end
+    # Caller may have given up (closed the channel) between our pop!
+    # above and this put!. Same race as `take_pending!`; not an error.
+    try
+        put!(ch, value)
+    catch e
+        e isa InvalidStateException || rethrow()
+    end
     return
 end
 
@@ -90,7 +134,7 @@ function handle_worker_control(state::ServerState, ws)
         hello_raw = WebSockets.receive(ws)
         hello = JSON.parse(String(hello_raw))
         if get(hello, "secret", "") != state.worker_secret
-            try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"unauthorized"))) catch end
+            send_ws_error(ws, Dict("ok"=>false, "error"=>"unauthorized"))
             return
         end
         # Worker identity. Newer workers send `worker_id` (stable UUID); old
@@ -264,18 +308,17 @@ function handle_handoff_ws(state::ServerState, ws, id_field::AbstractString;
     auth_raw = WebSockets.receive(ws)
     auth = JSON.parse(String(auth_raw))
     if get(auth, "secret", "") != state.worker_secret
-        try WebSockets.send(ws, JSON.json(Dict("ok"=>false, "error"=>"unauthorized"))) catch end
+        send_ws_error(ws, Dict("ok"=>false, "error"=>"unauthorized"))
         return
     end
     id = String(get(auth, id_field, ""))
     if isempty(id)
-        try WebSockets.send(ws, JSON.json(Dict("ok"=>false,
-                                                "error"=>"missing $id_field"))) catch end
+        send_ws_error(ws, Dict("ok"=>false, "error"=>"missing $id_field"))
         return
     end
     haskey(state.pending_rpcs, id) || begin
-        try WebSockets.send(ws, JSON.json(Dict("ok"=>false,
-                                                "error"=>"unknown or expired $id_field"))) catch end
+        send_ws_error(ws, Dict("ok"=>false,
+                               "error"=>"unknown or expired $id_field"))
         return
     end
     ch = pop!(state.pending_rpcs, id)
@@ -285,7 +328,7 @@ function handle_handoff_ws(state::ServerState, ws, id_field::AbstractString;
     while !WebSockets.isclosed(ws)
         sleep(1)
     end
-    close_on_exit && try close(ws) catch end
+    close_on_exit && close_ws_safe(ws)
 end
 
 # File transport over WS
@@ -334,7 +377,7 @@ function sync_dir_to_worker!(state::ServerState, worker_name::String,
         RemoteSync.send_directory(src, wsio; on_progress = on_progress)
         notify_progress(on_progress, :phase, (msg = "Done",))
     finally
-        try close(ws) catch end
+        close_ws_safe(ws)
     end
     return nothing
 end
@@ -371,7 +414,7 @@ function sync_dir_from_worker!(state::ServerState, worker_name::String,
         RemoteSync.receive_directory(dst, wsio; on_progress = on_progress)
         notify_progress(on_progress, :phase, (msg = "Done",))
     finally
-        try close(ws) catch end
+        close_ws_safe(ws)
     end
     return nothing
 end
@@ -577,7 +620,7 @@ function fetch_file_from_worker(state::ServerState, worker_name::String,
         wsio = RemoteSync.WebSocketIO(ws)
         RemoteSync.receive_file(String(dst_path), wsio; on_progress)
     finally
-        try close(ws) catch end
+        close_ws_safe(ws)
     end
     return String(dst_path)
 end
@@ -620,7 +663,7 @@ function send_file_to_worker!(state::ServerState, worker_name::String,
         wsio = RemoteSync.WebSocketIO(ws)
         RemoteSync.send_file(String(src_path), wsio; on_progress)
     finally
-        try close(ws) catch end
+        close_ws_safe(ws)
     end
     return String(dst_path)
 end

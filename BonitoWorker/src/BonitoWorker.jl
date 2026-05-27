@@ -58,14 +58,39 @@ function load_or_generate_worker_id()
     return id
 end
 
-# Default display name. Falls back through hostname → username → "worker".
-# When hostname is "localhost"/empty (common on freshly-installed Linux
-# distros) we splice in a 4-char chunk of the worker_id so two laptops with
-# the same `gethostname()=="localhost"` still get distinct *display* names —
-# the dict key is the full UUID either way, but the user sees something
-# friendlier than "localhost" twice.
+# OS-friendly display name. Prefers the user-configured "pretty" name when
+# the OS exposes one (macOS ComputerName, Linux hostnamectl pretty); falls
+# back to `gethostname()`. Always returns a String; never throws.
+function friendly_hostname()
+    name = ""
+    @static if Sys.isapple()
+        # macOS System Settings → General → About → Name. Includes spaces /
+        # apostrophes (e.g. "Sebastian's MacBook Pro"). `scutil` ships on
+        # every macOS install — no Homebrew dependency.
+        try
+            name = strip(read(`scutil --get ComputerName`, String))
+        catch
+        end
+    elseif Sys.islinux()
+        # `hostnamectl --pretty` prints the user-set pretty hostname if
+        # configured, otherwise empty. systemd ships it on most distros.
+        try
+            name = strip(read(`hostnamectl --pretty`, String))
+        catch
+        end
+    end
+    isempty(name) && (name = gethostname())
+    return String(name)
+end
+
+# Default display name. Falls back through friendly-hostname → username →
+# "worker". When the hostname is "localhost"/empty (common on freshly-
+# installed Linux distros) we splice in a 4-char chunk of the worker_id so
+# two laptops with the same `gethostname()=="localhost"` still get distinct
+# *display* names — the dict key is the full UUID either way, but the user
+# sees something friendlier than "localhost" twice.
 function default_worker_name(worker_id::String)
-    h = gethostname()
+    h = friendly_hostname()
     if !isempty(h) && lowercase(h) != "localhost"
         return h
     end
@@ -606,102 +631,294 @@ end
 # ── Claude session scanner ─────────────────────────────────────────────────────
 #
 # Discovers Claude Code projects from the on-disk session history under
-# `~/.claude/projects/<encoded>/*.jsonl`. We deliberately don't try to enumerate
-# *live* claude processes — Linux can do it via /proc but macOS/Windows can't
-# without OS-specific PEB-reading / libproc shenanigans, and the history walk
-# already surfaces any project a user has touched (active sessions write to a
-# jsonl in the same directory, so they're picked up too — just sorted by
-# `last_used` mtime instead of via process introspection).
+# `~/.claude/projects/<encoded>/`. We don't try to enumerate live claude
+# processes (Linux /proc only; macOS/Windows need OS-specific libproc / PEB
+# work); the history walk surfaces both completed and currently-running
+# sessions, since active sessions write to a jsonl in the same directory.
 #
-# The only piece that's genuinely platform-specific is `decode_project_path`
-# (Unix vs Windows path encoding); everything else is one cross-platform impl.
+# The encoded folder name is NOT used to recover the project path — Claude
+# Code maps `/`, `.`, AND `_` all to `-`, so the inverse is ambiguous and
+# silently fails for any project name containing `.` or `_` (i.e. every
+# Julia `Foo.jl` package, every snake_case directory). Instead we read the
+# `cwd` field from inside each jsonl. We re-read per jsonl (not once per
+# encoded folder) so that subagent rows reflect the cwd recorded in THAT
+# subagent's file — if it ran in a nested directory, we honor it.
+
+const CWD_LINE_LIMIT    = 100  # cwd typically lands on line 1-3, but generous
+const PREVIEW_MAX_CHARS = 120  # truncated length for the dashboard preview line
 
 """
     scan_claude_sessions(; home) → Vector{Dict{String,Any}}
 
-Enumerate Claude Code projects from `~/.claude/projects/`. One entry per
-project, sorted by `last_used` descending. Each entry has:
-- `path`       — absolute project directory (decoded from the encoded dir name)
-- `name`       — basename of `path`
-- `session_id` — basename of the most-recently-modified jsonl in the project
-                 (used by the import flow's `session/load` to resume the session)
-- `last_used`  — Unix timestamp (latest jsonl mtime in the project)
+Enumerate Claude Code sessions under `~/.claude/projects/`. One entry per
+discovered `.jsonl` (top-level session jsonl AND each subagent jsonl), sorted
+by `last_used` descending. Each entry has:
+
+- `path`              — absolute project directory (read from a `cwd` field
+                        in the jsonl content, not derived from the folder name)
+- `name`              — `basename(path)`
+- `session_id`        — basename of the jsonl minus `.jsonl`. For top-level
+                        sessions this is the UUID Claude Code uses for
+                        `session/load`; for subagents it is the agent id
+                        (e.g. `agent-a56e94ef589608347`).
+- `last_used`         — Unix timestamp (jsonl mtime)
+- `kind`              — `"session"` or `"subagent"`
+- `agent_type`        — `nothing` for sessions; for subagents, the `agentType`
+                        from the sibling `<id>.meta.json` (e.g. `"Explore"`).
+- `parent_session_id` — `nothing` for sessions; for subagents, the UUID
+                        directory name immediately above `subagents/`.
+- `running`           — `true`  iff `~/.claude/sessions/<pid>.json` exists for
+                        this `session_id` AND the OS confirms that PID is
+                        still alive; `false` if no sessions file exists or the
+                        OS says the PID is gone; `nothing` if the OS-level
+                        liveness check is unavailable (e.g. Windows path
+                        couldn't open the process handle for unknown reasons).
+                        Subagents share their parent's process, so they're
+                        never tracked in `~/.claude/sessions/` and always get
+                        `running = false`.
+- `pid`               — set only when `running === true`; the OS PID of the
+                        live Claude CLI process. `nothing` otherwise.
+- `first_prompt`      — short preview of the first user-message text in the
+                        jsonl (whitespace-collapsed, truncated to
+                        PREVIEW_MAX_CHARS). `nothing` if the jsonl contains no
+                        real user message in its first `CWD_LINE_LIMIT` lines.
+
+Folders whose jsonls yield no `cwd` field (malformed / empty) are skipped.
 """
 function scan_claude_sessions(; home::String = homedir())
     results = Dict{String,Any}[]
     projects_dir = joinpath(home, ".claude", "projects")
     isdir(projects_dir) || return results
+    pid_map = load_sessions_pid_map(; home = home)
     for encoded in readdir(projects_dir)
         proj_dir = joinpath(projects_dir, encoded)
         isdir(proj_dir) || continue
-        jsonl_files = filter(f -> endswith(f, ".jsonl"),
-                             readdir(proj_dir; join=true))
-        isempty(jsonl_files) && continue
-        decoded = decode_project_path(encoded)
-        decoded === nothing && continue
-        latest    = jsonl_files[argmax(stat(f).mtime for f in jsonl_files)]
-        last_used = stat(latest).mtime
-        push!(results, Dict{String,Any}(
-            "path"       => decoded,
-            "name"       => basename(decoded),
-            "session_id" => first(splitext(basename(latest))),
-            "last_used"  => last_used,
-        ))
+        for jsonl in find_jsonls(proj_dir)
+            entry = entry_from_jsonl(jsonl, pid_map)
+            entry === nothing && continue
+            push!(results, entry)
+        end
     end
     sort!(results; by = r -> -Float64(get(r, "last_used", 0.0)))
     return results
 end
 
-# Decode ~/.claude/projects/<encoded> back to an absolute path. Claude Code
-# encodes by replacing every path separator with `-`, so a `-` inside a folder
-# name is ambiguous — we DFS against the real filesystem and return the
-# variant whose components actually exist.
-#
-# Per-platform piece is just "what's the root and how is it encoded":
-#   Unix:    "/foo/bar"      → "-foo-bar"                  (leading '/' → '-')
-#   Windows: "C:\Users\foo"  → "C--Users-foo"              (':' → '-', '\' → '-')
-# `reconstruct_path` itself is platform-neutral because `joinpath`/`isdir`
-# already use the correct separators.
-@static if Sys.iswindows()
-    function decode_project_path(encoded::String)
-        # Layout: <drive-letter> '-' (':') '-' ('\\') <rest joined by '-'>.
-        length(encoded) >= 3                || return nothing
-        isletter(encoded[1])                || return nothing
-        encoded[2] == '-' && encoded[3] == '-' || return nothing
-        root = string(encoded[1], ":\\")
-        candidates = reconstruct_path(root, encoded[4:end])
-        for c in candidates
-            isdir(c) && return c
+# Recursively collect `*.jsonl` files under `proj_dir`. Skips `memory/`
+# (Claude's user-memory store, never contains jsonls) and follows no symlinks
+# to avoid loops. Returns the list sorted by mtime descending so the freshest
+# file is tried first when extracting cwd — its format is most likely current.
+function find_jsonls(proj_dir::AbstractString)
+    out = String[]
+    for (root, dirs, files) in walkdir(String(proj_dir); follow_symlinks=false)
+        # Don't descend into `<proj_dir>/memory/`.
+        if "memory" in dirs && root == String(proj_dir)
+            filter!(d -> d != "memory", dirs)
         end
-        return nothing
-    end
-else
-    function decode_project_path(encoded::String)
-        startswith(encoded, "-") || return nothing
-        candidates = reconstruct_path("/", encoded[2:end])
-        for c in candidates
-            isdir(c) && return c
+        for f in files
+            endswith(f, ".jsonl") && push!(out, joinpath(root, f))
         end
-        return nothing
     end
+    sort!(out; by = f -> -stat(f).mtime)
+    return out
 end
 
-function reconstruct_path(current::String, remaining::String)
-    isempty(remaining) && return [current]
-    results = String[]
-    parts   = split(remaining, '-'; keepempty=false)
-    for i in 1:length(parts)
-        segment   = join(parts[1:i], '-')
-        candidate = joinpath(current, segment)
-        isdir(candidate) || continue
-        rest = i < length(parts) ? join(parts[i+1:end], '-') : ""
-        if isempty(rest)
-            push!(results, candidate)
-        else
-            append!(results, reconstruct_path(candidate, rest))
+# Scan up to CWD_LINE_LIMIT lines from `jsonl`, JSON-parsing each, and extract
+# both the project `cwd` (first record with a non-empty `"cwd"`) and a `preview`
+# (first user-message text). Returned as `(cwd, preview)`; either can be
+# `nothing` if not found. One pass; corrupt lines are skipped silently.
+#
+# A "user message" record is `{"type":"user","message":{"role":"user",
+# "content": str | [block, ...]}}`. For list content we take the first
+# `"type":"text"` block (skipping tool-result blocks etc.).
+function scan_jsonl_metadata(jsonl::AbstractString)
+    cwd     = nothing
+    preview = nothing
+    try
+        open(jsonl, "r") do io
+            n = 0
+            while !eof(io) && n < CWD_LINE_LIMIT && (cwd === nothing || preview === nothing)
+                line = readline(io)
+                n += 1
+                isempty(line) && continue
+                rec = try
+                    JSON.parse(line)
+                catch
+                    continue
+                end
+                if cwd === nothing
+                    v = get(rec, "cwd", nothing)
+                    v isa AbstractString && !isempty(v) && (cwd = String(v))
+                end
+                if preview === nothing
+                    t = first_user_text(rec)
+                    t !== nothing && (preview = t)
+                end
+            end
+        end
+    catch e
+        @debug "scan_jsonl_metadata: read failed" jsonl exception=e
+    end
+    return (cwd, preview)
+end
+
+# Return the user-message text from one jsonl record, or `nothing` if this
+# record isn't a real user prompt. Handles both string content and array
+# content (picking the first text block; ignoring tool_result blocks).
+function first_user_text(rec)
+    rec isa AbstractDict || return nothing
+    String(get(rec, "type", "")) == "user" || return nothing
+    msg = get(rec, "message", nothing)
+    msg isa AbstractDict || return nothing
+    String(get(msg, "role", "")) == "user" || return nothing
+    c = get(msg, "content", nothing)
+    if c isa AbstractString
+        return clean_preview(c)
+    elseif c isa AbstractVector
+        for blk in c
+            blk isa AbstractDict || continue
+            String(get(blk, "type", "")) == "text" || continue
+            t = get(blk, "text", "")
+            t isa AbstractString && !isempty(t) && return clean_preview(t)
         end
     end
-    return results
+    return nothing
+end
+
+# Strip whitespace, collapse internal whitespace runs to a single space, then
+# truncate to PREVIEW_MAX_CHARS with an ellipsis. Returns `nothing` if empty.
+function clean_preview(s::AbstractString)
+    s = strip(replace(String(s), r"\s+" => " "))
+    isempty(s) && return nothing
+    length(s) > PREVIEW_MAX_CHARS && (s = first(s, PREVIEW_MAX_CHARS - 1) * "…")
+    return String(s)
+end
+
+# Build a result Dict for one jsonl. Reads `cwd` from the jsonl itself
+# (returns `nothing` if no cwd is recoverable in the first CWD_LINE_LIMIT
+# lines). Subagent metadata is read from `<jsonl-stem>.meta.json` next to
+# the jsonl; missing or unreadable meta → `agent_type = nothing`. `pid_map`
+# (sessionId → OS pid, from `load_sessions_pid_map`) is used to compute the
+# `running` / `pid` fields.
+function entry_from_jsonl(jsonl::AbstractString, pid_map::Dict{String,Int})
+    cwd, preview = scan_jsonl_metadata(jsonl)
+    cwd === nothing && return nothing
+    sid = first(splitext(basename(jsonl)))
+    is_subagent = occursin("/subagents/", replace(jsonl, '\\' => '/'))
+    agent_type        = nothing
+    parent_session_id = nothing
+    if is_subagent
+        # Layout: <proj>/<parent-sid>/subagents/<agent-id>.jsonl
+        subagents_dir = dirname(jsonl)
+        parent_dir    = dirname(subagents_dir)
+        parent_session_id = basename(parent_dir)
+        meta_path = joinpath(subagents_dir, sid * ".meta.json")
+        if isfile(meta_path)
+            try
+                meta = JSON.parse(read(meta_path, String))
+                at = get(meta, "agentType", nothing)
+                at isa AbstractString && (agent_type = String(at))
+            catch e
+                @debug "entry_from_jsonl: meta read failed" meta_path exception=e
+            end
+        end
+    end
+    # Liveness: only top-level sessions can match a sessions-file entry —
+    # subagents share their parent's process and never appear in the map.
+    running = nothing
+    pid     = nothing
+    if !is_subagent && haskey(pid_map, sid)
+        pid_candidate = pid_map[sid]
+        live = process_running(pid_candidate)
+        if live === true
+            running, pid = true, pid_candidate
+        elseif live === false
+            running = false
+        else
+            # OS check unavailable (Windows fallback). Conservative: leave
+            # running as `nothing` so the UI shows no badge.
+        end
+    else
+        # No sessions-file entry → definitively not running. (Same for
+        # subagents.)
+        running = false
+    end
+    return Dict{String,Any}(
+        "path"              => String(cwd),
+        "name"              => basename(String(cwd)),
+        "session_id"        => sid,
+        "last_used"         => Float64(stat(jsonl).mtime),
+        "kind"              => is_subagent ? "subagent" : "session",
+        "agent_type"        => agent_type,
+        "parent_session_id" => parent_session_id,
+        "running"           => running,
+        "pid"               => pid,
+        "first_prompt"      => preview,
+    )
+end
+
+# ── Liveness helpers ──────────────────────────────────────────────────────────
+# `~/.claude/sessions/<pid>.json` is Claude Code's own liveness registry:
+# filename = OS PID, body has `{pid, sessionId, cwd, ...}`. We pair "file
+# exists" with an OS-level "PID still alive" check; only the conjunction is
+# trustworthy (files can linger past process death; PIDs can be reused).
+
+# Walk `~/.claude/sessions/*.json` once per scan, returning sessionId → pid.
+# Cost is O(K) where K is the number of tracked sessions (typically < 20).
+function load_sessions_pid_map(; home::String = homedir())
+    out = Dict{String,Int}()
+    sdir = joinpath(home, ".claude", "sessions")
+    isdir(sdir) || return out
+    for f in readdir(sdir; join = true)
+        endswith(f, ".json") || continue
+        try
+            d = JSON.parse(read(f, String))
+            sid = String(get(d, "sessionId", ""))
+            pid = get(d, "pid", nothing)
+            (isempty(sid) || pid === nothing) && continue
+            out[sid] = Int(pid)
+        catch e
+            @debug "load_sessions_pid_map: skip" file=f exception=e
+        end
+    end
+    return out
+end
+
+# Check whether the given PID is currently alive. Returns:
+#   `true`    — confirmed alive,
+#   `false`   — confirmed dead,
+#   `nothing` — the OS-level check couldn't determine (always show no badge).
+@static if Sys.iswindows()
+    const _PROCESS_QUERY_LIMITED_INFORMATION = UInt32(0x1000)
+    function process_running(pid::Integer)
+        try
+            h = ccall((:OpenProcess, "kernel32"), Ptr{Cvoid},
+                      (UInt32, Cint, UInt32),
+                      _PROCESS_QUERY_LIMITED_INFORMATION, Cint(0), UInt32(pid))
+            if h != C_NULL
+                ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), h)
+                return true
+            end
+            # NULL could mean "no such process" or "access denied" — we don't
+            # bother calling GetLastError(); be conservative and report
+            # "unknown" so the UI shows no badge.
+            return nothing
+        catch
+            return nothing
+        end
+    end
+else
+    function process_running(pid::Integer)
+        try
+            r = ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(0))
+            r == 0 && return true
+            err = Libc.errno()
+            err == Libc.ESRCH && return false   # No such process
+            err == Libc.EPERM && return true    # Process exists, no signal perm
+            return false
+        catch
+            return nothing
+        end
+    end
 end
 
 function handle_scan_sessions(ws, cmd::AbstractDict)

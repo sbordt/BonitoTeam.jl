@@ -58,14 +58,39 @@ function load_or_generate_worker_id()
     return id
 end
 
-# Default display name. Falls back through hostname → username → "worker".
-# When hostname is "localhost"/empty (common on freshly-installed Linux
-# distros) we splice in a 4-char chunk of the worker_id so two laptops with
-# the same `gethostname()=="localhost"` still get distinct *display* names —
-# the dict key is the full UUID either way, but the user sees something
-# friendlier than "localhost" twice.
+# OS-friendly display name. Prefers the user-configured "pretty" name when
+# the OS exposes one (macOS ComputerName, Linux hostnamectl pretty); falls
+# back to `gethostname()`. Always returns a String; never throws.
+function friendly_hostname()
+    name = ""
+    @static if Sys.isapple()
+        # macOS System Settings → General → About → Name. Includes spaces /
+        # apostrophes (e.g. "Sebastian's MacBook Pro"). `scutil` ships on
+        # every macOS install — no Homebrew dependency.
+        try
+            name = strip(read(`scutil --get ComputerName`, String))
+        catch
+        end
+    elseif Sys.islinux()
+        # `hostnamectl --pretty` prints the user-set pretty hostname if
+        # configured, otherwise empty. systemd ships it on most distros.
+        try
+            name = strip(read(`hostnamectl --pretty`, String))
+        catch
+        end
+    end
+    isempty(name) && (name = gethostname())
+    return String(name)
+end
+
+# Default display name. Falls back through friendly-hostname → username →
+# "worker". When the hostname is "localhost"/empty (common on freshly-
+# installed Linux distros) we splice in a 4-char chunk of the worker_id so
+# two laptops with the same `gethostname()=="localhost"` still get distinct
+# *display* names — the dict key is the full UUID either way, but the user
+# sees something friendlier than "localhost" twice.
 function default_worker_name(worker_id::String)
-    h = gethostname()
+    h = friendly_hostname()
     if !isempty(h) && lowercase(h) != "localhost"
         return h
     end

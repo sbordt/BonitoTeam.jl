@@ -1,7 +1,7 @@
 # Cross-platform regression suite for BonitoWorker. Focus on the surfaces we
-# burned ourselves on: Windows `.cmd` shims, the Unix vs Windows project-path
-# encoding under ~/.claude/projects/, scan_claude_sessions invariants, and
-# worker_id / worker_name derivation.
+# burned ourselves on: Windows `.cmd` shims, scan_claude_sessions invariants
+# (cwd from jsonl content, not folder name), and worker_id / worker_name
+# derivation.
 
 using Test
 using BonitoWorker
@@ -51,56 +51,6 @@ const BW = BonitoWorker
     end
 end
 
-# ── decode_project_path / reconstruct_path ────────────────────────────────────
-@testset "decode_project_path" begin
-    # Use the actual filesystem under a temp dir; encode a known path two ways
-    # (with and without a hyphen in a segment) and confirm DFS resolution picks
-    # the variant that physically exists.
-    mktempdir() do root
-        nested = joinpath(root, "alpha", "beta-gamma", "delta")
-        mkpath(nested)
-
-        if Sys.iswindows()
-            # Encoding: replace ':' and '\\' with '-'. Root is "<drive>:\\".
-            #   C:\Users\… → "C--Users-…"
-            # We round-trip through the helper by building the encoded form
-            # from the temp dir's drive + components.
-            drive   = string(uppercase(string(root[1])))
-            parts   = splitpath(root)[2:end]                # drop drive root
-            tail    = vcat(parts, "alpha", "beta-gamma", "delta")
-            encoded = drive * "--" * join(tail, "-")
-            decoded = BW.decode_project_path(encoded)
-            @test decoded !== nothing
-            @test isdir(decoded)
-            @test normpath(decoded) == normpath(nested)
-        else
-            # Unix encoding: leading '/' → '-', then '/' → '-'.
-            #   /home/foo → "-home-foo"
-            encoded = "-" * join(splitpath(nested)[2:end], "-")
-            decoded = BW.decode_project_path(encoded)
-            @test decoded !== nothing
-            @test decoded == nested
-        end
-
-        # Negative cases.
-        @test BW.decode_project_path("garbage-no-such-path") === nothing
-        @test BW.decode_project_path("") === nothing
-    end
-end
-
-@testset "reconstruct_path DFS" begin
-    # Two real directories sharing a hyphen-containing name proves the DFS
-    # resolves ambiguity correctly (no false positive on the wrong split).
-    mktempdir() do root
-        mkpath(joinpath(root, "foo-bar", "baz"))
-        # `reconstruct_path` walks segments separated by '-'; passing the
-        # combined tail "foo-bar-baz" with root=<temp> should resolve to the
-        # real nested dir, not invent "foo/bar-baz" or "foo-bar-baz".
-        candidates = BW.reconstruct_path(root, "foo-bar-baz")
-        @test joinpath(root, "foo-bar", "baz") in candidates
-    end
-end
-
 # ── scan_claude_sessions ──────────────────────────────────────────────────────
 @testset "scan_claude_sessions" begin
     # Empty home → empty results, no error (don't crash on a fresh machine).
@@ -108,36 +58,29 @@ end
         @test BW.scan_claude_sessions(home = home) == Dict{String,Any}[]
     end
 
-    # Build a fake ~/.claude/projects/ with two real subprojects and verify
-    # the dict shape + descending sort by last_used.
+    # Build a fake ~/.claude/projects/ with two subprojects and verify the
+    # dict shape + descending sort by last_used. The encoded folder name is
+    # NOT parsed by the new scanner — we read `cwd` directly from the jsonl
+    # content. So the folder name is arbitrary; the jsonl payload is what
+    # matters.
     mktempdir() do home
-        # Real project directories that the encoded names will resolve to.
         proj_a = joinpath(home, "proj-a")
         proj_b = joinpath(home, "proj-b")
         mkpath(proj_a); mkpath(proj_b)
 
-        # Build the encoded ~/.claude/projects/<encoded>/ entries.
-        if Sys.iswindows()
-            drive = string(uppercase(string(home[1])))
-            tail_a = vcat(splitpath(home)[2:end], "proj-a")
-            tail_b = vcat(splitpath(home)[2:end], "proj-b")
-            enc_a  = drive * "--" * join(tail_a, "-")
-            enc_b  = drive * "--" * join(tail_b, "-")
-        else
-            enc_a = "-" * join(vcat(splitpath(home)[2:end], "proj-a"), "-")
-            enc_b = "-" * join(vcat(splitpath(home)[2:end], "proj-b"), "-")
-        end
-
         claude_root = joinpath(home, ".claude", "projects")
-        mkpath(joinpath(claude_root, enc_a))
-        mkpath(joinpath(claude_root, enc_b))
+        # Arbitrary folder names; deliberately NOT a valid encoding of the
+        # cwd — this proves we don't rely on folder-name decoding anymore.
+        mkpath(joinpath(claude_root, "enc-a"))
+        mkpath(joinpath(claude_root, "enc-b"))
 
-        # Two jsonls; touch B's to be newer so it sorts first.
-        a_jsonl = joinpath(claude_root, enc_a, "11111111-1111-1111-1111-111111111111.jsonl")
-        b_jsonl = joinpath(claude_root, enc_b, "22222222-2222-2222-2222-222222222222.jsonl")
-        write(a_jsonl, "{}\n")
+        # Two jsonls. First line carries the cwd field; that's all the
+        # scanner needs. Touch B's after A so B sorts first by mtime.
+        a_jsonl = joinpath(claude_root, "enc-a", "11111111-1111-1111-1111-111111111111.jsonl")
+        b_jsonl = joinpath(claude_root, "enc-b", "22222222-2222-2222-2222-222222222222.jsonl")
+        write(a_jsonl, """{"cwd":"$(escape_string(proj_a))"}\n""")
         sleep(0.05)
-        write(b_jsonl, "{}\n")
+        write(b_jsonl, """{"cwd":"$(escape_string(proj_b))"}\n""")
 
         results = BW.scan_claude_sessions(home = home)
 
@@ -145,6 +88,8 @@ end
         @test length(results) == 2
         @test results[1]["name"] == "proj-b"
         @test results[2]["name"] == "proj-a"
+        @test results[1]["path"] == proj_b
+        @test results[2]["path"] == proj_a
 
         # Required keys present + types right.
         for r in results
@@ -154,11 +99,16 @@ end
             @test haskey(r, "last_used") && r["last_used"] isa Number
         end
 
-        # No `active`/`pid`/`process_count` — those were removed.
+        # New optional fields are present with their default values: no
+        # sessions/<pid>.json in the fake home → not running; no user
+        # message in the jsonl → no preview; no subagents/ dir → kind=session.
         for r in results
-            @test !haskey(r, "active")
-            @test !haskey(r, "pid")
-            @test !haskey(r, "process_count")
+            @test r["kind"] == "session"
+            @test r["running"] === false
+            @test r["pid"] === nothing
+            @test r["first_prompt"] === nothing
+            @test r["agent_type"] === nothing
+            @test r["parent_session_id"] === nothing
         end
 
         # Unique paths (the scanner never duplicates).

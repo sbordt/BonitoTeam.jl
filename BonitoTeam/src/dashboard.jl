@@ -987,9 +987,66 @@ const DashboardStyles = Bonito.Styles(
         "color" => "var(--bt-text-muted)", "margin-top" => "2px",
         "overflow" => "hidden",
         "text-overflow" => "ellipsis", "white-space" => "nowrap"),
+    # First-user-prompt preview shown in place of the path inside group rows.
+    # Italic + slightly larger than the mono path so it reads as content,
+    # not metadata. One-line ellipsis; truncation happens server-side at
+    # PREVIEW_MAX_CHARS so the layout stays predictable.
+    CSS(".bt-session-preview",
+        "font-size" => "11.5px",
+        "color" => "var(--bt-text-muted)", "margin-top" => "2px",
+        "font-style" => "italic",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis", "white-space" => "nowrap"),
     CSS(".bt-session-meta",
         "font-size" => "11px",
         "color" => "var(--bt-text-faint)", "margin-top" => "2px"),
+
+    # ── Project-group disclosure (two-level session list) ────────────────────
+    # One <details> per project cwd; expands to reveal child .bt-session-row
+    # widgets. Chevron is a CSS `::before` content swap on `[open]`, never a
+    # `transform: rotate()` — same reason documented for `.bt-subsection-*`.
+    CSS(".bt-group",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-surface)",
+        "margin-bottom" => "6px",
+        "overflow" => "hidden"),
+    CSS(".bt-group-summary",
+        "display" => "flex", "align-items" => "baseline", "gap" => "10px",
+        "padding" => "10px 12px",
+        "cursor" => "pointer", "user-select" => "none",
+        "list-style" => "none",
+        "background" => "var(--bt-surface)"),
+    CSS(".bt-group-summary::-webkit-details-marker", "display" => "none"),
+    CSS(".bt-group-summary::before",
+        "content" => "\"▸\"",
+        "color" => "var(--bt-text-faint)", "font-size" => "10px",
+        "flex-shrink" => "0"),
+    CSS("details.bt-group[open] > .bt-group-summary::before",
+        "content" => "\"▾\""),
+    CSS(".bt-group-summary:hover",
+        "background" => "var(--bt-surface-2)"),
+    CSS(".bt-group-name",
+        "font-weight" => "600", "font-size" => "13px",
+        "flex-shrink" => "0"),
+    CSS(".bt-group-path",
+        "font-family" => "ui-monospace, monospace", "font-size" => "11px",
+        "color" => "var(--bt-text-muted)",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "white-space" => "nowrap", "min-width" => "0",
+        "flex" => "1 1 auto"),
+    CSS(".bt-group-meta",
+        "font-size" => "11px", "color" => "var(--bt-text-faint)",
+        "flex-shrink" => "0"),
+    CSS(".bt-group-body",
+        "padding" => "8px 10px 4px",
+        "border-top" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface-2)"),
+    # Child rows inside a group — drop their own border so the group's
+    # border carries the visual outer frame.
+    CSS(".bt-group-body .bt-session-row",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)"),
 
     # ── Spinner ──────────────────────────────────────────────────────────────
     CSS(".bt-spinner-row",

@@ -217,33 +217,64 @@ function render_discover_panel(c::WorkerCard, wid::String)
             class = "bt-errors-list")
     end
 
-    # Active flag is part of the key so it remounts with the right badge.
-    session_rows = Dict{String,SessionRow}()
+    # Two-level rendering: one project group per cwd, each containing the
+    # session/subagent rows from that project. Both levels use KeyedList
+    # for stable identity across rescans — opening a group survives a
+    # Refresh because the <details> DOM node is preserved when its key
+    # (= path) is unchanged.
+    #
+    # Caches are pruned each tick to avoid unbounded growth if a project
+    # disappears between scans (e.g. its on-disk jsonl was deleted).
+    session_groups = Dict{String, SessionGroup}()
+    session_rows   = Dict{String, SessionRow}()
+
     function get_session_row(r::AbstractDict)
         sr = SessionRow(c, r)
         get!(session_rows, sr.row_key, sr)
     end
-    active_widgets_obs = map(c.discover_results) do results
-        SessionRow[get_session_row(r) for r in results
-                    if !haskey(r, "error") && get(r, "active", false) === true]
-    end
-    historical_widgets_obs = map(c.discover_results) do results
-        SessionRow[get_session_row(r) for r in results
-                    if !haskey(r, "error") && get(r, "active", false) !== true]
-    end
-    active_keyed_list     = KeyedList(active_widgets_obs;     key = s -> s.row_key)
-    historical_keyed_list = KeyedList(historical_widgets_obs; key = s -> s.row_key)
 
-    show_active_obs = map(active_widgets_obs, c.discover_busy) do rows, busy
-        !busy && !isempty(rows)
+    groups_obs = map(c.discover_results) do results
+        by_path  = Dict{String, Vector{Any}}()
+        latest_by_path = Dict{String, Float64}()
+        for r in results
+            haskey(r, "error") && continue
+            # Subagents share their parent's process and aren't user-startable.
+            # Surface only top-level sessions. A project whose only entries are
+            # subagents (e.g. older Claude Code versions that didn't persist the
+            # parent jsonl) drops out of the list entirely.
+            String(get(r, "kind", "session")) == "subagent" && continue
+            p = String(get(r, "path", ""))
+            push!(get!(by_path, p, Any[]), r)
+            ts = get(r, "last_used", 0.0)
+            t = ts isa Number ? Float64(ts) : 0.0
+            t > get(latest_by_path, p, 0.0) && (latest_by_path[p] = t)
+        end
+        out = SessionGroup[]
+        seen_row_keys = Set{String}()
+        for (p, rs) in by_path
+            sort!(rs; by = r -> -Float64(get(r, "last_used", 0.0)))
+            rows = SessionRow[get_session_row(r) for r in rs]
+            for sr in rows; push!(seen_row_keys, sr.row_key); end
+            g = get!(session_groups, p) do
+                SessionGroup(p, basename(p),
+                             Observable(rows), Observable(""))
+            end
+            g.rows_obs[]    = rows
+            g.summary_obs[] = group_summary_string(rs)
+            push!(out, g)
+        end
+        # Prune stale cache entries (paths/rows no longer present).
+        for k in collect(keys(session_groups))
+            haskey(by_path, k) || delete!(session_groups, k)
+        end
+        for k in collect(keys(session_rows))
+            k in seen_row_keys || delete!(session_rows, k)
+        end
+        sort!(out; by = g -> -get(latest_by_path, g.path, 0.0))
+        return out
     end
-    show_hist_obs = map(historical_widgets_obs, c.discover_busy) do rows, busy
-        !busy && !isempty(rows)
-    end
-    active_label_class = map(show -> show ? "bt-section-label" : "bt-section-label bt-hidden", show_active_obs)
-    hist_label_class   = map(show -> show ? "bt-section-label" : "bt-section-label bt-hidden", show_hist_obs)
-    active_list_class = map(show -> show ? "bt-discover-section" : "bt-discover-section bt-hidden", show_active_obs)
-    hist_list_class   = map(show -> show ? "bt-discover-section" : "bt-discover-section bt-hidden", show_hist_obs)
+
+    groups_keyed_list = KeyedList(groups_obs; key = g -> g.path)
 
     DOM.div(
         DOM.div(
@@ -253,9 +284,6 @@ function render_discover_panel(c::WorkerCard, wid::String)
         spinner_block,
         empty_block,
         errors_obs,
-        DOM.div("Active"; class = active_label_class),
-        DOM.div(active_keyed_list; class = active_list_class),
-        DOM.div("Historical"; class = hist_label_class),
-        DOM.div(historical_keyed_list; class = hist_list_class);
+        DOM.div(groups_keyed_list; class = "bt-discover-section");
         class = "bt-discover-panel bt-slide-in")
 end

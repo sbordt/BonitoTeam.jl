@@ -57,7 +57,7 @@ end
 ```
 """
 function dev_server(; port::Union{Int,Nothing} = nothing,
-                      name::String             = "dev",
+                      name::String             = BonitoWorker.friendly_hostname(),
                       auto_open::Bool          = false)
     # port=0 lets the kernel pick a free ephemeral port; Bonito.Server
     # writes the real port back to srv.port after start.

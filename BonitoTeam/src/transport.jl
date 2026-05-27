@@ -22,9 +22,11 @@ Concrete subtypes:
   * `MockTransport` — in-memory loopback used by tests.
 
 Each transport overloads `ACP.send(t, line)`, `ACP.recv(t)`, and
-`ACP.close!(t)` for line-level I/O, and `start_session(t, on_update)`
+`Base.close(t)` for line-level I/O, and `start_session(t, handler)`
 to drive the standard `initialize` + `session/new` (or `session/load`)
-sequence and return a live `ACP.Client`.
+sequence and return a live `ACP.Client`. `handler` is an `ACP.Handler`
+subtype (see `ChatHandler` in chat.jl) that owns the routing of
+agent→client requests and `session/update` notifications.
 """
 abstract type ChatTransport <: ACP.Transport end
 
@@ -36,7 +38,7 @@ mutable struct LocalTransport <: ChatTransport
     agent_bin    :: String
     agent_env    :: Dict{String,String}
     # Lazily populated by start_session (set to the spawned process'
-    # subprocess transport so send/recv/close! can delegate).
+    # subprocess transport so send/recv/close can delegate).
     inner        :: Ref{Union{ACP.SubprocessTransport,Nothing}}
 end
 
@@ -50,7 +52,8 @@ LocalTransport(cwd::AbstractString;
 
 ACP.send(t::LocalTransport, line::AbstractString) = ACP.send(t.inner[], line)
 ACP.recv(t::LocalTransport)                       = ACP.recv(t.inner[])
-ACP.close!(t::LocalTransport) = (t.inner[] === nothing || ACP.close!(t.inner[]); nothing)
+Base.close(t::LocalTransport) =
+    (t.inner[] === nothing || close(t.inner[]); nothing)
 
 # ── 2. Worker over WebSocket ────────────────────────────────────────────────
 
@@ -88,13 +91,16 @@ function ACP.recv(t::WorkerTransport)
     end
 end
 
-function ACP.close!(t::WorkerTransport)
+function Base.close(t::WorkerTransport)
     ws = t.ws[]
     ws === nothing && return nothing
-    try close(ws)
+    HTTP.WebSockets.isclosed(ws) && return nothing
+    try
+        close(ws)
     catch e
-        (e isa Base.IOError || e isa HTTP.WebSockets.WebSocketError) && return nothing
-        @warn "WorkerTransport.close! failed" exception=e
+        # Peer (worker) may have closed concurrently — that's the resource state
+        # we want anyway. Only swallow the specific races; anything else is real.
+        (e isa Base.IOError || e isa HTTP.WebSockets.WebSocketError) || rethrow()
     end
     return nothing
 end
@@ -108,7 +114,7 @@ end
 
 mutable struct MockTransport <: ChatTransport
     # Mutable + Refs so `start_session` can swap in fresh channels on a
-    # re-bring-up (after `restart_chat_session!` calls `close!` on the
+    # re-bring-up (after `restart_chat_session!` calls `close` on the
     # old client, the channels are closed and can't be put!/take!'d).
     incoming :: Channel{String}    # we read from this
     outgoing :: Channel{String}    # we write to this
@@ -124,8 +130,16 @@ MockTransport(on_setup::Function; cwd::AbstractString = "/tmp",
 
 ACP.send(t::MockTransport, line::AbstractString) = (put!(t.outgoing, String(line)); nothing)
 ACP.recv(t::MockTransport)                       = take!(t.incoming)
-ACP.close!(t::MockTransport)                     =
-    (try close(t.outgoing) catch end; try close(t.incoming) catch end; nothing)
+# Channel.close is idempotent in Base, so no wrapper is needed.
+Base.close(t::MockTransport) = (close(t.outgoing); close(t.incoming); nothing)
+
+# The path the *agent* sees as its working directory. The chat layer uses
+# this when constructing the ACP `FSRequestHandler` so server-side fs RPCs
+# resolve paths against the right root (server cwd locally, worker path
+# for remote sessions). Mock sessions report the cosmetic test cwd.
+agent_cwd(t::LocalTransport)  = t.cwd
+agent_cwd(t::WorkerTransport) = t.worker_path
+agent_cwd(t::MockTransport)   = t.cwd
 
 # ── ACP session bring-up, dispatched per transport ─────────────────────────
 
@@ -138,7 +152,7 @@ mcp_list_payload(mcp_servers) =
      for s in mcp_servers]
 
 # 1. Local: spawn claude-agent-acp, then drive initialize + session/new.
-function start_session(t::LocalTransport, on_update::Function)
+function start_session(t::LocalTransport, handler::ACP.Handler)
     isfile(t.agent_bin) || error("claude-agent-acp not found at: $(t.agent_bin)")
     env = merge(Dict(k => v for (k,v) in ENV),
                 Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
@@ -147,9 +161,7 @@ function start_session(t::LocalTransport, on_update::Function)
     proc = open(Cmd(`$(t.agent_bin)`; env, dir = t.cwd), "r+")
     t.inner[] = ACP.SubprocessTransport(proc)
 
-    conn = ACP.Connection(t;
-                          request_handler = ACP.make_request_handler(t.cwd),
-                          update_handler  = on_update)
+    conn = ACP.Connection(t, handler)
     ACP.send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
         "clientCapabilities" => Dict("fs" => Dict(
@@ -164,7 +176,7 @@ end
 
 # 2. Worker: ask the worker to spawn claude-agent-acp and dial back, then
 #    drive initialize + session/new (or session/load when resuming).
-function start_session(t::WorkerTransport, on_update::Function)
+function start_session(t::WorkerTransport, handler::ACP.Handler)
     haskey(t.state.worker_control_ws, t.worker_id) ||
         error("Worker '$(t.worker_id)' is not connected")
 
@@ -192,9 +204,7 @@ function start_session(t::WorkerTransport, on_update::Function)
     t.ws[] = take_pending!(t.state, ch, sid, 30.0,
                           "open_session on '$(t.worker_id)'")
 
-    conn = ACP.Connection(t;
-                          request_handler = ACP.make_request_handler(t.worker_path),
-                          update_handler  = on_update)
+    conn = ACP.Connection(t, handler)
     ACP.send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
         "clientCapabilities" => Dict("fs" => Dict(
@@ -224,11 +234,11 @@ end
 #    Channels are recreated each call because `restart_chat_session!`
 #    closes the old transport (killing the old responder) before bringing
 #    up a new one.
-function start_session(t::MockTransport, on_update::Function)
+function start_session(t::MockTransport, handler::ACP.Handler)
     if !isopen(t.outgoing); t.outgoing = Channel{String}(t.capacity); end
     if !isopen(t.incoming); t.incoming = Channel{String}(t.capacity); end
     t.on_setup(t.outgoing, t.incoming)
-    conn = ACP.Connection(t; update_handler = on_update)
+    conn = ACP.Connection(t, handler)
     ACP.send_request(conn, "initialize", Dict("protocolVersion" => 1))
     result = ACP.send_request(conn, "session/new",
                               Dict("cwd" => t.cwd, "mcpServers" => []))

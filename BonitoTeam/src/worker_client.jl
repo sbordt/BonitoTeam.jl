@@ -626,5 +626,5 @@ function send_file_to_worker!(state::ServerState, worker_name::String,
 end
 
 # NOTE: WS-backed ACP I/O now lives in `WorkerTransport` (src/transport.jl)
-# as `AgentClientProtocol.send` / `recv` / `close!` overloads — the
+# as `AgentClientProtocol.send` / `recv` and `Base.close` overloads — the
 # Connection talks to the transport via dispatched verbs, not callbacks.

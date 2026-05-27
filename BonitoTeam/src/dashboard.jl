@@ -387,13 +387,8 @@ function stop_session!(state::ServerState, p::ProjectInfo)
         m === nothing || delete!(state.chat_models, p.id)
         m
     end
-    if model !== nothing
-        try
-            AgentClientProtocol.close!(model.transport)
-        catch e
-            @warn "stop_session!: transport close failed" project=p.name exception=e
-        end
-    end
+    # close is idempotent + total now; a real error here is worth surfacing.
+    model === nothing || close(model.transport)
     release_project!(state, p)
     return nothing
 end

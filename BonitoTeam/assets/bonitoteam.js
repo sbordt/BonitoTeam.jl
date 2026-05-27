@@ -129,7 +129,7 @@ class BonitoChat {
 
         // Image attachments (paste / drag-drop). Wired AFTER the input area
         // is in the DOM, on a microtask so .bt-app's children are queryable.
-        Promise.resolve().then(() => this._setupAttachments());
+        Promise.resolve().then(() => this._setupInputs());
     }
 
     destroy() {
@@ -162,6 +162,9 @@ class BonitoChat {
         }
         if (this._onSendClickCapture && this.sendBtn) {
             this.sendBtn.removeEventListener('click', this._onSendClickCapture, true);
+        }
+        if (this._onStopClick && this.stopBtn) {
+            this.stopBtn.removeEventListener('click', this._onStopClick);
         }
         if (this.app) {
             this._onDragOver  && this.app.removeEventListener('dragover',  this._onDragOver);
@@ -203,8 +206,8 @@ class BonitoChat {
             case 'user_chunk':   return this.appendUserChunk(msg.text);
             case 'attach_error':
                 return this._showAttachError(msg.error || 'Attachment failed');
-            case 'send_ack':
-                return; // server accepted the multimodal send; nothing more to do
+            // (formerly `send_ack` — JS now clears the input widget
+            // unconditionally on submit, so no server ack is needed.)
             case 'user':
             case 'agent':
             case 'thought':
@@ -590,19 +593,18 @@ class BonitoChat {
     }
 
     // ── Image attachments ────────────────────────────────────────────────
-    // Paste / drag-drop images into the chat input. Each attachment lives
-    // locally in `this.attachments` (Map<id, {blob, mime, filename, dataUrl}>)
-    // and shows a thumbnail above the input row. On submit, JS posts a
-    // `{type: 'send', text, attachments}` comm event — Julia stores the
-    // bytes under `<cwd>/.bt-attachments/<ts>.<ext>`, pushes to the worker
-    // mirror (via send_file_to_worker!), and forwards the multimodal blocks
-    // to claude via ACP.
-    //
-    // For text-only sends, we leave the existing Bonito.Button → Julia
-    // `text_val` path untouched (the JS hijack only fires when there's at
-    // least one attachment queued). That preserves every test that drives
-    // the chat by typing + clicking the send button.
-    _setupAttachments() {
+    // Wire up the input widgets (textarea + send/stop buttons + attachments).
+    // Single send path: ALL user submissions ship `{type: 'send', text,
+    // attachments}` through `comm`. The send-button click + textarea Enter
+    // are JS-owned in capture phase; the local textarea + attachment strip
+    // are cleared right after `comm.notify` — no Julia round-trip for the
+    // UI reset. Stop button posts `{type: 'cancel'}`. Paste / drag-drop
+    // populates `this.attachments` (Map<id, {blob, mime, filename, dataUrl}>)
+    // with thumbnails shown above the input row; on submit Julia stores
+    // the bytes under `<cwd>/.bt-attachments/<ts>.<ext>`, pushes to the
+    // worker mirror (via `send_file_to_worker!`), and forwards them to
+    // claude as multimodal content blocks.
+    _setupInputs() {
         if (this.destroyed) return;
         const app = this.container?.parentElement;
         if (!app) return;
@@ -663,26 +665,32 @@ class BonitoChat {
         this.app.addEventListener('dragleave', this._onDragLeave);
         this.app.addEventListener('drop',      this._onDrop);
 
-        // Send hijack — capture phase + stopImmediatePropagation so neither
-        // Bonito's Button click nor the textarea's inline onkeydown fire
-        // when we intercept. We only intercept when there's something to
-        // attach; pure-text sends go through the existing path unchanged.
+        // Send click — capture phase so we run before any other listener
+        // (none exist now that Julia uses a plain DOM button, but
+        // capture is robust against future additions). Same shape for
+        // textarea Enter.
         this._onSendClickCapture = (e) => {
-            if (this.attachments.size === 0) return;
             e.preventDefault();
             e.stopImmediatePropagation();
-            this._submitWithAttachments();
+            this._submit();
         };
         this.sendBtn.addEventListener('click', this._onSendClickCapture, true);
 
         this._onTextInputKeyCapture = (e) => {
             if (e.key !== 'Enter' || e.shiftKey) return;
-            if (this.attachments.size === 0) return;
             e.preventDefault();
             e.stopImmediatePropagation();
-            this._submitWithAttachments();
+            this._submit();
         };
         this.textInput.addEventListener('keydown', this._onTextInputKeyCapture, true);
+
+        if (this.stopBtn) {
+            this._onStopClick = (e) => {
+                e.preventDefault();
+                this.comm.notify({type: 'cancel'});
+            };
+            this.stopBtn.addEventListener('click', this._onStopClick);
+        }
     }
 
     _dragHasImage(e) {
@@ -782,9 +790,12 @@ class BonitoChat {
         }, 4500);
     }
 
-    async _submitWithAttachments() {
-        if (this.attachments.size === 0) return;
+    async _submit() {
         const text = this.textInput.value;
+        // Nothing to send → noop. (Pressing Enter on an empty textarea
+        // shouldn't fire a request, and the user can have queued some
+        // attachments without any text — the latter case still sends.)
+        if (text.trim() === '' && this.attachments.size === 0) return;
         const payload = [];
         for (const item of this.attachments.values()) {
             const buf = await item.blob.arrayBuffer();
@@ -795,8 +806,11 @@ class BonitoChat {
             });
         }
         this.comm.notify({type: 'send', text, attachments: payload});
-        // Optimistic clear — server confirms via send_ack but we don't
-        // want the user re-clicking send while the bytes are in flight.
+        // Clear the local input immediately. We don't wait for any
+        // server ack — the textarea content is already encoded on the
+        // wire, Julia will surface errors (e.g. attachment rejection)
+        // via a separate event, and locking the user out of typing
+        // their next message while bytes are in flight would be hostile.
         this.textInput.value = '';
         this.textInput.dispatchEvent(new Event('input', {bubbles: true}));
         this._attachClear();

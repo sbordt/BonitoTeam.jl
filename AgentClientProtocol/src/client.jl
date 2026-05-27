@@ -1,7 +1,8 @@
 # High-level ACP client: manages one claude-agent-acp subprocess per instance.
 #
 # Usage:
-#   client = AgentClientProtocol.Client(cwd; on_update = upd -> ...)
+#   handler = MyCustomHandler(...)   # subtype of Handler with on_update overloads
+#   client  = AgentClientProtocol.Client(cwd, handler)
 #   AgentClientProtocol.prompt!(client, "hello")   # blocks until end_turn/cancelled
 #   AgentClientProtocol.cancel!(client)
 
@@ -21,43 +22,49 @@ mutable struct Client
     cwd::String
 end
 
-function make_request_handler(cwd::String)
-    return (method::String, params) -> begin
-        if method == "fs/read_text_file"
-            path = get(params, "path", "")
-            return Dict("content" => read(path, String))
+# Default request handler for the local-subprocess Client. Handles the
+# fs/terminal/permission RPCs claude-agent-acp can fire. Holds the cwd so
+# `fs/read_text_file` / `fs/write_text_file` can be sandboxed if needed
+# later — for now it just uses the path the agent sends.
+struct FSRequestHandler <: Handler
+    cwd::String
+end
 
-        elseif method == "fs/write_text_file"
-            path = get(params, "path", "")
-            content = get(params, "content", "")
-            mkpath(dirname(path))
-            write(path, content)
-            return nothing
+# Custom handlers compose with FSRequestHandler by wrapping it: the chat
+# layer's ChatHandler delegates its on_request to a FSRequestHandler
+# instance. Update handling is per-subtype, see e.g. BonitoTeam.ChatHandler.
+function on_request(h::FSRequestHandler, method::AbstractString, params)
+    if method == "fs/read_text_file"
+        path = get(params, "path", "")
+        return Dict("content" => read(path, String))
 
-        elseif method == "session/request_permission"
-            # bypassPermissions should prevent this; auto-allow if it appears anyway.
-            options = get(params, "options", [])
-            idx = findfirst(o -> get(o, "kind", "") in ("allow_once", "allow_always"), options)
-            if idx !== nothing
-                return Dict("outcome" => Dict("outcome" => "selected",
-                                              "optionId" => options[idx]["optionId"]))
-            end
-            return Dict("outcome" => Dict("outcome" => "cancelled"))
+    elseif method == "fs/write_text_file"
+        path = get(params, "path", "")
+        content = get(params, "content", "")
+        mkpath(dirname(path))
+        write(path, content)
+        return nothing
 
-        elseif startswith(method, "terminal/")
-            if method == "terminal/create"
-                return Dict("terminalId" => string(rand(UInt32), base=16))
-            elseif method == "terminal/output"
-                return Dict("output" => "", "exitStatus" => nothing)
-            elseif method in ("terminal/release", "terminal/kill", "terminal/wait_for_exit")
-                return nothing
-            end
-
-        else
-            @warn "ACP: unhandled client request" method
+    elseif method == "session/request_permission"
+        # bypassPermissions should prevent this; auto-allow if it appears anyway.
+        options = get(params, "options", [])
+        idx = findfirst(o -> get(o, "kind", "") in ("allow_once", "allow_always"), options)
+        if idx !== nothing
+            return Dict("outcome" => Dict("outcome" => "selected",
+                                          "optionId" => options[idx]["optionId"]))
         end
+        return Dict("outcome" => Dict("outcome" => "cancelled"))
+
+    elseif method == "terminal/create"
+        return Dict("terminalId" => string(rand(UInt32), base=16))
+    elseif method == "terminal/output"
+        return Dict("output" => "", "exitStatus" => nothing)
+    elseif method in ("terminal/release", "terminal/kill", "terminal/wait_for_exit")
         return nothing
     end
+
+    @warn "ACP: unhandled client request" method
+    return nothing
 end
 
 # Discover the agent binary: env var → PATH → node_modules search.
@@ -85,8 +92,7 @@ function find_agent_bin()
     return "claude-agent-acp"  # let OS raise a clear error at spawn time
 end
 
-function Client(cwd::String;
-                on_update::Function = identity,
+function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
                 mcp_servers::Vector{MCPServer} = MCPServer[],
                 agent_env::Dict{String,String} = Dict{String,String}(),
                 agent_bin::String = find_agent_bin())
@@ -100,10 +106,7 @@ function Client(cwd::String;
                 agent_env)
 
     proc = open(Cmd(`$agent_bin`; env, dir=cwd), "r+")
-
-    conn = Connection(proc;
-                      request_handler = make_request_handler(cwd),
-                      update_handler = on_update)
+    conn = Connection(proc, handler)
 
     send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
@@ -159,6 +162,4 @@ function cancel!(client::Client)
                       Dict("sessionId" => client.session_id))
 end
 
-function close!(client::Client)
-    close!(client.conn)
-end
+Base.close(client::Client) = close(client.conn)

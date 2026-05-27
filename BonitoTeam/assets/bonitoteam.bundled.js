@@ -75,7 +75,7 @@ class BonitoChat {
             this._onVPResize = ()=>this.onViewportResize();
             window.visualViewport.addEventListener('resize', this._onVPResize);
         }
-        Promise.resolve().then(()=>this._setupAttachments());
+        Promise.resolve().then(()=>this._setupInputs());
     }
     destroy() {
         this.destroyed = true;
@@ -107,6 +107,9 @@ class BonitoChat {
         }
         if (this._onSendClickCapture && this.sendBtn) {
             this.sendBtn.removeEventListener('click', this._onSendClickCapture, true);
+        }
+        if (this._onStopClick && this.stopBtn) {
+            this.stopBtn.removeEventListener('click', this._onStopClick);
         }
         if (this.app) {
             this._onDragOver && this.app.removeEventListener('dragover', this._onDragOver);
@@ -148,8 +151,6 @@ class BonitoChat {
                 return this.appendUserChunk(msg.text);
             case 'attach_error':
                 return this._showAttachError(msg.error || 'Attachment failed');
-            case 'send_ack':
-                return;
             case 'user':
             case 'agent':
             case 'thought':
@@ -471,7 +472,7 @@ class BonitoChat {
         }
         this.refresh();
     }
-    _setupAttachments() {
+    _setupInputs() {
         if (this.destroyed) return;
         const app = this.container?.parentElement;
         if (!app) return;
@@ -521,20 +522,27 @@ class BonitoChat {
         this.app.addEventListener('dragleave', this._onDragLeave);
         this.app.addEventListener('drop', this._onDrop);
         this._onSendClickCapture = (e)=>{
-            if (this.attachments.size === 0) return;
             e.preventDefault();
             e.stopImmediatePropagation();
-            this._submitWithAttachments();
+            this._submit();
         };
         this.sendBtn.addEventListener('click', this._onSendClickCapture, true);
         this._onTextInputKeyCapture = (e)=>{
             if (e.key !== 'Enter' || e.shiftKey) return;
-            if (this.attachments.size === 0) return;
             e.preventDefault();
             e.stopImmediatePropagation();
-            this._submitWithAttachments();
+            this._submit();
         };
         this.textInput.addEventListener('keydown', this._onTextInputKeyCapture, true);
+        if (this.stopBtn) {
+            this._onStopClick = (e)=>{
+                e.preventDefault();
+                this.comm.notify({
+                    type: 'cancel'
+                });
+            };
+            this.stopBtn.addEventListener('click', this._onStopClick);
+        }
     }
     _dragHasImage(e) {
         const dt = e.dataTransfer;
@@ -623,9 +631,9 @@ class BonitoChat {
             }
         }, 4500);
     }
-    async _submitWithAttachments() {
-        if (this.attachments.size === 0) return;
+    async _submit() {
         const text = this.textInput.value;
+        if (text.trim() === '' && this.attachments.size === 0) return;
         const payload = [];
         for (const item of this.attachments.values()){
             const buf = await item.blob.arrayBuffer();

@@ -307,7 +307,7 @@ TH.section("Stress 6: streaming agent chunks via unified_app") do
                      "consectetur ", "adipiscing ", "elit."]
             upd = BonitoTeam.AgentClientProtocol.AgentMessageChunk(
                 BonitoTeam.AgentClientProtocol.TextContent(text))
-            BonitoTeam.chat_on_agent_chunk!(model, upd)
+            BonitoTeam.apply!(model, BonitoTeam.AgentUpdate(upd))
             sleep(0.3)
         end
         ok = wait_for_js(w.win, """

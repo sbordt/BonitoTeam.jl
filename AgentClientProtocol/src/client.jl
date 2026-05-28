@@ -137,19 +137,16 @@ struct ImageAttachment
     mime::String
 end
 
-# Send a user message; blocks until the agent signals end_turn / cancelled
-# AND every session/update notification queued before that response has
-# been delivered to the handler. Returning this way means the caller can
-# treat "prompt! returned" as "the turn is fully observed" without having
-# to think about the inbox dispatcher running ahead/behind.
+# Send a user message; returns a `Channel{Message}` of the whole, ordered
+# messages that make up this turn (agent text, thoughts, tool calls, plans).
+# Each streaming message carries its own `updates` channel; iterate the
+# returned channel and drain each message's `updates` to render it. The
+# channel closes when the turn ends (end_turn / cancelled); if the connection
+# dies mid-turn, draining the channel rethrows `ConnectionClosed`.
 #
-# Without the trailing `drain_updates`, this race exists: chunks are
-# queued in the update inbox (FIFO) while end_turn arrives on a different
-# JSON-RPC pending channel; the response can unblock send_request before
-# the dispatcher has finished applying the last chunks, and the caller's
-# "turn over" finalize can race the tail of the chunk stream into a
-# corrupted state. The barrier is invisible to callers — they just see
-# `prompt!` block until everything's settled.
+# The whole turn is ONE bounded loop: a local `TurnState` coalesces the raw
+# update stream into messages and is `close`d when the stream ends. Nothing
+# outlives the turn.
 #
 # `images` are appended after the text as ACP image content blocks.
 function prompt!(client::Client, text::String;
@@ -162,12 +159,55 @@ function prompt!(client::Client, text::String;
             "mimeType" => img.mime,
         ))
     end
-    send_request(client.conn, "session/prompt", Dict(
-        "sessionId" => client.session_id,
-        "prompt"    => blocks,
-    ))
-    drain_updates(client.conn)
-    return nothing
+    params = Dict("sessionId" => client.session_id, "prompt" => blocks)
+    updates, response = prompt_updates(client.conn, params)
+    return Channel{Message}(BUF) do messages
+        st = TurnState()
+        try
+            for u in updates
+                parse_update!(messages, st, u)
+            end
+        finally
+            close(st)                 # finish the trailing message + any open tools
+        end
+        result = take!(response)      # end_turn / cancelled — or ConnectionClosed on teardown
+        result isa Exception && throw(result)
+    end
+end
+
+# Drive `session/load` and collect the resumed session's replayed history as a
+# flat, ordered, fully-materialized `Vector{Message}` (same coalescing the live
+# `prompt!` loop uses — `parse_update!`/`TurnState`). The agent re-streams the
+# session's jsonl as `session/update` notifications during the load; we feed them
+# through the coalescer in a task and drain each message's own stream as it
+# closes (so a long message can't deadlock on the bounded per-message channel).
+#
+# `params` is the `session/load` params dict (`sessionId`, `cwd`, `mcpServers`).
+# Returns after the load response arrives (the whole replay is drained). Throws
+# the rpc error / ConnectionClosed if the load fails.
+function replay_history(conn::Connection, params)
+    updates, response = request_updates(conn, "session/load", params)
+    out = Channel{Message}(BUF)
+    feeder = Base.errormonitor(@async begin
+        st = TurnState()
+        try
+            for u in updates
+                parse_update!(out, st, u)
+            end
+        finally
+            close(st)
+            close(out)
+        end
+    end)
+    msgs = Message[]
+    for m in out
+        drain_message!(m)
+        push!(msgs, m)
+    end
+    wait(feeder)
+    result = take!(response)
+    result isa Exception && throw(result)
+    return msgs
 end
 
 # Cancel the active turn (notification, non-blocking).

@@ -12,6 +12,71 @@
 // `[data-tool-id]` slot directly. Everything else (counts, ranges, message
 // pushes, status pings) is on `comm`.
 
+// One reusable collapsible-section behaviour, shared by tool rows and thought
+// bubbles (and any future lazy section). It owns the expand/collapse plus the
+// lazy-body lifecycle that used to be duplicated across wireToolToggle /
+// setToolExpanded / wireThoughtToggle:
+//   • a header click (or, in `native` mode, a <details> `toggle`) flips expanded
+//   • the first expand of a lazy section shows a "loading…" placeholder and
+//     fires `onExpand` once; the owner fills the body (via dom_in_js or a comm
+//     reply) and `fill()` marks it loaded so a re-expand doesn't refetch
+//   • `fetchEachExpand` (tools) refetches on every expand and `discardOnCollapse`
+//     empties the body on collapse (frees the mounted Monaco editors)
+export class Collapsable {
+    constructor(headerEl, bodyEl, opts = {}) {
+        this.header  = headerEl;
+        this.body    = bodyEl;
+        this.toggle  = opts.toggleEl || null;
+        this.native  = opts.native || false;          // hosted in <details>/<summary>
+        this.fetchEachExpand   = opts.fetchEachExpand || false;
+        this.discardOnCollapse = opts.discardOnCollapse || false;
+        this.onExpand = opts.onExpand || null;
+        this.lazy     = !!this.onExpand;
+        this.loaded   = !this.lazy;                    // eager bodies start loaded
+        this.expanded = false;
+
+        if (this.native) {
+            this.details = headerEl.closest('details') || bodyEl.closest('details');
+            this.details && this.details.addEventListener(
+                'toggle', () => this.applyExpanded(this.details.open));
+        } else {
+            headerEl.style.cursor = 'pointer';
+            headerEl.addEventListener('click', () => this.applyExpanded(!this.expanded));
+        }
+    }
+
+    setExpanded(expanded) {
+        if (this.native) { if (this.details) this.details.open = expanded; return; }
+        this.applyExpanded(expanded);
+    }
+
+    applyExpanded(expanded) {
+        if (expanded === this.expanded) return;        // idempotent
+        this.expanded = expanded;
+        if (!this.native) {
+            this.header.dataset.expanded = expanded ? 'true' : 'false';
+            if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
+            this.body.style.display = expanded ? '' : 'none';
+        }
+        if (expanded) {
+            if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
+                this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+                this.onExpand && this.onExpand();
+            }
+        } else if (this.discardOnCollapse) {
+            this.body.innerHTML = '';
+            this.loaded = false;
+        }
+    }
+
+    // Owner finished loading the lazy body: set its html + mark loaded so a
+    // subsequent expand shows it without another round-trip.
+    fill(html) {
+        if (html != null) this.body.innerHTML = html;
+        this.loaded = true;
+    }
+}
+
 class BonitoChat {
     constructor(container, comm) {
         this.container = container;
@@ -54,6 +119,10 @@ class BonitoChat {
         this.spacerTop    = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
         this.busyEl       = container.parentElement.querySelector('.bt-busy');
+        // Transient "reasoning…" indicator: shown for the lifetime of an agent
+        // thought, then removed. Most thoughts are redacted (empty) so this is
+        // usually all the user sees of the model's thinking.
+        this.thinkingEl   = container.parentElement.querySelector('.bt-thinking');
 
         // Single subscription. `comm` is a Bonito Observable bridged via
         // WS; every message Julia sets via `model.comm[] = {...}` arrives here.
@@ -160,11 +229,11 @@ class BonitoChat {
         if (this._onTextInputKeyCapture && this.textInput) {
             this.textInput.removeEventListener('keydown', this._onTextInputKeyCapture, true);
         }
-        if (this._onSendClickCapture && this.sendBtn) {
-            this.sendBtn.removeEventListener('click', this._onSendClickCapture, true);
+        if (this._onAppClickCapture && this.app) {
+            this.app.removeEventListener('click', this._onAppClickCapture, true);
         }
-        if (this._onStopClick && this.stopBtn) {
-            this.stopBtn.removeEventListener('click', this._onStopClick);
+        if (this._onEscapeKey) {
+            document.removeEventListener('keydown', this._onEscapeKey, true);
         }
         if (this.app) {
             this._onDragOver  && this.app.removeEventListener('dragover',  this._onDragOver);
@@ -198,11 +267,11 @@ class BonitoChat {
                 if (this.followMode) this._queueScrollToBottom();
                 return;
             case 'agent_final':  return this.onAgentFinal(msg);
+            case 'thinking':     return this.onThinking(msg.active);
             case 'thought_final':return this.onThoughtFinal(msg);
             case 'thought.body': return this.onThoughtBody(msg);
             case 'tool_update':  return this.onToolUpdate(msg);
             case 'chunk':        return this.appendChunk(msg.id, msg.text);
-            case 'thought_chunk':return this.appendChunk(msg.id, msg.text);
             case 'user_chunk':   return this.appendUserChunk(msg.text);
             case 'attach_error':
                 return this._showAttachError(msg.error || 'Attachment failed');
@@ -409,26 +478,24 @@ class BonitoChat {
         if (node && msg.html) node.innerHTML = msg.html;
     }
 
+    // A committed thought ships its html on close — pre-fill so the body is
+    // there (and marked loaded) before the user even expands.
     onThoughtFinal(msg) {
         const node = this.nodeById.get(msg.id);
-        if (!node) return;
-        if (msg.html) {
-            const body = node.querySelector('.bt-thought-body');
-            if (body) body.innerHTML = msg.html;
-        }
-        const details = node.querySelector('.bt-thought-details');
-        if (details) details.dataset.streamed = 'true';
+        node && node.collapsable && node.collapsable.fill(msg.html || '');
     }
 
+    // Reply to a `thought.render` request (reloaded thought, lazy body).
     onThoughtBody(msg) {
-        // Reply to a `thought.render` request — populate the lazy body.
         const node = this.nodeById.get(msg.id);
-        if (!node) return;
-        const body = node.querySelector('.bt-thought-body');
-        if (body) {
-            body.innerHTML = msg.html;
-            body.dataset.loaded = 'true';
-        }
+        node && node.collapsable && node.collapsable.fill(msg.html);
+    }
+
+    // Transient "reasoning…" indicator toggled by Julia for the lifetime of an
+    // agent thought (redacted thoughts have no body, so this is the only trace).
+    onThinking(active) {
+        if (this.thinkingEl) this.thinkingEl.classList.toggle('bt-thinking-active', !!active);
+        if (active && this.followMode) this._queueScrollToBottom();
     }
 
     onToolUpdate(msg) {
@@ -446,6 +513,22 @@ class BonitoChat {
             const s = node.querySelector('.bt-tool-summary');
             if (s) s.textContent = msg.summary;
         }
+        // Edit tools ship their inline diff preview as a follow-up update (the
+        // header was emitted before the diff was on disk). Insert it right after
+        // the header, matching the initial toolHTML layout.
+        if (msg.preview != null) {
+            let prev = node.querySelector('.bt-edit-preview');
+            if (!prev) {
+                prev = document.createElement('div');
+                prev.className = 'bt-edit-preview';
+                const header = node.querySelector('.bt-tool-header');
+                if (header) header.insertAdjacentElement('afterend', prev);
+            }
+            prev.innerHTML = msg.preview;
+        }
+        // bt_show: the completion update is when we learn it's a "show me this"
+        // tool — auto-expand its preview (idempotent; user can still collapse).
+        if (msg.expand && node.collapsable) node.collapsable.setExpanded(true);
     }
 
     // ── DOM node creation ────────────────────────────────────────────────
@@ -471,16 +554,38 @@ class BonitoChat {
                     div.innerHTML = msg.html || '';
                 }
                 break;
-            case 'thought':
+            case 'thought': {
                 div.className = 'bt-thought-msg';
                 div.innerHTML = this.thoughtHTML(msg);
-                this.wireThoughtToggle(div, msg.id);
+                const id = msg.id;
+                // Native <details> host, lazy body loaded once via thought.render.
+                div.collapsable = new Collapsable(
+                    div.querySelector('.bt-thought-summary'),
+                    div.querySelector('.bt-thought-body'),
+                    { native: true,
+                      onExpand: () => this.comm.notify({type: 'thought.render', id}) });
+                if (msg.html) div.collapsable.fill(msg.html);
                 break;
-            case 'tool':
+            }
+            case 'tool': {
                 div.className = 'bt-tool-msg';
                 div.innerHTML = this.toolHTML(msg);
-                this.wireToolToggle(div, msg.id);
+                const id = msg.id;
+                // Click-header host; the body is re-rendered (Monaco etc.) on
+                // every expand via tool.render → dom_in_js, and discarded on
+                // collapse so the editors are freed.
+                div.collapsable = new Collapsable(
+                    div.querySelector('.bt-tool-header'),
+                    div.querySelector('.bt-tool-body'),
+                    { toggleEl: div.querySelector('.bt-tool-toggle'),
+                      fetchEachExpand: true, discardOnCollapse: true,
+                      onExpand: () => this.comm.notify({type: 'tool.render', id}) });
+                // Auto-expand (e.g. bt_show). Deferred to a microtask so the
+                // node is inserted into the document before tool.render's
+                // dom_in_js tries to mount into its `[data-tool-id]` slot.
+                if (msg.expand) queueMicrotask(() => div.collapsable.setExpanded(true));
                 break;
+            }
             case 'plan':
                 div.className = 'bt-plan-msg';
                 div.innerHTML = msg.html || '';
@@ -490,27 +595,11 @@ class BonitoChat {
     }
 
     thoughtHTML(msg) {
-        const body = msg.streaming ?
-                       `<span class="bt-stream-text">${escapeHTML(msg.text || '')}</span>` :
-                     msg.html      ? msg.html : '';
-        const summary = msg.streaming ? 'Thinking…' :
-                        (msg.summary || 'Show thinking');
+        const summary = msg.summary || 'Show thinking';
         return `<details class="bt-thought-details" data-thought-id="${escapeAttr(msg.id || '')}">
             <summary class="bt-thought-summary">💭 ${escapeHTML(summary)}</summary>
-            <div class="bt-thought-body" data-loaded="${msg.streaming || msg.html ? 'true' : 'false'}">${body}</div>
+            <div class="bt-thought-body">${msg.html || ''}</div>
         </details>`;
-    }
-
-    wireThoughtToggle(node, thoughtId) {
-        const details = node.querySelector('.bt-thought-details');
-        const body    = node.querySelector('.bt-thought-body');
-        if (!details || !body) return;
-        details.addEventListener('toggle', () => {
-            if (!details.open) return;
-            if (body.dataset.loaded === 'true') return;
-            body.innerHTML = '<span class="bt-thought-loading">loading…</span>';
-            this.comm.notify({type: 'thought.render', id: thoughtId});
-        });
     }
 
     toolHTML(msg) {
@@ -532,32 +621,6 @@ class BonitoChat {
             </div>
             ${preview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
-    }
-
-    wireToolToggle(node, toolId) {
-        const header = node.querySelector('.bt-tool-header');
-        const toggle = header.querySelector('.bt-tool-toggle');
-        const body   = node.querySelector('.bt-tool-body');
-        if (!header || !body) return;
-        header.style.cursor = 'pointer';
-        header.addEventListener('click', () => {
-            // The glyph is swapped directly (`▶` ↔ `▼`) — a plain
-            // textContent change that works in every renderer. There is
-            // NO CSS `transform: rotate()` on `.bt-tool-toggle`: the old
-            // code rotated the glyph 90° *as well as* swapping it, so the
-            // expanded `▼` came out sideways (looked like a small `◀`).
-            const expanded = header.dataset.expanded === 'true';
-            if (expanded) {
-                body.innerHTML = '';
-                header.dataset.expanded = 'false';
-                toggle.textContent = '▶';
-            } else {
-                body.innerHTML = '<div class="bt-tool-loading">loading…</div>';
-                this.comm.notify({type: 'tool.render', id: toolId});
-                header.dataset.expanded = 'true';
-                toggle.textContent = '▼';
-            }
-        });
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
@@ -626,8 +689,18 @@ class BonitoChat {
         this.app       = app;
         this.inputArea = app.querySelector('.bt-input-area');
         this.textInput = app.querySelector('.bt-text-input');
-        this.sendBtn   = app.querySelector('.bt-send-btn');
-        if (!this.inputArea || !this.textInput || !this.sendBtn) return;
+        // NOTE: we deliberately do NOT cache `.bt-send-btn` / `.bt-stop-btn`
+        // references at setup time. Bonito renders the chat's children
+        // non-atomically — the send button can land in the DOM a frame
+        // before the stop button, so a `querySelector('.bt-stop-btn')`
+        // here can return `null` even though the button shows up moments
+        // later. A null-ref + late button = silently dead click handler
+        // (esp. the stop button, which is the user's only interrupt
+        // affordance). Event delegation on the chat root (`.bt-app`)
+        // sidesteps the race entirely: the listener is alive before
+        // either button exists, and dispatches by `e.target.closest`
+        // at click time.
+        if (!this.inputArea || !this.textInput) return;
 
         // Thumbnail strip lives ABOVE the input row inside .bt-input-area.
         this.attachBar = document.createElement('div');
@@ -680,17 +753,25 @@ class BonitoChat {
         this.app.addEventListener('dragleave', this._onDragLeave);
         this.app.addEventListener('drop',      this._onDrop);
 
-        // Send click — capture phase so we run before any other listener
-        // (none exist now that Julia uses a plain DOM button, but
-        // capture is robust against future additions). Same shape for
-        // textarea Enter.
-        this._onSendClickCapture = (e) => {
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            this._submit();
+        // Single delegated click handler on the chat root. Capture phase
+        // so we run before any inner element that might (in the future)
+        // also wire a click handler. `target.closest` survives DOM swaps
+        // and works regardless of when the buttons are added.
+        this._onAppClickCapture = (e) => {
+            if (this.destroyed) return;
+            if (e.target.closest('.bt-send-btn')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this._submit();
+            } else if (e.target.closest('.bt-stop-btn')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this._cancel();
+            }
         };
-        this.sendBtn.addEventListener('click', this._onSendClickCapture, true);
+        this.app.addEventListener('click', this._onAppClickCapture, true);
 
+        // Enter-to-send on the textarea (Shift+Enter newline as usual).
         this._onTextInputKeyCapture = (e) => {
             if (e.key !== 'Enter' || e.shiftKey) return;
             e.preventDefault();
@@ -699,13 +780,25 @@ class BonitoChat {
         };
         this.textInput.addEventListener('keydown', this._onTextInputKeyCapture, true);
 
-        if (this.stopBtn) {
-            this._onStopClick = (e) => {
-                e.preventDefault();
-                this.comm.notify({type: 'cancel'});
-            };
-            this.stopBtn.addEventListener('click', this._onStopClick);
-        }
+        // ESC anywhere → cancel. Listener on `document` so the user's
+        // current focus (textarea, scroll position, anywhere) can't
+        // suppress it. The Monaco tool-body editor owns ESC for its own
+        // semantics — skip when the user is editing inside one.
+        this._onEscapeKey = (e) => {
+            if (e.key !== 'Escape' || e.repeat) return;
+            const t = e.target;
+            if (t && t.closest && t.closest('.monaco-editor')) return;
+            e.preventDefault();
+            this._cancel();
+        };
+        document.addEventListener('keydown', this._onEscapeKey, true);
+    }
+
+    // Fire a cancel notification. Used by both the stop button click
+    // and the ESC keystroke. Stays a one-line helper so the two
+    // entry points can't drift in what they send.
+    _cancel() {
+        this.comm.notify({type: 'cancel'});
     }
 
     _dragHasImage(e) {

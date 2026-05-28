@@ -66,15 +66,26 @@ end
 tool_file(chat_dir::AbstractString, tool_id::AbstractString) =
     joinpath(tools_dir(chat_dir), String(tool_id) * ".json")
 
-# ACP sends either a full snapshot (initial notif + final update with content)
-# or status-only updates with `content: []`. We only persist when there's real
-# content; status/title transitions live in memory on ToolMsg.
-function update_tool_file!(chat_dir::AbstractString, tool_id::AbstractString, params::AbstractDict)
-    content = get(params, "content", nothing)
-    (content === nothing || isempty(content)) && return nothing
-    path = tool_file(chat_dir, tool_id)
-    open(io -> JSON.print(io, params), path, "w")
-    return params
+# Persist a tool's parsed content blocks so the lazily-loaded body survives
+# restarts. We serialize the typed `Vector{ToolContent}` back to the same
+# `{"content": [...]}` shape `load_tool_content` reads (the inverse of
+# `parse_tool_content_item`) — no raw wire dict round-trips through the chat.
+# Status-only updates carry no content, so there's nothing to persist.
+tool_content_to_dict(c::DiffContent) = Dict{String,Any}(
+    "type" => "diff", "path" => c.path, "oldText" => c.old_text, "newText" => c.new_text)
+tool_content_to_dict(c::TextContent) = Dict{String,Any}(
+    "type" => "content", "content" => Dict{String,Any}("type" => "text", "text" => c.text))
+tool_content_to_dict(c::ImageContent) = Dict{String,Any}(
+    "type" => "content", "content" => Dict{String,Any}(
+        "type" => "image", "data" => c.data, "mimeType" => c.mime_type))
+
+function persist_tool_content!(chat_dir::AbstractString, tc::AgentClientProtocol.ToolCall)
+    isempty(tc.content) && return nothing
+    path = tool_file(chat_dir, tc.id)
+    open(path, "w") do io
+        JSON.print(io, Dict("content" => [tool_content_to_dict(c) for c in tc.content]))
+    end
+    return nothing
 end
 
 function load_tool_file(chat_dir::AbstractString, tool_id::AbstractString)::Union{AbstractDict,Nothing}
@@ -281,8 +292,12 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
                 push!(entries, PlanEntry(String(m.captures[2]), "", status))
             end
             isempty(entries) || push!(msgs, PlanMsg(entries))
+        elseif category == "thought"
+            # `!!! thought "<id>"` — reload the (non-empty) reasoning so a
+            # reopened chat keeps the trail. `title` is the original thought id
+            # so the lazy `thought.render` round-trip still finds it.
+            isempty(strip(body)) || push!(msgs, ThoughtMsg(String(title), String(body)))
         end
-        # `thought` admonitions are intentionally not reloaded (ephemeral).
     end
     return msgs
 end

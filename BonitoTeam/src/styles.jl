@@ -547,6 +547,23 @@ const ChatStyles = Bonito.Styles(
         CSS("0%, 100%", "opacity" => "0.3", "transform" => "scale(0.8)"),
         CSS("50%",      "opacity" => "1",   "transform" => "scale(1.2)")),
 
+    # ── Transient "reasoning…" indicator ──────────────────────────────────────
+    # Shown for the lifetime of an agent thought (most are redacted/empty, so
+    # this is usually the only visible trace of the model thinking). Collapsed
+    # to zero height until `.bt-thinking-active` is toggled by the JS.
+    CSS(".bt-thinking",
+        "flex-shrink" => "0", "height" => "0", "overflow" => "hidden",
+        "display" => "flex", "align-items" => "center",
+        "padding" => "0 16px", "font-size" => "12.5px", "font-style" => "italic",
+        "color" => "var(--bt-text-muted)",
+        "transition" => "height 150ms ease, padding 150ms ease"),
+    CSS(".bt-thinking.bt-thinking-active",
+        "height" => "22px", "padding" => "2px 16px"),
+    CSS(".bt-collapsable-loading",
+        "color" => "var(--bt-text-faint)",
+        "font-style" => "italic", "font-size" => "12px",
+        "padding" => "4px 0"),
+
     # ── New-messages pill ────────────────────────────────────────────────────
     # Floats above the input area when followMode is off and new content
     # arrived in scrollback. Click → re-engage follow + scroll to bottom.

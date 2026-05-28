@@ -5,9 +5,9 @@
 #
 #     mock responder
 #       → MockTransport.incoming Channel
-#       → ACP.reader_loop (parse JSON-RPC)
-#       → conn.update_inbox (FIFO Channel{Any})
-#       → update_dispatcher_loop (single task, in order)
+#       → ACP.reader_loop (parse JSON-RPC, put! to inbox)
+#       → conn.inbox (FIFO Channel{Any} for ALL frame kinds)
+#       → dispatcher_loop (single task; routes by kind in wire order)
 #       → on_update(::ChatHandler, ::AgentMessageChunk)
 #       → apply!(model, AgentUpdate(...))
 #       → do_apply! → ingest!(::AgentStream, ...) → comm[]
@@ -18,8 +18,10 @@
 #   1. Total chunk count matches K × N exactly — no drops.
 #   2. Within each turn, chunks arrive in strictly ascending `idx`.
 #   3. Across turns, every turn-K chunk arrives strictly before any
-#      turn-(K+1) chunk (the drain barrier in `drive_prompt!` gates
-#      PromptCompleted on the dispatcher catching up).
+#      turn-(K+1) chunk. This is the structural guarantee of the
+#      single-inbox dispatcher in `Connection`: `prompt!` only returns
+#      after the dispatcher delivers the end_turn response, which
+#      means every preceding chunk has already been ingested.
 #   4. `msgs_store` ends with K UserMsg + K AgentMsg.
 #   5. Each AgentMsg's text contains BOTH the first and last tag of its
 #      turn — i.e. all N chunks landed in the correct bubble, not split
@@ -137,11 +139,17 @@ record(name, ok) = push!(results, name => ok)
 try
     TH.section("Sustained streaming: $TURNS turns × $CHUNKS_PER_TURN chunks") do
         t_start = time()
+        # Enqueue all turns. `send_message!` is asynchronous now (it `put!`s a
+        # UserMessage onto the queue); the single `run_chat!` consumer drives
+        # them strictly one at a time, in order. Wait for the store to fill
+        # (TURNS user + TURNS agent messages) — the reliable "all done" signal,
+        # since busy_active flickers between turns.
         for k in 1:TURNS
             BonitoTeam.send_message!(model, BonitoTeam.UserMsg("turn $k"))
-            ok = wait_for(() -> !model.busy_active[]; timeout = 60)
-            ok || error("turn $k did not complete (busy_active stayed true)")
         end
+        ok = wait_for(() -> length(model.msgs_store) >= 2TURNS && !model.busy_active[];
+                      timeout = 120)
+        ok || error("not all turns completed: msgs_store=$(length(model.msgs_store)), busy=$(model.busy_active[])")
         t_total = time() - t_start
         println("  drove $TURNS turns in $(round(t_total, digits=2))s ",
                 "($(round(TURNS * CHUNKS_PER_TURN / t_total, digits=0)) chunks/s)")
@@ -175,7 +183,7 @@ try
                 @info "cross-turn bleed" turn=k last_k=last_k first_next=first_nxt
             end
         end
-        record("no cross-turn bleed (drain barrier holds)",
+        record("no cross-turn bleed (single-inbox FIFO holds)",
                @TH.test_true no_bleed)
 
         # 4. msgs_store shape
@@ -197,9 +205,11 @@ try
         record("each AgentMsg has its turn's first+last chunk",
                @TH.test_true agent_bodies_ok)
 
-        # 6. Final streaming state
-        record("final streaming state is NoStream",
-               @TH.test_true (model.streaming[] isa BonitoTeam.NoStream))
+        # 6. Settled: not busy (every turn's prompt loop ran to completion; the
+        #    per-turn parser seals the trailing message at end_turn, so there is
+        #    no model-level streaming state left to inspect).
+        record("final state idle (not busy)",
+               @TH.test_true (!model.busy_active[]))
 
         # 7. Exactly one `agent` open event per turn (no orphan AgentStreams)
         agent_open_events = count(a -> a[1] == "agent", arrivals)

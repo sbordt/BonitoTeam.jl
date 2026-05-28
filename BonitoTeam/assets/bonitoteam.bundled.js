@@ -2,6 +2,56 @@
 // deno-lint-ignore-file
 // This code was bundled using `deno bundle` and it's not recommended to edit it manually
 
+class Collapsable {
+    constructor(headerEl, bodyEl, opts = {}){
+        this.header = headerEl;
+        this.body = bodyEl;
+        this.toggle = opts.toggleEl || null;
+        this.native = opts.native || false;
+        this.fetchEachExpand = opts.fetchEachExpand || false;
+        this.discardOnCollapse = opts.discardOnCollapse || false;
+        this.onExpand = opts.onExpand || null;
+        this.lazy = !!this.onExpand;
+        this.loaded = !this.lazy;
+        this.expanded = false;
+        if (this.native) {
+            this.details = headerEl.closest('details') || bodyEl.closest('details');
+            this.details && this.details.addEventListener('toggle', ()=>this.applyExpanded(this.details.open));
+        } else {
+            headerEl.style.cursor = 'pointer';
+            headerEl.addEventListener('click', ()=>this.applyExpanded(!this.expanded));
+        }
+    }
+    setExpanded(expanded) {
+        if (this.native) {
+            if (this.details) this.details.open = expanded;
+            return;
+        }
+        this.applyExpanded(expanded);
+    }
+    applyExpanded(expanded) {
+        if (expanded === this.expanded) return;
+        this.expanded = expanded;
+        if (!this.native) {
+            this.header.dataset.expanded = expanded ? 'true' : 'false';
+            if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
+            this.body.style.display = expanded ? '' : 'none';
+        }
+        if (expanded) {
+            if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
+                this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+                this.onExpand && this.onExpand();
+            }
+        } else if (this.discardOnCollapse) {
+            this.body.innerHTML = '';
+            this.loaded = false;
+        }
+    }
+    fill(html) {
+        if (html != null) this.body.innerHTML = html;
+        this.loaded = true;
+    }
+}
 class BonitoChat {
     constructor(container, comm){
         this.container = container;
@@ -22,6 +72,7 @@ class BonitoChat {
         this.spacerTop = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
         this.busyEl = container.parentElement.querySelector('.bt-busy');
+        this.thinkingEl = container.parentElement.querySelector('.bt-thinking');
         comm.on((msg)=>{
             if (this.destroyed) return;
             if (msg && typeof msg === 'object') this.dispatch(msg);
@@ -105,11 +156,11 @@ class BonitoChat {
         if (this._onTextInputKeyCapture && this.textInput) {
             this.textInput.removeEventListener('keydown', this._onTextInputKeyCapture, true);
         }
-        if (this._onSendClickCapture && this.sendBtn) {
-            this.sendBtn.removeEventListener('click', this._onSendClickCapture, true);
+        if (this._onAppClickCapture && this.app) {
+            this.app.removeEventListener('click', this._onAppClickCapture, true);
         }
-        if (this._onStopClick && this.stopBtn) {
-            this.stopBtn.removeEventListener('click', this._onStopClick);
+        if (this._onEscapeKey) {
+            document.removeEventListener('keydown', this._onEscapeKey, true);
         }
         if (this.app) {
             this._onDragOver && this.app.removeEventListener('dragover', this._onDragOver);
@@ -137,6 +188,8 @@ class BonitoChat {
                 return;
             case 'agent_final':
                 return this.onAgentFinal(msg);
+            case 'thinking':
+                return this.onThinking(msg.active);
             case 'thought_final':
                 return this.onThoughtFinal(msg);
             case 'thought.body':
@@ -144,8 +197,6 @@ class BonitoChat {
             case 'tool_update':
                 return this.onToolUpdate(msg);
             case 'chunk':
-                return this.appendChunk(msg.id, msg.text);
-            case 'thought_chunk':
                 return this.appendChunk(msg.id, msg.text);
             case 'user_chunk':
                 return this.appendUserChunk(msg.text);
@@ -316,22 +367,15 @@ class BonitoChat {
     }
     onThoughtFinal(msg) {
         const node = this.nodeById.get(msg.id);
-        if (!node) return;
-        if (msg.html) {
-            const body = node.querySelector('.bt-thought-body');
-            if (body) body.innerHTML = msg.html;
-        }
-        const details = node.querySelector('.bt-thought-details');
-        if (details) details.dataset.streamed = 'true';
+        node && node.collapsable && node.collapsable.fill(msg.html || '');
     }
     onThoughtBody(msg) {
         const node = this.nodeById.get(msg.id);
-        if (!node) return;
-        const body = node.querySelector('.bt-thought-body');
-        if (body) {
-            body.innerHTML = msg.html;
-            body.dataset.loaded = 'true';
-        }
+        node && node.collapsable && node.collapsable.fill(msg.html);
+    }
+    onThinking(active) {
+        if (this.thinkingEl) this.thinkingEl.classList.toggle('bt-thinking-active', !!active);
+        if (active && this.followMode) this._queueScrollToBottom();
     }
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
@@ -351,6 +395,17 @@ class BonitoChat {
             const s = node.querySelector('.bt-tool-summary');
             if (s) s.textContent = msg.summary;
         }
+        if (msg.preview != null) {
+            let prev = node.querySelector('.bt-edit-preview');
+            if (!prev) {
+                prev = document.createElement('div');
+                prev.className = 'bt-edit-preview';
+                const header = node.querySelector('.bt-tool-header');
+                if (header) header.insertAdjacentElement('afterend', prev);
+            }
+            prev.innerHTML = msg.preview;
+        }
+        if (msg.expand && node.collapsable) node.collapsable.setExpanded(true);
     }
     createNode(msg) {
         const div = document.createElement('div');
@@ -371,15 +426,37 @@ class BonitoChat {
                 }
                 break;
             case 'thought':
-                div.className = 'bt-thought-msg';
-                div.innerHTML = this.thoughtHTML(msg);
-                this.wireThoughtToggle(div, msg.id);
-                break;
+                {
+                    div.className = 'bt-thought-msg';
+                    div.innerHTML = this.thoughtHTML(msg);
+                    const id = msg.id;
+                    div.collapsable = new Collapsable(div.querySelector('.bt-thought-summary'), div.querySelector('.bt-thought-body'), {
+                        native: true,
+                        onExpand: ()=>this.comm.notify({
+                                type: 'thought.render',
+                                id
+                            })
+                    });
+                    if (msg.html) div.collapsable.fill(msg.html);
+                    break;
+                }
             case 'tool':
-                div.className = 'bt-tool-msg';
-                div.innerHTML = this.toolHTML(msg);
-                this.wireToolToggle(div, msg.id);
-                break;
+                {
+                    div.className = 'bt-tool-msg';
+                    div.innerHTML = this.toolHTML(msg);
+                    const id = msg.id;
+                    div.collapsable = new Collapsable(div.querySelector('.bt-tool-header'), div.querySelector('.bt-tool-body'), {
+                        toggleEl: div.querySelector('.bt-tool-toggle'),
+                        fetchEachExpand: true,
+                        discardOnCollapse: true,
+                        onExpand: ()=>this.comm.notify({
+                                type: 'tool.render',
+                                id
+                            })
+                    });
+                    if (msg.expand) queueMicrotask(()=>div.collapsable.setExpanded(true));
+                    break;
+                }
             case 'plan':
                 div.className = 'bt-plan-msg';
                 div.innerHTML = msg.html || '';
@@ -388,26 +465,11 @@ class BonitoChat {
         return div;
     }
     thoughtHTML(msg) {
-        const body = msg.streaming ? `<span class="bt-stream-text">${escapeHTML(msg.text || '')}</span>` : msg.html ? msg.html : '';
-        const summary = msg.streaming ? 'Thinking…' : msg.summary || 'Show thinking';
+        const summary = msg.summary || 'Show thinking';
         return `<details class="bt-thought-details" data-thought-id="${escapeAttr(msg.id || '')}">
             <summary class="bt-thought-summary">💭 ${escapeHTML(summary)}</summary>
-            <div class="bt-thought-body" data-loaded="${msg.streaming || msg.html ? 'true' : 'false'}">${body}</div>
+            <div class="bt-thought-body">${msg.html || ''}</div>
         </details>`;
-    }
-    wireThoughtToggle(node, thoughtId) {
-        const details = node.querySelector('.bt-thought-details');
-        const body = node.querySelector('.bt-thought-body');
-        if (!details || !body) return;
-        details.addEventListener('toggle', ()=>{
-            if (!details.open) return;
-            if (body.dataset.loaded === 'true') return;
-            body.innerHTML = '<span class="bt-thought-loading">loading…</span>';
-            this.comm.notify({
-                type: 'thought.render',
-                id: thoughtId
-            });
-        });
     }
     toolHTML(msg) {
         const statusCls = `bt-tool-status bt-status-${msg.status || 'pending'}`;
@@ -424,29 +486,6 @@ class BonitoChat {
             </div>
             ${preview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
-    }
-    wireToolToggle(node, toolId) {
-        const header = node.querySelector('.bt-tool-header');
-        const toggle = header.querySelector('.bt-tool-toggle');
-        const body = node.querySelector('.bt-tool-body');
-        if (!header || !body) return;
-        header.style.cursor = 'pointer';
-        header.addEventListener('click', ()=>{
-            const expanded = header.dataset.expanded === 'true';
-            if (expanded) {
-                body.innerHTML = '';
-                header.dataset.expanded = 'false';
-                toggle.textContent = '▶';
-            } else {
-                body.innerHTML = '<div class="bt-tool-loading">loading…</div>';
-                this.comm.notify({
-                    type: 'tool.render',
-                    id: toolId
-                });
-                header.dataset.expanded = 'true';
-                toggle.textContent = '▼';
-            }
-        });
     }
     atBottom() {
         const { scrollTop , scrollHeight , clientHeight  } = this.container;
@@ -478,8 +517,7 @@ class BonitoChat {
         this.app = app;
         this.inputArea = app.querySelector('.bt-input-area');
         this.textInput = app.querySelector('.bt-text-input');
-        this.sendBtn = app.querySelector('.bt-send-btn');
-        if (!this.inputArea || !this.textInput || !this.sendBtn) return;
+        if (!this.inputArea || !this.textInput) return;
         this.attachBar = document.createElement('div');
         this.attachBar.className = 'bt-attachments';
         this.inputArea.insertBefore(this.attachBar, this.inputArea.firstChild);
@@ -520,12 +558,19 @@ class BonitoChat {
         this.app.addEventListener('dragover', this._onDragOver);
         this.app.addEventListener('dragleave', this._onDragLeave);
         this.app.addEventListener('drop', this._onDrop);
-        this._onSendClickCapture = (e)=>{
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            this._submit();
+        this._onAppClickCapture = (e)=>{
+            if (this.destroyed) return;
+            if (e.target.closest('.bt-send-btn')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this._submit();
+            } else if (e.target.closest('.bt-stop-btn')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this._cancel();
+            }
         };
-        this.sendBtn.addEventListener('click', this._onSendClickCapture, true);
+        this.app.addEventListener('click', this._onAppClickCapture, true);
         this._onTextInputKeyCapture = (e)=>{
             if (e.key !== 'Enter' || e.shiftKey) return;
             e.preventDefault();
@@ -533,15 +578,19 @@ class BonitoChat {
             this._submit();
         };
         this.textInput.addEventListener('keydown', this._onTextInputKeyCapture, true);
-        if (this.stopBtn) {
-            this._onStopClick = (e)=>{
-                e.preventDefault();
-                this.comm.notify({
-                    type: 'cancel'
-                });
-            };
-            this.stopBtn.addEventListener('click', this._onStopClick);
-        }
+        this._onEscapeKey = (e)=>{
+            if (e.key !== 'Escape' || e.repeat) return;
+            const t = e.target;
+            if (t && t.closest && t.closest('.monaco-editor')) return;
+            e.preventDefault();
+            this._cancel();
+        };
+        document.addEventListener('keydown', this._onEscapeKey, true);
+    }
+    _cancel() {
+        this.comm.notify({
+            type: 'cancel'
+        });
     }
     _dragHasImage(e) {
         const dt = e.dataTransfer;
@@ -736,5 +785,6 @@ function connect(node, comm) {
     return chat;
 }
 export { BonitoChat as BonitoChat };
+export { Collapsable as Collapsable };
 export { connect as connect };
 

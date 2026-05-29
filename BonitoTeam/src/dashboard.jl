@@ -70,7 +70,7 @@ function create_project!(state::ServerState, name::String, src_path::String,
     isdir(src_path)   || error("Source path is not a directory: $src_path")
 
     w = state.workers[][worker_name]
-    server_path = joinpath(state.working_dir, name)
+    server_path = compute_server_path(state, worker_name, name)
     worker_path = joinpath(w.projects_root, name)
 
     # Idempotent re-import: if the same folder on the same worker is already
@@ -127,30 +127,11 @@ basename in `~/.claude/projects/<encoded>/`), the chat will use ACP's
 chat UI and the agent regains full context. The ID persists across server
 restarts.
 """
-# Raised by `create_project_from_worker!` when a project with the same
-# `name` is already registered under a DIFFERENT `(worker_id, worker_path)`.
-# The UI catches this, shows the `comparison` summaries, and re-invokes
-# the import with an explicit `on_collision` directive (`:take_candidate`,
-# `:keep_existing`, or a renamed import via `name = "..."`).
-struct ProjectCollisionError <: Exception
-    existing::ProjectInfo
-    candidate_worker_name::String
-    candidate_worker_path::String
-    comparison::NamedTuple    # from compare_for_collision
-end
-
-Base.showerror(io::IO, e::ProjectCollisionError) = print(io,
-    "project name '", e.existing.name, "' already bound to worker '",
-    e.existing.worker_id, "' (path: ", e.existing.worker_path, "); ",
-    "candidate is worker '", e.candidate_worker_name, "' at ",
-    e.candidate_worker_path)
-
 function create_project_from_worker!(state::ServerState, worker_name::String,
                                       worker_path::String;
                                       name::String = basename(rstrip(worker_path, '/')),
                                       sync::Bool = false,
                                       resume_session_id::Union{String,Nothing} = nothing,
-                                      on_collision::Symbol = :detect,
                                       start_session::Bool = true,
                                       progress = nothing)
     # `start_session=false` skips the post-registration ACP session
@@ -180,39 +161,14 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
         return existing
     end
 
-    # Name collision: a different (worker, path) pair already owns this name.
-    # `on_collision` controls the behaviour:
-    #   :detect          (default) raise ProjectCollisionError with both
-    #                    sides' summaries — the UI catches this and shows
-    #                    the compare panel so the user picks.
-    #   :take_candidate  reassign the existing project to this worker/path
-    #                    (effectively a move; uses transfer_project!).
-    #   :keep_existing   no-op; returns the existing project unchanged.
-    # A renamed import (pass `name = "different"`) skips the collision
-    # check entirely because the names no longer match.
-    name_collider = find_project_by_name(state, name)
-    if name_collider !== nothing
-        if on_collision === :keep_existing
-            @info "create_project_from_worker!: name collision; keeping existing" name id=name_collider.id
-            maybe_start(name_collider)
-            return name_collider
-        elseif on_collision === :take_candidate
-            @info "create_project_from_worker!: name collision; reassigning to candidate" name from=name_collider.worker_id to=worker_name
-            name_collider.worker_id   = worker_name
-            name_collider.worker_path = worker_path
-            name_collider.backup_status = :stale
-            save_projects!(state)
-            safe_notify!(state.projects)
-            maybe_start(name_collider)
-            return name_collider
-        else  # :detect
-            cmp = compare_for_collision(state, name_collider, worker_name, worker_path)
-            throw(ProjectCollisionError(name_collider, worker_name, worker_path, cmp))
-        end
-    end
-
+    # Same-name-different-(worker,path) is NOT a collision: we want to let
+    # each worker have its own "BonitoTeam" project that opens to its own
+    # chat. server_path is disambiguated via `compute_server_path` (which
+    # prefixes the worker name), so the two mirrors live side-by-side.
+    # Reconciling them is an explicit, sync-time operation — not an
+    # open-time decision.
     id = string(uuid4())[1:8]
-    server_path = joinpath(state.working_dir, name)
+    server_path = compute_server_path(state, worker_name, name)
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     p.resume_session_id = resume_session_id
@@ -1736,11 +1692,6 @@ function dashboard_dom(state::ServerState;
                         current_view::Union{Observable{String},Nothing} = nothing)
     error_obs = Observable("")
 
-    # Collision modal state. `nothing` ⇒ no modal; otherwise carries the
-    # comparison + the args needed to re-invoke create_project_from_worker!
-    # with an explicit on_collision directive (when the user picks a side).
-    collision_state = Observable{Union{Nothing,NamedTuple}}(nothing)
-
     # Workers self-register over WS — no manual "Add worker" form.
 
     # `which_form` is the single source of truth for which slide-in panel is
@@ -1959,14 +1910,13 @@ function dashboard_dom(state::ServerState;
     end
 
     # Shared import path used by both the "discovered sessions" panel and
-    # the remote-folder picker. Catches ProjectCollisionError and routes
-    # the comparison into the modal Observable; the user picks a side,
-    # and the modal re-invokes this same helper with the explicit
-    # on_collision directive baked in.
+    # the remote-folder picker. Name collisions across workers are no
+    # longer treated as a decision — each worker gets its own project with
+    # its own server_path mirror. The "merge / move" decision only matters
+    # at sync-time and is handled separately.
     function do_import(w_name::String, path::String;
                         name::Union{Nothing,String} = nothing,
-                        resume_session_id::Union{Nothing,String} = nothing,
-                        on_collision::Symbol = :detect)
+                        resume_session_id::Union{Nothing,String} = nothing)
         proj_name = name !== nothing ? name :
             let n = replace(basename(rstrip(path, '/')), r"[^a-zA-Z0-9_\-]" => "_")
                 isempty(n) ? "project" : n
@@ -1980,25 +1930,13 @@ function dashboard_dom(state::ServerState;
                 p = create_project_from_worker!(state, w_name, path;
                     name = proj_name,
                     resume_session_id = resume_session_id,
-                    on_collision = on_collision,
                     progress = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[]      = ""
                 discover_state[] = ""
                 picker_state[]   = ""
-                collision_state[] = nothing
                 current_view !== nothing && (current_view[] = p.id)
             catch e
-                if e isa ProjectCollisionError
-                    collision_state[] = (
-                        existing         = e.existing,
-                        candidate_worker = w_name,
-                        candidate_path   = path,
-                        candidate_name   = proj_name,
-                        comparison       = e.comparison,
-                    )
-                else
-                    error_obs[] = "Failed to import: $(sprint(showerror, e))"
-                end
+                error_obs[] = "Failed to import: $(sprint(showerror, e))"
             finally
                 busy_clear!(busy)
             end
@@ -2229,13 +2167,10 @@ function dashboard_dom(state::ServerState;
         DOM.span(msg_obs;   class = "bt-busy-msg");
         class = visibility_class)
 
-    collision_overlay = render_collision_modal(state, collision_state, do_import)
-
     # Layout — DOM only; the App() wrapper + global assets (DashboardStyles,
     # ConnectionIndicator) live in the caller (unified_app or dashboard_app).
     DOM.div(
         busy_card,
-        collision_overlay,
         DOM.div(
             DOM.h1("BonitoTeam"),
             DOM.div("Multi-host orchestrator for agentic coding sessions";
@@ -2258,93 +2193,84 @@ function dashboard_dom(state::ServerState;
         class = "bt-dash")
 end
 
-# ── Collision-resolution modal ──────────────────────────────────────────────
-# When `create_project_from_worker!` raises ProjectCollisionError, the
-# dashboard's import handler stuffs the comparison + retry info into the
-# `collision_state` Observable. This renderer turns that into a fixed
-# overlay with side-by-side summaries and three actions:
-#   - Keep existing  → :keep_existing (no reassignment)
-#   - Use candidate  → :take_candidate (reassign to the candidate worker)
-#   - Cancel         → close modal, do nothing
-function render_collision_modal(state::ServerState,
-                                  collision_state::Observable,
-                                  do_import_fn::Function)
-    map(collision_state) do c
+# ── Cross-worker sync modal ─────────────────────────────────────────────────
+# Surfaced from the chat header when a project has a same-named sibling on
+# another worker (see `same_name_siblings`). `sync_modal_state` is `nothing`
+# (hidden) or `(current, other, comparison)` where comparison comes from
+# `compare_projects`. The user picks a direction; `on_apply(src, dst)` runs the
+# directional overwrite via `sync_across_workers!`. Reuses the `bt-collision-*`
+# CSS that already ships in DashboardStyles.
+function render_sync_modal(state::ServerState,
+                            sync_modal_state::Observable,
+                            on_apply::Function)
+    worker_label(id) = haskey(state.workers[], id) ? state.workers[][id].name : id
+    map(sync_modal_state) do c
         c === nothing && return DOM.div()
-        existing_worker_name = haskey(state.workers[], c.existing.worker_id) ?
-            state.workers[][c.existing.worker_id].name : c.existing.worker_id
-        candidate_worker_name = haskey(state.workers[], c.candidate_worker) ?
-            state.workers[][c.candidate_worker].name : c.candidate_worker
+        cur_label   = worker_label(c.current.worker_id)
+        other_label = worker_label(c.other.worker_id)
 
-        existing_side  = collision_side_panel(
-            "Existing — $(existing_worker_name)",
-            c.existing.worker_path,
-            c.comparison.existing,
-            c.comparison.existing_source === :worker ? "live" : "server mirror")
-        candidate_side = collision_side_panel(
-            "Candidate — $(candidate_worker_name)",
-            c.candidate_path,
-            c.comparison.candidate,
-            "live")
+        cur_side = sync_side_panel(
+            "$(cur_label) (this chat)", c.current.worker_path,
+            c.comparison.a,
+            c.comparison.a_source === :worker ? "live" : "server mirror")
+        other_side = sync_side_panel(
+            other_label, c.other.worker_path,
+            c.comparison.b,
+            c.comparison.b_source === :worker ? "live" : "server mirror")
 
-        # Highlight the side that's been edited more recently.
-        ex_mt = Float64(c.comparison.existing["latest_mtime"])
-        ca_mt = Float64(c.comparison.candidate["latest_mtime"])
-        newer = ex_mt > ca_mt ? :existing : (ca_mt > ex_mt ? :candidate : :tie)
-        if newer === :existing
-            existing_side = DOM.div(existing_side; class = "bt-collision-newer")
-        elseif newer === :candidate
-            candidate_side = DOM.div(candidate_side; class = "bt-collision-newer")
+        # Highlight whichever side was edited more recently.
+        cur_mt   = Float64(c.comparison.a["latest_mtime"])
+        other_mt = Float64(c.comparison.b["latest_mtime"])
+        newer = cur_mt > other_mt ? :current : (other_mt > cur_mt ? :other : :tie)
+        if newer === :current
+            cur_side = DOM.div(cur_side; class = "bt-collision-newer")
+        elseif newer === :other
+            other_side = DOM.div(other_side; class = "bt-collision-newer")
         end
 
-        keep_btn   = Bonito.Button("Keep existing"; style=nothing,
-                                    class = "bt-btn bt-btn-secondary",
-                                    title = "Leave the project bound to $existing_worker_name; do nothing")
-        take_btn   = Bonito.Button("Use candidate"; style=nothing,
-                                    class = "bt-btn bt-btn-primary",
-                                    title = "Reassign the project to $candidate_worker_name")
-        cancel_btn = Bonito.Button("Cancel"; style=nothing,
-                                    class = "bt-btn bt-btn-ghost")
-        on(keep_btn.value) do clicked
+        push_btn = Bonito.Button("Use $cur_label → overwrite $other_label";
+            style = nothing, class = "bt-btn bt-btn-primary",
+            title = "Copy $(cur_label)'s files onto $other_label, overwriting it")
+        pull_btn = Bonito.Button("Use $other_label → overwrite $cur_label";
+            style = nothing, class = "bt-btn bt-btn-secondary",
+            title = "Copy $(other_label)'s files onto $cur_label, overwriting it")
+        cancel_btn = Bonito.Button("Cancel"; style = nothing,
+            class = "bt-btn bt-btn-ghost")
+        on(push_btn.value) do clicked
             clicked || return
-            do_import_fn(c.candidate_worker, c.candidate_path;
-                          name = c.candidate_name,
-                          on_collision = :keep_existing)
+            on_apply(c.current, c.other)
         end
-        on(take_btn.value) do clicked
+        on(pull_btn.value) do clicked
             clicked || return
-            do_import_fn(c.candidate_worker, c.candidate_path;
-                          name = c.candidate_name,
-                          on_collision = :take_candidate)
+            on_apply(c.other, c.current)
         end
         on(cancel_btn.value) do clicked
             clicked || return
-            collision_state[] = nothing
+            sync_modal_state[] = nothing
         end
 
         DOM.div(
             DOM.div(
                 DOM.div(
-                    DOM.h3("Project name '$(c.existing.name)' already exists"),
-                    DOM.div("This name is already bound to $existing_worker_name. " *
-                            "Compare the two sides and pick which one to keep.";
+                    DOM.h3("Sync '$(c.current.name)' across workers"),
+                    DOM.div("This project exists on both $cur_label and $other_label. " *
+                            "Pick which side's files to keep — the other side is overwritten.";
                             class = "bt-collision-sub")),
-                DOM.div(existing_side, candidate_side;
-                        class = "bt-collision-sides"),
-                DOM.div(cancel_btn, keep_btn, take_btn;
+                DOM.div(cur_side, other_side; class = "bt-collision-sides"),
+                DOM.div(cancel_btn, pull_btn, push_btn;
                         class = "bt-collision-actions");
                 class = "bt-collision-card");
             class = "bt-collision-overlay")
     end
 end
 
-# One column of the side-by-side compare. Top line is the headline
-# decision signal (last edit time), then file/byte counts, then a
-# short recent-files list and a per-subrepo git breakdown.
-function collision_side_panel(title::AbstractString,
-                                path::AbstractString,
-                                summary::AbstractDict,
-                                source_label::AbstractString)
+# One column of the side-by-side compare. Top line is the headline decision
+# signal (last edit time), then file/byte counts, then a short recent-files
+# list and a per-subrepo git breakdown.
+function sync_side_panel(title::AbstractString,
+                          path::AbstractString,
+                          summary::AbstractDict,
+                          source_label::AbstractString)
     age_str    = format_relative_age(Float64(summary["latest_mtime"]))
     n_files    = Int(summary["total_files"])
     total_kb   = round(Int(summary["total_bytes"]) / 1024; digits = 1)
@@ -2362,10 +2288,9 @@ function collision_side_panel(title::AbstractString,
     end
 
     git_rows = if isempty(subrepos)
-        [DOM.div("no git sub-repos found";
-                  class = "bt-collision-empty")]
+        [DOM.div("no git sub-repos found"; class = "bt-collision-empty")]
     else
-        [collision_git_row(g) for g in subrepos]
+        [sync_git_row(g) for g in subrepos]
     end
 
     DOM.div(
@@ -2377,8 +2302,7 @@ function collision_side_panel(title::AbstractString,
                 DOM.span(age_str; class = "bt-collision-value")),
             DOM.div(
                 DOM.span("Files: "; class = "bt-collision-label"),
-                DOM.span("$n_files ($(total_kb) KB)";
-                         class = "bt-collision-value")),
+                DOM.span("$n_files ($(total_kb) KB)"; class = "bt-collision-value")),
             DOM.div(
                 DOM.span("Source: "; class = "bt-collision-label"),
                 DOM.span(source_label; class = "bt-collision-value-faint"));
@@ -2394,7 +2318,7 @@ function collision_side_panel(title::AbstractString,
         class = "bt-collision-side")
 end
 
-function collision_git_row(g::AbstractDict)
+function sync_git_row(g::AbstractDict)
     head = String(get(g, "head_sha", ""))
     short_sha = isempty(head) ? "(no head)" : (length(head) >= 7 ? head[1:7] : head)
     dirty = Int(get(g, "dirty_count", 0))
@@ -2411,9 +2335,7 @@ function collision_git_row(g::AbstractDict)
         class = "bt-collision-git-row")
 end
 
-# "5m ago" / "3h ago" / "2d ago" — short, glanceable. Skips
-# fractional precision past the second decimal so big mtime
-# gaps don't render as "1.7892… days ago".
+# "5m ago" / "3h ago" / "2d ago" — short, glanceable.
 function format_relative_age(t::Float64)
     t <= 0 && return "—"
     Δ = time() - t

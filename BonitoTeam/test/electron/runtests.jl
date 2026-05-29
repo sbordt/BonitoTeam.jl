@@ -42,6 +42,7 @@ const FILES = [
     "test_markdown.jl",
     "test_virtual_scroll.jl",
     "test_chat_controls.jl",
+    "test_cross_worker_sync_ui.jl",
     "test_chat_remount.jl",
     # test_callback_dereg.jl removed — it asserted the old global
     # `window.BonitoChat` + multi-callback architecture. The new ES6
@@ -55,7 +56,6 @@ const FILES = [
     "test_scroll_chase.jl",
     "test_chat_attach.jl",
     "test_scroll_stress.jl",
-    "test_collision_modal.jl",
     "test_follow_pill.jl",
     "test_keyed_list.jl",
     # Dashboard
@@ -67,7 +67,7 @@ const FILES = [
     "test_worker_handshake.jl",
     "test_worker_disconnect.jl",
     "test_worker_move.jl",
-    "test_project_collision.jl",
+    "test_cross_worker_sync.jl",
 ]
 
 # (file, label, pass, fail) — populated as each test runs.

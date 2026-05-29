@@ -104,13 +104,19 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # so the *initial* `bt-side-active` class is correct on each
     # re-render, but subsequent navigation flips the class via the
     # `onjs` handler below — no body re-render.
-    body = map(state.projects) do projects
+    body = map(state.projects, state.workers) do projects, workers
         active_pid = current_view[]
         entries = [sidebar_entry("Home", home_icon, "", "Dashboard";
                                   active = active_pid == "")]
         for p in values(projects)
+            # Always disambiguate by worker name. Two workers can each have
+            # a project named "BonitoTeam"; without the suffix you'd see
+            # two indistinguishable rows in the sidebar.
+            w_label = haskey(workers, p.worker_id) ?
+                      workers[p.worker_id].name : p.worker_id
+            label   = "$(p.name) · $(w_label)"
             push!(entries,
-                  sidebar_entry(p.name, project_icon(p), p.id, p.name;
+                  sidebar_entry(label, project_icon(p), p.id, label;
                                 active = active_pid == p.id))
         end
         DOM.div(entries...; class = "bt-side-list")

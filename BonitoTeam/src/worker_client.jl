@@ -506,33 +506,68 @@ function inspect_path_local(path::AbstractString)
 end
 
 """
-    compare_for_collision(state, existing_project, candidate_worker_name,
-                           candidate_worker_path; timeout=30.0) -> NamedTuple
+    inspect_project(state, p; timeout=30.0) -> (summary::Dict, source::Symbol)
 
-Build the side-by-side summary used by the import-collision UI. Returns
-`(existing = summary_dict, existing_source = :worker|:mirror,
-   candidate = summary_dict)`. The existing-side summary is preferred
-from the project's bound worker (live state); falls back to the server
-mirror if the worker is offline.
+Content summary for a project, preferring its live worker (`:worker`) and
+falling back to the server mirror (`:mirror`) when the worker is offline or
+the live inspect fails. Shape matches `inspect_worker_path`.
 """
-function compare_for_collision(state::ServerState, p::ProjectInfo,
-                                candidate_worker_name::String,
-                                candidate_worker_path::String;
-                                timeout::Real = 30.0)
-    candidate = inspect_worker_path(state, candidate_worker_name,
-                                     candidate_worker_path; timeout = timeout)
-    existing, source = if haskey(state.worker_control_ws, p.worker_id)
+function inspect_project(state::ServerState, p::ProjectInfo; timeout::Real = 30.0)
+    if haskey(state.worker_control_ws, p.worker_id)
         try
-            inspect_worker_path(state, p.worker_id, p.worker_path; timeout = timeout),
-                :worker
+            return inspect_worker_path(state, p.worker_id, p.worker_path; timeout = timeout), :worker
         catch e
-            @warn "compare_for_collision: live inspect failed, falling back to mirror" exception=e
-            inspect_path_local(p.server_path), :mirror
+            @warn "inspect_project: live inspect failed, falling back to mirror" project=p.name exception=e
         end
-    else
-        inspect_path_local(p.server_path), :mirror
     end
-    return (existing = existing, existing_source = source, candidate = candidate)
+    return inspect_path_local(p.server_path), :mirror
+end
+
+"""
+    compare_projects(state, a, b; timeout=30.0) -> NamedTuple
+
+Symmetric side-by-side summary of two projects for the cross-worker sync
+modal. Returns `(a, a_source, b, b_source)` where each summary is a Dict
+from `inspect_project`.
+"""
+function compare_projects(state::ServerState, a::ProjectInfo, b::ProjectInfo;
+                          timeout::Real = 30.0)
+    a_sum, a_src = inspect_project(state, a; timeout = timeout)
+    b_sum, b_src = inspect_project(state, b; timeout = timeout)
+    return (a = a_sum, a_source = a_src, b = b_sum, b_source = b_src)
+end
+
+"""
+    sync_across_workers!(state, src::ProjectInfo, dst::ProjectInfo; on_progress=nothing)
+
+Directional overwrite: make `dst`'s worker tree match `src`'s content. There
+is no worker↔worker transport, so this is server-mediated — refresh `src`'s
+server mirror from its live worker, then push that mirror onto `dst`'s worker
+path. `dst`'s divergent edits are overwritten (the caller has confirmed the
+direction via the sync modal). Both workers must be online.
+"""
+function sync_across_workers!(state::ServerState, src::ProjectInfo, dst::ProjectInfo;
+                              on_progress = nothing)
+    src.id == dst.id && error("Source and target are the same project")
+    haskey(state.workers[], src.worker_id) ||
+        error("Source worker '$(src.worker_id)' is not connected")
+    haskey(state.workers[], dst.worker_id) ||
+        error("Target worker '$(dst.worker_id)' is not connected")
+
+    notify_progress(on_progress, :phase, (msg = "Pulling '$(src.name)' from source worker…",))
+    sync_dir_from_worker!(state, src.worker_id, src.worker_path, src.server_path;
+                          on_progress = on_progress)
+    src.backup_status = :synced
+    src.last_sync_at  = now(UTC)
+
+    notify_progress(on_progress, :phase, (msg = "Pushing onto target worker…",))
+    sync_dir_to_worker!(state, dst.worker_id, src.server_path, dst.worker_path;
+                        on_progress = on_progress)
+    # dst's worker tree now matches src; dst's own server mirror is out of date.
+    dst.backup_status = :stale
+    save_projects!(state)
+    safe_notify!(state.projects)
+    return nothing
 end
 
 """

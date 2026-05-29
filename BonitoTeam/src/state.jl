@@ -376,20 +376,33 @@ function find_project_by_location(state::ServerState,
 end
 
 """
-    find_project_by_name(state, name) -> Union{ProjectInfo,Nothing}
+    compute_server_path(state, worker_name, name) -> String
 
-Look up a project by its display/dir name. Used by the import-collision
-flow: two projects with the same `name` would land at the same
-`server_path` (`<working_dir>/<name>`), so the second import has to
-either reassign the existing one to the new worker, keep it, or be
-imported under a different name.
+Where the server keeps its mirror of `(worker_name, name)`'s files. We
+disambiguate by worker name so two workers can each have a project called
+"BonitoTeam" without their server-side mirrors (or `.bonitoTeam/chat.md`
+histories) overwriting each other. The decision to *merge* same-named
+projects from different workers is intentionally separate, and only
+surfaces when the user explicitly asks to sync between them.
 """
-function find_project_by_name(state::ServerState, name::AbstractString)
-    target = String(name)
-    for p in values(state.projects[])
-        p.name == target && return p
-    end
-    return nothing
+compute_server_path(state::ServerState,
+                     worker_name::AbstractString,
+                     name::AbstractString) =
+    joinpath(state.working_dir, "$(String(worker_name))-$(String(name))")
+
+"""
+    same_name_siblings(state, project_id) -> Vector{ProjectInfo}
+
+Projects that share `project_id`'s display `name` but live on a *different*
+worker. Because `compute_server_path` keeps each worker's mirror separate,
+two workers can both carry a "BonitoTeam" project; these are the candidates
+for an explicit cross-worker reconcile (see `sync_across_workers!`).
+"""
+function same_name_siblings(state::ServerState, project_id::AbstractString)
+    haskey(state.projects[], project_id) || return ProjectInfo[]
+    p = state.projects[][project_id]
+    [q for q in values(state.projects[])
+        if q.id != p.id && q.name == p.name && q.worker_id != p.worker_id]
 end
 
 # Collapse projects.json entries that share `(worker_id, worker_path)`.

@@ -137,4 +137,7 @@ function add_worker_ws_routes!(srv::Bonito.Server, state::ServerState)
         handle_worker_acp(state, ws))
     Bonito.HTTPServer.websocket_route!(srv, "/transfer-ws" => (_ctx, ws) ->
         handle_transfer_ws(state, ws))
+    # Eval workers (BonitoMCP) dial here to be driven for interactive app proxying.
+    Bonito.HTTPServer.websocket_route!(srv, "/eval-ws" => (_ctx, ws) ->
+        handle_eval_ws(state, ws))
 end

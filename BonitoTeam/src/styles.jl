@@ -274,7 +274,7 @@ const ChatStyles = Bonito.Styles(
         "width" => "10px"),
     CSS(".bt-tool-kind",
         "font-size" => "13px", "flex-shrink" => "0"),
-    # MCP server badge — dim pill before the tool name (e.g. "bonitoteam").
+    # MCP server badge — dim pill before the tool name (e.g. "btworker").
     CSS(".bt-tool-server",
         "flex-shrink" => "0",
         "font-size" => "10.5px", "font-weight" => "600",

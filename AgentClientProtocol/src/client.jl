@@ -67,7 +67,10 @@ function on_request(h::FSRequestHandler, method::AbstractString, params)
     return nothing
 end
 
-# Discover the agent binary: env var → PATH → node_modules search.
+# Discover the agent binary. We rely solely on the user-installed binary:
+# the CLAUDE_AGENT_ACP env var, then PATH. Node installs are user-managed, so
+# we deliberately do NOT walk the repo for a vendored node_modules/.bin copy —
+# that would re-create a node_modules under e.g. dev/Bonito, which we never want.
 function find_agent_bin()
     explicit = get(ENV, "CLAUDE_AGENT_ACP", "")
     !isempty(explicit) && return explicit
@@ -75,21 +78,7 @@ function find_agent_bin()
     global_bin = Sys.which("claude-agent-acp")
     global_bin !== nothing && return global_bin
 
-    # Walk up from this source file; check both direct node_modules and
-    # sibling subdirectory node_modules (e.g. dev/Bonito/node_modules).
-    dir = @__DIR__
-    for _ in 1:8
-        bin = joinpath(dir, "node_modules", ".bin", "claude-agent-acp")
-        isfile(bin) && return bin
-        # Check one level of subdirectories (covers dev/*/node_modules pattern)
-        for sub in readdir(dir; join=true)
-            isdir(sub) || continue
-            bin = joinpath(sub, "node_modules", ".bin", "claude-agent-acp")
-            isfile(bin) && return bin
-        end
-        dir = dirname(dir)
-    end
-    return "claude-agent-acp"  # let OS raise a clear error at spawn time
+    return "claude-agent-acp"  # not on PATH; Client() raises a clear error below
 end
 
 function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
@@ -97,8 +86,11 @@ function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
                 agent_env::Dict{String,String} = Dict{String,String}(),
                 agent_bin::String = find_agent_bin())
 
-    isfile(agent_bin) || error("claude-agent-acp not found at: $agent_bin\n" *
-                               "Set CLAUDE_AGENT_ACP env var or pass agent_bin=.")
+    isfile(agent_bin) || error(
+        "claude-agent-acp not found (resolved to: $agent_bin).\n" *
+        "Install it yourself and put it on PATH, e.g.\n" *
+        "    npm install -g @agentclientprotocol/claude-agent-acp\n" *
+        "or point CLAUDE_AGENT_ACP at the binary / pass agent_bin=.")
 
     env = merge(Dict(k => v for (k,v) in ENV),
                 Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",

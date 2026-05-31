@@ -28,6 +28,7 @@ include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
 include("transport.jl")        # ChatTransport + LocalTransport / WorkerTransport / MockTransport
 include("styles.jl")
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
+include("remote_app.jl")       # embed_remote_app — interactive worker Bonito apps in the browser
 include("persistence.jl")
 include("dashboard.jl")        # dashboard_app
 include("worker_widget.jl")    # WorkerCard widget (stable per worker_id, used by KeyedList)

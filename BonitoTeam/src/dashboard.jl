@@ -341,8 +341,19 @@ function ensure_project_session!(state::ServerState, p::ProjectInfo;
     # The worker reports its BonitoMCP launch as a `julia` binary (`mcp_path`)
     # plus an argv array (`mcp_args`) — no shell wrapper, so it's identical on
     # Windows. claude-agent-acp spawns `command + args` directly.
+    # `env` carries the eval-worker dial-back coordinates so BonitoMCP's eval
+    # session can connect back to the server for interactive app proxying.
+    #
+    # The server name must NOT collide with any MCP server the user has in their
+    # global/project config: claude-agent-acp runs the agent with
+    # settingSources ["user","project","local"], so it ALSO loads the user's
+    # `~/.claude.json` mcpServers. A same-named (e.g. stale/broken) entry there
+    # shadows the one we inject here, and the tools silently vanish. `btworker`
+    # is deliberately specific to avoid that — see `mcp__btworker__*` tool names.
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
-        [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path; args = w.mcp_args)]
+        [AgentClientProtocol.MCPServer("btworker", w.mcp_path;
+                                       args = w.mcp_args,
+                                       env  = eval_dialback_env(state, p.id))]
 
     # The transport carries everything start_session needs — including the
     # `resume_session_id` so the worker bring-up path uses session/load

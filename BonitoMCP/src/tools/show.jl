@@ -100,3 +100,70 @@ register!(
     ),
     julia_show_handler,
 )
+
+# bt_show_app — display a LIVE, interactive Bonito app in the chat. The `code`
+# (which must evaluate to a `Bonito.App`) runs in the eval session; the server
+# renders it there and proxies it into the browser, so widgets/observables stay
+# fully interactive (unlike bt_show, which snapshots a file). Requires the eval
+# session to have dialed back to the server (automatic under BonitoTeam).
+const SHOW_APP_DESCRIPTION = """
+Display a LIVE, interactive Bonito app in the chat. `code` must evaluate to a
+`Bonito.App(...)`. Pass the SAME `env_path` you use for bt_julia_eval (the
+project directory) — the app then runs in that exact session, so state and
+`using Bonito` from earlier evals are in scope, AND it uses the project's Bonito
+which the server proxies the app through. Omitting `env_path` spins up a separate
+temp-env session whose Bonito may differ from the server's and fail to proxy.
+The app renders live in the browser — sliders, buttons, WGLMakie plots etc. stay
+interactive. Use bt_show instead for a static file/plot snapshot.
+"""
+
+function julia_show_app_handler(args::AbstractDict)
+    code     = String(get(args, "code", ""))
+    env_path = get(args, "env_path", nothing)
+    julia_cmd = get(args, "julia_cmd", nothing)
+    isempty(strip(code)) && return Dict{String,Any}(
+        "content" => [Dict("type"=>"text", "text"=>"error: missing `code`")], "isError" => true)
+    s = try
+        get_or_create!(manager(), env_path; julia_cmd)
+    catch e
+        return Dict{String,Any}("content"=>[Dict("type"=>"text",
+            "text"=>"error starting session: $(sprint(showerror, e))")], "isError"=>true)
+    end
+    ensure_eval_dialed!(s)   # also waits for RemoteProxy bridge to be installed
+    id = string(rand(UInt64); base = 16)
+    try
+        Malt.remote_eval_fetch(s.worker, quote
+            # Build the Bonito.App from the agent's code and register it on the
+            # worker's RemoteProxy bridge. `include_string` evaluates the code
+            # as a top-level file — each statement runs in its own world so
+            # `global X = …` definitions are visible to the App's handler
+            # closure that comes after them; the return value is the value of
+            # the last expression (the `Bonito.App(...)`).
+            Main.RemoteProxy.register_app!($id, include_string(Main, $code))
+        end)
+    catch e
+        return Dict{String,Any}("content"=>[Dict("type"=>"text",
+            "text"=>"error building app: $(sprint(showerror, e))")], "isError"=>true)
+    end
+    # The server's `find_app_reference` picks up this token and embeds the
+    # bridge-registered app into the chat-bubble subsession (see remote_app.jl).
+    return Dict{String,Any}(
+        "content" => [Dict("type"=>"text", "text"=>"shown_app: $id")], "isError" => false)
+end
+
+register!(
+    "bt_show_app", SHOW_APP_DESCRIPTION,
+    Dict{String,Any}(
+        "type" => "object",
+        "properties" => Dict{String,Any}(
+            "code" => Dict("type"=>"string",
+                "description"=>"Julia code that evaluates to a Bonito.App to display live in the chat."),
+            "env_path" => Dict("type"=>"string",
+                "description"=>"Project directory of the eval session — use the SAME value as bt_julia_eval so the app runs in that session and the project's Bonito. Omit only for a throwaway temp env (proxying may fail)."),
+            "julia_cmd" => Dict("type"=>"string",
+                "description"=>"Custom Julia invocation, e.g. `julia +1.11`. Use rarely; match bt_julia_eval if you set it there."),
+        ),
+        "required" => ["code"],
+    ),
+    julia_show_app_handler,
+)

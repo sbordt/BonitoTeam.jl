@@ -42,6 +42,7 @@ mutable struct JuliaSession
     in_flight_started::Float64
     lock::ReentrantLock                 # serialises eval/continue/interrupt
     log_path::Union{String,Nothing}
+    dialed_back::Bool                   # `ensure_eval_dialed!` dedupes against this; flipped under `lock`
 end
 
 function JuliaSession(env_path;
@@ -53,7 +54,7 @@ function JuliaSession(env_path;
                         nothing, IOBuffer(), ReentrantLock(),
                         nothing, nothing,
                         nothing, "", 0.0,
-                        ReentrantLock(), log_path)
+                        ReentrantLock(), log_path, false)
 end
 
 is_alive(s::JuliaSession) = s.worker !== nothing && Malt.isrunning(s.worker)
@@ -74,6 +75,71 @@ function build_exeflags(env_path, julia_cmd)::Vector{String}
     return base
 end
 
+"""
+    ensure_eval_dialed!(s::JuliaSession)
+
+If the server injected WebSocket dial-back coordinates (via the MCP `env`),
+bootstrap the worker-side proxy bridge and have the worker dial the server. This
+one Malt call (over BonitoMCP's OWN link to the worker) includes `RemoteProxy` +
+builds the bridge; the worker then opens the dial-back WebSocket and runs
+`RemoteProxy.serve_bridge`, which pipes the Bonito protocol over it RAW (no Malt
+on that socket — see RemoteProxy.jl). Lets the server drive this worker to render
+interactive Bonito apps into the chat. Idempotent + lazy (call when Bonito is
+loaded, e.g. from `bt_show_app`).
+"""
+function ensure_eval_dialed!(s::JuliaSession)
+    wsurl = get(ENV, "BONITOTEAM_EVAL_WS", "")
+    isempty(wsurl) && return s
+    is_alive(s) || start!(s)
+    secret     = get(ENV, "BONITOTEAM_SECRET", "")
+    project_id = get(ENV, "BONITOTEAM_PROJECT_ID", "")
+    # Dedupe against this session's own state — avoids a Main-global
+    # idempotency flag on the worker (Julia 1.12 strict-globals would force
+    # a `Core.eval`/world-age dance, and we'd be inventing the dedupe twice).
+    s.dialed_back && return s
+    try
+        # Bootstrap over BonitoMCP's OWN Malt link: include RemoteProxy + build the
+        # bridge, get its namespace prefix. The dial-back socket itself carries NO
+        # Malt — it's a raw Bonito frame pipe (see RemoteProxy.serve_bridge); Malt
+        # is only this one-time setup call.
+        prefix = Malt.remote_eval_fetch(s.worker, quote
+            using Bonito
+            isdefined(Main, :RemoteProxy) || include($(REMOTE_PROXY_PATH))
+            Main.RemoteProxy.ensure_bridge!()
+        end)
+        # Dial the server and run the raw bridge frame loop. Handshake carries the
+        # prefix so the host knows the namespace before any frame flows.
+        Malt.remote_eval_fetch(s.worker, quote
+            @async try
+                Bonito.HTTP.WebSockets.open($wsurl) do ws
+                    Bonito.HTTP.WebSockets.send(ws, $(secret * " " * project_id * " " * prefix))
+                    Main.RemoteProxy.serve_bridge(ws)
+                end
+            catch e
+                @warn "BonitoMCP eval-ws dial failed" exception = (e, catch_backtrace())
+            end
+            nothing
+        end)
+        # Wait until the dial actually connects (serve_bridge sets the socket) so
+        # callers can immediately reach the bridge over the raw transport.
+        ready = false
+        for _ in 1:120   # ~30s budget — covers cold include + first dial
+            if Malt.remote_eval_fetch(s.worker,
+                    :(isdefined(Main, :RemoteProxy) && Main.RemoteProxy.BRIDGE[] !== nothing &&
+                      Main.RemoteProxy.BRIDGE[].parent.connection.ws[] !== nothing))
+                ready = true; break
+            end
+            sleep(0.25)
+        end
+        ready || @warn "BonitoMCP: bridge dial not connected 30s after setup" wsurl
+        s.dialed_back = true
+    catch e
+        s.dialed_back = false   # allow retry on the next call
+        @warn "BonitoMCP: eval dial-back setup failed" exception = (e, catch_backtrace())
+    end
+    return s
+end
+
 function start!(s::JuliaSession)
     is_alive(s) && return s
     s.worker = Malt.Worker(
@@ -92,6 +158,9 @@ function start!(s::JuliaSession)
     # Malt can't serialise a `Module` reference back to the parent.
     Malt.remote_eval_fetch(s.worker, :(try; using Revise; catch; end; nothing))
     Malt.remote_eval_fetch(s.worker, :(include($HELPER_PATH); nothing))
+
+    # Interactive-app dial-back is lazy (ensure_eval_dialed! from bt_show_app),
+    # so non-Bonito eval sessions don't pay for it.
 
     if s.is_test
         Malt.remote_eval_fetch(s.worker,

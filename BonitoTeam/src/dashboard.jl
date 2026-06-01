@@ -145,18 +145,16 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
         error("Project name must be alphanumeric/_/- only — got '$name'")
     isempty(worker_path) && error("Worker path is required (pick a folder).")
 
-    # Idempotent re-import: same (worker_name, worker_path) returns the
-    # already-registered project. If this caller supplied a `resume_session_id`
-    # and the existing entry didn't have one, adopt it so the next chat session
-    # uses session/load instead of session/new.
-    existing = find_project_by_location(state, worker_name, worker_path)
+    # Threads: a folder can hold several conversations, identified by
+    # (worker, path, chat_id) where chat_id is the claude session id. Importing
+    # the SAME session id reuses its thread; importing a DIFFERENT session of
+    # the same folder creates a sibling thread; a no-session import
+    # (resume_session_id === nothing) always starts a fresh thread. This is the
+    # fix for "opening a folder→subchat locks that one in".
+    existing = find_thread(state, worker_name, worker_path, resume_session_id)
     if existing !== nothing
-        @info "create_project_from_worker!: reusing existing project" id=existing.id name=existing.name
-        if resume_session_id !== nothing && existing.resume_session_id === nothing
-            existing.resume_session_id = resume_session_id
-            save_projects!(state)
-        end
-        notify_progress(progress, :phase, (msg = "Reusing existing project…",))
+        @info "create_project_from_worker!: reusing existing thread" id=existing.id name=existing.name session=resume_session_id
+        notify_progress(progress, :phase, (msg = "Reusing existing chat…",))
         maybe_start(existing)
         return existing
     end
@@ -356,6 +354,7 @@ function stop_session!(state::ServerState, p::ProjectInfo)
     end
     # close is idempotent + total now; a real error here is worth surfacing.
     model === nothing || close(model.transport)
+    model === nothing || notify_chats!(state)   # drop from the active-chats sidebar
     release_project!(state, p)
     return nothing
 end
@@ -660,6 +659,22 @@ const DashboardStyles = Bonito.Styles(
         "text-overflow" => "ellipsis",
         "white-space" => "nowrap",
         "word-break" => "keep-all"),
+    # Remove-worker affordance: a faint ✕ pinned to the right of the title
+    # row (margin-left:auto), turning red on hover so it reads as destructive.
+    CSS(".bt-card-remove",
+        "margin-left" => "auto",
+        "flex-shrink" => "0",
+        "cursor" => "pointer",
+        "color" => "var(--bt-text-faint)",
+        "font-size" => "13px",
+        "line-height" => "1",
+        "padding" => "2px 6px",
+        "border-radius" => "var(--bt-radius-sm)",
+        "user-select" => "none",
+        "transition" => "background 80ms, color 80ms"),
+    CSS(".bt-card-remove:hover",
+        "background" => "rgba(239,68,68,0.12)",
+        "color" => "var(--bt-error)"),
     # Inline-editable variant for the worker name. Reads as plain text until
     # the user clicks/focuses it; on focus we surface a soft border so it's
     # discoverable that the field is editable.
@@ -1000,6 +1015,17 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-group-meta",
         "font-size" => "11px", "color" => "var(--bt-text-faint)",
         "flex-shrink" => "0"),
+    # "+ New thread" in a folder's summary row — reveal on hover so it doesn't
+    # clutter the collapsed list.
+    CSS(".bt-new-thread",
+        "flex-shrink" => "0",
+        "font-size" => "11px", "font-weight" => "500",
+        "color" => "var(--bt-accent)", "cursor" => "pointer",
+        "padding" => "2px 8px", "border-radius" => "var(--bt-radius-sm)",
+        "white-space" => "nowrap",
+        "opacity" => "0", "transition" => "opacity 80ms, background 80ms"),
+    CSS(".bt-group-summary:hover .bt-new-thread", "opacity" => "1"),
+    CSS(".bt-new-thread:hover", "background" => "var(--bt-surface-2)"),
     CSS(".bt-group-body",
         "padding" => "8px 10px 4px",
         "border-top" => "1px solid var(--bt-border)",
@@ -1024,6 +1050,28 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-spinner-sm",
         "width" => "11px", "height" => "11px", "border-width" => "1.5px"),
     CSS("@keyframes bt-spin", CSS("to", "transform" => "rotate(360deg)")),
+
+    # ── Chat loading screen (project_loading_view) ───────────────────────────
+    # Centered in the main panel while a chat's ACP session is brought up, or
+    # to explain that the project's worker is offline.
+    CSS(".bt-loading",
+        "flex" => "1 1 auto",
+        "display" => "flex", "flex-direction" => "column",
+        "align-items" => "center", "justify-content" => "center",
+        "gap" => "12px", "padding" => "40px", "text-align" => "center"),
+    CSS(".bt-loading-spinner",
+        "width" => "30px", "height" => "30px",
+        "border-radius" => "50%",
+        "border" => "3px solid var(--bt-border)",
+        "border-top-color" => "var(--bt-accent)",
+        "animation" => "bt-spin 0.7s linear infinite"),
+    CSS(".bt-loading-glyph", "font-size" => "28px", "opacity" => "0.7"),
+    CSS(".bt-loading-title",
+        "font-size" => "15px", "font-weight" => "600",
+        "color" => "var(--bt-text)"),
+    CSS(".bt-loading-sub",
+        "font-size" => "13px", "color" => "var(--bt-text-muted)",
+        "max-width" => "360px", "line-height" => "1.5"),
 
     # ── Open chat link ───────────────────────────────────────────────────────
     CSS(".bt-link",
@@ -1961,9 +2009,12 @@ function dashboard_dom(state::ServerState;
         sid_raw = get(payload, "session_id", nothing)
         resume_session_id = (sid_raw === nothing || isempty(String(sid_raw))) ?
                                 nothing : String(sid_raw)
+        # The worker now travels in the payload (the folder→threads tree is
+        # always-visible, not a single "open" panel), so it identifies which
+        # worker the clicked row / "+ New thread" belongs to.
+        w_name = String(get(payload, "worker", ""))
         import_path[] = Dict{String,Any}()    # reset so the same path can re-fire
         is_busy_idle(busy[]) || return
-        w_name = discover_state[]
         isempty(w_name) && return
         do_import(w_name, path; resume_session_id = resume_session_id)
     end

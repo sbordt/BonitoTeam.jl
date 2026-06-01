@@ -79,3 +79,7 @@ end
 end
 
 end  # BonitoTeam paths
+
+@testset "worker state" begin
+    include("test_worker_state.jl")
+end

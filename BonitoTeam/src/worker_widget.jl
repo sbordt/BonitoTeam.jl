@@ -60,17 +60,9 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     end
 
     new_proj_btn = Bonito.Button("+ Project"; style=nothing, class = "bt-btn bt-btn-secondary")
-    discover_btn = Bonito.Button("Discover";  style=nothing, class = "bt-btn bt-btn-secondary")
     on(new_proj_btn.value) do clicked
         clicked || return
         c.picker_state[]   = c.picker_state[] == wid ? "" : wid
-        c.discover_state[] = ""
-        c.error_obs[]      = ""
-    end
-    on(discover_btn.value) do clicked
-        clicked || return
-        c.discover_state[] = c.discover_state[] == wid ? "" : wid
-        c.picker_state[]   = ""
         c.error_obs[]      = ""
     end
 
@@ -105,16 +97,38 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
         status_dot(s)
     end
 
+    # Remove worker. The confirm() lives in JS so we never fire the
+    # destructive call without an explicit OK; only then does the trigger
+    # Observable flip and the Julia handler run `remove_worker!`.
+    remove_trigger = Observable(false)
+    on(remove_trigger) do go
+        go || return
+        try
+            remove_worker!(state, wid)
+            c.error_obs[] = ""
+        catch e
+            c.error_obs[] = "Remove failed: $(sprint(showerror, e))"
+        end
+    end
+    remove_btn = DOM.div("✕";
+        class = "bt-card-remove",
+        title = "Remove this worker",
+        onclick = js"""event => {
+            event.stopPropagation();
+            if (confirm("Remove this worker and its projects from the list?\n\nChat history files are kept on disk. A worker whose process is still running may reconnect."))
+                $(remove_trigger).notify(true);
+        }""")
+
     # Render both action variants; toggle visibility via class. Keeps the
     # Bonito.Button instances mounted so click handlers don't churn.
     online_class  = map(o -> o ? "bt-card-actions"            : "bt-card-actions bt-hidden", is_online_obs)
     offline_class = map(o -> o ? "bt-card-actions bt-hidden"  : "bt-card-actions",            is_online_obs)
     actions_block = DOM.div(
-        DOM.div(discover_btn, new_proj_btn; class = online_class),
+        DOM.div(new_proj_btn; class = online_class),
         DOM.div(DOM.span("offline"; class = "bt-pill bt-pill-muted"); class = offline_class))
 
     card_body = DOM.div(
-        DOM.div(status_dot_obs, name_input; class = "bt-card-title"),
+        DOM.div(status_dot_obs, name_input, remove_btn; class = "bt-card-title"),
         DOM.div(subtitle_obs; class = "bt-card-meta", title = title_attr);
         class = "bt-card-body")
 
@@ -125,10 +139,9 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     picker_class   = map(p -> p ? "bt-form-wrapper" : "bt-form-wrapper bt-hidden", is_picking_obs)
     picker_block   = DOM.div(picker_form; class = picker_class)
 
-    is_discover_obs = map(s -> s == wid, c.discover_state)
-    discover_block_dom = render_discover_panel(c, wid)
-    discover_class = map(d -> d ? "bt-discover-wrapper" : "bt-discover-wrapper bt-hidden", is_discover_obs)
-    discover_block = DOM.div(discover_block_dom; class = discover_class)
+    # The folder→threads browser is now ALWAYS visible (persistent), fed from
+    # state.discovered — no Discover toggle. Folders are collapsable <details>.
+    discover_block = DOM.div(render_discover_panel(c, wid); class = "bt-discover-wrapper")
 
     return Bonito.jsrender(session,
         DOM.div(card, picker_block, discover_block;
@@ -179,38 +192,56 @@ function render_remote_picker_form(c::WorkerCard, wid::String)
         class = "bt-form")
 end
 
-# All pieces (spinner, empty, errors, two KeyedLists, section labels) are
-# mounted simultaneously; class-bound observables flip visibility so
-# nothing re-renders on busy / results transitions.
+# Persistent folder→threads browser for one worker. Reads from the
+# server-side `state.discovered[wid]` cache (saved to discovered.json), so the
+# tree survives a restart with no re-scan; the per-card Rescan button refreshes
+# it. All pieces (spinner, empty, errors, the KeyedList of folder groups) are
+# mounted simultaneously; class-bound observables flip visibility so nothing
+# re-renders on busy / results transitions.
 function render_discover_panel(c::WorkerCard, wid::String)
-    close_btn  = Bonito.Button("✕";       style=nothing, class = "bt-btn bt-btn-ghost")
+    # Per-card scan-in-flight flag so rescanning one worker doesn't spin every
+    # other worker's panel.
+    scan_busy  = Observable(false)
     rescan_btn = Bonito.Button("↻ Rescan"; style=nothing, class = "bt-btn bt-btn-secondary")
-    on(close_btn.value)  do clicked; clicked && (c.discover_state[] = ""); end
-    on(rescan_btn.value) do clicked; clicked && c.trigger_scan(wid); end
+    on(rescan_btn.value) do clicked
+        clicked || return
+        scan_busy[] || (scan_busy[] = true;
+            @async try
+                scan_and_store!(c.state, wid)
+            catch e
+                c.error_obs[] = "Scan failed: $(sprint(showerror, e))"
+            finally
+                scan_busy[] = false
+            end)
+    end
+
+    # This worker's persisted scan results (worker_id → Vector of session dicts).
+    results_obs = map(c.state.discovered) do d
+        get(d, wid, Dict{String,Any}[])
+    end
 
     display_name_obs = map(c.state.workers) do workers
         w = get(workers, wid, nothing)
         w === nothing ? wid : w.name
     end
-    title_obs = map(n -> "Claude Code sessions on $n", display_name_obs)
+    title_obs = map(n -> "Folders & threads on $n", display_name_obs)
 
     spinner_msg_obs = map(n -> "Scanning $n for Claude Code sessions…", display_name_obs)
-    spinner_class = map(b -> b ? "bt-spinner-row" : "bt-spinner-row bt-hidden",
-                        c.discover_busy)
+    spinner_class = map(b -> b ? "bt-spinner-row" : "bt-spinner-row bt-hidden", scan_busy)
     spinner_block = DOM.div(
         DOM.div(class = "bt-spinner"),
         DOM.span(spinner_msg_obs);
         class = spinner_class)
 
-    empty_msg_obs = map(n -> "No Claude Code sessions found on $n.", display_name_obs)
-    show_empty_obs = map(c.discover_busy, c.discover_results) do busy, results
+    empty_msg_obs = map(n -> "No Claude Code sessions found on $n yet — click Rescan.", display_name_obs)
+    show_empty_obs = map(scan_busy, results_obs) do busy, results
         !busy && isempty(results)
     end
     empty_class = map(show -> show ? "bt-empty" : "bt-empty bt-hidden", show_empty_obs)
     empty_block = DOM.div(empty_msg_obs; class = empty_class)
 
     # Errors are 0..N small spans, rebuilt via map(); KeyedList overkill.
-    errors_obs = map(c.discover_results) do results
+    errors_obs = map(results_obs) do results
         DOM.div(
             (DOM.div("Error: $(r["error"])"; class = "bt-error")
              for r in results if haskey(r, "error"))...;
@@ -233,7 +264,7 @@ function render_discover_panel(c::WorkerCard, wid::String)
         get!(session_rows, sr.row_key, sr)
     end
 
-    groups_obs = map(c.discover_results) do results
+    groups_obs = map(results_obs) do results
         by_path  = Dict{String, Vector{Any}}()
         latest_by_path = Dict{String, Float64}()
         for r in results
@@ -257,7 +288,8 @@ function render_discover_panel(c::WorkerCard, wid::String)
             for sr in rows; push!(seen_row_keys, sr.row_key); end
             g = get!(session_groups, p) do
                 SessionGroup(p, basename(p),
-                             Observable(rows), Observable(""))
+                             Observable(rows), Observable(""),
+                             wid, c.import_path)
             end
             g.rows_obs[]    = rows
             g.summary_obs[] = group_summary_string(rs)
@@ -279,7 +311,7 @@ function render_discover_panel(c::WorkerCard, wid::String)
     DOM.div(
         DOM.div(
             DOM.span(title_obs; class = "bt-discover-title"),
-            DOM.div(rescan_btn, close_btn; class = "bt-discover-actions");
+            DOM.div(rescan_btn; class = "bt-discover-actions");
             class = "bt-discover-header"),
         spinner_block,
         empty_block,

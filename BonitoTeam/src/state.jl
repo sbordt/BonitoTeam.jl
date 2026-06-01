@@ -139,12 +139,27 @@ mutable struct ServerState
     # panel pulls the model from here when a project icon is selected.
     chat_models :: Dict{String,Any}   # id → ChatModel
 
+    # Bumped (via `notify_chats!`) whenever `chat_models` gains or loses an
+    # entry. `chat_models` is a plain Dict (not an Observable), but the
+    # left-hand "active chats" sidebar needs to re-render when a chat opens or
+    # closes — so it `map`s this signal and snapshots the live keys. The value
+    # is meaningless; only the notification matters.
+    chat_signal :: Observable{Int}
+
     # Live worker connections (name → HTTP.WebSocket)
     worker_control_ws :: Dict{String,Any}
 
     # Pending request_id → channel handoffs for every RPC type. Channel{Any}
     # because the answer shape varies (WS for handoff, Dict for rpc result).
     pending_rpcs :: Dict{String,Channel{Any}}
+
+    # Persisted result of "discover Claude Code sessions" per worker:
+    # worker_id → Vector of session dicts (session_id, path, first_prompt,
+    # last_used, running, kind, …). Backs the dashboard's persistent
+    # folder→threads browser so the tree survives a server restart without
+    # re-scanning (refresh via the per-worker Rescan button). Saved to
+    # `discovered.json`; mutated in place + `notify`d like `projects`.
+    discovered :: Observable{Dict{String,Vector{Dict{String,Any}}}}
 end
 
 """
@@ -164,11 +179,14 @@ function ServerState(; state_dir::String,
         Observable(Dict{String,WorkerInfo}()),    # workers
         Observable(Dict{String,ProjectInfo}()),   # projects
         Dict{String,Any}(),                       # chat_models
+        Observable(0),                            # chat_signal
         Dict{String,Any}(),                       # worker_control_ws
         Dict{String,Channel{Any}}(),              # pending_rpcs
+        Observable(Dict{String,Vector{Dict{String,Any}}}()),  # discovered
     )
     load_workers!(s)
     load_projects!(s)
+    load_discovered!(s)
     return s
 end
 
@@ -190,14 +208,17 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             map(identity, session, s.workers),
             map(identity, session, s.projects),
             s.chat_models,
+            map(identity, session, s.chat_signal),
             s.worker_control_ws,
             s.pending_rpcs,
+            map(identity, session, s.discovered),
         )
     end
 end
 
-workers_file(s::ServerState)  = joinpath(s.state_dir, "workers.json")
-projects_file(s::ServerState) = joinpath(s.state_dir, "projects.json")
+workers_file(s::ServerState)    = joinpath(s.state_dir, "workers.json")
+projects_file(s::ServerState)   = joinpath(s.state_dir, "projects.json")
+discovered_file(s::ServerState) = joinpath(s.state_dir, "discovered.json")
 
 # Setting an Observable propagates to the browser via Bonito's WebSocket;
 # if a session is broken (e.g. a stale tab whose hashed asset URLs went 404
@@ -226,6 +247,14 @@ function safe_notify!(obs::Observable)
     end
     return nothing
 end
+
+# Signal that `chat_models` changed (a chat opened or closed) so the active-
+# chats sidebar re-renders. Call with the SAME state the mutation used: a
+# worker handler / async task holds the parent state (fans out to every
+# session's bridged `chat_signal`); a UI handler holds its per-session view
+# (updates that session). Mirrors how the existing `safe_notify!(state.projects)`
+# calls are threaded.
+notify_chats!(s::ServerState) = safe_notify!(s.chat_signal)
 
 # ── Persistence ───────────────────────────────────────────────────────────
 # Atomic JSON write: serialise to a sibling .tmp first, then rename into place.
@@ -346,6 +375,23 @@ function load_projects!(s::ServerState)
     dedup_projects!(s)
 end
 
+# Persist / restore the per-worker discovered-sessions cache. Best-effort:
+# it's a cache (re-derivable by Rescan), so a corrupt file just starts empty.
+function save_discovered!(s::ServerState)
+    atomic_write_json(discovered_file(s), s.discovered[])
+end
+
+function load_discovered!(s::ServerState)
+    raw = load_json_tolerant(discovered_file(s), "discovered.json")
+    raw === nothing && return
+    d = Dict{String,Vector{Dict{String,Any}}}()
+    for (wid, sessions) in raw
+        sessions isa AbstractVector || continue
+        d[String(wid)] = Dict{String,Any}[Dict{String,Any}(x) for x in sessions]
+    end
+    s.discovered[] = d
+end
+
 """
     project_location_key(p) -> Tuple{String,String}
 
@@ -371,6 +417,54 @@ function find_project_by_location(state::ServerState,
     key = (String(worker_id), rstrip(String(worker_path), '/'))
     for p in values(state.projects[])
         project_location_key(p) == key && return p
+    end
+    return nothing
+end
+
+"""
+    thread_dedup_key(p) -> Tuple{String,String,String}
+
+A *thread's* identity: `(worker_id, worker_path, chat_id)`, where `chat_id`
+is the claude session id (`resume_session_id`) or, for a brand-new thread
+that hasn't a session yet, the project's own `id`. A folder
+(`(worker_id, worker_path)`) can host several threads, so this is what we
+de-duplicate on — NOT the folder key, which would wrongly merge sibling
+threads of the same folder.
+"""
+thread_dedup_key(p::ProjectInfo) =
+    (p.worker_id, rstrip(p.worker_path, '/'),
+     something(p.resume_session_id, p.id))
+
+"""
+    thread_tag(p) -> String
+
+A short human tag distinguishing sibling threads of the same folder: the
+claude session id prefix for a resumed thread, or `new <id>` for a fresh one.
+Used to disambiguate identical folder names in the active-chats sidebar.
+"""
+thread_tag(p::ProjectInfo) =
+    p.resume_session_id === nothing ? "new " * first(p.id, 4) :
+                                      first(p.resume_session_id, 8)
+
+"""
+    find_thread(state, worker_id, worker_path, chat_id) -> Union{ProjectInfo,Nothing}
+
+Look up the thread `(worker_id, worker_path, chat_id)`, matching on the
+claude session id (`resume_session_id`). `chat_id === nothing` means "a
+brand-new thread" and never matches an existing one (so "+ New thread" and a
+no-session import always create a fresh thread, while re-importing the same
+session id reuses its thread and importing a *different* session of the same
+folder creates a sibling).
+"""
+function find_thread(state::ServerState,
+                     worker_id::AbstractString,
+                     worker_path::AbstractString,
+                     chat_id::Union{AbstractString,Nothing})
+    chat_id === nothing && return nothing
+    key = (String(worker_id), rstrip(String(worker_path), '/'), String(chat_id))
+    for p in values(state.projects[])
+        (p.worker_id, rstrip(p.worker_path, '/'), p.resume_session_id) == key &&
+            return p
     end
     return nothing
 end
@@ -405,18 +499,19 @@ function same_name_siblings(state::ServerState, project_id::AbstractString)
         if q.id != p.id && q.name == p.name && q.worker_id != p.worker_id]
 end
 
-# Collapse projects.json entries that share `(worker_id, worker_path)`.
-# Same coordinates means the same on-disk folder — and since the project
-# name is derived from `basename(worker_path)`, both copies actually share
-# the same `server_path` (and therefore the same `.bonitoTeam/chat.md`),
-# so dropping the runner-up loses no chat history. When picking which
-# entry to keep we prefer the one carrying state we can't easily
-# reconstruct (resume_session_id > auto_prompt > earliest `created`).
+# Collapse projects.json entries that are the SAME THREAD —
+# `(worker_id, worker_path, chat_id)` (see `thread_dedup_key`). A folder can
+# legitimately host several threads (different claude sessions, or new ones),
+# so we de-dup per thread, NOT per folder: sibling threads of the same folder
+# are kept. Genuine duplicates (e.g. the same session imported twice) share a
+# `chat_id` and collapse to one. When picking which entry to keep we prefer
+# the one carrying state we can't easily reconstruct (resume_session_id >
+# auto_prompt > earliest `created`).
 function dedup_projects!(s::ServerState)
     isempty(s.projects[]) && return
-    groups = Dict{Tuple{String,String},Vector{ProjectInfo}}()
+    groups = Dict{Tuple{String,String,String},Vector{ProjectInfo}}()
     for p in values(s.projects[])
-        push!(get!(() -> ProjectInfo[], groups, project_location_key(p)), p)
+        push!(get!(() -> ProjectInfo[], groups, thread_dedup_key(p)), p)
     end
     dropped = Tuple{String,String,String}[]   # (worker, path, dropped_id)
     for (key, members) in groups
@@ -429,7 +524,7 @@ function dedup_projects!(s::ServerState)
         end
     end
     if !isempty(dropped)
-        @warn "dedup: collapsed duplicate projects sharing (worker_id, worker_path)" dropped
+        @warn "dedup: collapsed duplicate threads sharing (worker_id, worker_path, chat_id)" dropped
         save_projects!(s)
     end
     return

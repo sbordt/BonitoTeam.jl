@@ -1047,6 +1047,7 @@ function start_chat_client!(model::ChatModel)
         lock(model.state.lock) do
             model.state.chat_models[model.project_id] = model
         end
+        notify_chats!(model.state)   # surface in the active-chats sidebar
     end
     return nothing
 end

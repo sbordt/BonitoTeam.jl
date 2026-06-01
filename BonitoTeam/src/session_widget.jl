@@ -6,6 +6,7 @@
 
 mutable struct SessionRow
     import_path :: Observable{Dict{String,Any}}
+    worker_id   :: String   # which worker this thread lives on (import payload)
     path        :: String
     name        :: String
     session_id  :: String
@@ -36,7 +37,7 @@ function SessionRow(c::WorkerCard, r::AbstractDict)
     # falls through silently.
     running = get(r, "running", nothing) === true
     row_key = string(path, '|', session_id)
-    SessionRow(c.import_path, path, name, session_id, preview, meta, running, row_key)
+    SessionRow(c.import_path, c.worker_id, path, name, session_id, preview, meta, running, row_key)
 end
 
 Base.hash(s::SessionRow, h::UInt) = hash(s.row_key, hash(:SessionRow, h))
@@ -47,22 +48,18 @@ function Bonito.jsrender(session::Bonito.Session, s::SessionRow)
     running_pill = s.running ?
         DOM.span("running"; class = "bt-pill bt-pill-online") :
         DOM.span()
-    # Inside a project group, the cwd is already shown in the group header,
-    # so the per-row "path" line is redundant. Display the session's first
-    # user prompt as a preview instead — falls back to the path if no
-    # preview was extractable (rare: jsonl had no real user message yet).
-    preview_node = isempty(s.preview) ?
-        DOM.div(s.path; class = "bt-session-path") :
-        DOM.div(s.preview; class = "bt-session-preview")
+    # The folder is already in the group header, so the row LEADS with what the
+    # user actually typed (the cleaned first prompt) instead of repeating the
+    # folder name. Falls back to a neutral label when no prose was recoverable
+    # (e.g. a session whose only messages were tooling noise).
+    title = isempty(s.preview) ? "Untitled session" : s.preview
     return Bonito.jsrender(session, DOM.div(
         DOM.div(
             DOM.div(
-                # Wrap the name text in a span so it can ellipsize when the
-                # row is narrow.
-                DOM.span(s.name; class = "bt-session-name-text"),
+                # Wrap the title in a span so it ellipsizes when the row is narrow.
+                DOM.span(title; class = "bt-session-name-text"),
                 running_pill;
                 class = "bt-session-name"),
-            preview_node,
             isempty(s.meta) ? DOM.span() : DOM.div(s.meta; class = "bt-session-meta");
             class = "bt-session-info"),
         DOM.div(btn_label;
@@ -74,7 +71,7 @@ function Bonito.jsrender(session::Bonito.Session, s::SessionRow)
                 btn.textContent = $(btn_label) === 'Resume' ? 'Resuming…' : 'Importing…';
                 // js_path: backslashes are invalid JS string escapes; forward
                 // slashes round-trip cleanly and Julia accepts them on Windows.
-                $(s.import_path).notify({path: $(js_path(s.path)), session_id: $(s.session_id)});
+                $(s.import_path).notify({path: $(js_path(s.path)), session_id: $(s.session_id), worker: $(s.worker_id)});
             }""");
         class = "bt-session-row"))
 end
@@ -87,6 +84,8 @@ mutable struct SessionGroup
     name        :: String                           # basename(path)
     rows_obs    :: Observable{Vector{SessionRow}}   # nested KeyedList input
     summary_obs :: Observable{String}               # "5 sessions · 12 subagents · Last used …"
+    worker_id   :: String                           # for the "+ New thread" import
+    import_path :: Observable{Dict{String,Any}}     # shared import sink
 end
 
 Base.hash(g::SessionGroup, h::UInt) = hash(g.path, hash(:SessionGroup, h))
@@ -122,11 +121,23 @@ function group_summary_string(rs::Vector)
 end
 
 function Bonito.jsrender(session::Bonito.Session, g::SessionGroup)
+    # Start a brand-new thread (fresh claude session, no resume) in this
+    # folder. `preventDefault`/`stopPropagation` so the click doesn't toggle
+    # the enclosing <details>. Empty session_id ⇒ the import handler uses
+    # session/new and `find_thread` always makes a sibling.
+    new_thread_btn = DOM.span("+ New thread";
+        class   = "bt-new-thread",
+        title   = "Start a fresh chat in this folder",
+        onclick = js"""event => {
+            event.preventDefault(); event.stopPropagation();
+            $(g.import_path).notify({path: $(js_path(g.path)), session_id: "", worker: $(g.worker_id)});
+        }""")
     return Bonito.jsrender(session, DOM.details(
         DOM.summary(
             DOM.span(g.name; class = "bt-group-name"),
             DOM.span(g.path; class = "bt-group-path"),
-            DOM.span(g.summary_obs; class = "bt-group-meta");
+            DOM.span(g.summary_obs; class = "bt-group-meta"),
+            new_thread_btn;
             class = "bt-group-summary"),
         DOM.div(KeyedList(g.rows_obs; key = sr -> sr.row_key);
             class = "bt-group-body");

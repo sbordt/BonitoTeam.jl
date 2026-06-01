@@ -174,16 +174,11 @@ function handle_worker_control(state::ServerState, ws)
         # critical section so the workers/worker_control_ws/projects tables
         # are mutually consistent across concurrent observers (other RPC
         # handlers, App-body re-renders).
-        projects_to_attach = lock(state.lock) do
+        lock(state.lock) do
             state.workers[][worker_id] = w
             state.worker_control_ws[worker_id] = ws
             migrate_legacy_worker_refs!(state, w)
             save_workers!(state)
-            # Snapshot the projects we want to attach BEFORE leaving the
-            # lock — `ensure_project_session!` itself takes the lock and
-            # also does network I/O, so we don't want to hold the mutex
-            # across that work.
-            [p for p in values(state.projects[]) if p.worker_id == worker_id]
         end
         # Worker added → fan out to worker-cards consumers. If any
         # legacy projects had their worker_id rewritten by
@@ -194,11 +189,22 @@ function handle_worker_control(state::ServerState, ws)
         safe_notify!(state.projects)
         @info "Worker connected" worker_id=worker_id name=display_name hostname=w.hostname
 
-        for p in projects_to_attach
-            try
-                ensure_project_session!(state, p)
+        # Bring-up is LAZY: we no longer spawn a chat (claude process) for every
+        # project the moment a worker connects. A chat starts only when the user
+        # opens one of its threads (ensure_project_session! via the loading view
+        # / dashboard), at which point it appears in the active-chats sidebar.
+        # Eager bring-up meant N claude processes per worker on every reconnect
+        # and made "active" meaningless.
+
+        # Populate the persistent folder→threads browser on FIRST connect only
+        # (if we have no cached scan for this worker yet). Subsequent refreshes
+        # are explicit via the Rescan button — so "no need to click Discover
+        # again" after the first time, and reconnects don't re-scan every time.
+        if !haskey(state.discovered[], worker_id)
+            @async try
+                scan_and_store!(state, worker_id)
             catch e
-                @warn "Failed to (re)attach project on connect" project=p.name exception=e
+                @warn "auto-scan on connect failed" worker_id=worker_id exception=e
             end
         end
 
@@ -241,6 +247,7 @@ function handle_worker_control(state::ServerState, ws)
             end
         end
         safe_notify!(state.workers)
+        notify_chats!(state)        # evicted chats drop out of the active-chats sidebar
         release_projects_for_worker!(state, worker_id)
         @info "Worker disconnected" worker_id=worker_id
     end
@@ -284,6 +291,56 @@ function rename_worker!(state::ServerState, worker_id::AbstractString,
     save_workers!(state)
     safe_notify!(state.workers)
     return state.workers[][worker_id]
+end
+
+"""
+    remove_worker!(state, worker_id; remove_projects=true)
+
+Forget a worker: drop it from `state.workers`, close and discard its
+control WebSocket, and evict any cached `ChatModel`s for its projects. By
+default its projects are also removed from the list (their server-side
+chat history under `state_dir/chats/<id>/` is left on disk, so a later
+re-import can still find it).
+
+A worker whose process is still running will dial `/worker-ws` again and
+re-register itself, so removal primarily targets decommissioned (offline)
+workers; closing the control WS here just hangs up the current link.
+"""
+function remove_worker!(state::ServerState, worker_id::AbstractString;
+                         remove_projects::Bool = true)
+    wid = String(worker_id)
+    ws, dropped = lock(state.lock) do
+        sock = get(state.worker_control_ws, wid, nothing)
+        delete!(state.worker_control_ws, wid)
+        delete!(state.workers[], wid)
+        dropped = String[]
+        for p in collect(values(state.projects[]))
+            p.worker_id == wid || continue
+            delete!(state.chat_models, p.id)
+            if remove_projects
+                delete!(state.projects[], p.id)
+                push!(dropped, p.id)
+            end
+        end
+        save_workers!(state)
+        remove_projects && save_projects!(state)
+        (sock, dropped)
+    end
+    # Close the control WS outside the lock — it's network I/O, and closing it
+    # ends the worker's `handle_worker_control` receive loop (its `finally`
+    # teardown is idempotent against the eviction we just did).
+    if ws !== nothing
+        try
+            close(ws)
+        catch e
+            @debug "remove_worker!: closing control WS failed" exception=e
+        end
+    end
+    safe_notify!(state.workers)
+    remove_projects && safe_notify!(state.projects)
+    notify_chats!(state)        # evicted chats drop out of the active-chats sidebar
+    @info "Worker removed" worker_id=wid removed_projects=length(dropped)
+    return nothing
 end
 
 # Handler for /transfer-ws — one invocation per directional RemoteSync transfer.
@@ -585,6 +642,32 @@ function scan_worker_sessions(state::ServerState, worker_name::String;
     send_command(state, worker_name, Dict("type" => "scan_sessions", "request_id" => rid))
     resp = take_pending!(state, ch, rid, timeout, "scan_sessions on '$worker_name'")
     return resp isa AbstractVector ? resp : Dict{String,Any}[]
+end
+
+"""
+    scan_and_store!(state, worker_id) -> Vector{Dict}
+
+Scan a worker for Claude Code sessions and persist the result into
+`state.discovered[worker_id]` (→ `discovered.json`), then notify so the
+dashboard's folder→threads browser updates. A scan error is stored as a
+single `{"error" => …}` entry (the panel surfaces it) rather than thrown, so
+this is safe to call from a connect handler or a Rescan click. Returns the
+stored vector.
+"""
+function scan_and_store!(state::ServerState, worker_id::AbstractString)
+    wid = String(worker_id)
+    raw = try
+        scan_worker_sessions(state, wid)
+    catch e
+        Any[Dict{String,Any}("error" => sprint(showerror, e))]
+    end
+    norm = Dict{String,Any}[Dict{String,Any}(r) for r in raw]
+    lock(state.lock) do
+        state.discovered[][wid] = norm
+        save_discovered!(state)
+    end
+    safe_notify!(state.discovered)
+    return norm
 end
 
 """

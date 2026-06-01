@@ -21,21 +21,22 @@ try
         n_cards = TH.dom_count(ctx, ".bt-card")
         record("at least 2+2 cards (workers + projects)",
                @TH.test_true (n_cards >= 4))
-        # Online worker shows + Project + Discover buttons.
-        # Offline worker shows the "offline" pill.
+        # Online worker shows the "+ Project" button (the folder→threads
+        # browser is now always-visible below the card, not behind a Discover
+        # toggle). Offline worker shows the "offline" pill.
         has_online_card = TH.eval_js(ctx, """
             (() => {
                 const cards = document.querySelectorAll('.bt-card');
                 for (const c of cards) {
                     const name = c.querySelector('.bt-card-name');
                     if (!name || (name.value || name.innerText) !== 'w-1') continue;
-                    const buttons = c.querySelectorAll('button');
-                    return buttons.length >= 2;  // + Project + Discover
+                    const buttons = Array.from(c.querySelectorAll('button'));
+                    return buttons.some(b => b.innerText.indexOf('Project') !== -1);
                 }
                 return false;
             })()
         """)
-        record("online worker shows action buttons", @TH.test_true has_online_card)
+        record("online worker shows + Project button", @TH.test_true has_online_card)
 
         has_offline_pill = TH.eval_js(ctx, """
             (() => {
@@ -105,7 +106,7 @@ try
         @assert TH.wait_for(ctx, "document.body.innerText.indexOf('Project1') !== -1"; timeout = 3.0)
     end
 
-    TH.section("+ Project / Discover buttons fire without errors") do
+    TH.section("+ Project button fires without errors") do
         # Click "+ Project" on the online worker card. The button toggles
         # picker_state on the Julia side, which feeds a reactive picker
         # rendering — without a real worker connection, the actual picker
@@ -135,23 +136,21 @@ try
                """; timeout = 3.0))
     end
 
-    TH.section("Discover button on worker card") do
-        # Click Discover on the online worker.
+    TH.section("folder→threads browser is always present") do
+        # The per-worker discover panel is no longer toggled by a Discover
+        # button — it's always rendered (a persistent folder→threads tree fed
+        # from the saved scan), with a Rescan button to refresh.
+        record("folder→threads panel present",
+               @TH.test_true TH.wait_for(ctx, """
+                   (() => document.querySelector('.bt-discover-panel') !== null
+                          || document.body.innerText.indexOf('Folders & threads') !== -1)()
+               """; timeout = 3.0))
+        # Rescan should be reachable and clicking it must not raise a JS error.
         TH.eval_js(ctx, """
-            const cards = document.querySelectorAll('.bt-card');
-            for (const c of cards) {
-                const name = c.querySelector('.bt-card-name');
-                if (!name || (name.value || name.innerText) !== 'w-1') continue;
-                const btn = Array.from(c.querySelectorAll('button')).find(b => b.innerText.indexOf('Discover') !== -1);
-                if (btn) btn.click();
-                break;
-            }
+            (() => { const b = Array.from(document.querySelectorAll('button')).find(x => x.innerText.indexOf('Rescan') !== -1); if (b) b.click(); })()
         """)
-        # Without a real worker the discover RPC will eventually fail / time
-        # out, but the click itself shouldn't raise a JS error and SOME
-        # element should change on the page — usually a loading spinner.
-        sleep(0.5)
-        record("no JS errors after discover click",
+        sleep(0.4)
+        record("no JS errors after Rescan click",
                @TH.test_eq length(TH.js_errors(ctx)) 0)
     end
 

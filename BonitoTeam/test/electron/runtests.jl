@@ -60,6 +60,7 @@ const FILES = [
     "test_keyed_list.jl",
     # Dashboard
     "test_dashboard.jl",
+    "test_folder_threads.jl",
     # Persistence (no UI)
     "test_persistence.jl",
     # Real I/O at the end so it doesn't tie up sockets during the chat tests

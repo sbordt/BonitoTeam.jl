@@ -103,7 +103,7 @@ function create_project_from_github!(state::ServerState, url::AbstractString;
         error("Derived project name '$proj_name' is invalid; pass `name=` explicitly")
 
     w = state.workers[][worker_name]
-    server_path = joinpath(state.working_dir, proj_name)
+    server_path = compute_server_path(state, worker_name, proj_name)
     worker_path = joinpath(w.projects_root, proj_name)
 
     # Idempotent re-clone: a project at the same `(worker, worker_path)` is

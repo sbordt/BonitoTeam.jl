@@ -1243,7 +1243,7 @@ function reconcile_replay!(model::ChatModel, replay)
 end
 
 # ── DOM building (split into header / messages / input / banner) ──────────
-function chat_header(model::ChatModel)
+function chat_header(model::ChatModel, sync_modal_state::Observable)
     state = model.state
     project_id = model.project_id
     cwd = model.cwd
@@ -1265,6 +1265,40 @@ function chat_header(model::ChatModel)
         handle_chat_sync_click(state, project_id, sync_status)
     end
 
+    # Cross-worker sync: only present when this project has a same-named
+    # sibling on another worker. Clicking inspects both sides and opens the
+    # comparison modal (see `render_sync_modal`). Computed at header build
+    # time — re-navigating refreshes it if siblings appear/disappear.
+    sibs = isempty(project_id) ? ProjectInfo[] : same_name_siblings(state, project_id)
+    xsync_control = if isempty(sibs)
+        DOM.span()
+    else
+        other = first(sibs)
+        other_label = haskey(state.workers[], other.worker_id) ?
+            state.workers[][other.worker_id].name : other.worker_id
+        xsync_status = Observable("")
+        xsync_button = DOM.button(map(s -> isempty(s) ? "⇄ $other_label" : s, xsync_status);
+            class="bt-header-sync",
+            title="Compare and sync this project with $other_label",
+            onclick=js"event => $(xsync_status).notify('__click__')")
+        on(xsync_status) do s
+            s == "__click__" || return
+            xsync_status[] = "comparing…"
+            cur = state.projects[][project_id]
+            @async begin
+                try
+                    cmp = compare_projects(state, cur, other)
+                    sync_modal_state[] = (current = cur, other = other, comparison = cmp)
+                    safe_set!(xsync_status, "")
+                catch e
+                    @warn "cross-worker compare failed" exception=e
+                    safe_set!(xsync_status, "compare failed")
+                end
+            end
+        end
+        xsync_button
+    end
+
     # No back arrow — the unified app's sidebar Home icon is the way home.
     DOM.div(
         DOM.div(
@@ -1272,6 +1306,7 @@ function chat_header(model::ChatModel)
             DOM.div(
                 DOM.span(basename(rstrip(cwd, '/')); title=cwd),
                 class="bt-header-title"),
+            xsync_control,
             sync_button;
             class="bt-header-row");
         class="bt-header")
@@ -1644,9 +1679,26 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
     # `busy_start` / `busy_end` events only forward to FUTURE bridges,
     # so a tab that opens mid-prompt would otherwise miss the start.
     busy_class = map(b -> b ? "bt-busy bt-busy-active" : "bt-busy", model.busy_active)
+
+    # Cross-worker sync modal state + apply. `nothing` ⇒ hidden; otherwise
+    # `(current, other, comparison)`. `on_apply(src, dst)` runs the
+    # directional overwrite in a Task and closes the modal when done.
+    sync_modal_state = Observable{Union{Nothing,NamedTuple}}(nothing)
+    sync_modal = render_sync_modal(model.state, sync_modal_state,
+        (src, dst) -> @async begin
+            try
+                sync_across_workers!(model.state, src, dst)
+            catch e
+                @warn "cross-worker sync failed" src=src.name dst=dst.name exception=e
+            finally
+                sync_modal_state[] = nothing
+            end
+        end)
+
     Bonito.jsrender(session, DOM.div(
-        chat_header(model),
+        chat_header(model, sync_modal_state),
         chat_session_banner(model),
+        sync_modal,
         messages_container,
         init_script,
         DOM.div(DOM.div(class="bt-busy-dot"),

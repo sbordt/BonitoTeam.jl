@@ -909,21 +909,45 @@ const DashboardStyles = Bonito.Styles(
         "color" => "var(--bt-text-muted)",
         "padding" => "12px", "font-size" => "12px"),
 
-    # ── Discover panel ───────────────────────────────────────────────────────
-    CSS(".bt-discover-panel",
+    # ── Discover panel (collapsable <details>) ───────────────────────────────
+    # `<details>` keeps the worker pill compact by default; clicking the header
+    # toggles the folder→threads tree. Rescan inside the summary
+    # preventDefault's the toggle and force-opens, so scan progress is visible.
+    CSS("details.bt-discover-panel",
         "background" => "var(--bt-surface-2)",
         "border" => "1px solid var(--bt-border)",
         "border-radius" => "var(--bt-radius)",
-        "padding" => "14px 16px",
+        "padding" => "10px 14px",
         "margin-top" => "-4px", "margin-bottom" => "8px"),
+    CSS("details.bt-discover-panel[open]", "padding-bottom" => "14px"),
     CSS(".bt-discover-header",
         "display" => "flex", "align-items" => "center",
         "justify-content" => "space-between",
-        "margin-bottom" => "10px"),
+        "cursor" => "pointer", "user-select" => "none",
+        "list-style" => "none",
+        # Add some breathing room between the chevron and title.
+        "gap" => "10px"),
+    CSS("details[open] > .bt-discover-header", "margin-bottom" => "10px"),
+    # Hide the default disclosure triangle (Chrome / Safari).
+    CSS(".bt-discover-header::-webkit-details-marker", "display" => "none"),
+    # Custom chevron — matches `.bt-group-summary::before` so the two collapsable
+    # surfaces feel like one design language.
+    CSS(".bt-discover-header::before",
+        "content" => "\"▸\"",
+        "color" => "var(--bt-text-faint)", "font-size" => "10px",
+        "flex-shrink" => "0"),
+    CSS("details.bt-discover-panel[open] > .bt-discover-header::before",
+        "content" => "\"▾\""),
+    CSS(".bt-discover-header:hover",
+        "background" => "var(--bt-surface)"),
     CSS(".bt-discover-title",
-        "font-weight" => "600", "font-size" => "13px"),
+        "font-weight" => "600", "font-size" => "13px",
+        "flex" => "1 1 auto", "min-width" => "0",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "white-space" => "nowrap"),
     CSS(".bt-discover-actions",
-        "display" => "flex", "gap" => "6px", "align-items" => "center"),
+        "display" => "flex", "gap" => "6px", "align-items" => "center",
+        "flex-shrink" => "0"),
 
     CSS(".bt-section-label",
         "font-size" => "10.5px", "font-weight" => "600",

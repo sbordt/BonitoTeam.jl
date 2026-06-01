@@ -201,19 +201,33 @@ end
 function render_discover_panel(c::WorkerCard, wid::String)
     # Per-card scan-in-flight flag so rescanning one worker doesn't spin every
     # other worker's panel.
-    scan_busy  = Observable(false)
-    rescan_btn = Bonito.Button("↻ Rescan"; style=nothing, class = "bt-btn bt-btn-secondary")
-    on(rescan_btn.value) do clicked
-        clicked || return
-        scan_busy[] || (scan_busy[] = true;
-            @async try
-                scan_and_store!(c.state, wid)
-            catch e
-                c.error_obs[] = "Scan failed: $(sprint(showerror, e))"
-            finally
-                scan_busy[] = false
-            end)
+    scan_busy = Observable(false)
+    rescan_trigger = Observable(false)
+    on(rescan_trigger) do go
+        go || return
+        scan_busy[] && return
+        scan_busy[] = true
+        @async try
+            scan_and_store!(c.state, wid)
+        catch e
+            c.error_obs[] = "Scan failed: $(sprint(showerror, e))"
+        finally
+            scan_busy[] = false
+        end
     end
+    # Plain DOM (not Bonito.Button) so the onclick can `preventDefault` the
+    # enclosing <details> summary toggle (Rescan should NOT collapse the panel
+    # — it should open it so the spinner / refreshed tree are visible), and
+    # `stopPropagation` belt-and-braces.
+    rescan_btn = DOM.span("↻ Rescan";
+        class = "bt-btn bt-btn-secondary",
+        style = Styles("cursor" => "pointer"),
+        onclick = js"""event => {
+            event.preventDefault(); event.stopPropagation();
+            const d = event.currentTarget.closest('details');
+            if (d) d.open = true;
+            $(rescan_trigger).notify(true);
+        }""")
 
     # This worker's persisted scan results (worker_id → Vector of session dicts).
     results_obs = map(c.state.discovered) do d
@@ -308,8 +322,12 @@ function render_discover_panel(c::WorkerCard, wid::String)
 
     groups_keyed_list = KeyedList(groups_obs; key = g -> g.path)
 
-    DOM.div(
-        DOM.div(
+    # The whole tree is now a collapsable `<details>` so the worker card stays
+    # compact by default ("BOOM — opens the list on click"). Rescan inside the
+    # summary preventDefaults the toggle and force-opens, so the user always
+    # sees scan progress + refreshed results.
+    DOM.details(
+        DOM.summary(
             DOM.span(title_obs; class = "bt-discover-title"),
             DOM.div(rescan_btn; class = "bt-discover-actions");
             class = "bt-discover-header"),
@@ -317,5 +335,5 @@ function render_discover_panel(c::WorkerCard, wid::String)
         empty_block,
         errors_obs,
         DOM.div(groups_keyed_list; class = "bt-discover-section");
-        class = "bt-discover-panel bt-slide-in")
+        class = "bt-discover-panel")
 end

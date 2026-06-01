@@ -56,7 +56,7 @@ const ChatStyles = Bonito.Styles(
         "box-sizing" => "border-box"),
     CSS(".bt-header-row",
         "display" => "flex", "align-items" => "center", "gap" => "10px",
-        "width" => "100%", "max-width" => "880px"),
+        "width" => "100%"),
     CSS(".bt-header-back",
         "color" => "var(--bt-text)", "text-decoration" => "none",
         "font-size" => "20px", "line-height" => "1",
@@ -140,10 +140,11 @@ const ChatStyles = Bonito.Styles(
         "background" => "var(--bt-surface-2)"),
 
     # ── Messages container ───────────────────────────────────────────────────
-    # On wide screens the column self-centers (max-width + align-self), so
-    # bubbles don't sprawl across a 1440px+ viewport. Scrollbar stays at the
-    # right edge of the column rather than the screen edge — natural for a
-    # chat app with content margins.
+    # Fills `.bt-main` (no centered 880px column) — the user complained that a
+    # centered messages column left a dead band of empty space between its
+    # right scrollbar and the shell border. Individual bubbles still cap their
+    # own width (see `.bt-user-msg`/`.bt-agent-msg` `max-width: min(…)`) so a
+    # very wide viewport doesn't sprawl any single message.
     CSS(".bt-messages",
         "flex" => "1 1 0", "min-height" => "0",
         "overflow-y" => "auto", "overflow-x" => "hidden",
@@ -153,8 +154,7 @@ const ChatStyles = Bonito.Styles(
         "padding" => "16px",
         "display" => "flex", "flex-direction" => "column",
         "gap" => "10px",
-        "width" => "100%", "max-width" => "880px",
-        "align-self" => "center",
+        "width" => "100%",
         "box-sizing" => "border-box"),
     CSS(".bt-spacer-top, .bt-spacer-bottom",
         "flex-shrink" => "0", "overflow-anchor" => "none"),
@@ -618,7 +618,7 @@ const ChatStyles = Bonito.Styles(
         "background" => "var(--bt-surface)"),
     CSS(".bt-input-row",
         "display" => "flex", "gap" => "8px", "align-items" => "flex-end",
-        "width" => "100%", "max-width" => "880px"),
+        "width" => "100%"),
 
     # ── Attachment thumbnail strip ──────────────────────────────────────────
     # Sits above .bt-input-row. Hidden (display:none) when there's nothing
@@ -627,7 +627,7 @@ const ChatStyles = Bonito.Styles(
     # in the same screen position regardless of attachment count.
     CSS(".bt-attachments",
         "display" => "none",
-        "width" => "100%", "max-width" => "880px"),
+        "width" => "100%"),
     CSS(".bt-attachments.bt-attachments-active",
         "display" => "flex",
         "gap" => "8px",

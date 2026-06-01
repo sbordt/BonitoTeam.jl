@@ -292,7 +292,7 @@ const UnifiedShellStyles = Bonito.Styles(
     # vertical borders give the contained app a subtle frame on wide
     # monitors and disappear visually when the shell hits the viewport
     # edges.
-    CSS(":root", "--bt-shell-max" => "1280px"),
+    CSS(":root", "--bt-shell-max" => "1600px"),
     CSS(".bt-shell",
         "max-width" => "var(--bt-shell-max)",
         "margin"    => "0 auto",
@@ -456,15 +456,30 @@ function unified_app(state::ServerState)
         end
         sidebar = project_sidebar(session, view, current_view)
         main_panel = unified_main(view, current_view, ls)
-        DOM.div(
+        # Chat-global floating "show-app target" + right-side plotpane column.
+        # `Detach` on any bt_show_app bubble moves the embed DOM into the
+        # popup (or plotpane, if that was the last location); close → restore
+        # to bubble. Drag the popup title bar over the plotpane → docks.
+        # Geometry + location persist per chat to disk.
+        popup, plotpane, popup_controller_js = install_popup!(session, view, current_view)
+        shell = DOM.div(
             UnifiedShellStyles,
             DashboardStyles,
             ChatStyles,
             SidebarStyles,
+            PopupStyles,
             Bonito.MarkdownCSS,
             Bonito.ConnectionIndicator(),
             sidebar,
-            DOM.div(main_panel; class = "bt-main");
+            DOM.div(main_panel; class = "bt-main"),
+            plotpane,
+            popup;
             class = "bt-shell")
+        # Install `window._btPopup` once the shell is in the DOM. The DOM nodes
+        # the controller queries (#bt-popup-mount inside the popup body, and
+        # per-tool #bt-slot-<id> / #bt-embed-<id> in the chat) are all
+        # descendants of the shell, so they're guaranteed present by onload.
+        Bonito.onload(session, shell, popup_controller_js)
+        shell
     end
 end

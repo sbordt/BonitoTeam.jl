@@ -52,7 +52,12 @@ try
         # the KeyedList content actually mounts in the browser).
         record("two folder groups render",
                @TH.test_true TH.wait_for(ctx, "document.querySelectorAll('.bt-group').length >= 2"; timeout = 6.0))
-        record("folder name MyApp shown",
+        # The outer discover panel is now a collapsable <details> (closed by
+        # default — the worker pill stays compact). Open it so its contents
+        # show up in innerText for the assertions below.
+        TH.eval_js(ctx, "(() => { const d = document.querySelector('details.bt-discover-panel'); if (d) d.open = true; })()")
+        sleep(0.2)
+        record("folder name MyApp shown (after opening the panel)",
                @TH.test_true TH.eval_js(ctx, "document.body.innerText.indexOf('MyApp') !== -1"))
         # Rows + Resume live inside the (default-collapsed) <details> body —
         # present in the DOM, just not in innerText until expanded — so assert

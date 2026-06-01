@@ -731,10 +731,12 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     # leaves a `shown_app:` reference in the content (handled after load below).
     # `show_remote_app!` registered the app on the bridge under tool_id;
     # `bt_show_app` registered it under a separate id we pick up below.
-    m.kind == "bonito_app" && return remote_app_placeholder(m.id, project_id, m.id)
+    m.kind == "bonito_app" &&
+        return wrap_for_detach(m.id, remote_app_placeholder(m.id, project_id, m.id))
     content = load_tool_content(chat_dir, m.id)
     app_id = find_app_reference(content)
-    app_id === nothing || return remote_app_placeholder(m.id, project_id, app_id)
+    app_id === nothing ||
+        return wrap_for_detach(m.id, remote_app_placeholder(m.id, project_id, app_id))
     isempty(content) &&
         return DOM.div("(no body — tool details not persisted for this entry)",
             class="bt-tool-empty")

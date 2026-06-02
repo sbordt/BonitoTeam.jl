@@ -132,20 +132,24 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
         DOM.div(subtitle_obs; class = "bt-card-meta", title = title_attr);
         class = "bt-card-body")
 
-    card = DOM.div(card_body, actions_block; class = "bt-card")
+    # Top row of the worker pill: identity + actions. The discover details lives
+    # inside the SAME pill (below this row), so a worker with a collapsed project
+    # list takes the same space as a bare card — no separate pill underneath.
+    card_row = DOM.div(card_body, actions_block; class = "bt-card-row")
 
     is_picking_obs = map(s -> s == wid, c.picker_state)
     picker_form    = render_remote_picker_form(c, wid)
     picker_class   = map(p -> p ? "bt-form-wrapper" : "bt-form-wrapper bt-hidden", is_picking_obs)
     picker_block   = DOM.div(picker_form; class = picker_class)
 
-    # The folder→threads browser is now ALWAYS visible (persistent), fed from
-    # state.discovered — no Discover toggle. Folders are collapsable <details>.
-    discover_block = DOM.div(render_discover_panel(c, wid); class = "bt-discover-wrapper")
+    # Project list is a `<details>` nested INSIDE the card so the closed state is
+    # just a thin "▸ projects (N)" toggle row — no separate pill chrome. Fed
+    # from state.discovered (no scan needed on first paint); the per-card Rescan
+    # button refreshes it.
+    card = DOM.div(card_row, render_discover_panel(session, c, wid); class = "bt-card")
 
     return Bonito.jsrender(session,
-        DOM.div(card, picker_block, discover_block;
-                class = "bt-worker-cell"))
+        DOM.div(card, picker_block; class = "bt-worker-cell"))
 end
 
 function render_remote_picker_form(c::WorkerCard, wid::String)
@@ -198,7 +202,7 @@ end
 # it. All pieces (spinner, empty, errors, the KeyedList of folder groups) are
 # mounted simultaneously; class-bound observables flip visibility so nothing
 # re-renders on busy / results transitions.
-function render_discover_panel(c::WorkerCard, wid::String)
+function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::String)
     # Per-card scan-in-flight flag so rescanning one worker doesn't spin every
     # other worker's panel.
     scan_busy = Observable(false)
@@ -238,7 +242,18 @@ function render_discover_panel(c::WorkerCard, wid::String)
         w = get(workers, wid, nothing)
         w === nothing ? wid : w.name
     end
-    title_obs = map(n -> "Folders & threads on $n", display_name_obs)
+    # Live count of distinct project folders for the inline "projects (N)" label.
+    # Same dedup the groups_obs builder below uses (skip errors + subagents).
+    project_count_obs = map(results_obs) do results
+        seen = Set{String}()
+        for r in results
+            haskey(r, "error") && continue
+            String(get(r, "kind", "session")) == "subagent" && continue
+            push!(seen, String(get(r, "path", "")))
+        end
+        length(seen)
+    end
+    title_obs = map(n -> "projects ($n)", project_count_obs)
 
     spinner_msg_obs = map(n -> "Scanning $n for Claude Code sessions…", display_name_obs)
     spinner_class = map(b -> b ? "bt-spinner-row" : "bt-spinner-row bt-hidden", scan_busy)
@@ -326,7 +341,7 @@ function render_discover_panel(c::WorkerCard, wid::String)
     # compact by default ("BOOM — opens the list on click"). Rescan inside the
     # summary preventDefaults the toggle and force-opens, so the user always
     # sees scan progress + refreshed results.
-    DOM.details(
+    panel = DOM.details(
         DOM.summary(
             DOM.span(title_obs; class = "bt-discover-title"),
             DOM.div(rescan_btn; class = "bt-discover-actions");
@@ -336,4 +351,24 @@ function render_discover_panel(c::WorkerCard, wid::String)
         errors_obs,
         DOM.div(groups_keyed_list; class = "bt-discover-section");
         class = "bt-discover-panel")
+
+    # One delegated click for the whole panel — N session rows queue ONE
+    # listener-install message instead of N per-row onclick rebinds.
+    Bonito.onload(session, panel, js"""(el) => {
+        el.addEventListener('click', (ev) => {
+            const btn = ev.target.closest('.bt-btn[data-bt-action="session-pick"]');
+            if (!btn) return;
+            // Optimistic UI: the controller-side import is async, so flip the
+            // label + dim immediately so the user sees the click landed.
+            btn.classList.add('bt-clicked');
+            btn.textContent = btn.textContent.trim() === 'Resume' ?
+                'Resuming…' : 'Importing…';
+            $(c.import_path).notify({
+                path:       btn.dataset.btSessionPath || '',
+                session_id: btn.dataset.btSessionId   || '',
+                worker:     btn.dataset.btWorkerId    || '',
+            });
+        });
+    }""")
+    return panel
 end

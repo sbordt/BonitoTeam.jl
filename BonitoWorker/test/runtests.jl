@@ -164,6 +164,92 @@ end
     @test BW.generate_worker_id() != BW.generate_worker_id()
 end
 
+# ── singleton pidfile guard ──────────────────────────────────────────────────
+# A duplicate worker sharing the persisted worker_id fights the original over
+# the server's control-WS registration. The pidfile guard makes start()/
+# spawn_worker refuse when a live worker already holds the slot. We test the
+# path-injectable predicates against a temp file so the real scratch pidfile is
+# never touched (which would block the user's actual worker).
+@testset "pidfile singleton guard" begin
+    mktempdir() do dir
+        pf = joinpath(dir, "sub", "worker.pid")   # nested → also tests mkpath
+
+        # Empty slot: no file → free.
+        @test BW.read_pidfile(pf) === nothing
+        @test BW.running_worker_pid(pf) === nothing
+
+        # Our own pid recorded → not "another" worker (re-entry is fine).
+        mkpath(dirname(pf))
+        write(pf, string(getpid()))
+        @test BW.read_pidfile(pf) == getpid()
+        @test BW.running_worker_pid(pf) === nothing
+
+        # Stale file pointing at a dead pid → slot free (overwritable).
+        write(pf, "999999")
+        @test BW.process_running(999999) === false
+        @test BW.running_worker_pid(pf) === nothing
+
+        # A live OTHER pid → blocked. pid 1 (init/launchd) is always alive and
+        # never us; on Unix kill(1,0) → EPERM which process_running maps to true.
+        write(pf, "1")
+        @test BW.process_running(1) === true
+        @test BW.running_worker_pid(pf) == 1
+
+        # Garbage content → nothing (never throws).
+        write(pf, "not-a-pid")
+        @test BW.read_pidfile(pf) === nothing
+        @test BW.running_worker_pid(pf) === nothing
+
+        # claim_pidfile! records our pid and creates parent dirs.
+        rm(pf; force = true)
+        BW.claim_pidfile!(pf)
+        @test BW.read_pidfile(pf) == getpid()
+    end
+end
+
+# ── systemd service: unit rendering + run-mode decision ──────────────────────
+# Only the PURE pieces are tested here — we never invoke `systemctl` (that would
+# touch the real user systemd). render_service_unit is a pure string builder;
+# decide_run_mode is the pure answer→mode map factored out of the tty IO.
+@testset "service unit rendering" begin
+    u = BW.render_service_unit(; julia = "/opt/julia/bin/julia",
+                                 projects_root = "/home/u/projs",
+                                 memory_max = "80%",
+                                 path_env = "/usr/bin:/home/u/.local/bin")
+    # ExecStart launches start() in the shared env.
+    @test occursin("ExecStart=/opt/julia/bin/julia --project=@bonito-team", u)
+    @test occursin("BonitoWorker.start()", u)
+    # PATH is baked in (systemd --user doesn't inherit the shell PATH; without
+    # this the worker can't find claude-agent-acp/node/git at runtime).
+    @test occursin("Environment=PATH=/usr/bin:/home/u/.local/bin", u)
+    # Crash-restart, memory cap, boot target, workdir.
+    @test occursin("Restart=on-failure", u)
+    @test occursin("MemoryMax=80%", u)
+    @test occursin("WantedBy=default.target", u)
+    @test occursin("WorkingDirectory=/home/u/projs", u)
+    # Pure: identical inputs → byte-identical output (so install can diff for
+    # idempotency — only rewrite+reload when the unit actually changed).
+    @test u == BW.render_service_unit(; julia = "/opt/julia/bin/julia",
+                                        projects_root = "/home/u/projs",
+                                        memory_max = "80%",
+                                        path_env = "/usr/bin:/home/u/.local/bin")
+end
+
+@testset "run-mode decision" begin
+    # Explicit answers.
+    @test BW.decide_run_mode("1", false) == :service
+    @test BW.decide_run_mode("1", true)  == :service
+    @test BW.decide_run_mode("2", false) == :background
+    @test BW.decide_run_mode("2", true)  == :background
+    @test BW.decide_run_mode("", false)  == :service       # bare Enter → default
+    @test BW.decide_run_mode("yes", true) == :service      # anything not "2" → service
+    # No answer (no tty / timed out): keep an existing service, else background —
+    # never silently enable a boot service in a non-interactive context, never
+    # silently downgrade an existing one.
+    @test BW.decide_run_mode(nothing, true)  == :service
+    @test BW.decide_run_mode(nothing, false) == :background
+end
+
 end  # BonitoWorker
 
 # Real-agent integration test — separate file because it boots a subprocess

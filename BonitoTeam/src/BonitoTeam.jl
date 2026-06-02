@@ -18,6 +18,13 @@ using TOML
 using Base64
 using SHA
 
+# CommonMark for the chat-message renderer. Used in `chat.jl :: markdown_html`
+# (strict CommonMark fixes Julia's stdlib bug where `foo_bar_baz` italicizes
+# everything between the intraword `_`s) AND in `persistence.jl` for the
+# `+++` front-matter parse on chat.md. Hoisted here so the `const` parser in
+# chat.jl can resolve at include time — chat.jl is included before persistence.jl.
+import CommonMark as CM
+
 import BonitoBook       # MonacoEditor / DiffEditor / Collapsible for tool rendering
 import BonitoMCP        # shipped to workers, also used by the bundle build
 import BonitoWorker     # ditto
@@ -29,6 +36,7 @@ include("transport.jl")        # ChatTransport + LocalTransport / WorkerTranspor
 include("styles.jl")
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("remote_app.jl")       # embed_remote_app — interactive worker Bonito apps in the browser
+include("floating_window.jl")  # draggable/resizable position:fixed panel — used by popup.jl
 include("popup.jl")            # chat-global FloatingWindow for detaching bt_show_app
 include("persistence.jl")
 include("dashboard.jl")        # dashboard_app

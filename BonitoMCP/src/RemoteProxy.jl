@@ -120,8 +120,53 @@ namespace prefix. Bootstrapped over BonitoMCP's Malt link; the prefix is handed 
 the dial handshake so the host knows the namespace before any frame flows.
 """
 function ensure_bridge!(; compression::Bool = false)
-    BRIDGE[] === nothing && (BRIDGE[] = RemoteBridge(; compression))
+    if BRIDGE[] === nothing
+        BRIDGE[] = RemoteBridge(; compression)
+        # Log every (re)build with the prefix so the worker log shows when this
+        # happens — a rebuild discards prior `register_app!` routes, which is
+        # otherwise invisible (no `delete!` is called, the whole Dict is gone).
+        @info "RemoteProxy: BRIDGE built" prefix = BRIDGE[].parent.id
+    end
     return BRIDGE[].parent.id
+end
+
+"""
+    dial_loop(wsurl, handshake; min_backoff=0.5, max_backoff=8.0)
+
+Run the dial-and-serve loop until BRIDGE[] goes away. Each iteration opens a
+fresh websocket to `wsurl`, sends the `handshake` line, and runs
+`serve_bridge`. When the socket dies (clean EOF, network drop, host restart),
+we sleep with exponential backoff and dial again — so a transient WS drop
+doesn't leave the bridge silently disconnected (the previous one-shot dial
+made every later `call_ctrl` time out at 30 s).
+
+Successful connect resets the backoff so a brief blip → fast reconnect.
+BRIDGE[].routes survives the drop, so already-registered apps keep working
+on the new socket — host needs to recognise the dial-back as a *reconnect*
+(same `prefix`) rather than spinning up a new `EvalBridge`.
+"""
+function dial_loop(wsurl::AbstractString, handshake::AbstractString;
+                   min_backoff::Float64 = 0.5, max_backoff::Float64 = 8.0)
+    backoff = min_backoff
+    while BRIDGE[] !== nothing
+        connected = false
+        try
+            Bonito.HTTP.WebSockets.open(wsurl) do ws
+                Bonito.HTTP.WebSockets.send(ws, handshake)
+                connected = true
+                serve_bridge(ws)
+            end
+        catch e
+            @warn "RemoteProxy: dial failed; will retry" wsurl backoff exception = e
+        end
+        # `connected` is the right signal — `serve_bridge` returning is normal
+        # (peer EOF), but if we never got past `open`, that's a real failure
+        # and we want backoff to grow.
+        backoff = connected ? min_backoff : min(backoff * 2, max_backoff)
+        sleep(backoff)
+    end
+    @info "RemoteProxy: dial loop exiting (BRIDGE cleared)"
+    return
 end
 
 """
@@ -167,24 +212,46 @@ function serve_bridge(ws)
 end
 
 # Control request/response (the only ops that aren't a plain frame).
+#
+# The request-shaped ops (`delegate`, `asset_read`, `register`) carry an `id`
+# the host waits on. Any exception below MUST come back as a reply with an
+# `err` field — otherwise the host's `call_ctrl` would only learn about the
+# failure after a 30 s `Base.timedwait`, freezing the chat tool-render path
+# in the meantime. Notifications (`close`) carry no id; their exceptions just
+# get logged by serve_bridge's catch.
 function handle_control(b::RemoteBridge, msg::AbstractDict)
     op = msg["op"]
     c = b.parent.connection
-    if op == "delegate"
-        sub_id, html, init_url = render_embed(b, String(msg["app"]))
-        send_control(c, Dict("op" => "reply", "id" => msg["id"],
-                             "val" => Any[sub_id, html, init_url]))
-    elseif op == "asset_read"
-        bytes = Bonito.read_proxy_asset(b.parent.asset_server.registry,
-                    String(msg["key"]), Int(msg["start"]), Int(msg["stop"]))
-        send_control(c, Dict("op" => "reply", "id" => msg["id"], "val" => bytes))
-    elseif op == "register"
-        app = Base.include_string(Main, String(msg["code"]))
-        register_app!(String(msg["app"]), app)
-        send_control(c, Dict("op" => "reply", "id" => msg["id"], "val" => String(msg["app"])))
-    elseif op == "close"
-        s = Bonito.get_session(b.parent, String(msg["sub"]))
-        s === nothing || close(s)
+    id = get(msg, "id", nothing)
+    try
+        if op == "delegate"
+            sub_id, html, init_url = render_embed(b, String(msg["app"]))
+            send_control(c, Dict("op" => "reply", "id" => id,
+                                 "val" => Any[sub_id, html, init_url]))
+        elseif op == "asset_read"
+            bytes = Bonito.read_proxy_asset(b.parent.asset_server.registry,
+                        String(msg["key"]), Int(msg["start"]), Int(msg["stop"]))
+            send_control(c, Dict("op" => "reply", "id" => id, "val" => bytes))
+        elseif op == "register"
+            app = Base.include_string(Main, String(msg["code"]))
+            register_app!(String(msg["app"]), app)
+            send_control(c, Dict("op" => "reply", "id" => id, "val" => String(msg["app"])))
+        elseif op == "close"
+            s = Bonito.get_session(b.parent, String(msg["sub"]))
+            s === nothing || close(s)
+        end
+    catch e
+        # Surface the failure to the host so its 30 s timedwait turns into a
+        # fast, informative error. Then rethrow so serve_bridge's @warn keeps
+        # the worker-side stacktrace for diagnosis.
+        if id !== nothing
+            try
+                send_control(c, Dict("op" => "reply", "id" => id,
+                                     "err" => sprint(showerror, e)))
+            catch
+            end
+        end
+        rethrow()
     end
     return
 end

@@ -271,8 +271,10 @@ class BonitoChat {
             case 'thought_final':return this.onThoughtFinal(msg);
             case 'thought.body': return this.onThoughtBody(msg);
             case 'tool_update':  return this.onToolUpdate(msg);
-            case 'chunk':        return this.appendChunk(msg.id, msg.text);
+            case 'chunk':        return this.appendChunk(msg);
             case 'user_chunk':   return this.appendUserChunk(msg.text);
+            case 'user_unqueue': return this.unqueueOldestUser();
+            case 'summary_final':return this.onSummaryFinal(msg);
             case 'attach_error':
                 return this._showAttachError(msg.error || 'Attachment failed');
             // (formerly `send_ack` — JS now clears the input widget
@@ -282,6 +284,7 @@ class BonitoChat {
             case 'thought':
             case 'tool':
             case 'plan':
+            case 'summary':
                 return this.appendNewMessage(msg);
         }
     }
@@ -440,11 +443,21 @@ class BonitoChat {
         }
     }
 
-    appendChunk(id, text) {
-        const node = this.nodeById.get(id);
+    appendChunk(msg) {
+        const node = this.nodeById.get(msg.id);
         if (!node) return;
-        const t = node.querySelector('.bt-stream-text');
-        if (t) t.textContent += text;
+        // Server ships the FULL rendered html of the message-so-far each
+        // chunk (CommonMark-rendered, so intraword `_`s don't italicize and
+        // newlines/lists/headings format correctly while streaming). Just
+        // replace the bubble's content.
+        if (msg.html !== undefined) {
+            node.innerHTML = msg.html;
+        } else if (msg.text !== undefined) {
+            // Legacy text-delta path (kept for the streaming-stress mocks
+            // that still feed plain text). Append to the streaming span.
+            const t = node.querySelector('.bt-stream-text');
+            if (t) t.textContent += msg.text;
+        }
         // _queueScrollToBottom rAF-batches multiple chunks per frame so
         // we only scroll AFTER the layout pass that includes the new
         // text (avoids the stale-scrollHeight race).
@@ -538,6 +551,7 @@ class BonitoChat {
         switch (msg.type) {
             case 'user':
                 div.className = 'bt-user-msg';
+                if (msg.queued) div.classList.add('bt-queued');
                 div.textContent = msg.text;
                 break;
             case 'agent':
@@ -580,6 +594,18 @@ class BonitoChat {
                     { toggleEl: div.querySelector('.bt-tool-toggle'),
                       fetchEachExpand: true, discardOnCollapse: true,
                       onExpand: () => this.comm.notify({type: 'tool.render', id}) });
+                // Full-chat-width toggle: extends the tool pill to span the
+                // whole message column, so wide content (diffs / tables /
+                // remote-app embeds) gets the room it needs. Independent of
+                // the body-expand collapsable above — the wide button must NOT
+                // toggle expand/collapse, so we stopPropagation on its click.
+                const wideBtn = div.querySelector('.bt-tool-wide');
+                if (wideBtn) wideBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const active = div.classList.toggle('bt-tool-wide-active');
+                    wideBtn.title = active ?
+                        'Collapse to default width' : 'Expand to full chat width';
+                });
                 // Auto-expand (e.g. bt_show). Deferred to a microtask so the
                 // node is inserted into the document before tool.render's
                 // dom_in_js tries to mount into its `[data-tool-id]` slot.
@@ -590,8 +616,41 @@ class BonitoChat {
                 div.className = 'bt-plan-msg';
                 div.innerHTML = msg.html || '';
                 break;
+            case 'summary': {
+                // Centered separator block for a `/compact` summary — NOT a
+                // user/agent bubble. Streaming case shows a tiny placeholder
+                // until `summary_final` lands; the persisted-replay case ships
+                // the html directly in `msg.html`.
+                div.className = 'bt-summary-msg';
+                const inner = document.createElement('div');
+                inner.className = 'bt-summary-body';
+                if (msg.streaming && !msg.html) {
+                    inner.textContent = 'Session continued — summary loading…';
+                } else {
+                    inner.innerHTML = msg.html || '';
+                }
+                div.appendChild(inner);
+                break;
+            }
         }
         return div;
+    }
+
+    // Clear the "queued" state from the FIRST (oldest) still-queued user
+    // bubble. Server-side FIFO under `promote_queued_user_bubble!` matches the
+    // DOM order the bubbles were created in, so first-match is correct.
+    unqueueOldestUser() {
+        const q = this.container.querySelector('.bt-user-msg.bt-queued');
+        if (q) q.classList.remove('bt-queued');
+    }
+
+    onSummaryFinal(msg) {
+        // Find the LAST summary node still in streaming/placeholder state and
+        // fill it. We don't carry an id (summaries are rare — one per session
+        // continuation — and there's no ambiguity in practice).
+        const nodes = this.container.querySelectorAll('.bt-summary-msg .bt-summary-body');
+        const tgt = nodes[nodes.length - 1];
+        if (tgt) tgt.innerHTML = msg.html || '';
     }
 
     thoughtHTML(msg) {
@@ -618,6 +677,8 @@ class BonitoChat {
                 <span class="bt-tool-title">${escapeHTML(msg.title || '')}</span>
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
+                <button class="bt-tool-wide" type="button"
+                        title="Expand to full chat width">⤢</button>
             </div>
             ${preview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;

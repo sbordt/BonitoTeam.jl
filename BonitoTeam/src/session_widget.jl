@@ -53,6 +53,9 @@ function Bonito.jsrender(session::Bonito.Session, s::SessionRow)
     # folder name. Falls back to a neutral label when no prose was recoverable
     # (e.g. a session whose only messages were tooling noise).
     title = isempty(s.preview) ? "Untitled session" : s.preview
+    # No inline `onclick` per row — that would queue N jscall-id-keyed setup
+    # messages per dashboard render. The delegated listener at the panel level
+    # (`render_discover_panel`) reads these `data-bt-*` attrs and notifies.
     return Bonito.jsrender(session, DOM.div(
         DOM.div(
             DOM.div(
@@ -65,14 +68,13 @@ function Bonito.jsrender(session::Bonito.Session, s::SessionRow)
         DOM.div(btn_label;
             class   = "bt-btn bt-btn-secondary",
             style   = Styles("cursor" => "pointer", "flex-shrink" => "0"),
-            onclick = js"""event => {
-                const btn = event.currentTarget;
-                btn.classList.add('bt-clicked');
-                btn.textContent = $(btn_label) === 'Resume' ? 'Resuming…' : 'Importing…';
-                // js_path: backslashes are invalid JS string escapes; forward
-                // slashes round-trip cleanly and Julia accepts them on Windows.
-                $(s.import_path).notify({path: $(js_path(s.path)), session_id: $(s.session_id), worker: $(s.worker_id)});
-            }""");
+            # The delegated listener reads these three to construct the
+            # `notify(...)` payload. `js_path` normalises backslashes (Windows
+            # paths into a JS data attribute, then back).
+            dataBtAction      = "session-pick",
+            dataBtSessionPath = js_path(s.path),
+            dataBtSessionId   = s.session_id,
+            dataBtWorkerId    = s.worker_id);
         class = "bt-session-row"))
 end
 

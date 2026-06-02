@@ -26,6 +26,52 @@ worker_id_path() = joinpath(config_dir(), "worker_id")
 # Install config written by `install!` and read back by `start`.
 config_path() = joinpath(config_dir(), "config.json")
 
+# ── Singleton guard ──────────────────────────────────────────────────────────
+# Two worker processes sharing the same persisted `worker_id` fight over the
+# server's control-WS registration and tear each other's chat sessions down
+# (the server keys workers by id). There is no OS service supervising us, so
+# `start()` / `spawn_worker()` could otherwise launch duplicates freely (a
+# double install, a manual start on top of an autostart). A pidfile is the
+# cross-platform guard: record our pid, and refuse to start if a live worker
+# already holds it.
+pidfile_path() = joinpath(config_dir(), "worker.pid")
+
+# The pid recorded in the pidfile, or `nothing` if absent/empty/garbage.
+function read_pidfile(path::AbstractString = pidfile_path())
+    isfile(path) || return nothing
+    return tryparse(Int, strip(read(path, String)))
+end
+
+# Pid of a *live, other* worker holding the pidfile, or `nothing` if the slot is
+# free (no file, stale file pointing at a dead pid, or it's our own pid). A
+# `process_running` result of `nothing` (can't determine) is treated as "not
+# confirmed running" so an unverifiable stale file never permanently blocks
+# startup — the failure mode of a false-free is a duplicate (caught server-side
+# by the identity guard), which is better than a worker that refuses to boot.
+function running_worker_pid(path::AbstractString = pidfile_path())
+    pid = read_pidfile(path)
+    pid === nothing && return nothing
+    pid == getpid() && return nothing
+    process_running(pid) === true ? pid : nothing
+end
+
+# Claim the pidfile for this process and arrange to release it on exit. Best
+# effort: a hard kill (SIGKILL) leaves a stale file, which the next start
+# detects as dead and overwrites.
+function claim_pidfile!(path::AbstractString = pidfile_path())
+    mkpath(dirname(path))
+    write(path, string(getpid()))
+    atexit() do
+        # Only remove if it's still ours — a successor that took over the slot
+        # must keep its own claim.
+        try
+            read_pidfile(path) == getpid() && rm(path; force = true)
+        catch
+        end
+    end
+    return nothing
+end
+
 # UUIDv4-shaped identifier built from `hash(time_ns(), gethostname(), pid())`.
 # We deliberately avoid pulling in the Random or UUIDs stdlibs here — adding
 # a new dep to BonitoWorker forces the user's runtime Manifest.toml to be
@@ -120,17 +166,253 @@ function mcp_args()
     ]
 end
 
+# ── systemd --user service (Linux) ───────────────────────────────────────────
+# Optional supervised run mode chosen at install time. A `--user` unit gives us
+# start-on-boot, restart-on-crash, and a memory cap (so a runaway eval can't
+# take the whole box down) — and the service manager is itself the singleton, so
+# it composes with (and reinforces) the pidfile guard. Linux-only; macOS/Windows
+# stay on the bare-detached path for now.
+const SERVICE_NAME = "bonito-worker.service"
+
+systemd_user_dir()  = joinpath(homedir(), ".config", "systemd", "user")
+service_unit_path() = joinpath(systemd_user_dir(), SERVICE_NAME)
+
+# Is a `systemctl --user` manager reachable here? False on non-Linux, no systemd,
+# or environments without a user manager (some containers, WSL without systemd).
+function systemd_user_available()
+    Sys.islinux() || return false
+    Sys.which("systemctl") === nothing && return false
+    try
+        return success(pipeline(`systemctl --user show-environment`;
+                                stdout = devnull, stderr = devnull))
+    catch
+        return false
+    end
+end
+
+# The unit text. PURE (no side effects) so install can diff it against the
+# on-disk unit and only rewrite+reload when it actually changed (template bump,
+# new server, a juliaup update moving `julia`, a different PATH). `path_env` is
+# baked in because systemd --user services do NOT inherit the interactive
+# shell's PATH — without it the worker can't find `claude-agent-acp`/`node`/`git`
+# at runtime. We capture the install-time PATH, which has them resolved.
+function render_service_unit(; julia::AbstractString = julia_bin(),
+                               project::AbstractString = "@bonito-team",
+                               projects_root::AbstractString = pwd(),
+                               memory_max::AbstractString = "85%",
+                               path_env::AbstractString = get(ENV, "PATH", ""))
+    exec = "$(julia) --project=$(project) --startup-file=no " *
+           "-e 'using BonitoWorker; BonitoWorker.start()'"
+    return """
+    [Unit]
+    Description=BonitoTeam worker
+    After=network-online.target
+    Wants=network-online.target
+
+    [Service]
+    Type=simple
+    Environment=PATH=$(path_env)
+    ExecStart=$(exec)
+    Restart=on-failure
+    RestartSec=5
+    # Cap the whole process tree (worker + MCP + Malt eval workers share the
+    # unit's cgroup) so a runaway computation gets OOM-killed + restarted instead
+    # of freezing the desktop. Tune or remove this line if you want no limit.
+    MemoryMax=$(memory_max)
+    WorkingDirectory=$(projects_root)
+
+    [Install]
+    WantedBy=default.target
+    """
+end
+
+service_installed() = isfile(service_unit_path())
+
+# Best-effort: let the service start at boot without an active login session.
+# enable-linger for one's own user is normally allowed via polkit; if it isn't,
+# the service still runs while logged in — so we warn, not error.
+function enable_linger!()
+    user = get(ENV, "USER", "")
+    isempty(user) && (user = try strip(read(`whoami`, String)) catch; "" end)
+    isempty(user) && return false
+    try
+        run(pipeline(`loginctl enable-linger $user`; stdout = devnull, stderr = devnull))
+        return true
+    catch e
+        @warn "BonitoWorker: could not enable linger (service won't auto-start at boot " *
+              "without an active session); enable it manually with `loginctl enable-linger $user`" exception = e
+        return false
+    end
+end
+
+# Stop a bare-detached worker if one is holding the pidfile, so a mode switch
+# (background → service) doesn't leave the old process fighting the new one over
+# the server registration. Unix only (the service path is Linux-only anyway).
+function stop_running_worker!()
+    pid = read_pidfile()
+    pid === nothing && return
+    if pid != getpid() && process_running(pid) === true
+        try
+            ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(15))   # SIGTERM
+        catch
+        end
+        for _ in 1:30
+            process_running(pid) === true || break
+            sleep(0.1)
+        end
+    end
+    rm(pidfile_path(); force = true)
+    return
+end
+
+"""
+    install_service!(; projects_root, memory_max="85%") -> (path, changed::Bool)
+
+Idempotently install/upgrade the `--user` systemd unit and make sure it's
+enabled (boot) + running. Re-running is safe:
+
+  * unit absent            → write, daemon-reload, enable, start
+  * unit present, same     → no-op (just ensure enabled + running)
+  * unit present, changed  → rewrite, daemon-reload, enable, RESTART
+
+"changed" is a byte compare of the rendered unit vs the on-disk one, so it
+catches template bumps, a new `julia` path, a different PATH, etc.
+"""
+function install_service!(; projects_root::AbstractString = pwd(),
+                            memory_max::AbstractString = "85%")
+    systemd_user_available() ||
+        error("BonitoWorker: systemctl --user not available; cannot install a service")
+    mkpath(systemd_user_dir())
+    path     = service_unit_path()
+    desired  = render_service_unit(; projects_root, memory_max)
+    existing = isfile(path) ? read(path, String) : nothing
+    changed  = existing != desired
+
+    # Any bare-detached worker must go first — the service will claim the pidfile.
+    stop_running_worker!()
+
+    if changed
+        write(path, desired)
+        run(`systemctl --user daemon-reload`)
+    end
+    run(`systemctl --user enable $SERVICE_NAME`)
+    enable_linger!()
+    # `restart` applies a changed unit; `start` is a no-op if already running.
+    run(`systemctl --user $(changed ? "restart" : "start") $SERVICE_NAME`)
+    return path, changed
+end
+
+"""
+    uninstall_service!()
+
+Stop + disable + remove the `--user` unit if present. No-op otherwise. Used when
+the user switches back to the plain background run mode.
+"""
+function uninstall_service!()
+    systemd_user_available() || return
+    service_installed() || return
+    run(ignorestatus(`systemctl --user disable --now $SERVICE_NAME`))
+    rm(service_unit_path(); force = true)
+    run(ignorestatus(`systemctl --user daemon-reload`))
+    return
+end
+
+# ── Run-mode selection (interactive, via the controlling terminal) ───────────
+# The installer runs as `curl … | julia -`, so the script's stdin IS the program
+# text (already at EOF) — we CANNOT read a choice from stdin. Read the
+# controlling terminal directly, the way `curl | sh` installers do. Returns the
+# trimmed answer, or `nothing` when there's no tty (CI / nohup / `ssh` without
+# `-t`) OR no answer arrives within `timeout` (a tty that's openable but has no
+# typist — some CI ptys), so the caller can fall back to a safe default rather
+# than hang the install forever.
+function prompt_tty(question::AbstractString; timeout::Real = 120)
+    tty = try
+        open("/dev/tty", "r")
+    catch
+        return nothing
+    end
+    try
+        print(question)
+        flush(stdout)
+        result = Ref{Union{String,Nothing}}(nothing)
+        task = @async try
+            result[] = strip(readline(tty))
+        catch
+            # `close(tty)` below unblocks a pending readline → lands here.
+        end
+        if timedwait(() -> istaskdone(task), float(timeout)) !== :ok
+            println("\n(no response in $(round(Int, timeout))s; using the default)")
+            return nothing
+        end
+        return result[]
+    finally
+        close(tty)   # also unblocks the reader task if it's still waiting
+    end
+end
+
+# Pure decision: map a prompt answer + current service presence to a run mode.
+# Factored out of the IO so it's unit-testable without a tty or systemd.
+#   nothing (no answer) → keep an existing service (don't silently downgrade),
+#                         else background (don't silently enable a boot service)
+#   "2"                 → background
+#   anything else / ""  → service (the recommended default)
+function decide_run_mode(answer::Union{AbstractString,Nothing}, service_exists::Bool)
+    answer === nothing && return service_exists ? :service : :background
+    return answer == "2" ? :background : :service
+end
+
+# Decide how the worker should run. Linux + systemd → ask at the terminal;
+# no systemd → always background. When a service is already installed the prompt
+# makes that the visible default ("keep it"), so a re-run that just hits Enter
+# never accidentally downgrades to a bare process.
+function choose_run_mode()
+    systemd_user_available() || return :background
+    have = service_installed()
+    note = have ? " — a service is already installed" : ""
+    svc_line = have ?
+        "[1] Service (current, recommended) — keep the boot/restart/memory-capped service" :
+        "[1] Service (recommended) — start on boot, restart on crash, memory-capped"
+    answer = prompt_tty("""
+==> How should the BonitoTeam worker run?$(note)
+    $(svc_line)
+    [2] Background process — stops on reboot; you restart it manually
+  choice [1]: """)
+    mode = decide_run_mode(answer, have)
+    answer === nothing &&
+        @info "BonitoWorker: no run-mode answer; using default" mode
+    return mode
+end
+
+# Apply a chosen run mode. `:service` reconciles the unit (idempotent upgrade);
+# `:background` tears down any service then spawns the detached process.
+function apply_run_mode!(mode::Symbol; projects_root::AbstractString = pwd())
+    if mode === :service
+        path, changed = install_service!(; projects_root)
+        return (; mode, path, changed)
+    else
+        uninstall_service!()          # ensure no service competes with the bg process
+        proc, logfile = spawn_worker()
+        return (; mode, proc, logfile)
+    end
+end
+
 # ── Install / start ────────────────────────────────────────────────────────────
 """
-    BonitoWorker.install!(; server_url, secret, projects_root = pwd())
+    BonitoWorker.install!(; server_url, secret, projects_root = pwd(), run_mode = :prompt)
 
-Persist the worker config into the Scratch config space and launch the worker
-process detached. Called at the end of `install.jl`; also the entry point for
-re-pointing an existing install at a different server (just re-run it).
+Persist the worker config into the Scratch config space and bring the worker up
+in the chosen run mode. Called at the end of `install.jl`; also the entry point
+for re-pointing an existing install at a different server (just re-run it).
+
+`run_mode`:
+  * `:prompt`     — ask at the controlling terminal (Linux+systemd only), else background
+  * `:service`    — install/upgrade the systemd `--user` service
+  * `:background` — bare detached process (current default elsewhere)
 """
 function install!(; server_url::String,
                     secret::String,
-                    projects_root::String = pwd())
+                    projects_root::String = pwd(),
+                    run_mode::Symbol = :prompt)
     worker_id = load_or_generate_worker_id()
     config = Dict(
         "server_url"    => server_url,
@@ -141,11 +423,47 @@ function install!(; server_url::String,
     cfg = config_path()
     write(cfg, JSON.json(config))
     @info "BonitoWorker: wrote config" path=cfg server_url projects_root=config["projects_root"]
-    proc, logfile = spawn_worker()
+
+    mode = run_mode == :prompt ? choose_run_mode() : run_mode
+    result = apply_run_mode!(mode; projects_root = abspath(projects_root))
     println()
+    if mode === :service
+        verb = result.changed ? (service_installed() ? "installed/updated" : "installed") : "already up to date"
+        println("==> BonitoTeam worker service $(verb)")
+        println("    unit   : ", result.path)
+        println("    config : ", cfg)
+        println("    server : ", server_url)
+        println()
+        println("    Manage it with:")
+        println("      systemctl --user status  $(SERVICE_NAME)")
+        println("      systemctl --user restart $(SERVICE_NAME)")
+        println("      journalctl --user -u $(SERVICE_NAME) -f")
+        println("    Switch back to a plain process: re-run the installer and pick [2].")
+        println()
+        return result
+    end
+
+    # Background mode.
+    proc = result.proc
+    if proc === nothing
+        # spawn_worker found a live worker and skipped — config was still
+        # rewritten above, so the running worker picks up the new server/secret
+        # on its next reconnect (or restart it to apply immediately).
+        println("==> BonitoTeam worker already running (pid $(running_worker_pid()))")
+        println("    config updated : ", cfg)
+        println("    log            : ", result.logfile)
+        println("    server         : ", server_url)
+        println()
+        println("    The existing worker keeps running. To apply the new config now,")
+        println("    restart it:")
+        println()
+        println("      pkill -f 'BonitoWorker.start' ; julia --project=@bonito-team -e \"using BonitoWorker; BonitoWorker.start()\"")
+        println()
+        return result
+    end
     println("==> BonitoTeam worker started (pid $(getpid(proc)))")
     println("    config : ", cfg)
-    println("    log    : ", logfile)
+    println("    log    : ", result.logfile)
     println("    server : ", server_url)
     println()
     println("    The worker runs detached and survives this shell. To start it")
@@ -153,7 +471,7 @@ function install!(; server_url::String,
     println()
     println("      julia --project=@bonito-team -e \"using BonitoWorker; BonitoWorker.start()\"")
     println()
-    return proc
+    return result
 end
 
 # Launch `BonitoWorker.start()` as a detached background process so it outlives
@@ -162,6 +480,15 @@ end
 # every OS; stdout+stderr append to `worker.log` in the config dir.
 function spawn_worker()
     logfile = joinpath(config_dir(), "worker.log")
+    # Don't launch a duplicate on top of a live worker (re-running the installer
+    # is the common trigger). The child's own `start()` also guards via pidfile,
+    # but skipping the spawn here keeps the install output honest ("already
+    # running" instead of "started pid N" for a process that immediately exits).
+    other = running_worker_pid()
+    if other !== nothing
+        @info "BonitoWorker: worker already running; not spawning a duplicate" pid = other
+        return nothing, logfile
+    end
     project = something(Base.active_project(), "@bonito-team")
     cmd = `$(julia_bin()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`
     proc = run(pipeline(detach(cmd); stdout = logfile, stderr = logfile, append = true);
@@ -170,15 +497,26 @@ function spawn_worker()
 end
 
 """
-    BonitoWorker.start()
+    BonitoWorker.start(; force=false)
 
 Read the install config written by `install!` and connect to the server.
 Blocks forever (reconnecting on drop). This is the worker process entry point.
+
+Refuses to start if another live worker already holds the pidfile (a duplicate
+would fight it over the server's control-WS registration). Pass `force=true`
+to start anyway (e.g. you intend to replace a wedged instance you'll kill).
 """
-function start()
+function start(; force::Bool = false)
     cfg = config_path()
     isfile(cfg) || error("BonitoWorker: no config at $cfg — run the installer first " *
                           "(`curl -fsSL <server-url>/install.jl | julia -`)")
+    other = running_worker_pid()
+    if other !== nothing && !force
+        @warn "BonitoWorker: a worker is already running; refusing to start a duplicate" *
+              " (kill it first, or call start(; force=true))" pid = other pidfile = pidfile_path()
+        return nothing
+    end
+    claim_pidfile!()
     config = JSON.parse(read(cfg, String))
     worker_id = load_or_generate_worker_id()
     connect_and_serve(;

@@ -583,7 +583,6 @@ const DashboardStyles = Bonito.Styles(
     # Wrappers around the toggled blocks; semantic class for the test
     # suite to query.
     CSS(".bt-form-wrapper", "display" => "block"),
-    CSS(".bt-discover-wrapper", "display" => "block"),
     CSS(".bt-install-wrap", "display" => "block"),
     CSS(".bt-empty-wrap", "display" => "block"),
     # Per-project cell — sibling to the card slot, currently a thin pass-
@@ -640,12 +639,18 @@ const DashboardStyles = Bonito.Styles(
         "border-radius" => "var(--bt-radius)",
         "padding" => "14px 16px",
         "margin-bottom" => "8px",
-        "display" => "flex", "align-items" => "center",
-        "justify-content" => "space-between", "gap" => "16px",
+        "display" => "flex", "flex-direction" => "column",
+        "align-items" => "stretch", "gap" => "8px",
         "transition" => "border-color 120ms ease, box-shadow 120ms ease"),
     CSS(".bt-card:hover",
         "border-color" => "var(--bt-border-strong)",
         "box-shadow" => "var(--bt-shadow-sm)"),
+    # The top row of a worker card — what `.bt-card` itself used to be (title +
+    # actions on one line). The card is now a column so the nested project
+    # `<details>` can sit beneath the row INSIDE the same pill chrome.
+    CSS(".bt-card-row",
+        "display" => "flex", "align-items" => "center",
+        "justify-content" => "space-between", "gap" => "16px"),
     CSS(".bt-card-body",
         "min-width" => "0", "flex" => "1 1 auto"),
     CSS(".bt-card-title",
@@ -913,20 +918,27 @@ const DashboardStyles = Bonito.Styles(
     # `<details>` keeps the worker pill compact by default; clicking the header
     # toggles the folder→threads tree. Rescan inside the summary
     # preventDefault's the toggle and force-opens, so scan progress is visible.
-    CSS("details.bt-discover-panel",
-        "background" => "var(--bt-surface-2)",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius)",
-        "padding" => "10px 14px",
-        "margin-top" => "-4px", "margin-bottom" => "8px"),
-    CSS("details.bt-discover-panel[open]", "padding-bottom" => "14px"),
+    # Nested inside `.bt-card` now — no separate pill chrome (the card's
+    # background/border IS the chrome). A faint top divider separates the
+    # "▸ projects (N)" toggle from the worker title row above it.
+    CSS(".bt-card > details.bt-discover-panel",
+        "background" => "transparent",
+        "border" => "none",
+        "border-top" => "1px solid var(--bt-border)",
+        "border-radius" => "0",
+        "padding" => "8px 0 0", "margin" => "0"),
+    CSS(".bt-card > details.bt-discover-panel[open]", "padding-bottom" => "4px"),
     CSS(".bt-discover-header",
         "display" => "flex", "align-items" => "center",
         "justify-content" => "space-between",
         "cursor" => "pointer", "user-select" => "none",
         "list-style" => "none",
         # Add some breathing room between the chevron and title.
-        "gap" => "10px"),
+        "gap" => "10px",
+        # The toggle is meant to be unobtrusive — small text, muted by default,
+        # full-color on hover (the :hover rule below).
+        "font-size" => "12px",
+        "color" => "var(--bt-text-muted)"),
     CSS("details[open] > .bt-discover-header", "margin-bottom" => "10px"),
     # Hide the default disclosure triangle (Chrome / Safari).
     CSS(".bt-discover-header::-webkit-details-marker", "display" => "none"),
@@ -941,7 +953,7 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-discover-header:hover",
         "background" => "var(--bt-surface)"),
     CSS(".bt-discover-title",
-        "font-weight" => "600", "font-size" => "13px",
+        "font-weight" => "500", "font-size" => "12px",
         "flex" => "1 1 auto", "min-width" => "0",
         "overflow" => "hidden", "text-overflow" => "ellipsis",
         "white-space" => "nowrap"),
@@ -1259,8 +1271,10 @@ const DashboardStyles = Bonito.Styles(
             "gap" => "8px"),
         CSS(".bt-form label",
             "padding-top" => "0", "font-size" => "12px"),
-        # Cards: body + actions stack instead of sitting on one row
-        CSS(".bt-card", "flex-wrap" => "wrap"),
+        # Cards: body + actions stack instead of sitting on one row. The card
+        # is column-flex now (project list lives inside it), so wrapping is on
+        # the top row (`.bt-card-row`) rather than the card itself.
+        CSS(".bt-card-row", "flex-wrap" => "wrap"),
         # Card title row (name + badges): if the natural widths don't all
         # fit, let the pills wrap onto a second row below the name rather
         # than shrinking the name to "Cl..." just to keep one row.

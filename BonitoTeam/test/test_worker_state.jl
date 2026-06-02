@@ -152,3 +152,45 @@ end
     @test haskey(st2.discovered[], "ghost")
     @test JSON.parsefile(joinpath(dir, "discovered.json")) |> d -> haskey(d, "ghost")
 end
+
+@testset "teardown_worker_control! identity guard" begin
+    # Regression: two control sockets sharing a worker_id (duplicate worker
+    # process, or a reconnect that re-registered before the old socket's
+    # `finally` ran) must not destroy each other. The stale socket's teardown
+    # must be a no-op; only the socket that is STILL the registered one tears
+    # down the worker + evicts its chat models.
+    dir = mktempdir()
+    st = BT.ServerState(; state_dir = dir,
+                          working_dir = joinpath(dir, "work"),
+                          worker_secret = "s")
+    wid = "dup-worker"
+    st.workers[][wid] = BT.WorkerInfo(wid, "Box", "<inbound-ws>", "s", nothing,
+                                      "h", "/home/u", "julia", String[],
+                                      "/home/u/projects", :online, now(UTC))
+    st.projects[][ "pp" ] = BT.ProjectInfo("pp", "Proj", wid,
+                                joinpath(dir, "work", "Proj"),
+                                "/home/u/projects/Proj", now(UTC))
+    st.chat_models["pp"] = :live_model
+
+    # Sockets are compared by `===`, so any two distinct objects stand in for
+    # two real WebSockets here.
+    ws_old = Ref(:old)
+    ws_new = Ref(:new)
+
+    # Worker connects (old), then reconnects (new) — last writer wins.
+    st.worker_control_ws[wid] = ws_old
+    st.worker_control_ws[wid] = ws_new
+
+    # The OLD socket's loop now ends and runs teardown. It is NOT the current
+    # registration → must be a no-op: live socket, worker, and chat model intact.
+    @test BT.teardown_worker_control!(st, wid, ws_old) == false
+    @test st.worker_control_ws[wid] === ws_new
+    @test st.workers[][wid].status == :online
+    @test haskey(st.chat_models, "pp")
+
+    # The NEW (current) socket dropping DOES tear down.
+    @test BT.teardown_worker_control!(st, wid, ws_new) == true
+    @test !haskey(st.worker_control_ws, wid)
+    @test st.workers[][wid].status == :offline
+    @test !haskey(st.chat_models, "pp")
+end

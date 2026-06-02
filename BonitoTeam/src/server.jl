@@ -65,6 +65,14 @@ function serve(; host::String        = "0.0.0.0",
         w.status = :offline
     end
 
+    # Survive long browser disconnects (phone goes into pocket, laptop sleeps,
+    # network blip) by keeping SOFT_CLOSED sessions alive for an hour, so the
+    # browser can reconnect to the SAME session with all of its Observable
+    # state — current view, popup geometry, chat consumer task — intact.
+    # The new-tab case still falls back to the localStorage last-route memory
+    # wired in the sidebar onload.
+    Bonito.set_cleanup_time!(1.0)   # hours
+
     # Single-page app: sidebar + dashboard/chat swap. No per-project routes.
     srv = Bonito.Server(unified_app(state), host, port; proxy_url = ".")
     state.srv = srv

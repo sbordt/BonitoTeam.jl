@@ -232,25 +232,49 @@ function handle_worker_control(state::ServerState, ws)
             end
         end
     finally
-        # Atomic teardown: mark offline, drop the WS handle, evict the
-        # ChatModels for this worker's projects. release_projects_for_worker!
-        # also takes the lock per release; safe because ReentrantLock is.
-        lock(state.lock) do
-            delete!(state.worker_control_ws, worker_id)
-            if haskey(state.workers[], worker_id)
-                state.workers[][worker_id].status = :offline
-            end
-            for p in values(state.projects[])
-                if p.worker_id == worker_id
-                    delete!(state.chat_models, p.id)
-                end
+        teardown_worker_control!(state, worker_id, ws)
+    end
+end
+
+"""
+    teardown_worker_control!(state, worker_id, ws) -> Bool
+
+Tear down a worker's registration when its control socket closes — but ONLY if
+`ws` is still the registered socket for `worker_id`. Returns `true` if it ran
+the teardown, `false` if the connection was superseded.
+
+Two connections can share a `worker_id`: a duplicate worker process, or a
+reconnect that re-registered before this old socket's `finally` ran. The
+registration map is last-writer-wins (`worker_control_ws[id] = ws` at connect),
+so a stale connection dying must NOT delete the entry, flip the worker offline,
+or evict its chat models — that would destroy the LIVE connection that replaced
+it (the bug that made duplicate workers mutually destructive). The `=== ws`
+identity check is the guard.
+"""
+function teardown_worker_control!(state::ServerState, worker_id::AbstractString, ws)
+    is_current = lock(state.lock) do
+        current = get(state.worker_control_ws, worker_id, nothing)
+        current === ws || return false           # superseded — leave the live one alone
+        delete!(state.worker_control_ws, worker_id)
+        if haskey(state.workers[], worker_id)
+            state.workers[][worker_id].status = :offline
+        end
+        for p in values(state.projects[])
+            if p.worker_id == worker_id
+                delete!(state.chat_models, p.id)
             end
         end
+        return true
+    end
+    if is_current
         safe_notify!(state.workers)
-        notify_chats!(state)        # evicted chats drop out of the active-chats sidebar
+        notify_chats!(state)    # evicted chats drop out of the active-chats sidebar
         release_projects_for_worker!(state, worker_id)
         @info "Worker disconnected" worker_id=worker_id
+    else
+        @info "Worker control socket closed but superseded; keeping live registration" worker_id=worker_id
     end
+    return is_current
 end
 
 """

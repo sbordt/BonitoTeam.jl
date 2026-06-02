@@ -1,4 +1,5 @@
-import CommonMark as CM
+# `CM` is `import CommonMark as CM` in BonitoTeam.jl — hoisted so chat.jl's
+# const CommonMark parser resolves at include time.
 
 # Session metadata + file path
 struct ChatSession
@@ -217,6 +218,19 @@ function append_plan(session::ChatSession, msg::PlanMsg)
     end
 end
 
+# `/compact` summary boundary, persisted under its own block so reload doesn't
+# have to re-classify by matching the verbatim Claude Code prefix every time.
+function append_summary(session::ChatSession, msg::SummaryMsg)
+    isempty(strip(msg.text)) && return
+    open(session.path, "a") do io
+        println(io, "!!! summary \"$(now(UTC))\"")
+        for line in split(msg.text, '\n')
+            println(io, "    ", line)
+        end
+        println(io)
+    end
+end
+
 # Load history from file.
 #
 # chat.md is hand-written by the `append_*` / `finalize_*` writers above in a
@@ -297,6 +311,9 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
             # reopened chat keeps the trail. `title` is the original thought id
             # so the lazy `thought.render` round-trip still finds it.
             isempty(strip(body)) || push!(msgs, ThoughtMsg(String(title), String(body)))
+        elseif category == "summary"
+            # `/compact` boundary — centered separator, NOT a user bubble.
+            isempty(strip(body)) || push!(msgs, SummaryMsg(String(body)))
         end
     end
     return msgs

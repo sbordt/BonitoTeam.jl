@@ -197,9 +197,13 @@ class BonitoChat {
             case 'tool_update':
                 return this.onToolUpdate(msg);
             case 'chunk':
-                return this.appendChunk(msg.id, msg.text);
+                return this.appendChunk(msg);
             case 'user_chunk':
                 return this.appendUserChunk(msg.text);
+            case 'user_unqueue':
+                return this.unqueueOldestUser();
+            case 'summary_final':
+                return this.onSummaryFinal(msg);
             case 'attach_error':
                 return this._showAttachError(msg.error || 'Attachment failed');
             case 'user':
@@ -207,6 +211,7 @@ class BonitoChat {
             case 'thought':
             case 'tool':
             case 'plan':
+            case 'summary':
                 return this.appendNewMessage(msg);
         }
     }
@@ -338,11 +343,15 @@ class BonitoChat {
             this._registerUnread();
         }
     }
-    appendChunk(id, text) {
-        const node = this.nodeById.get(id);
+    appendChunk(msg) {
+        const node = this.nodeById.get(msg.id);
         if (!node) return;
-        const t = node.querySelector('.bt-stream-text');
-        if (t) t.textContent += text;
+        if (msg.html !== undefined) {
+            node.innerHTML = msg.html;
+        } else if (msg.text !== undefined) {
+            const t = node.querySelector('.bt-stream-text');
+            if (t) t.textContent += msg.text;
+        }
         if (this.followMode) {
             this._queueScrollToBottom();
         } else {
@@ -412,6 +421,7 @@ class BonitoChat {
         switch(msg.type){
             case 'user':
                 div.className = 'bt-user-msg';
+                if (msg.queued) div.classList.add('bt-queued');
                 div.textContent = msg.text;
                 break;
             case 'agent':
@@ -454,6 +464,12 @@ class BonitoChat {
                                 id
                             })
                     });
+                    const wideBtn = div.querySelector('.bt-tool-wide');
+                    if (wideBtn) wideBtn.addEventListener('click', (e)=>{
+                        e.stopPropagation();
+                        const active = div.classList.toggle('bt-tool-wide-active');
+                        wideBtn.title = active ? 'Collapse to default width' : 'Expand to full chat width';
+                    });
                     if (msg.expand) queueMicrotask(()=>div.collapsable.setExpanded(true));
                     break;
                 }
@@ -461,8 +477,30 @@ class BonitoChat {
                 div.className = 'bt-plan-msg';
                 div.innerHTML = msg.html || '';
                 break;
+            case 'summary':
+                {
+                    div.className = 'bt-summary-msg';
+                    const inner = document.createElement('div');
+                    inner.className = 'bt-summary-body';
+                    if (msg.streaming && !msg.html) {
+                        inner.textContent = 'Session continued — summary loading…';
+                    } else {
+                        inner.innerHTML = msg.html || '';
+                    }
+                    div.appendChild(inner);
+                    break;
+                }
         }
         return div;
+    }
+    unqueueOldestUser() {
+        const q = this.container.querySelector('.bt-user-msg.bt-queued');
+        if (q) q.classList.remove('bt-queued');
+    }
+    onSummaryFinal(msg) {
+        const nodes = this.container.querySelectorAll('.bt-summary-msg .bt-summary-body');
+        const tgt = nodes[nodes.length - 1];
+        if (tgt) tgt.innerHTML = msg.html || '';
     }
     thoughtHTML(msg) {
         const summary = msg.summary || 'Show thinking';
@@ -483,6 +521,8 @@ class BonitoChat {
                 <span class="bt-tool-title">${escapeHTML(msg.title || '')}</span>
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
+                <button class="bt-tool-wide" type="button"
+                        title="Expand to full chat width">⤢</button>
             </div>
             ${preview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;

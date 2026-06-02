@@ -56,20 +56,56 @@ end
 # below without churning any tracked Observable IDs.
 function sidebar_entry(label::AbstractString, icon::Bonito.Node,
                         target_value::AbstractString, title::AbstractString;
-                        active::Bool = false, closeable::Bool = false)
+                        active::Bool = false, closeable::Bool = false,
+                        extra_class::AbstractString = "")
     kids = Any[icon, DOM.span(label; class = "bt-side-name")]
     # A ✕ to close (stop) an active chat. Plain markup — the delegated
     # handler on the aside reads `.bt-side-close` and routes to close_trigger
     # rather than current_view, so no per-entry Observable is interpolated
     # into the recyclable body.
     closeable && push!(kids, DOM.span("✕"; class = "bt-side-close", title = "Close chat"))
+    cls = "bt-side-item" * (active ? " bt-side-active" : "")
+    isempty(extra_class) || (cls = cls * " " * String(extra_class))
     DOM.div(kids...;
-        class = "bt-side-item" * (active ? " bt-side-active" : ""),
+        class = cls,
         title = title,
         # `data-project-id` is the empty string for "Home" (the dashboard
         # entry) and the project id for everything else. The delegated
         # click handler reads this to know which view to switch to.
         dataProjectId = target_value)
+end
+
+"""
+    sidebar_resumable_projects(projects, discovered, open_set) -> Vector{ProjectInfo}
+
+Projects whose Claude Code session is currently running on the worker (per the
+cached discover scan) but which aren't already open as a live ChatModel. These
+are what should re-fill the sidebar after a server restart — the agent process
+is still alive on the worker, the user just needs to click it to resume the
+session via `session/load`.
+
+Match rule: `discovered[project.worker_id]` has a record with
+`path == project.worker_path` and `running == true`. We don't require the
+record's `session_id` to match `project.resume_session_id` — any running
+session at that path makes the project resumable (resume_session_id is the
+hint the bring-up uses; matching at the path is enough to surface the entry).
+"""
+function sidebar_resumable_projects(projects::AbstractDict{<:AbstractString,ProjectInfo},
+                                     discovered::AbstractDict,
+                                     open_set::AbstractSet{<:AbstractString})
+    out = ProjectInfo[]
+    for (pid, p) in projects
+        pid in open_set && continue
+        scans = get(discovered, p.worker_id, nothing)
+        scans === nothing && continue
+        for r in scans
+            haskey(r, "error") && continue
+            String(get(r, "path", "")) == p.worker_path && get(r, "running", false) === true || continue
+            push!(out, p)
+            break
+        end
+    end
+    return out
 end
 
 const HOME_ICON = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "icons", "home.svg"))
@@ -123,18 +159,29 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     end
 
     # The left strip is now an ACTIVE-CHATS switcher: one entry per running
-    # ChatModel (`state.chat_models`), not per registered project. It
-    # re-renders on `chat_signal` (a chat opened/closed) plus project/worker
-    # changes (rename, etc.). We read `current_view[]` synchronously so the
-    # initial `bt-side-active` class is right; live navigation flips the class
-    # via the `onjs` handler below without a body re-render.
-    body = map(state.chat_signal, state.projects, state.workers) do _, projects, workers
+    # ChatModel (`state.chat_models`), not per registered project. It also
+    # picks up "resumable" projects — ones whose Claude Code session is
+    # currently running on the worker (per the cached discover scan) but
+    # which the server hasn't brought up yet (e.g. fresh after a server
+    # restart). Those render dimmer and clicking them does the normal
+    # current_view = pid path, which `ensure_project_session!` turns into a
+    # `session/load` resume. Re-renders on `chat_signal` (a chat opened/
+    # closed), `discovered` (a worker rescan), or project/worker changes.
+    body = map(state.chat_signal, state.projects, state.workers, state.discovered) do _, projects, workers, discovered
         active_pid = current_view[]
         open_ids = lock(state.lock) do
             collect(keys(state.chat_models))
         end
+        open_set = Set{String}(open_ids)
         open_projs = ProjectInfo[projects[id] for id in open_ids if haskey(projects, id)]
         sort!(open_projs; by = p -> lowercase(p.name))
+
+        # Resumable: projects with a `running == true` discover record matching
+        # (worker_id, worker_path), AND which aren't already open. Survives a
+        # server restart since `discovered` is loaded from disk on boot.
+        resumable_projs = sidebar_resumable_projects(projects, discovered, open_set)
+        sort!(resumable_projs; by = p -> lowercase(p.name))
+
         entries = Any[sidebar_entry("Home", home_icon, "", "Dashboard";
                                     active = active_pid == "")]
         # Base label is "name · worker" (disambiguates same-named projects on
@@ -151,7 +198,20 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
                   sidebar_entry(label, project_icon(p), p.id, label;
                                 active = active_pid == p.id, closeable = true))
         end
-        isempty(open_projs) && push!(entries,
+        if !isempty(resumable_projs)
+            push!(entries, DOM.div("Running on worker"; class = "bt-side-section"))
+            for p in resumable_projs
+                b = base(p)
+                # Clicking pulls them up the normal way (current_view = pid),
+                # which `ensure_project_session!` resolves to a session/load resume.
+                push!(entries,
+                      sidebar_entry(b, project_icon(p), p.id, "$b · resumable";
+                                    active = active_pid == p.id,
+                                    closeable = false,
+                                    extra_class = "bt-side-resumable"))
+            end
+        end
+        isempty(open_projs) && isempty(resumable_projs) && push!(entries,
             DOM.div("No open chats yet — open one from the dashboard.";
                     class = "bt-side-empty"))
         DOM.div(entries...; class = "bt-side-list")
@@ -164,7 +224,16 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # `.bt-side-item` switches `current_view`. Both Observables enter the JS
     # object cache here exactly once and never get re-tracked by a recycling
     # subsession.
+    #
+    # Last-route memory: complements Bonito's soft_close session reconnect
+    # (which preserves Observable state for an hour, set in `serve()`). When
+    # that timeout DOES lapse, or the user opens a fresh tab, this onload
+    # restores `current_view` from localStorage so you still land on your last
+    # chat instead of getting bounced to home. We only restore IF the entry
+    # for that pid exists (worker still has the project) — otherwise fall
+    # back to home so a deleted project doesn't strand the user on an empty view.
     Bonito.onload(session, aside, js"""(el) => {
+        const LAST_PID_KEY = 'bt-last-pid';
         el.addEventListener('click', e => {
             const close = e.target.closest('.bt-side-close');
             if (close) {
@@ -176,15 +245,27 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             const item = e.target.closest('.bt-side-item');
             if (item) $(current_view).notify(item.dataset.projectId || '');
         });
+        // Restore last route on fresh sessions (when soft_close didn't catch us).
+        const saved = localStorage.getItem(LAST_PID_KEY);
+        if (saved) {
+            // Only restore if that sidebar entry exists right now — projects can
+            // be deleted while you're away, and we don't want to navigate to a
+            // dangling pid (the loading view would show an error).
+            const entry = el.querySelector('.bt-side-item[data-project-id="' + saved.replace(/"/g, '') + '"]');
+            if (entry) $(current_view).notify(saved);
+        }
     }""")
 
     # Active-highlight swap: when current_view changes, find every
     # sidebar item, toggle .bt-side-active based on data-project-id
-    # match. No DOM replacement, no subsession recycling.
+    # match. No DOM replacement, no subsession recycling. Also persists the
+    # current pid to localStorage so a hard reconnect (past soft_close window
+    # OR a fresh tab) can restore it via the onload above.
     Bonito.onjs(session, current_view, js"""(pid) => {
         document.querySelectorAll('.bt-sidebar .bt-side-item').forEach(el => {
             el.classList.toggle('bt-side-active', el.dataset.projectId === pid);
         });
+        try { localStorage.setItem('bt-last-pid', pid || ''); } catch (e) {}
     }""")
 
     return aside
@@ -219,6 +300,20 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-active",
         "border-left-color" => "var(--bt-accent)",
         "background" => "var(--bt-surface-2)"),
+    # Subheader for the "Running on worker" group. Dim, uppercase, small —
+    # reads as a section label, not an item.
+    CSS(".bt-side-section",
+        "padding" => "10px 12px 4px",
+        "font-size" => "10.5px", "font-weight" => "600",
+        "letter-spacing" => "0.08em", "text-transform" => "uppercase",
+        "color" => "var(--bt-text-faint)"),
+    # A resumable entry is dimmer (the agent process is alive but the server
+    # hasn't brought up its ChatModel yet — clicking does the resume).
+    CSS(".bt-side-resumable",
+        "opacity" => "0.78"),
+    CSS(".bt-side-resumable .bt-side-name",
+        "color" => "var(--bt-text-muted)",
+        "font-style" => "italic"),
     CSS(".bt-proj-icon",
         "border-radius" => "8px",
         "color" => "#fff", "font-weight" => "600",

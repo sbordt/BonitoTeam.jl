@@ -173,7 +173,22 @@ const ChatStyles = Bonito.Styles(
         "padding" => "10px 14px",
         "font-size" => "14px", "line-height" => "1.5",
         "white-space" => "pre-wrap", "word-break" => "break-word",
-        "box-shadow" => "var(--bt-shadow-sm)"),
+        "box-shadow" => "var(--bt-shadow-sm)",
+        "position" => "relative",
+        "transition" => "opacity 160ms ease"),
+    # Queued state: the user submitted while a prior turn was still running.
+    # Dim the bubble and badge it "queued" until `user_unqueue` promotes it.
+    CSS(".bt-user-msg.bt-queued",
+        "opacity" => "0.65"),
+    CSS(".bt-user-msg.bt-queued::after",
+        "content" => "\"queued\"",
+        "position" => "absolute",
+        "right" => "10px", "bottom" => "-16px",
+        "font-size" => "10px",
+        "font-weight" => "500",
+        "letter-spacing" => "0.04em",
+        "color" => "var(--bt-text-faint)",
+        "text-transform" => "uppercase"),
 
     # ── Agent message ────────────────────────────────────────────────────────
     CSS(".bt-agent-msg",
@@ -256,13 +271,50 @@ const ChatStyles = Bonito.Styles(
         "border-radius" => "var(--bt-radius-sm)",
         "font-size" => "13px",
         "box-shadow" => "var(--bt-shadow-sm)",
-        "overflow" => "hidden"),
+        "overflow" => "hidden",
+        # Transition so flipping the wide toggle animates smoothly rather than
+        # snapping in at a different width and tearing the layout.
+        "transition" => "max-width 160ms ease, align-self 160ms ease"),
+    # Full-chat-width toggle. Spans the entire message column so wide content
+    # (diffs / tables / `bt_show_app` embeds) has the room it needs. Flipped by
+    # the .bt-tool-wide button in the tool header.
+    CSS(".bt-tool-msg.bt-tool-wide-active",
+        "align-self" => "stretch",
+        "max-width" => "100%"),
+    # The toggle button itself: small, neutral, right-aligned in the header
+    # (margin-left:auto pushes it past the status badge to the edge).
+    CSS(".bt-tool-wide",
+        "margin-left" => "4px",
+        "background" => "transparent",
+        "border" => "none",
+        "padding" => "2px 6px",
+        "cursor" => "pointer",
+        "color" => "var(--bt-text-faint)",
+        "font-size" => "13px",
+        "line-height" => "1",
+        "border-radius" => "var(--bt-radius-sm)",
+        "transition" => "background 80ms, color 80ms"),
+    CSS(".bt-tool-wide:hover",
+        "background" => "var(--bt-surface-2)",
+        "color" => "var(--bt-text)"),
+    # Visual state when wide: invert glyph (collapse-to-default cue).
+    CSS(".bt-tool-msg.bt-tool-wide-active .bt-tool-wide",
+        "color" => "var(--bt-accent)"),
     CSS(".bt-tool-header",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "padding" => "8px 12px",
         "cursor" => "pointer",
         "user-select" => "none",
         "transition" => "background 80ms"),
+    # The title (and summary, and MCP server badge) carry the actual content
+    # the user wants to grab — Read shows the file path here, Edit the path,
+    # MCP tools their server name. Override the header's `user-select: none`
+    # so a drag-select copies the path. The icon / status badge / toggle
+    # stay non-selectable so click-to-expand isn't confused by stray drags.
+    # The browser treats a drag-select as a drag (not a click), so the
+    # expand-on-click handler still fires only on real clicks.
+    CSS(".bt-tool-title, .bt-tool-summary, .bt-tool-server",
+        "user-select" => "text", "cursor" => "text"),
     CSS(".bt-tool-header:hover",
         "background" => "var(--bt-surface-2)"),
     # The expand/collapse glyph (`▶` / `▼`) is swapped directly in JS
@@ -502,6 +554,29 @@ const ChatStyles = Bonito.Styles(
         "text-align" => "center",
         "color" => "var(--bt-text-muted)",
         "font-weight" => "600"),
+
+    # ── Compact-summary separator ────────────────────────────────────────────
+    # `/compact` boundary — rendered as a centered, muted, narrower block with
+    # subtle horizontal rules on each side so it visually reads "session
+    # continued here." Not a bubble: no alignment, no border, no shadow.
+    CSS(".bt-summary-msg",
+        "align-self" => "center",
+        "max-width" => "min(80%, 720px)",
+        "margin" => "8px 0",
+        "padding" => "10px 18px",
+        "text-align" => "center",
+        "color" => "var(--bt-text-muted)",
+        "font-size" => "12.5px",
+        "font-style" => "italic",
+        "border-top" => "1px solid var(--bt-border)",
+        "border-bottom" => "1px solid var(--bt-border)"),
+    CSS(".bt-summary-msg .bt-summary-body",
+        "display" => "block",
+        # Tighten the markdown render so the centered block reads like a
+        # caption, not a wall of body text.
+        "line-height" => "1.5"),
+    CSS(".bt-summary-msg .bt-summary-body > *:first-child", "margin-top" => "0"),
+    CSS(".bt-summary-msg .bt-summary-body > *:last-child",  "margin-bottom" => "0"),
 
     # ── Markdown inside agent bubble ─────────────────────────────────────────
     CSS(".bt-agent-msg .markdown-body, .bt-agent-msg .markdown",
@@ -752,6 +827,7 @@ const ChatStyles = Bonito.Styles(
         CSS(".bt-user-msg, .bt-agent-msg", "max-width" => "88%"),
         CSS(".bt-tool-msg",                "max-width" => "100%"),
         CSS(".bt-plan-msg",                "max-width" => "100%"),
+        CSS(".bt-summary-msg",             "max-width" => "92%"),
         # Hide the cwd path in the header — not enough room
         CSS(".bt-header-cwd", "display" => "none"),
         # Title takes the available horizontal space and ellipsizes; the

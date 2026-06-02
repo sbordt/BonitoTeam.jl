@@ -148,18 +148,63 @@ chat_emit(model::ChatModel, event::AbstractDict) =
 # ── Concrete message types (carry the `chat` back-ref) ──────────────────────
 mutable struct UserMsg <: ChatMsg
     text::String
+    # `true` when this bubble was submitted while an earlier turn was still in
+    # flight — the consumer hasn't picked it up yet, so we show it dimmed with
+    # a "queued" badge. Cleared via the `user_unqueue` wire event when
+    # `run_turn!` finally pops it off `user_messages`.
+    queued::Bool
     chat::Union{ChatModel,Nothing}
 end
-UserMsg(text::AbstractString) = UserMsg(String(text), nothing)
-UserMsg(chat::ChatModel, text::AbstractString) = UserMsg(String(text), chat)
+UserMsg(text::AbstractString) = UserMsg(String(text), false, nothing)
+UserMsg(chat::ChatModel, text::AbstractString) = UserMsg(String(text), false, chat)
+
+# A `/compact` session summary, rendered as a centered separator block — NOT a
+# user message. Claude Code persists it in its jsonl as a synthetic user record
+# with `isCompactSummary: true`, but claude-agent-acp doesn't surface that flag
+# over ACP — only the body text. We route on the stable prefix instead (see
+# `SUMMARY_PREFIX` / `is_summary_text`). `html` caches the rendered markdown the
+# same way `AgentMsg` does.
+mutable struct SummaryMsg <: ChatMsg
+    text::String
+    html::String
+    chat::Union{ChatModel,Nothing}
+end
+SummaryMsg(text::AbstractString) = SummaryMsg(String(text), "", nothing)
+SummaryMsg(chat::ChatModel, text::AbstractString) = SummaryMsg(String(text), "", chat)
+ensure_html!(m::SummaryMsg) =
+    isempty(m.html) ? (m.html = markdown_html(m.text)) : m.html
+
+# The exact opening Claude Code writes on `/compact` resume. Verbatim Claude
+# Code text — extremely unlikely as a real user message, and the only signal we
+# get from ACP (claude-agent-acp drops `isCompactSummary` on the wire).
+const SUMMARY_PREFIX = "This session is being continued from a previous conversation that ran out of context."
+is_summary_text(text::AbstractString) = startswith(lstrip(text), SUMMARY_PREFIX)
 
 mutable struct AgentMsg <: ChatMsg
     id::String
     text::String
+    # Cached rendered HTML so scrolling never has to re-run `Markdown.parse`.
+    # Empty = not yet built; `ensure_html!` populates it lazily. Set eagerly
+    # by the 2-arg constructor (history-load / replay-adopt: text is final),
+    # and at `close(::AgentMsg)` for streaming (text becomes final there).
+    # `append!` clears it (defensive; streaming bubbles aren't asked for via
+    # `msgs.request`, but a stale cache would silently lose the trailing chunks).
+    html::String
     chat::Union{ChatModel,Nothing}
 end
-AgentMsg(id::AbstractString, text::AbstractString) = AgentMsg(String(id), String(text), nothing)
-AgentMsg(chat::ChatModel, text::AbstractString) = AgentMsg(string(uuid4()), String(text), chat)
+# Cache starts empty in BOTH paths (history-load/replay-adopt AND streaming):
+# `ensure_html!` populates on first request, then every subsequent fetch is free.
+# Eagerly pre-building here would push the per-message parse onto chat-open;
+# lazy distributes it across the scroll events that actually need it (~3 ms
+# per 30-msg visible window) while keeping repeat fetches allocation-free.
+AgentMsg(id::AbstractString, text::AbstractString) =
+    AgentMsg(String(id), String(text), "", nothing)
+AgentMsg(chat::ChatModel, text::AbstractString) =
+    AgentMsg(string(uuid4()), String(text), "", chat)
+
+# Lazy cache populate. Used by `msg_to_dict` / `wire_final`.
+ensure_html!(m::AgentMsg) =
+    isempty(m.html) ? (m.html = markdown_html(m.text)) : m.html
 
 mutable struct ToolMsg <: ChatMsg
     id::String
@@ -332,11 +377,14 @@ end
 # all messages uniformly. The `cwd` argument is only consulted for ToolMsg
 # (to render the edit preview); other variants ignore it.
 msg_to_dict(m::UserMsg, _chat_dir::AbstractString="") =
-    Dict{String,Any}("type" => "user", "text" => m.text)
+    Dict{String,Any}("type" => "user", "text" => m.text, "queued" => m.queued)
 
 function msg_to_dict(m::AgentMsg, _chat_dir::AbstractString="")
-    html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
-    Dict{String,Any}("type" => "agent", "id" => m.id, "html" => html)
+    Dict{String,Any}("type" => "agent", "id" => m.id, "html" => ensure_html!(m))
+end
+
+function msg_to_dict(m::SummaryMsg, _chat_dir::AbstractString="")
+    Dict{String,Any}("type" => "summary", "html" => ensure_html!(m))
 end
 
 msg_to_dict(m::ToolMsg, chat_dir::AbstractString="") = tool_header_dict(m, chat_dir)
@@ -829,21 +877,35 @@ function send!(model::ChatModel, m::ChatMsg)
 end
 
 # Grow a streaming text bubble in place and emit the delta. `m.chat` is the
-# sink captured when the bubble was created.
-Base.append!(m::AgentMsg, t::AbstractString) = (m.text *= t; chat_emit(m.chat, wire_chunk(m, t)); m)
+# sink captured when the bubble was created. AgentMsg clears its cached html
+# so a finalize-then-rerequest never serves the pre-streaming snapshot.
+Base.append!(m::AgentMsg, t::AbstractString) = (m.text *= t; m.html = ""; chat_emit(m.chat, wire_chunk(m, t)); m)
 Base.append!(m::UserMsg, t::AbstractString) = (m.text *= t; chat_emit(m.chat, wire_chunk(m, t)); m)
+# Summaries arrive whole on replay; live they can stream through `process_update!`
+# like a UserMessage. Append clears the HTML cache so the eventual close-time
+# render reflects the full text.
+Base.append!(m::SummaryMsg, t::AbstractString) = (m.text *= t; m.html = ""; m)
 
 # Finalize a message: persist to chat.md (per-type writer) + emit its closing
 # event. UserMsg / PlanMsg have no `*_final` event; a ToolMsg only persists once
-# it reaches a terminal status.
-Base.close(m::AgentMsg) = (finalize_agent(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
+# it reaches a terminal status. AgentMsg builds its rendered html ONCE here so
+# later `msgs.request` round-trips (scroll-back, re-mount) reuse the cache.
+Base.close(m::AgentMsg) = (ensure_html!(m); finalize_agent(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
 Base.close(m::ThoughtMsg) = (append_thought(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
 Base.close(m::UserMsg) = (append_user(m.chat.chat_session, m); nothing)
 Base.close(m::PlanMsg) = (append_plan(m.chat.chat_session, m); nothing)
 Base.close(m::ToolMsg) = (m.status in ("completed", "failed") && append_tool(m.chat.chat_session, m); nothing)
+Base.close(m::SummaryMsg) = (ensure_html!(m); append_summary(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
 
 # ── Wire-dict builders (the browser protocol; byte-identical to before) ─────
-markdown_html(text::AbstractString) = sprint(show, MIME("text/html"), Markdown.parse(text))
+# CommonMark for rendering — Julia's stdlib `Markdown` doesn't follow the
+# CommonMark "intraword `_` doesn't trigger emphasis" rule, so `path/foo_bar_baz.jl`
+# came out as `path/foo<em>bar</em>baz.jl` (italic eats the underscores). The
+# parser is reused across calls; CommonMark.Parser is mutating but the parse +
+# write_html cycle leaves it in the same state each time.
+const MARKDOWN_PARSER = CM.Parser()
+markdown_html(text::AbstractString) =
+    sprint(io -> CM.html(io, MARKDOWN_PARSER(String(text))))
 
 # "new message" event. Streaming-open shape for agent/thought (seeded with the
 # first chunk); plain shape for user/tool/plan. `send!` adds the `n` count.
@@ -853,15 +915,28 @@ wire_new(::ChatModel, m::AgentMsg) =
 # like a reloaded one (summary only, lazy body); `close` then ships the html.
 wire_new(::ChatModel, m::ThoughtMsg) = msg_to_dict(m)
 wire_new(::ChatModel, m::UserMsg) =
-    Dict{String,Any}("type" => "user", "text" => m.text)
+    Dict{String,Any}("type" => "user", "text" => m.text, "queued" => m.queued)
 wire_new(model::ChatModel, m::ToolMsg) = tool_header_dict(m, model.chat_dir)
 wire_new(model::ChatModel, m::PlanMsg) = msg_to_dict(m, model.chat_dir)
+# Summary opens as a centered placeholder; `close` ships the rendered html.
+wire_new(::ChatModel, ::SummaryMsg) =
+    Dict{String,Any}("type" => "summary", "html" => "", "streaming" => true)
 
-wire_chunk(m::AgentMsg, t) = Dict{String,Any}("type" => "chunk", "id" => m.id, "text" => t)
+# Stream the FULL rendered html of the message-so-far rather than the text
+# delta — so a live agent message reads as proper markdown (lists, headings,
+# code blocks, bold, links) instead of running together as one wall of text
+# whose newlines also get lost. CommonMark is cheap per parse (~µs) and
+# claude-agent-acp chunks are paragraph-sized, not per-character, so the
+# O(N²) cumulative cost over a single message stays well under a millisecond
+# for typical lengths. `append!` already invalidated the cache; `ensure_html!`
+# rebuilds it from the new accumulated text.
+wire_chunk(m::AgentMsg, _t) = Dict{String,Any}(
+    "type" => "chunk", "id" => m.id, "html" => ensure_html!(m))
 wire_chunk(m::UserMsg, t) = Dict{String,Any}("type" => "user_chunk", "text" => t)
 
-wire_final(m::AgentMsg) = Dict{String,Any}("type" => "agent_final", "id" => m.id, "html" => markdown_html(m.text))
+wire_final(m::AgentMsg) = Dict{String,Any}("type" => "agent_final", "id" => m.id, "html" => ensure_html!(m))
 wire_final(m::ThoughtMsg) = Dict{String,Any}("type" => "thought_final", "id" => m.id, "html" => markdown_html(m.text))
+wire_final(m::SummaryMsg) = Dict{String,Any}("type" => "summary_final", "html" => ensure_html!(m))
 
 # ── Rendering one ACP message into a bubble ─────────────────────────────────
 # `process!` is the per-message renderer used by the `run_chat!` loop: turn the
@@ -890,7 +965,10 @@ function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
 end
 
 to_message(chat::ChatModel, m::AgentClientProtocol.AgentMessage) = AgentMsg(chat, m.text)
-to_message(chat::ChatModel, m::AgentClientProtocol.UserMessage) = UserMsg(chat, m.text)
+# Compact-summary "user" messages get their own centered kind. ACP doesn't carry
+# Claude Code's `isCompactSummary` flag, so we route on the verbatim opening.
+to_message(chat::ChatModel, m::AgentClientProtocol.UserMessage) =
+    is_summary_text(m.text) ? SummaryMsg(chat, m.text) : UserMsg(chat, m.text)
 to_message(chat::ChatModel, m::AgentClientProtocol.ToolCall) = ToolMsg(chat, m)
 to_message(chat::ChatModel, m::AgentClientProtocol.Plan) = PlanMsg(chat, m.entries)
 
@@ -959,12 +1037,15 @@ function run_chat!(chat::ChatModel)
     return nothing
 end
 
-# One user turn: render + persist the user bubble, then drive the prompt and
-# render each whole message of the agent's reply. `busy_active` is the single
-# source of truth for the spinner (set here, cleared in `finally`) — no
-# separate busy_start/busy_end comm events.
+# One user turn: drive the prompt and render each whole message of the agent's
+# reply. The user bubble is ALREADY rendered + persisted — `send_message!` did
+# that synchronously when the user hit send, so the message appears in the
+# chat instantly (even when a prior turn is still running, where it shows up
+# as a "queued" bubble). Here we just promote any queued bubble that's about
+# to be processed, then prompt. `busy_active` is the single source of truth
+# for the spinner (set here, cleared in `finally`).
 function run_turn!(chat::ChatModel, user_msg::UserMessage)
-    close(send!(chat, UserMsg(chat, user_msg.text)))   # render + persist the user bubble
+    promote_queued_user_bubble!(chat)
     client = chat.client[]
     client === nothing && return nothing
     chat.busy_active[] = true
@@ -1074,17 +1155,46 @@ function restart_chat_session!(model::ChatModel)
 end
 
 # Single-entry "user submitted a message" path. Every call site (input area,
-# auto-prompt, scripted hooks) goes through here, which just enqueues a
-# `UserMessage` onto the shared `user_messages`; the `run_chat!` loop renders
-# the bubble, prepends any armed history prelude, and drives the turn.
+# auto-prompt, scripted hooks) goes through here. We render + persist the user
+# bubble synchronously so the message appears the instant the user hits send —
+# previously the bubble was created inside `run_turn!`, which meant messages
+# submitted while an earlier turn was still running stayed invisible (queued
+# silently on the channel) until that turn finished. Now they show up as
+# "queued" bubbles immediately; `promote_queued_user_bubble!` clears the
+# `queued` flag when `run_turn!` actually picks them up.
 #
 # `images` are sent to the agent as multimodal content blocks; the caller is
 # responsible for embedding any file-path reference into `msg.text` so display
 # + replay see what claude does.
 function send_message!(model::ChatModel, msg::UserMsg;
     images=AgentClientProtocol.ImageAttachment[])
-    put!(shared(model).user_messages,
+    s = shared(model)
+    # If there's a turn in flight, the bubble joins the queue (visually dim).
+    bubble = UserMsg(model, msg.text)
+    bubble.queued = s.busy_active[]
+    close(send!(model, bubble))   # send! pushes + emits wire_new; close persists
+    put!(s.user_messages,
         UserMessage(msg.text, collect(AgentClientProtocol.ImageAttachment, images)))
+    return nothing
+end
+
+# `run_turn!` calls this right before driving the agent prompt for a popped
+# `UserMessage`. Finds the oldest UserMsg in `msgs_store` still marked queued
+# (FIFO matches the channel order under `send_message!`) and emits a
+# `user_unqueue` event so the browser drops the "queued" class. No-op when
+# the chat was idle — the just-pushed bubble was never queued.
+function promote_queued_user_bubble!(chat::ChatModel)
+    target = lock(chat.lock) do
+        for m in chat.msgs_store
+            if m isa UserMsg && m.queued
+                m.queued = false
+                return m
+            end
+        end
+        return nothing
+    end
+    target === nothing && return nothing
+    chat_emit(chat, Dict{String,Any}("type" => "user_unqueue"))
     return nothing
 end
 
@@ -1185,7 +1295,10 @@ keep_in_history(m::AgentClientProtocol.Plan)         = true
 # claude's tool_use id (the one id that survives the replay, stored as ToolMsg.id);
 # user/agent turns on text; plans on entries. Different shapes never match.
 msg_matches(a::ToolMsg,  b::AgentClientProtocol.ToolCall)     = a.id == b.id
-msg_matches(a::UserMsg,  b::AgentClientProtocol.UserMessage)  = strip(a.text) == strip(b.text)
+msg_matches(a::UserMsg,  b::AgentClientProtocol.UserMessage)  =
+    !is_summary_text(b.text) && strip(a.text) == strip(b.text)
+msg_matches(a::SummaryMsg, b::AgentClientProtocol.UserMessage) =
+    is_summary_text(b.text) && strip(a.text) == strip(b.text)
 msg_matches(a::AgentMsg, b::AgentClientProtocol.AgentMessage) = strip(a.text) == strip(b.text)
 msg_matches(a::PlanMsg,  b::AgentClientProtocol.Plan)         = plan_entries_equal(a.entries, b.entries)
 msg_matches(::ChatMsg,   ::AgentClientProtocol.Message)       = false
@@ -1212,9 +1325,15 @@ function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.AgentMessage)
     finalize_agent(model.chat_session, msg)
 end
 function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.UserMessage)
-    msg = UserMsg(m.text)
-    lock(model.lock) do; push!(model.msgs_store, msg); end
-    append_user(model.chat_session, msg)
+    if is_summary_text(m.text)
+        msg = SummaryMsg(m.text)
+        lock(model.lock) do; push!(model.msgs_store, msg); end
+        append_summary(model.chat_session, msg)
+    else
+        msg = UserMsg(m.text)
+        lock(model.lock) do; push!(model.msgs_store, msg); end
+        append_user(model.chat_session, msg)
+    end
 end
 function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.ToolCall)
     isempty(m.content) || persist_tool_content!(model.chat_dir, m)
@@ -1566,14 +1685,22 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
     isempty(cmd.tool_id) && return nothing
     idx = findfirst(m -> m isa ToolMsg && m.id == cmd.tool_id, model.msgs_store)
     idx === nothing && return nothing
-    body = render_tool_body(model.state, model.msgs_store[idx],
-        model.cwd, model.chat_dir; project_id=model.project_id)
-    # `dom_in_js` schedules an async DOM mount through Bonito's session
-    # bridge. The renderer can legitimately error on stale tool ids
-    # (browser kept the row but the server-side msg was evicted), so a
-    # discriminating catch + warn is the right shape — bubbling would
-    # kill the whole comm-handling task for one stale render.
-    try
+    msg = model.msgs_store[idx]
+    # Run the render OFF the comm task. `render_tool_body` for a `bonito_app`
+    # ToolMsg mounts a `RemoteAppPlaceholder` whose `jsrender` calls
+    # `embed_remote_app` → `call_ctrl(eb, "delegate")`, which blocks up to 30 s
+    # on the worker bridge. If we ran it inline, that 30 s would stop EVERY
+    # other chat event for this tab (scroll fetches, sends, tab switches) until
+    # the timeout — multiple stuck tools compound to minutes of frozen UI.
+    #
+    # Each render is fire-and-forget — no return value the comm handler needs.
+    # Concurrent renders are safe: `call_ctrl` uses per-request channels +
+    # serial WS writes under `eb.wlock`, and `dom_in_js` opens its own
+    # subsession per call. The catch keeps a stale tool id / dead bridge from
+    # leaking out as an uncaught task error.
+    Base.errormonitor(@async try
+        body = render_tool_body(model.state, msg,
+            model.cwd, model.chat_dir; project_id=model.project_id)
         Bonito.dom_in_js(
             session,
             body,
@@ -1585,7 +1712,24 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
         )
     catch e
         @warn "tool render failed" tool_id = cmd.tool_id exception = e
-    end
+        # Replace the stale "loading…" with a visible failure so the user knows
+        # the body is gone (typically: the eval bridge was rebuilt since this
+        # turn, so the `shown_app:` id is no longer registered on the worker).
+        # We `dom_in_js` a tiny static node — no RemoteAppPlaceholder, no
+        # control round-trip, can't repeat the failure.
+        try
+            Bonito.dom_in_js(
+                session,
+                DOM.div("tool body unavailable: $(sprint(showerror, e))";
+                        class = "bt-tool-error"),
+                js"""(elem) => {
+    const slot = document.querySelector(
+        '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
+    if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
+}""")
+        catch
+        end
+    end)
     return nothing
 end
 
@@ -1623,18 +1767,51 @@ function handle_command!(model::ChatModel, ::Session, cmd::SendCommand)
     return nothing
 end
 
-function handle_command!(model::ChatModel, ::Session, ::CancelCommand)
+# How long to wait for a graceful `session/cancel` to actually end the turn
+# before escalating to a forceful connection teardown. Generous enough that a
+# normal cancel (agent stops within a beat) never escalates.
+const CANCEL_FORCE_GRACE = 6.0
+
+function handle_command!(model::ChatModel, ::Any, ::CancelCommand)
     # Off-band, instant: cancel is a lone ACP notification, not a chat-state
     # mutation, so it never goes through the `run_chat!` consumer. Reading
-    # `model.client[]` is a single-Ref read.
+    # `model.client[]` is a single-Ref read. (Session arg is unused here — typed
+    # `::Any` so the cancel path is unit-testable without a live Bonito.Session.)
     #
     # The cancel makes ACP close the active turn's update channel; the
     # turn's `prompt!` loop then ends, `run_turn!`'s `for` loop ends, its
     # `finally` clears `busy_active`, and the per-turn parser seals the
-    # partial bubble. One `cancel!` is enough; no state mutation here.
+    # partial bubble. One `cancel!` is enough in the happy path.
     c = model.client[]
     c === nothing && return nothing
+    s = shared(model)
     AgentClientProtocol.cancel!(c)
+
+    # Escalation. Graceful cancel relies on the agent HONORING `session/cancel`.
+    # A wedged agent — e.g. resumed onto an orphaned tool call (the
+    # "No onPostToolUseHook" state after a worker died mid-eval) — can ignore it.
+    # The connection is still alive, so no `ConnectionClosed` ever fires; the
+    # turn (and the busy spinner) would stay stuck forever with the stop button
+    # doing nothing. So if we're still busy on the SAME client after a short
+    # grace, force the connection down: that breaks the wedged `prompt!` loop
+    # via `ConnectionClosed`, `run_turn!`'s `finally` clears busy, and the
+    # dead-session banner appears with a working Restart.
+    #
+    # This fires ONLY on an explicit user cancel — never on a timer — so a
+    # legitimately long tool run (a multi-minute `bt_julia_eval`) the user still
+    # wants is never killed behind their back.
+    @async begin
+        sleep(CANCEL_FORCE_GRACE)
+        if s.busy_active[] && model.client[] === c
+            @warn "cancel not honored after grace; tearing down wedged session" project_id = model.project_id
+            s.last_error[] = "The agent didn't respond to cancel; session stopped. Click Restart to reconnect."
+            try
+                close(c)   # → ConnectionClosed in the wedged prompt! loop → busy cleared, banner shown
+            catch e
+                @warn "force-close after cancel failed" exception = e
+            end
+        end
+    end
     return nothing
 end
 

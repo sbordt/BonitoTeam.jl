@@ -26,14 +26,27 @@ const TAG_CTRL = UInt8('C')
 # worker→browser frames relay onto.
 mutable struct EvalBridge
     prefix::String                       # bridge parent.id == route_to_remote namespace
-    ws::Any                              # dial-back websocket (raw frame pipe)
-    wlock::ReentrantLock                 # serialize frame sends to the worker
+    ws::Any                              # dial-back websocket; swapped on reconnect under wlock
+    wlock::ReentrantLock                 # serialize frame sends to the worker AND ws-swap
     asset_host::Bonito.ChildAssetServer
     pending::Dict{Int, Channel{Any}}     # control req-id → reply channel
     pending_lock::ReentrantLock
     reqid::Threads.Atomic{Int}
     root_conn::Base.RefValue{Any}        # current browser root connection (worker→browser target)
+    # Set when the WS drops; cancelled if a reconnect arrives before it fires.
+    # Defers asset_host close + EVAL_WORKERS eviction so a transient drop doesn't
+    # tear down the per-worker registry that the reconnect would have reused.
+    teardown_armed::Threads.Atomic{Bool}
 end
+
+# Reconnects compare prefix (== BRIDGE[].parent.id on the worker): same prefix
+# means same BRIDGE[] / same routes, swap WS; different prefix means worker
+# restart, hard-replace.
+make_eval_bridge(prefix::AbstractString, ws, host) = EvalBridge(
+    String(prefix), ws, ReentrantLock(), host,
+    Dict{Int,Channel{Any}}(), ReentrantLock(),
+    Threads.Atomic{Int}(0), Base.RefValue{Any}(nothing),
+    Threads.Atomic{Bool}(false))
 
 const EVAL_WORKERS = Dict{String, EvalBridge}()    # project_id => EvalBridge
 
@@ -61,7 +74,12 @@ function call_ctrl(eb::EvalBridge, op::AbstractString; timeout = 30.0, kw...)
                                    (String(k) => v for (k, v) in kw)...))
     try
         Base.timedwait(() -> isready(ch), timeout) === :ok || error("remote control '$op' timed out")
-        return take!(ch)
+        result = take!(ch)
+        # Worker-side handle_control sends back an `err` field on exception;
+        # handle_worker_control wrapped it as an Exception. Rethrow so the
+        # caller sees the failure right away rather than a malformed value.
+        result isa Exception && throw(result)
+        return result
     finally
         lock(eb.pending_lock) do; delete!(eb.pending, id); end
     end
@@ -77,7 +95,12 @@ function handle_worker_control(eb::EvalBridge, msg::AbstractDict)
     op = msg["op"]
     if op == "reply"
         ch = lock(eb.pending_lock) do; get(eb.pending, Int(msg["id"]), nothing); end
-        ch === nothing || put!(ch, msg["val"])
+        # Worker can reply with `err` (string showerror) instead of `val` when
+        # `handle_control` raised. Surface as an Exception so `call_ctrl` throws
+        # immediately — no 30 s timedwait, no swallowed failures.
+        ch === nothing || put!(ch,
+            haskey(msg, "err") ? ErrorException(String(msg["err"])) :
+                                 get(msg, "val", nothing))
     elseif op == "asset_add"
         k = String(msg["key"])
         cached = ctrl_bytes(msg["cached"])
@@ -90,6 +113,29 @@ function handle_worker_control(eb::EvalBridge, msg::AbstractDict)
         Bonito.release_proxy_asset!(eb.asset_host, String(msg["key"]))
     end
     return
+end
+
+# Grace period before we tear an EvalBridge down after its WS dropped. The
+# worker's `dial_loop` retries with min 0.5 s and max 8 s backoff, so 30 s
+# easily covers a network blip; if the worker is truly gone after that, we
+# release the asset_host + clear EVAL_WORKERS so the next first-time dial-back
+# rebuilds cleanly.
+const EVAL_BRIDGE_RECONNECT_GRACE = 30.0
+
+# Fail every in-flight `call_ctrl` waiting on this bridge with a clean error —
+# called when the WS drops, so callers don't sit on a 30 s timeout for replies
+# that physically can't come back over the dead socket.
+function fail_pending!(eb::EvalBridge, why::AbstractString)
+    drained = lock(eb.pending_lock) do
+        pp = collect(values(eb.pending))
+        empty!(eb.pending)
+        pp
+    end
+    err = ErrorException(why)
+    for ch in drained
+        isready(ch) || put!(ch, err)
+    end
+    return nothing
 end
 
 # `/eval-ws` handler. Handshake is "secret project_id prefix"; after that the
@@ -105,11 +151,35 @@ function handle_eval_ws(state::ServerState, ws)
     if state.srv === nothing
         @warn "eval dial-back with no live server — cannot proxy assets"; return
     end
-    eb = EvalBridge(prefix, ws, ReentrantLock(), Bonito.HTTPAssetServer(state.srv),
-                    Dict{Int,Channel{Any}}(), ReentrantLock(),
-                    Threads.Atomic{Int}(0), Base.RefValue{Any}(nothing))
-    EVAL_WORKERS[project_id] = eb
-    @info "eval worker dialed back (ws) — raw bridge installed" project_id prefix
+
+    # Existing dial for this project? Decide reconnect vs. replace by comparing
+    # `prefix` against `BRIDGE[].parent.id` on the worker side. Same prefix ⇒
+    # same `BRIDGE[]` (routes intact) ⇒ swap WS into the existing EvalBridge.
+    # Different prefix ⇒ worker restarted ⇒ stale routes, hard-replace.
+    existing = get(EVAL_WORKERS, project_id, nothing)
+    eb = if existing !== nothing && existing.prefix == prefix
+        @info "eval worker reconnected" project_id prefix
+        # Fail any orphaned pending — those replies physically can't come back
+        # over the old WS, so the callers shouldn't wait for them.
+        fail_pending!(existing, "eval bridge reconnected; in-flight request dropped")
+        lock(existing.wlock) do
+            existing.ws = ws
+        end
+        existing.teardown_armed[] = false   # cancel any pending teardown
+        existing
+    else
+        if existing !== nothing
+            @info "eval worker replaced (new prefix; worker restarted?)" project_id old_prefix = existing.prefix new_prefix = prefix
+            # Old bridge's routes are stale — fail orphans, drop the asset host.
+            fail_pending!(existing, "eval bridge replaced by a new worker; in-flight request dropped")
+            try close(existing.asset_host) catch end
+        end
+        fresh = make_eval_bridge(prefix, ws, Bonito.HTTPAssetServer(state.srv))
+        EVAL_WORKERS[project_id] = fresh
+        @info "eval worker dialed back (ws) — raw bridge installed" project_id prefix
+        fresh
+    end
+
     try
         for msg in ws
             # Per-frame guard: a single malformed/raising frame must NOT tear down
@@ -133,8 +203,25 @@ function handle_eval_ws(state::ServerState, ws)
         e isa HTTP.WebSockets.WebSocketError || e isa Base.IOError || e isa EOFError ||
             @warn "eval dial-back relay loop ended" exception = (e, catch_backtrace())
     finally
-        close(eb.asset_host)   # drop every proxied asset this worker registered
-        get(EVAL_WORKERS, project_id, nothing) === eb && delete!(EVAL_WORKERS, project_id)
+        # WS dropped. Fail in-flight requests immediately (no point waiting for
+        # replies over a dead socket), then arm a deferred teardown — if the
+        # worker's dial_loop reconnects within the grace window, the reconnect
+        # branch above cancels it. Otherwise we drop the proxied assets and
+        # evict from EVAL_WORKERS, freeing the entry for a future fresh dial.
+        fail_pending!(eb, "eval bridge WS dropped; in-flight request abandoned")
+        eb.teardown_armed[] = true
+        Base.errormonitor(@async begin
+            sleep(EVAL_BRIDGE_RECONNECT_GRACE)
+            if eb.teardown_armed[]
+                eb.teardown_armed[] = false
+                try close(eb.asset_host) catch end
+                lock(state.lock) do
+                    get(EVAL_WORKERS, project_id, nothing) === eb &&
+                        delete!(EVAL_WORKERS, project_id)
+                end
+                @info "eval bridge teardown after no reconnect" project_id prefix
+            end
+        end)
     end
     return
 end

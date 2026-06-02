@@ -83,3 +83,13 @@ end  # BonitoTeam paths
 @testset "worker state" begin
     include("test_worker_state.jl")
 end
+
+include("test_history_sync.jl")
+
+include("test_summary_msg.jl")
+
+include("test_sidebar_resumable.jl")
+
+include("test_queued_messages.jl")
+
+include("test_cancel_escalation.jl")

@@ -159,12 +159,25 @@ function install_popup!(session::Bonito.Session,
     on(_ -> saver(), width);    on(_ -> saver(), height)
     on(_ -> saver(), location)
 
+    # The floating popup + plotpane are chat-global affordances — they belong
+    # to a chat's detached `bt_show_app` embed, not to the dashboard. Hide both
+    # whenever we navigate to home so a leftover embed from chat A doesn't
+    # linger on top of the project list. We deliberately DO NOT touch x/y/
+    # width/height here, so returning to the chat lands the popup at the
+    # exact position the user last dragged it to.
+    on(current_view) do pid
+        if isempty(pid)
+            visible[]    = false
+            plotpane_v[] = false
+        end
+    end
+
     # Two mount slots, one per surface. The controller moves the embed
     # `bt-embed-<tool_id>` between them.
     popup_mount = DOM.div(""; id = "bt-popup-mount", class = "bt-popup-mount")
     plotpane_mount = DOM.div(""; id = "bt-plotpane-mount", class = "bt-plotpane-mount")
 
-    fw = Bonito.FloatingWindow(popup_mount;
+    fw = FloatingWindow(popup_mount;
         title = title, x = x, y = y, width = width, height = height,
         visible = visible, close_trigger = close_t)
 
@@ -177,7 +190,13 @@ function install_popup!(session::Bonito.Session,
     pp_close_btn = DOM.span("×";
         class = "bt-pp-btn", title = "Close",
         onclick = js"event => { event.stopPropagation(); window._btPopup && window._btPopup.restore(); }")
+    # The resize handle is the first child so it sits at the left edge of the
+    # column (the column is `position: relative` so the absolute handle anchors
+    # to the pane, not the page). Drag wiring in `controller_js`.
+    pp_resize = DOM.div(""; class = "bt-pp-resize",
+        title = "Drag to resize · double-click to reset")
     plotpane = DOM.div(
+        pp_resize,
         DOM.div(
             DOM.span(pp_title; class = "bt-pp-title"),
             DOM.div(undock_btn, pp_close_btn; class = "bt-pp-controls");
@@ -223,6 +242,58 @@ function install_popup!(session::Bonito.Session,
         };
         ppvObs.on(applyPlotpaneVis);
         applyPlotpaneVis();
+
+        // ── Resize handle ────────────────────────────────────────────────────
+        // The plotpane width is a CSS var (`--bt-pp-width`) on the pane element,
+        // so the visible/transition rules in CSS just follow whatever we set.
+        // Min 280 px keeps the pane usable; we also leave at least MIN_CHAT_PX
+        // for the chat so dragging can't squeeze it to nothing.
+        const PP_MIN = 280;
+        const MIN_CHAT_PX = 480;
+        const PP_KEY = 'bt-pp-width';
+        const pp = document.getElementById('bt-plotpane-dropzone');
+        if (pp) {
+            // Restore the last persisted width (if any).
+            const saved = +localStorage.getItem(PP_KEY);
+            if (saved >= PP_MIN) pp.style.setProperty('--bt-pp-width', saved + 'px');
+
+            const handle = pp.querySelector('.bt-pp-resize');
+            if (handle) {
+                let startX = 0, startW = 0, shellW = 0;
+                const onMove = (e) => {
+                    // Pane grows when the cursor moves LEFT (handle is on the
+                    // pane's left edge), shrinks when it moves right.
+                    const proposed = startW - (e.clientX - startX);
+                    const max = Math.max(PP_MIN, shellW - MIN_CHAT_PX);
+                    const w = Math.max(PP_MIN, Math.min(max, proposed));
+                    pp.style.setProperty('--bt-pp-width', w + 'px');
+                };
+                const onUp = () => {
+                    window.removeEventListener('pointermove', onMove);
+                    window.removeEventListener('pointerup',   onUp);
+                    pp.classList.remove('bt-pp-resizing');
+                    const finalW = parseFloat(
+                        getComputedStyle(pp).getPropertyValue('--bt-pp-width')) || 0;
+                    if (finalW >= PP_MIN) localStorage.setItem(PP_KEY, Math.round(finalW));
+                };
+                handle.addEventListener('pointerdown', (e) => {
+                    e.preventDefault();
+                    const shell = document.querySelector('.bt-shell');
+                    shellW = shell ? shell.clientWidth : window.innerWidth;
+                    startX = e.clientX;
+                    startW = pp.getBoundingClientRect().width;
+                    pp.classList.add('bt-pp-resizing');
+                    window.addEventListener('pointermove', onMove);
+                    window.addEventListener('pointerup',   onUp);
+                });
+                // Double-click = reset to the CSS default (clears the override).
+                handle.addEventListener('dblclick', (e) => {
+                    e.preventDefault();
+                    pp.style.removeProperty('--bt-pp-width');
+                    localStorage.removeItem(PP_KEY);
+                });
+            }
+        }
 
         window._btPopup = {
             _currentToolId: null,
@@ -358,20 +429,45 @@ const PopupStyles = Bonito.Styles(
         "overflow" => "auto"),
 
     # ── Plotpane (right-side column dock target) ─────────────────────────────
-    # Width transitions from 0 (hidden) → 480px (visible). The column sits as a
-    # flex child of `.bt-shell`, right of `.bt-main`, with its own header
-    # (undock + close) above the mount slot.
+    # Width transitions from 0 (hidden) → `--bt-pp-width` (visible). The column
+    # sits as a flex child of `.bt-shell`, right of `.bt-main`, with its own
+    # header (undock + close) above the mount slot. Width is user-resizable via
+    # the left-edge drag handle (`.bt-pp-resize`) and persisted in localStorage,
+    # so re-opening lands on the same width.
+    # Adaptive default: takes up to half the shell (up to 720px) — gives wide
+    # monitors a comfortably large pane instead of a fixed-cramped 480px — and
+    # never goes below 360px on small screens. The user's drag override sets
+    # `--bt-pp-width` on the pane element itself, winning over this default.
+    Bonito.CSS(":root", "--bt-pp-width" => "min(720px, max(360px, 50%))"),
     Bonito.CSS(".bt-plotpane",
         "flex"        => "0 0 0",
         "width"       => "0",
         "overflow"    => "hidden",
+        "position"    => "relative",
         "display"     => "flex", "flex-direction" => "column",
         "background"  => "var(--bt-surface)",
         "border-left" => "1px solid var(--bt-border)",
         "transition"  => "flex-basis 200ms ease, width 200ms ease"),
     Bonito.CSS(".bt-plotpane.bt-plotpane-visible",
-        "flex"  => "0 0 480px",
-        "width" => "480px"),
+        "flex"  => "0 0 var(--bt-pp-width)",
+        "width" => "var(--bt-pp-width)"),
+    # Disable the width transition while the user is actively dragging the
+    # resize handle, otherwise every pointermove animates into place and the
+    # pane lags the cursor.
+    Bonito.CSS(".bt-plotpane.bt-pp-resizing",
+        "transition" => "none"),
+    # Drag handle on the left edge: thin column, full height, col-resize cursor.
+    # Slightly visible on hover so the affordance is discoverable.
+    Bonito.CSS(".bt-pp-resize",
+        "position" => "absolute",
+        "left" => "0", "top" => "0", "bottom" => "0",
+        "width" => "6px",
+        "cursor" => "col-resize",
+        "user-select" => "none",
+        "z-index" => "2",
+        "transition" => "background 80ms"),
+    Bonito.CSS(".bt-pp-resize:hover, .bt-plotpane.bt-pp-resizing .bt-pp-resize",
+        "background" => "var(--bt-accent)"),
     Bonito.CSS(".bt-pp-header",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "padding" => "6px 10px",

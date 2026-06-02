@@ -24,7 +24,7 @@ end
 ctx1 = TH.open_window(state1)
 
 try
-    p1 = TH.eval_js(ctx1, """(() => { const items = document.querySelectorAll('.bt-side-item .bt-side-name'); for (let i=0; i<items.length; i++) if (items[i].innerText==='Project1') return i; return -1; })()""")
+    p1 = TH.eval_js(ctx1, """(() => { const items = document.querySelectorAll('.bt-side-item .bt-side-name'); for (let i=0; i<items.length; i++) if (items[i].innerText.split(' · ')[0]==='Project1') return i; return -1; })()""")
     TH.eval_js(ctx1, """document.querySelectorAll('.bt-side-item')[$p1].click()""")
     @assert TH.wait_for(ctx1, "document.querySelector('.bt-text-input') !== null") "no chat"
 
@@ -79,7 +79,7 @@ end
 ctx2 = TH.open_window(state2)
 
 try
-    p1 = TH.eval_js(ctx2, """(() => { const items = document.querySelectorAll('.bt-side-item .bt-side-name'); for (let i=0; i<items.length; i++) if (items[i].innerText==='Project1') return i; return -1; })()""")
+    p1 = TH.eval_js(ctx2, """(() => { const items = document.querySelectorAll('.bt-side-item .bt-side-name'); for (let i=0; i<items.length; i++) if (items[i].innerText.split(' · ')[0]==='Project1') return i; return -1; })()""")
     TH.eval_js(ctx2, """document.querySelectorAll('.bt-side-item')[$p1].click()""")
     @assert TH.wait_for(ctx2, "document.querySelector('.bt-text-input') !== null") "no chat"
 

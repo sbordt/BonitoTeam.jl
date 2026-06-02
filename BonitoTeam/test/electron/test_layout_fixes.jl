@@ -177,7 +177,7 @@ try
             (() => {
                 const items = document.querySelectorAll('.bt-side-item .bt-side-name');
                 for (let i = 0; i < items.length; i++)
-                    if (items[i].innerText === 'Project1') return i;
+                    if (items[i].innerText.split(' · ')[0] === 'Project1') return i;
                 return -1;
             })()
         """)
@@ -257,7 +257,7 @@ try
             (() => {
                 const items = document.querySelectorAll('.bt-side-item .bt-side-name');
                 for (let i = 0; i < items.length; i++)
-                    if (items[i].innerText === 'Project1') return i;
+                    if (items[i].innerText.split(' · ')[0] === 'Project1') return i;
                 return -1;
             })()
         """)

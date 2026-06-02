@@ -64,7 +64,7 @@ record(name, ok) = push!(results, name => ok)
 try
     p1_idx = TH.eval_js(ctx, """(() => {
         const items = document.querySelectorAll('.bt-side-item .bt-side-name');
-        for (let i = 0; i < items.length; i++) if (items[i].innerText === 'Project1') return i;
+        for (let i = 0; i < items.length; i++) if (items[i].innerText.split(' · ')[0] === 'Project1') return i;
         return -1; })()""")
     TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[$p1_idx].click()""")
     @assert TH.wait_for(ctx, "document.querySelector('.bt-text-input') !== null") "no chat"

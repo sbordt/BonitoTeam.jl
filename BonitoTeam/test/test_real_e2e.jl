@@ -84,10 +84,11 @@ end
         # === server side: the shown_app ToolMsg → render_tool_body → embed ===
         model = BT.ChatModel(h.state, mktempdir(); project_id=pid, transport=BT.MockTransport((o,i)->nothing))
         toolid = string(Bonito.uuid4())
-        tc = ACP.ToolCall(toolid, "mcp", "bt_show_app", "completed",
-                          ACP.ToolContent[ACP.TextContent("shown_app: $appid")], Channel{ACP.ToolCall}(1))
+        tc = ACP.GenericTool(toolid, "mcp", "bt_show_app", "completed",
+                              ACP.ToolContent[ACP.TextContent("shown_app: $appid")], Channel{ACP.ToolCall}(1))
         BT.persist_tool_content!(model.chat_dir, tc)
-        tm = BT.ToolMsg(toolid, "mcp", "bt_show_app", "completed", "")
+        tm = BT.GenericToolMsg(toolid, "mcp", "bt_show_app", "completed", "",
+                                0.0, 0.0, nothing)
         body = BT.render_tool_body(h.state, tm, model.cwd, model.chat_dir; project_id=pid)
         @test body isa BT.RemoteAppPlaceholder
 

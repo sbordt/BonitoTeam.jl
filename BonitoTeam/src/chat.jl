@@ -206,18 +206,81 @@ AgentMsg(chat::ChatModel, text::AbstractString) =
 ensure_html!(m::AgentMsg) =
     isempty(m.html) ? (m.html = markdown_html(m.text)) : m.html
 
-mutable struct ToolMsg <: ChatMsg
+# ── Tool messages — abstract + typed variants ──────────────────────────────
+# Replaces the previous "one ToolMsg struct with a `kind::String` discriminator"
+# pattern: every Claude tool family with distinct UX (Bash background, MCP,
+# subagent Task, generic) gets its own concrete subtype so renderers,
+# persistence and the taskbar dispatch on the type instead of probing strings.
+# The five header fields (id/kind/title/status/summary) plus the
+# elapsed-time tracking (started_at/finished_at) are duplicated across the
+# variants — small cost, big dispatch clarity. `kind` here is still the ACP
+# abstraction ("read"/"execute"/…); the *actual* tool name lives in
+# subtype-specific fields (e.g. `MCPToolMsg.tool_name`).
+"""
+    ToolMsg <: ChatMsg
+
+Abstract supertype for one tool-call bubble in the chat. Concrete subtypes:
+
+  • `GenericToolMsg` — fallback (Read, Edit, Grep, … plus any future tool)
+  • `BashToolMsg`    — Claude's Bash tool; carries `is_background`
+  • `TaskToolMsg`    — subagent `Task` / `Agent` tool; carries `task_name`
+  • `MCPToolMsg`     — `mcp__<server>__<tool>` calls (our `bt_*` tools, others)
+
+All variants share `id` / `kind` / `title` / `status` / `summary`, plus
+`started_at` / `finished_at` epoch seconds used by the tool-pill timer.
+"""
+abstract type ToolMsg <: ChatMsg end
+
+mutable struct GenericToolMsg <: ToolMsg
     id::String
     kind::String
     title::String
     status::String
-    summary::String           # cached header summary; full content lives on disk
+    summary::String                       # cached header summary; full content on disk
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
     chat::Union{ChatModel,Nothing}
 end
-ToolMsg(id, kind, title, status, summary) =
-    ToolMsg(String(id), String(kind), String(title), String(status), String(summary), nothing)
-ToolMsg(chat::ChatModel, tc::AgentClientProtocol.ToolCall) =
-    ToolMsg(tc.id, tc.kind, tc.title, tc.status, content_summary(tc.kind, tc.content), chat)
+
+mutable struct BashToolMsg <: ToolMsg
+    id::String
+    kind::String
+    title::String
+    status::String
+    summary::String
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
+    command::String
+    is_background::Bool
+    chat::Union{ChatModel,Nothing}
+end
+
+mutable struct TaskToolMsg <: ToolMsg
+    id::String
+    kind::String
+    title::String
+    status::String
+    summary::String
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
+    description::String
+    is_background::Bool
+    task_name::Union{String,Nothing}      # SDK `name` — for SendMessage addressing
+    chat::Union{ChatModel,Nothing}
+end
+
+mutable struct MCPToolMsg <: ToolMsg
+    id::String
+    kind::String
+    title::String
+    status::String
+    summary::String
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
+    server::String                        # "bonitoteam" / "playwright" / …
+    tool_name::String                     # bare name (without `mcp__<server>__`)
+    chat::Union{ChatModel,Nothing}
+end
 
 mutable struct ThoughtMsg <: ChatMsg
     id::String
@@ -227,12 +290,36 @@ end
 ThoughtMsg(id::AbstractString, text::AbstractString) = ThoughtMsg(String(id), String(text), nothing)
 ThoughtMsg(chat::ChatModel, text::AbstractString) = ThoughtMsg(string(uuid4()), String(text), chat)
 
-mutable struct PlanMsg <: ChatMsg
+# TodoWrite stays a top-level ChatMsg (NOT under ToolMsg) because it arrives
+# as its own `Plan` wire variant — distinct from the `tool_call` channel —
+# and is the canonical LiveTracking message (each new PlanUpdate ABSORBS into
+# the previous bubble; see `absorb!` further down).
+mutable struct TodoListMsg <: ChatMsg
+    id::String                            # synthetic UUID, used by JS for DOM keying
     entries::Vector{PlanEntry}
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
     chat::Union{ChatModel,Nothing}
 end
-PlanMsg(entries::Vector{PlanEntry}) = PlanMsg(entries, nothing)
-PlanMsg(chat::ChatModel, entries) = PlanMsg(collect(PlanEntry, entries), chat)
+TodoListMsg(entries::Vector{PlanEntry}) =
+    TodoListMsg(string(uuid4()), entries, time(), nothing, nothing)
+TodoListMsg(chat::ChatModel, entries) =
+    TodoListMsg(string(uuid4()), collect(PlanEntry, entries), time(), nothing, chat)
+
+# ── Trait helpers ──────────────────────────────────────────────────────────
+# A live tool message is one whose `status` hasn't yet hit a terminal state.
+# The tool pill's pulsing glow + the taskbar slot both subscribe to this.
+is_live(m::ToolMsg) = !(m.status in ("completed", "failed"))
+is_live(t::TodoListMsg) = any(e -> e.status in ("pending", "in_progress"), t.entries)
+is_live(::ChatMsg) = false
+
+# A background-or-streamy task that deserves a taskbar slot. Default false;
+# Bash with `run_in_background`, Task/Agent with `run_in_background`, and
+# TodoListMsg opt in.
+is_taskbar_item(t::BashToolMsg) = t.is_background
+is_taskbar_item(t::TaskToolMsg) = t.is_background
+is_taskbar_item(::TodoListMsg)  = true
+is_taskbar_item(::ChatMsg)      = false
 
 # Tool kind → icon
 const TOOL_ICONS = Dict(
@@ -349,6 +436,11 @@ end
 # itself so the user can skim what changed without expanding the body.
 # `chat_dir` is needed so we can read the persisted DiffContent from disk;
 # pass "" when no on-disk content is available (preview is then omitted).
+#
+# Dispatches on the abstract `ToolMsg` — the four header fields plus
+# `started_at` / `finished_at` are shared across every concrete variant.
+# Subtype-specific augmentations (e.g. the `server` badge for `MCPToolMsg`)
+# patch the dict in their own dispatch arm below.
 function tool_header_dict(m::ToolMsg, chat_dir::AbstractString="")
     pretty_title, server = pretty_tool_title(m.title)
     d = Dict{String,Any}(
@@ -362,14 +454,44 @@ function tool_header_dict(m::ToolMsg, chat_dir::AbstractString="")
         "server" => server,
         "status" => m.status,
         "summary" => m.summary,
+        "started_at" => m.started_at,
     )
-    if m.kind == "edit" && !isempty(chat_dir)
-        prev = render_edit_preview(chat_dir, m.id)
+    m.finished_at === nothing || (d["finished_at"] = m.finished_at)
+    augment_header!(d, m, chat_dir)
+    return d
+end
+
+# Per-variant tweaks. The base header is enough for `GenericToolMsg`; the
+# typed variants opt in to their extras here.
+augment_header!(d::Dict, ::GenericToolMsg, chat_dir::AbstractString) =
+    augment_generic_header!(d, chat_dir)
+function augment_header!(d::Dict, m::BashToolMsg, chat_dir::AbstractString)
+    m.is_background && (d["background"] = true)
+    augment_generic_header!(d, chat_dir)
+end
+function augment_header!(d::Dict, m::TaskToolMsg, chat_dir::AbstractString)
+    m.is_background && (d["background"] = true)
+    m.task_name === nothing || (d["task_name"] = m.task_name)
+    augment_generic_header!(d, chat_dir)
+end
+function augment_header!(d::Dict, m::MCPToolMsg, chat_dir::AbstractString)
+    # Server already lives in `d` from `pretty_tool_title`, but the raw bare
+    # tool name (without `mcp__server__`) is more authoritative — prefer it.
+    isempty(m.server)    || (d["server"] = m.server)
+    isempty(m.tool_name) || (d["title"]  = m.tool_name)
+    augment_generic_header!(d, chat_dir)
+end
+
+# `kind == "edit"` and bt_show auto-expand are shared across all ToolMsg
+# variants and depend on persisted on-disk content, so they live here once.
+function augment_generic_header!(d::Dict, chat_dir::AbstractString)
+    if d["kind"] == "edit" && !isempty(chat_dir)
+        prev = render_edit_preview(chat_dir, d["id"])
         prev === nothing || (d["preview"] = prev)
     end
-    # A bt_show tool was an explicit "show me this" request — expand its preview
-    # by default (still collapsible). Detected from the persisted content.
-    isempty(chat_dir) || has_show_reference(load_tool_content(chat_dir, m.id)) && (d["expand"] = true)
+    isempty(chat_dir) ||
+        has_show_reference(load_tool_content(chat_dir, d["id"])) &&
+            (d["expand"] = true)
     return d
 end
 
@@ -398,11 +520,11 @@ function msg_to_dict(m::ThoughtMsg, _chat_dir::AbstractString="")
         "summary" => "$n $(n == 1 ? "line" : "lines")")
 end
 
-function msg_to_dict(m::PlanMsg, _chat_dir::AbstractString="")
+function msg_to_dict(m::TodoListMsg, _chat_dir::AbstractString="")
     rows = join(["""<div class="bt-plan-entry">
         <span class="bt-plan-status">$(e.status == "completed" ? "✓" : e.status == "in_progress" ? "▶" : "○")</span>
         <span>$(e.content)</span></div>""" for e in m.entries])
-    Dict{String,Any}("type" => "plan", "html" => rows)
+    Dict{String,Any}("type" => "plan", "id" => m.id, "html" => rows)
 end
 
 # ── Edit preview ──────────────────────────────────────────────────────────────
@@ -887,14 +1009,21 @@ Base.append!(m::UserMsg, t::AbstractString) = (m.text *= t; chat_emit(m.chat, wi
 Base.append!(m::SummaryMsg, t::AbstractString) = (m.text *= t; m.html = ""; m)
 
 # Finalize a message: persist to chat.md (per-type writer) + emit its closing
-# event. UserMsg / PlanMsg have no `*_final` event; a ToolMsg only persists once
+# event. UserMsg / TodoListMsg have no `*_final` event; a ToolMsg only persists once
 # it reaches a terminal status. AgentMsg builds its rendered html ONCE here so
 # later `msgs.request` round-trips (scroll-back, re-mount) reuse the cache.
 Base.close(m::AgentMsg) = (ensure_html!(m); finalize_agent(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
 Base.close(m::ThoughtMsg) = (append_thought(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
 Base.close(m::UserMsg) = (append_user(m.chat.chat_session, m); nothing)
-Base.close(m::PlanMsg) = (append_plan(m.chat.chat_session, m); nothing)
-Base.close(m::ToolMsg) = (m.status in ("completed", "failed") && append_tool(m.chat.chat_session, m); nothing)
+Base.close(m::TodoListMsg) =
+    (m.finished_at = time(); append_plan(m.chat.chat_session, m); nothing)
+function Base.close(m::ToolMsg)
+    if m.status in ("completed", "failed")
+        m.finished_at === nothing && (m.finished_at = time())
+        append_tool(m.chat.chat_session, m)
+    end
+    nothing
+end
 Base.close(m::SummaryMsg) = (ensure_html!(m); append_summary(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
 
 # ── Wire-dict builders (the browser protocol; byte-identical to before) ─────
@@ -926,7 +1055,7 @@ wire_new(::ChatModel, m::ThoughtMsg) = msg_to_dict(m)
 wire_new(::ChatModel, m::UserMsg) =
     Dict{String,Any}("type" => "user", "text" => m.text, "queued" => m.queued)
 wire_new(model::ChatModel, m::ToolMsg) = tool_header_dict(m, model.chat_dir)
-wire_new(model::ChatModel, m::PlanMsg) = msg_to_dict(m, model.chat_dir)
+wire_new(model::ChatModel, m::TodoListMsg) = msg_to_dict(m, model.chat_dir)
 # Summary opens as a centered placeholder; `close` ships the rendered html.
 wire_new(::ChatModel, ::SummaryMsg) =
     Dict{String,Any}("type" => "summary", "html" => "", "streaming" => true)
@@ -978,8 +1107,38 @@ to_message(chat::ChatModel, m::AgentClientProtocol.AgentMessage) = AgentMsg(chat
 # Claude Code's `isCompactSummary` flag, so we route on the verbatim opening.
 to_message(chat::ChatModel, m::AgentClientProtocol.UserMessage) =
     is_summary_text(m.text) ? SummaryMsg(chat, m.text) : UserMsg(chat, m.text)
-to_message(chat::ChatModel, m::AgentClientProtocol.ToolCall) = ToolMsg(chat, m)
-to_message(chat::ChatModel, m::AgentClientProtocol.Plan) = PlanMsg(chat, m.entries)
+# Typed dispatch on the ACP variant — one method per concrete `ToolCall`.
+to_message(chat::ChatModel, tc::AgentClientProtocol.GenericTool)   = build_tool_msg(chat, tc)
+to_message(chat::ChatModel, tc::AgentClientProtocol.BashCall)      = build_tool_msg(chat, tc)
+to_message(chat::ChatModel, tc::AgentClientProtocol.TaskCall)      = build_tool_msg(chat, tc)
+to_message(chat::ChatModel, tc::AgentClientProtocol.MCPCall)       = build_tool_msg(chat, tc)
+to_message(chat::ChatModel, tc::AgentClientProtocol.TodoWriteCall) = TodoListMsg(chat, tc.entries)
+to_message(chat::ChatModel, m::AgentClientProtocol.Plan)           = TodoListMsg(chat, m.entries)
+
+# Concrete-typed builders for the four ToolMsg variants. Each one knows which
+# tool-specific fields to lift out of its ACP source.
+build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.GenericTool) =
+    GenericToolMsg(tc.id, tc.kind, tc.title, tc.status,
+                   content_summary(tc.kind, tc.content),
+                   time(), nothing, chat)
+
+build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.BashCall) =
+    BashToolMsg(tc.id, tc.kind, tc.title, tc.status,
+                content_summary(tc.kind, tc.content),
+                time(), nothing,
+                tc.command, tc.run_in_background, chat)
+
+build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.TaskCall) =
+    TaskToolMsg(tc.id, tc.kind, tc.title, tc.status,
+                content_summary(tc.kind, tc.content),
+                time(), nothing,
+                tc.description, tc.run_in_background, tc.task_name, chat)
+
+build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.MCPCall) =
+    MCPToolMsg(tc.id, tc.kind, tc.title, tc.status,
+               content_summary(tc.kind, tc.content),
+               time(), nothing,
+               tc.server, tc.tool_name, chat)
 
 # Default: stream the message's text deltas into the bubble, then finalize.
 function process_update!(b::ChatMsg, m::AgentClientProtocol.Message)
@@ -993,17 +1152,24 @@ end
 # Tools: persist the content snapshot to disk (so the lazily-loaded body stays
 # current), re-render the header on each change, finalize on terminal status.
 # A tool's `updates` channel yields the (mutated) ToolCall after each change.
+# `b::ToolMsg` covers every concrete variant — they all carry the same five
+# header fields the update path touches.
 function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
     persist_tool_content!(b.chat.chat_dir, m)
     ship_edit_preview!(b)
     for snap in m.updates
+        prev_status = b.status
         b.status = snap.status
         b.title = snap.title
         b.summary = content_summary(snap.kind, snap.content)
+        # Stamp `finished_at` on terminal-transition so the live timer freezes.
+        prev_status in ("completed", "failed") || !(b.status in ("completed", "failed")) ||
+            (b.finished_at = time())
         persist_tool_content!(b.chat.chat_dir, snap)
         pretty_title, _ = pretty_tool_title(b.title)
         d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
             "status" => b.status, "title" => pretty_title, "summary" => b.summary)
+        b.finished_at === nothing || (d["finished_at"] = b.finished_at)
         # bt_show: once the content carries a `shown:` ref, tell JS to expand
         # the preview by default — it was an explicit "show me this" request.
         has_show_reference(snap.content) && (d["expand"] = true)
@@ -1026,8 +1192,55 @@ function ship_edit_preview!(b::ToolMsg)
     return nothing
 end
 
-# Plans are one-shot snapshots — nothing to stream, just finalize (persist).
-process_update!(b::PlanMsg, ::AgentClientProtocol.Plan) = (close(b); nothing)
+# Todos are one-shot snapshots — nothing to stream, just finalize (persist).
+process_update!(b::TodoListMsg, ::AgentClientProtocol.Plan) = (close(b); nothing)
+process_update!(b::TodoListMsg, ::AgentClientProtocol.TodoWriteCall) = (close(b); nothing)
+
+# ── TodoList absorption ────────────────────────────────────────────────────
+# Both Claude tooling paths land here: a `tool_call/TodoWrite` (the SDK tool)
+# AND a separate `plan` SessionUpdate (the older PlanUpdate channel). We
+# *don't* push a fresh `TodoListMsg` if a live one already exists — instead
+# the previous bubble absorbs the new entries and emits a `wire_update`. End
+# result: ONE pill in the chat that animates as the todos move, plus one
+# slot in the taskbar that mirrors it (see is_taskbar_item).
+function process!(chat::ChatModel, m::AgentClientProtocol.TodoWriteCall)
+    if !try_absorb_todo!(chat, m.entries)
+        msg = TodoListMsg(chat, m.entries)
+        close(send!(chat, msg))
+    end
+    for _ in m.updates; end                # drain any straggler updates (rare)
+    return nothing
+end
+
+function process!(chat::ChatModel, m::AgentClientProtocol.Plan)
+    try_absorb_todo!(chat, m.entries) ||
+        close(send!(chat, TodoListMsg(chat, m.entries)))
+    return nothing
+end
+
+# Find the last live `TodoListMsg` in the store and replace its entries with
+# `new_entries`. Returns `true` if absorption happened; `false` means there's
+# nothing live to update and the caller should push a fresh bubble.
+function try_absorb_todo!(chat::ChatModel, new_entries)
+    entries = collect(PlanEntry, new_entries)
+    target = lock(chat.lock) do
+        for i in length(chat.msgs_store):-1:1
+            m = chat.msgs_store[i]
+            m isa TodoListMsg || continue
+            return is_live(m) ? m : nothing   # done lists stop absorbing — start fresh
+        end
+        return nothing
+    end
+    target === nothing && return false
+    target.entries = entries
+    # Persist as a new chat.md plan section so a reload sees the latest state
+    # (until we teach `load_history` to dedupe by `id`, this also keeps the
+    # iteration trail visible on disk).
+    target.chat === nothing || append_plan(target.chat.chat_session, target)
+    chat_emit(chat, msg_to_dict(target))      # JS keys by id — same bubble re-renders
+    is_live(target) || (target.finished_at = time())
+    return true
+end
 
 # ── The chat consumer loop ──────────────────────────────────────────────────
 # ONE task per ChatModel drains `user_messages` and drives one prompt turn at a
@@ -1361,7 +1574,8 @@ msg_matches(a::UserMsg,  b::AgentClientProtocol.UserMessage)  =
 msg_matches(a::SummaryMsg, b::AgentClientProtocol.UserMessage) =
     is_summary_text(b.text) && strip(a.text) == strip(b.text)
 msg_matches(a::AgentMsg, b::AgentClientProtocol.AgentMessage) = strip(a.text) == strip(b.text)
-msg_matches(a::PlanMsg,  b::AgentClientProtocol.Plan)         = plan_entries_equal(a.entries, b.entries)
+msg_matches(a::TodoListMsg, b::AgentClientProtocol.Plan)         = plan_entries_equal(a.entries, b.entries)
+msg_matches(a::TodoListMsg, b::AgentClientProtocol.TodoWriteCall) = plan_entries_equal(a.entries, b.entries)
 msg_matches(::ChatMsg,   ::AgentClientProtocol.Message)       = false
 
 plan_entries_equal(a, b) = length(a) == length(b) &&
@@ -1398,15 +1612,48 @@ function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.UserMessage)
 end
 function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.ToolCall)
     isempty(m.content) || persist_tool_content!(model.chat_dir, m)
-    msg = ToolMsg(m.id, m.kind, m.title, m.status, content_summary(m.kind, m.content))
+    # Pick the typed BonitoTeam variant per ACP subtype. Replay always lands
+    # as a finished call (no live updates afterwards), so `finished_at = now`.
+    msg = replayed_tool_msg(m)
     lock(model.lock) do; push!(model.msgs_store, msg); end
     msg.status in ("completed", "failed") && append_tool(model.chat_session, msg)
 end
-function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.Plan)
-    msg = PlanMsg(collect(PlanEntry, m.entries))
+function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.TodoWriteCall)
+    msg = TodoListMsg(string(uuid4()), collect(PlanEntry, m.entries),
+                      time(), time(), nothing)
     lock(model.lock) do; push!(model.msgs_store, msg); end
     append_plan(model.chat_session, msg)
 end
+function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.Plan)
+    msg = TodoListMsg(string(uuid4()), collect(PlanEntry, m.entries),
+                      time(), time(), nothing)
+    lock(model.lock) do; push!(model.msgs_store, msg); end
+    append_plan(model.chat_session, msg)
+end
+
+# Mirror of `build_tool_msg` for the replay path: no `chat`, finished_at
+# stamped now so the timer doesn't tick. The typed variants persist their
+# subtype-specific fields too (so e.g. a replayed background bash still
+# rendered the right way).
+replayed_tool_msg(tc::AgentClientProtocol.GenericTool) =
+    GenericToolMsg(tc.id, tc.kind, tc.title, tc.status,
+                   content_summary(tc.kind, tc.content),
+                   time(), time(), nothing)
+replayed_tool_msg(tc::AgentClientProtocol.BashCall) =
+    BashToolMsg(tc.id, tc.kind, tc.title, tc.status,
+                content_summary(tc.kind, tc.content),
+                time(), time(),
+                tc.command, tc.run_in_background, nothing)
+replayed_tool_msg(tc::AgentClientProtocol.TaskCall) =
+    TaskToolMsg(tc.id, tc.kind, tc.title, tc.status,
+                content_summary(tc.kind, tc.content),
+                time(), time(),
+                tc.description, tc.run_in_background, tc.task_name, nothing)
+replayed_tool_msg(tc::AgentClientProtocol.MCPCall) =
+    MCPToolMsg(tc.id, tc.kind, tc.title, tc.status,
+               content_summary(tc.kind, tc.content),
+               time(), time(),
+               tc.server, tc.tool_name, nothing)
 
 function reconcile_replay!(model::ChatModel, replay)
     candidates = filter(keep_in_history, replay)

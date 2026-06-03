@@ -134,16 +134,18 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         # content carries a `shown:` ref); a normal tool gets no expand flag.
         ACP = BonitoTeam.AgentClientProtocol
         chat_dir = mktempdir()
-        showtc = ACP.ToolCall("tid", "other", "bt_show", "completed",
-                              ACP.ToolContent[ACP.TextContent("shown: /x/v.mp4 (video/mp4, 1MB)")],
-                              Channel{ACP.ToolCall}(1))
+        showtc = ACP.GenericTool("tid", "other", "bt_show", "completed",
+                                  ACP.ToolContent[ACP.TextContent("shown: /x/v.mp4 (video/mp4, 1MB)")],
+                                  Channel{ACP.ToolCall}(1))
         BT.persist_tool_content!(chat_dir, showtc)
-        @test BT.tool_header_dict(BT.ToolMsg("tid","other","bt_show","completed",""), chat_dir)["expand"] == true
+        @test BT.tool_header_dict(BT.GenericToolMsg("tid","other","bt_show","completed","",
+                                                     0.0, 0.0, nothing), chat_dir)["expand"] == true
 
-        readtc = ACP.ToolCall("tid2", "read", "cat", "completed",
-                              ACP.ToolContent[ACP.TextContent("plain file contents")],
-                              Channel{ACP.ToolCall}(1))
+        readtc = ACP.GenericTool("tid2", "read", "cat", "completed",
+                                  ACP.ToolContent[ACP.TextContent("plain file contents")],
+                                  Channel{ACP.ToolCall}(1))
         BT.persist_tool_content!(chat_dir, readtc)
-        @test !haskey(BT.tool_header_dict(BT.ToolMsg("tid2","read","cat","completed",""), chat_dir), "expand")
+        @test !haskey(BT.tool_header_dict(BT.GenericToolMsg("tid2","read","cat","completed","",
+                                                              0.0, 0.0, nothing), chat_dir), "expand")
     end
 end

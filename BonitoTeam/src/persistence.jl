@@ -206,7 +206,7 @@ function append_tool(session::ChatSession, msg::ToolMsg)
     end
 end
 
-function append_plan(session::ChatSession, msg::PlanMsg)
+function append_plan(session::ChatSession, msg::TodoListMsg)
     open(session.path, "a") do io
         println(io, "!!! plan")
         # Write as plain lines (not markdown list) so admonition_text can round-trip them
@@ -295,8 +295,14 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
                 tail = strip(body[nextind(body, title_line.offset + ncodeunits(title_line.match) - 1):end])
                 summary = String(tail)
             end
-            push!(msgs, ToolMsg(string(id), string(kind), tool_title,
-                                string(status), summary))
+            # Reload always lands as the generic variant — by the time chat.md
+            # was written, every tool had reached terminal status, so the
+            # subtype-specific fields (background flag, MCP server, …) no
+            # longer drive any live UX. New tool calls in the resumed session
+            # come through the typed dispatcher again.
+            push!(msgs, GenericToolMsg(string(id), string(kind), tool_title,
+                                       string(status), summary,
+                                       time(), time(), nothing))
         elseif category == "plan"
             entries = PlanEntry[]
             for line in split(body, '\n')
@@ -305,7 +311,8 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
                 status = m.captures[1] == "x" ? "completed" : "pending"
                 push!(entries, PlanEntry(String(m.captures[2]), "", status))
             end
-            isempty(entries) || push!(msgs, PlanMsg(entries))
+            isempty(entries) || push!(msgs, TodoListMsg(string(uuid4()), entries,
+                                                        time(), time(), nothing))
         elseif category == "thought"
             # `!!! thought "<id>"` — reload the (non-empty) reasoning so a
             # reopened chat keeps the trail. `title` is the original thought id

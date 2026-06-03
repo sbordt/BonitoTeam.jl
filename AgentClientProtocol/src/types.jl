@@ -61,6 +61,15 @@ struct ToolCallNotif <: SessionUpdate
     status::String     # "pending" | "in_progress" | "completed" | "failed"
     content::Vector    # Vector of ContentBlock | DiffContent
     locations::Vector{ToolCallLocation}
+    # claude-agent-acp surfaces the *actual* tool name and the unparsed input
+    # via `_meta.claudeCode.toolName` and `rawInput` on the wire — the parser
+    # reads them out so downstream consumers can dispatch on concrete typed
+    # `ToolCall`s (`BashCall` / `TodoWriteCall` / …) instead of probing the
+    # generic `title` string. Empty `tool_name` means a non-claude-agent
+    # backend that didn't fill the meta hint; the dispatcher falls back to
+    # `GenericTool`.
+    tool_name::String
+    raw_input::Dict{String,Any}
     raw::AbstractDict  # untouched ACP update params (for round-trip persistence)
 end
 
@@ -71,6 +80,8 @@ struct ToolCallUpdateNotif <: SessionUpdate
     status::Union{String,Nothing}
     content::Vector
     locations::Vector{ToolCallLocation}
+    tool_name::Union{String,Nothing}
+    raw_input::Union{Dict{String,Any},Nothing}
     raw::AbstractDict
 end
 
@@ -105,6 +116,27 @@ function parse_location(d::AbstractDict)
     ToolCallLocation(get(d, "path", ""), get(d, "line", nothing))
 end
 
+# claude-agent-acp tags every tool_call(_update) with the real Claude Code
+# tool name + the raw argument dict via the `_meta.claudeCode` envelope. The
+# envelope is optional on the spec, so absence is fine — `parse_tool_call`
+# falls back to `GenericTool` when `tool_name` is empty.
+function parse_claude_meta(params::AbstractDict)
+    meta = get(params, "_meta", nothing)
+    name = ""
+    if meta isa AbstractDict
+        cc = get(meta, "claudeCode", nothing)
+        if cc isa AbstractDict
+            v = get(cc, "toolName", "")
+            v isa AbstractString && (name = String(v))
+        end
+    end
+    rinput = get(params, "rawInput", nothing)
+    rinput_d = rinput isa AbstractDict ?
+                 Dict{String,Any}(String(k) => v for (k, v) in rinput) :
+                 Dict{String,Any}()
+    return (name, rinput_d)
+end
+
 function parse_session_update(params::AbstractDict)::SessionUpdate
     kind = get(params, "sessionUpdate", "")
     if kind == "agent_message_chunk"
@@ -120,22 +152,29 @@ function parse_session_update(params::AbstractDict)::SessionUpdate
     elseif kind == "tool_call"
         content = [parse_tool_content_item(c) for c in get(params, "content", [])]
         locs = [parse_location(l) for l in get(params, "locations", [])]
+        name, rinput = parse_claude_meta(params)
         return ToolCallNotif(
             get(params, "toolCallId", ""),
             get(params, "title", ""),
             get(params, "kind", "other"),
             get(params, "status", "pending"),
-            content, locs, params
+            content, locs, name, rinput, params
         )
     elseif kind == "tool_call_update"
         content = [parse_tool_content_item(c) for c in get(params, "content", [])]
         locs = [parse_location(l) for l in get(params, "locations", [])]
+        name, rinput = parse_claude_meta(params)
+        # Updates often omit meta + rawInput — preserve `nothing` so the
+        # dispatcher knows "no new info" vs "agent renamed the tool".
         return ToolCallUpdateNotif(
             get(params, "toolCallId", ""),
             get(params, "title", nothing),
             get(params, "kind", nothing),
             get(params, "status", nothing),
-            content, locs, params
+            content, locs,
+            isempty(name) ? nothing : name,
+            isempty(rinput) ? nothing : rinput,
+            params
         )
     else
         return UnknownUpdate(kind, params)

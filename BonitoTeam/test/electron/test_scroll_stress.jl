@@ -149,7 +149,8 @@ try
     end
 
     function emit_tool(id, status)
-        tool = BonitoTeam.ToolMsg(id, "execute", "ls -la", status, "1 line")
+        tool = BonitoTeam.GenericToolMsg(id, "execute", "ls -la", status, "1 line",
+                                         0.0, 0.0, nothing)
         push!(chat.msgs_store, tool)
         d = BonitoTeam.msg_to_dict(tool, chat.chat_dir)
         d["n"] = length(chat.msgs_store)

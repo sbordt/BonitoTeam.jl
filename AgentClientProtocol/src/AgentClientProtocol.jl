@@ -16,6 +16,9 @@ export SessionUpdate, AgentMessageChunk, UserMessageChunk, AgentThoughtChunk
 export ToolCallNotif, ToolCallUpdateNotif, PlanUpdate, UnknownUpdate
 export TextContent, ImageContent, DiffContent, ToolCallLocation, PlanEntry
 export parse_tool_content_item, parse_session_update, parse_location
+# Typed tool-call family — downstream consumers dispatch on these instead of
+# probing strings on the generic ACP `tool.kind`.
+export ToolCall, GenericTool, BashCall, TodoWriteCall, TaskCall, MCPCall
 
 # `send`, `recv`, `on_request` are dispatched verbs that callers overload on
 # their concrete Transport / Handler types. Intentionally NOT exported — `send`

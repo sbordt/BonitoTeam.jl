@@ -26,7 +26,7 @@ mkchat()   = BT.ChatModel(newstate(), mktempdir();
 
 am(t)  = ACP.AgentMessage(t)
 um(t)  = ACP.UserMessage(t)
-tcall(id; status="completed") = ACP.ToolCall(id, "read", "cat", status,
+tcall(id; status="completed") = ACP.GenericTool(id, "read", "cat", status,
     ACP.ToolContent[ACP.TextContent("contents of $id")], Channel{ACP.ToolCall}(1))
 
 # A MockTransport on_setup that answers `session/load` by streaming `frames`
@@ -82,7 +82,7 @@ end
     @testset "reconcile: empty chat.md adopts the whole replay (import)" begin
         m = mkchat()
         BT.reconcile_replay!(m, ACP.Message[um("hello"), am("hi there"), tcall("t1")])
-        @test [string(nameof(typeof(x))) for x in m.msgs_store] == ["UserMsg","AgentMsg","ToolMsg"]
+        @test [string(nameof(typeof(x))) for x in m.msgs_store] == ["UserMsg","AgentMsg","GenericToolMsg"]
         reloaded = BT.load_history(m.chat_session)          # round-trips through chat.md
         @test length(reloaded) == 3
         @test isfile(joinpath(m.chat_dir, "tools", "t1.json"))   # tool content persisted

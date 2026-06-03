@@ -898,14 +898,23 @@ Base.close(m::ToolMsg) = (m.status in ("completed", "failed") && append_tool(m.c
 Base.close(m::SummaryMsg) = (ensure_html!(m); append_summary(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
 
 # ── Wire-dict builders (the browser protocol; byte-identical to before) ─────
-# CommonMark for rendering — Julia's stdlib `Markdown` doesn't follow the
-# CommonMark "intraword `_` doesn't trigger emphasis" rule, so `path/foo_bar_baz.jl`
-# came out as `path/foo<em>bar</em>baz.jl` (italic eats the underscores). The
-# parser is reused across calls; CommonMark.Parser is mutating but the parse +
-# write_html cycle leaves it in the same state each time.
-const MARKDOWN_PARSER = CM.Parser()
+# CommonMark for rendering — `Bonito.bonito_parser()` already turns on the
+# extensions we want (TableRule, FootnoteRule, DollarMath, Admonition,
+# Strikethrough, RawContent, AttributeRule), so we share its config instead
+# of maintaining a parallel `enable!` list here. The bare stdlib `Markdown`
+# / `CM.Parser()` paths were both wrong: stdlib `Markdown` italicizes
+# intraword `_` (`foo_bar_baz` → `foo<em>bar</em>baz`); a bare `CM.Parser()`
+# fixes that but drops tables on the floor (they came out as literal `|`).
+# The parser is reused across calls; CommonMark.Parser is mutating but the
+# parse + write_html cycle leaves it in the same state each time.
+const MARKDOWN_PARSER = Bonito.bonito_parser()
+# Wrap the rendered html in `.markdown-body` so `Bonito.MarkdownCSS` (which
+# is GitHub-style and already loaded into the shell) handles tables, code
+# blocks, lists, etc. — we don't have to duplicate the styling.
 markdown_html(text::AbstractString) =
-    sprint(io -> CM.html(io, MARKDOWN_PARSER(String(text))))
+    "<div class=\"markdown-body\">" *
+    sprint(io -> CM.html(io, MARKDOWN_PARSER(String(text)))) *
+    "</div>"
 
 # "new message" event. Streaming-open shape for agent/thought (seeded with the
 # first chunk); plain shape for user/tool/plan. `send!` adds the `n` count.

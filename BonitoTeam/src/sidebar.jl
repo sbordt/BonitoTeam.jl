@@ -38,15 +38,22 @@ function project_color(id::AbstractString)
     return "hsl($(hue), 60%, 48%)"
 end
 
-# Renders one icon. `size_px` lets the sidebar reuse this at 32 px and the
-# project_card (if we want to surface it there too) at e.g. 24 px.
-function project_icon(p::ProjectInfo; size_px::Int = 32)
-    DOM.div(project_initials(p.name);
+# Renders one icon. The colour stays seeded by `p.id` (visually identifies
+# the project across surfaces); the *contents* default to the worker's
+# initials (`[DT]`-style — Desktop/HP Laptop/…) so the user reads from a
+# glance which machine hosts the chat. Pass `worker_tag = ""` to fall back
+# to the folder initials (used when a worker isn't connected). `size_px`
+# lets the sidebar reuse this at 32 px and the project_card at e.g. 24 px.
+function project_icon(p::ProjectInfo, worker_tag::AbstractString = "";
+                       size_px::Int = 32)
+    label = isempty(worker_tag) ? project_initials(p.name) : String(worker_tag)
+    tip   = isempty(worker_tag) ? p.name : "$(worker_tag) · $(p.name)"
+    DOM.div(label;
         class = "bt-proj-icon",
         style = string("background:", project_color(p.id), ";",
                        "width:$(size_px)px;height:$(size_px)px;",
                        "line-height:$(size_px)px;font-size:$(round(Int, size_px*0.42))px"),
-        title = p.name)
+        title = tip)
 end
 
 # A single sidebar row: icon + label + identifying data-attribute. NO
@@ -57,13 +64,10 @@ end
 function sidebar_entry(label::AbstractString, icon::Bonito.Node,
                         target_value::AbstractString, title::AbstractString;
                         active::Bool = false, closeable::Bool = false,
-                        extra_class::AbstractString = "",
-                        tag::AbstractString = "")
-    kids = Any[icon]
-    # `[WW]` worker-initials pill rendered as a separate span so the title can
-    # ellipsize / wrap independently. Empty tag → no pill (e.g. Home entry).
-    isempty(tag) || push!(kids, DOM.span("[$tag]"; class = "bt-side-tag"))
-    push!(kids, DOM.span(label; class = "bt-side-name"))
+                        extra_class::AbstractString = "")
+    # The icon now carries the worker initials (project_icon does the
+    # styling); the title span only needs the chat title text.
+    kids = Any[icon, DOM.span(label; class = "bt-side-name")]
     # A ✕ to close (stop) an active chat. Plain markup — the delegated
     # handler on the aside reads `.bt-side-close` and routes to close_trigger
     # rather than current_view, so no per-entry Observable is interpolated
@@ -207,9 +211,8 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             label = base_counts[b] > 1 ? "$b · $(thread_tag(p))" : b
             tooltip = "[$t] $label · folder: $(p.name)"
             push!(entries,
-                  sidebar_entry(label, project_icon(p), p.id, tooltip;
-                                active = active_pid == p.id, closeable = true,
-                                tag = t))
+                  sidebar_entry(label, project_icon(p, t), p.id, tooltip;
+                                active = active_pid == p.id, closeable = true))
         end
         if !isempty(resumable_projs)
             push!(entries, DOM.div("Running on worker"; class = "bt-side-section"))
@@ -220,11 +223,10 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
                 # Clicking pulls them up the normal way (current_view = pid),
                 # which `ensure_project_session!` resolves to a session/load resume.
                 push!(entries,
-                      sidebar_entry(b, project_icon(p), p.id, tooltip;
+                      sidebar_entry(b, project_icon(p, t), p.id, tooltip;
                                     active = active_pid == p.id,
                                     closeable = false,
-                                    extra_class = "bt-side-resumable",
-                                    tag = t))
+                                    extra_class = "bt-side-resumable"))
             end
         end
         isempty(open_projs) && isempty(resumable_projs) && push!(entries,
@@ -372,25 +374,6 @@ const SidebarStyles = Bonito.Styles(
         "overflow" => "hidden",
         "overflow-wrap" => "anywhere",
         "text-overflow" => "ellipsis"),
-    # `[WW]` worker-initials pill rendered in front of the title. Same shape
-    # / typography as the editable input in WorkerCard so the user sees the
-    # same chip everywhere a worker shows up.
-    CSS(".bt-side-tag",
-        "font-family" => "ui-monospace, monospace",
-        "font-size" => "10px", "font-weight" => "600",
-        "color" => "var(--bt-text-muted)",
-        "letter-spacing" => "0.04em",
-        "background" => "var(--bt-surface-2)",
-        "border" => "1px solid var(--bt-border)",
-        "padding" => "1px 5px",
-        "border-radius" => "999px",
-        "align-self" => "flex-start",
-        "flex-shrink" => "0",
-        "user-select" => "none"),
-    # Active row: the tag is more contrasted so the row reads as the current chat.
-    CSS(".bt-side-active .bt-side-tag",
-        "color" => "var(--bt-text)",
-        "background" => "var(--bt-surface)"),
     # Close (✕) on an active-chat row: reveal on row hover, red on its own hover.
     CSS(".bt-side-close",
         "margin-left" => "auto", "flex-shrink" => "0",

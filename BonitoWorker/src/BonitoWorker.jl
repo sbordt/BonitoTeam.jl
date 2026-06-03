@@ -126,6 +126,12 @@ function friendly_hostname()
         end
     end
     isempty(name) && (name = gethostname())
+    # `localhost` is the universal placeholder, not a useful display name —
+    # treat it as empty so callers (`default_worker_name`, `dev_server`)
+    # can fall through to user-id derivation. Otherwise every freshly
+    # installed Linux box ends up registering as "localhost" on the
+    # dashboard.
+    lowercase(String(name)) == "localhost" && (name = "")
     return String(name)
 end
 

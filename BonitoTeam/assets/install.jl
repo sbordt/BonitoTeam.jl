@@ -19,13 +19,17 @@
 import Pkg
 
 const REPO   = "https://github.com/SimonDanisch/BonitoTeam.jl"
-const REV    = "main"
+# Templated by the server (`render_install_script`) to whatever branch /
+# tag / sha the server is itself running from — so a dev iterating on a
+# feature branch can `curl … | sh` workers onto the same code without
+# users needing to know its name. See server.jl :: current_repo_rev.
+const REV    = "{{REV}}"
 const SERVER = "{{SERVER_URL}}"
 const SECRET = "{{WORKER_SECRET}}"
 
 # Guard against running the raw template (the `{{ }}` are intact only if this
 # file wasn't fetched through the server's rendering route).
-if startswith(SERVER, "{{") || startswith(SECRET, "{{")
+if startswith(SERVER, "{{") || startswith(SECRET, "{{") || startswith(REV, "{{")
     error("install.jl must be fetched from a running BonitoTeam server: " *
           "`curl -fsSL <server-url>/install.jl | julia -`")
 end

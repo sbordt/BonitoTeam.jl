@@ -124,15 +124,60 @@ function add_install_routes!(srv::Bonito.Server, public_url::String, worker_secr
     end)
 end
 
-# Substitute the server URL + shared secret into a templated install script.
-# install.jl guards against being run with the `{{ }}` placeholders intact, so
-# a raw fetch of any asset (bypassing these routes) fails loudly.
+# Substitute the server URL + shared secret + git rev into a templated install
+# script. install.jl guards against being run with the `{{ }}` placeholders
+# intact, so a raw fetch of any asset (bypassing these routes) fails loudly.
 function render_install_script(template::AbstractString,
                                  public_url::String, worker_secret::String)
     replace(template,
         "{{SERVER_URL}}"    => public_url,
         "{{WORKER_SECRET}}" => worker_secret,
+        "{{REV}}"           => current_repo_rev(),
     )
+end
+
+"""
+    current_repo_rev() -> String
+
+Branch (or sha) the server is currently running from, used to template the
+worker `install.jl` so a fresh `curl … | sh` lands the workers on the exact
+same revision the server is serving. Lets a dev iterate on a feature branch
+without users needing to know its name — they just re-run the curl one-liner.
+
+Resolves in order:
+
+  1. `BONITOTEAM_INSTALL_REV` env var (escape hatch for ops who want to pin
+     workers to a stable tag while running the server from `main`).
+  2. The monorepo's checked-out branch (best-effort via `git rev-parse
+     --abbrev-ref HEAD`; falls back to the exact sha when the repo is in
+     detached-HEAD state).
+  3. Fallback `"main"` if we can't locate the monorepo (e.g. the package
+     was installed via `Pkg.add` from the registry — no git working tree).
+
+Called per request so a `git checkout` on the server side propagates to the
+next worker install without restarting.
+"""
+function current_repo_rev()
+    override = get(ENV, "BONITOTEAM_INSTALL_REV", "")
+    isempty(override) || return override
+
+    pkg = pkgdir(@__MODULE__)
+    pkg === nothing && return "main"
+    # `pkgdir` returns `<monorepo>/BonitoTeam`; the monorepo (where `.git`
+    # lives) is one level up. `.git` may be a directory (normal clone) or a
+    # file (submodule / worktree); both count.
+    repo_root = abspath(pkg, "..")
+    ispath(joinpath(repo_root, ".git")) || return "main"
+    try
+        branch = strip(read(`git -C $repo_root rev-parse --abbrev-ref HEAD`, String))
+        # Detached HEAD ⇒ `git rev-parse --abbrev-ref` prints "HEAD"; fall
+        # back to the exact sha so workers still land on the same code.
+        branch == "HEAD" && return strip(read(`git -C $repo_root rev-parse HEAD`, String))
+        return String(branch)
+    catch e
+        @debug "current_repo_rev: git resolve failed; defaulting to main" exception=e
+        return "main"
+    end
 end
 
 # WebSocket routes (worker-side connection terminus). Each closure captures

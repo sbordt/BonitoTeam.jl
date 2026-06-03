@@ -198,7 +198,10 @@ class BonitoChat {
 
         // Image attachments (paste / drag-drop). Wired AFTER the input area
         // is in the DOM, on a microtask so .bt-app's children are queryable.
-        Promise.resolve().then(() => this._setupInputs());
+        Promise.resolve().then(() => {
+            this._setupInputs();
+            this._setupLiveTicker();
+        });
     }
 
     destroy() {
@@ -241,6 +244,13 @@ class BonitoChat {
             this._onDrop      && this.app.removeEventListener('drop',      this._onDrop);
         }
         clearTimeout(this._attachErrorTimer);
+        if (this._tickerId) {
+            clearInterval(this._tickerId);
+            this._tickerId = null;
+        }
+        if (this.taskbarEl && this._onTaskbarClick) {
+            this.taskbarEl.removeEventListener('click', this._onTaskbarClick);
+        }
     }
 
     // Single dispatch table. Julia sends `{type, ...}`; we route here.
@@ -271,6 +281,7 @@ class BonitoChat {
             case 'thought_final':return this.onThoughtFinal(msg);
             case 'thought.body': return this.onThoughtBody(msg);
             case 'tool_update':  return this.onToolUpdate(msg);
+            case 'plan_update':  return this.onPlanUpdate(msg);
             case 'chunk':        return this.appendChunk(msg);
             case 'user_chunk':   return this.appendUserChunk(msg.text);
             case 'user_unqueue': return this.unqueueOldestUser();
@@ -517,6 +528,14 @@ class BonitoChat {
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) { s.textContent = msg.status; s.className = `bt-tool-status bt-status-${msg.status}`; }
+            // Pulsing glow + taskbar slot are gated on the `bt-tool-live`
+            // class. Terminal status sheds it; mid-flight gets it.
+            const live = !(msg.status === 'completed' || msg.status === 'failed');
+            node.classList.toggle('bt-tool-live', live);
+        }
+        if (msg.finished_at != null) {
+            node.dataset.toolFinished = String(msg.finished_at);
+            node.classList.remove('bt-tool-live');
         }
         if (msg.title) {
             const t = node.querySelector('.bt-tool-title');
@@ -542,6 +561,10 @@ class BonitoChat {
         // bt_show: the completion update is when we learn it's a "show me this"
         // tool — auto-expand its preview (idempotent; user can still collapse).
         if (msg.expand && node.collapsable) node.collapsable.setExpanded(true);
+        // Live-set / timer / taskbar all sit on the same DOM data attrs the
+        // ticker reads — rebuild now so the taskbar reflects this change
+        // instantly instead of waiting for the next 1s tick.
+        this._refreshTaskbar();
     }
 
     // ── DOM node creation ────────────────────────────────────────────────
@@ -584,6 +607,18 @@ class BonitoChat {
             case 'tool': {
                 div.className = 'bt-tool-msg';
                 div.innerHTML = this.toolHTML(msg);
+                // Live state + start time live on the message node itself so
+                // the 1s ticker can find them by selector. Status `pending` /
+                // `in_progress` count as live until a terminal update flips
+                // the class via `onToolUpdate`.
+                if (msg.id) div.dataset.msgId = msg.id;
+                if (msg.started_at != null)
+                    div.dataset.toolStarted = String(msg.started_at);
+                if (msg.finished_at != null)
+                    div.dataset.toolFinished = String(msg.finished_at);
+                const liveTool = !(msg.status === 'completed' || msg.status === 'failed') &&
+                                  msg.finished_at == null;
+                if (liveTool) div.classList.add('bt-tool-live');
                 const id = msg.id;
                 // Click-header host; the body is re-rendered (Monaco etc.) on
                 // every expand via tool.render → dom_in_js, and discarded on
@@ -612,10 +647,22 @@ class BonitoChat {
                 if (msg.expand) queueMicrotask(() => div.collapsable.setExpanded(true));
                 break;
             }
-            case 'plan':
+            case 'plan': {
                 div.className = 'bt-plan-msg';
                 div.innerHTML = msg.html || '';
+                // TodoListMsg absorbs subsequent updates by id — every later
+                // emit overwrites the same node's html. The live flag (and
+                // started_at) drive the pulse + taskbar slot.
+                if (msg.id) div.dataset.msgId = msg.id;
+                if (msg.started_at != null)
+                    div.dataset.planStarted = String(msg.started_at);
+                if (msg.finished_at != null)
+                    div.dataset.planFinished = String(msg.finished_at);
+                if (msg.summary)
+                    div.dataset.planSummary = msg.summary;
+                if (msg.live) div.classList.add('bt-plan-live');
                 break;
+            }
             case 'summary': {
                 // Centered separator block for a `/compact` summary — NOT a
                 // user/agent bubble. Streaming case shows a tiny placeholder
@@ -669,6 +716,9 @@ class BonitoChat {
         // badge before the (already prefix-stripped) tool name.
         const server = msg.server ?
             `<span class="bt-tool-server">${escapeHTML(msg.server)}</span>` : '';
+        // Elapsed timer — only renders text once > 1s have passed (see
+        // _tickLiveTimers). Always emitted so the same span can be updated
+        // in place by every tick + by `onToolUpdate`.
         return `
             <div class="bt-tool-header" data-expanded="false">
                 <span class="bt-tool-toggle">▶</span>
@@ -676,12 +726,123 @@ class BonitoChat {
                 ${server}
                 <span class="bt-tool-title">${escapeHTML(msg.title || '')}</span>
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
+                <span class="bt-tool-timer"></span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
                 <button class="bt-tool-wide" type="button"
                         title="Expand to full chat width">⤢</button>
             </div>
             ${preview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
+    }
+
+    // ── Live tools / todos: pulse + timer + taskbar ──────────────────────
+    // A single 1s interval drives all live-state UX:
+    //   1) Update the inline `.bt-tool-timer` on each live pill (> 1s only).
+    //   2) Rebuild the floating taskbar from current live DOM (one slot per
+    //      live pill; click → scrollIntoView on the source).
+    // No per-pill timers, no server-pushed taskbar state — DOM is the source
+    // of truth. Cheap: scans at most a few dozen nodes once a second.
+    onPlanUpdate(msg) {
+        const node = this.nodeById.get(msg.id);
+        if (!node) return;
+        if (msg.html != null) node.innerHTML = msg.html;
+        if (msg.started_at != null)
+            node.dataset.planStarted = String(msg.started_at);
+        if (msg.finished_at != null) {
+            node.dataset.planFinished = String(msg.finished_at);
+            node.classList.remove('bt-plan-live');
+        } else if (msg.live === false) {
+            node.classList.remove('bt-plan-live');
+        } else if (msg.live === true) {
+            node.classList.add('bt-plan-live');
+        }
+        if (msg.summary) node.dataset.planSummary = msg.summary;
+        this._refreshTaskbar();
+    }
+
+    _setupLiveTicker() {
+        // The taskbar element is mounted by the Julia side as a sibling of
+        // `.bt-messages`. Bail gracefully if it's absent (older mount points
+        // / tests skipping the chat shell).
+        this.taskbarEl = this.app ?
+            this.app.querySelector('.bt-taskbar') :
+            this.container.parentElement.querySelector('.bt-taskbar');
+        if (!this.taskbarEl) return;
+        // Delegated click: hop to the source pill via scrollIntoView.
+        this._onTaskbarClick = (ev) => {
+            const slot = ev.target.closest('.bt-taskbar-slot');
+            if (!slot) return;
+            const id = slot.dataset.targetId;
+            if (!id) return;
+            const target = this.nodeById.get(id);
+            if (target) target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        };
+        this.taskbarEl.addEventListener('click', this._onTaskbarClick);
+        this._tickerId = setInterval(() => this._tickLiveTimers(), 1000);
+        // Initial paint so the bar is populated immediately on first mount
+        // (not after a 1s delay).
+        this._refreshTaskbar();
+    }
+
+    _tickLiveTimers() {
+        if (this.destroyed) return;
+        const now = Date.now() / 1000;
+        // Update inline timers on every live pill — both tools and todos.
+        for (const el of this.container.querySelectorAll(
+                'div.bt-tool-msg.bt-tool-live, div.bt-plan-msg.bt-plan-live')) {
+            const started = parseFloat(el.dataset.toolStarted ?? el.dataset.planStarted ?? '0');
+            if (!started) continue;
+            const elapsed = now - started;
+            const timer = el.querySelector('.bt-tool-timer');
+            if (timer) timer.textContent = elapsed > 1 ? _formatElapsed(elapsed) : '';
+        }
+        // Also tick the taskbar slot timers (cheaper than full rebuild).
+        for (const slot of this.taskbarEl.querySelectorAll('.bt-taskbar-slot')) {
+            const started = parseFloat(slot.dataset.started ?? '0');
+            if (!started) continue;
+            const elapsed = now - started;
+            const t = slot.querySelector('.bt-taskbar-slot-timer');
+            if (t) t.textContent = elapsed > 1 ? _formatElapsed(elapsed) : '';
+        }
+    }
+
+    _refreshTaskbar() {
+        if (this.destroyed || !this.taskbarEl) return;
+        // Collect live source nodes in document order: tool pills + todo
+        // pills. Pull the data we need to render a slot, then re-render.
+        const live = this.container.querySelectorAll(
+            'div.bt-tool-msg.bt-tool-live, div.bt-plan-msg.bt-plan-live');
+        if (live.length === 0) {
+            this.taskbarEl.replaceChildren();
+            return;
+        }
+        const frag = document.createDocumentFragment();
+        for (const el of live) {
+            const id = el.dataset.msgId;
+            if (!id) continue;
+            const isPlan = el.classList.contains('bt-plan-msg');
+            const icon = isPlan ? '📋' :
+                (el.querySelector('.bt-tool-kind')?.textContent || '⚙');
+            const label = isPlan ?
+                (el.dataset.planSummary || 'Todo list') :
+                (el.querySelector('.bt-tool-title')?.textContent || 'Tool');
+            const started = isPlan ? el.dataset.planStarted : el.dataset.toolStarted;
+            const slot = document.createElement('div');
+            slot.className = 'bt-taskbar-slot';
+            slot.dataset.targetId = id;
+            if (started) slot.dataset.started = started;
+            slot.innerHTML =
+                `<span class="bt-taskbar-slot-icon">${icon}</span>` +
+                `<span class="bt-taskbar-slot-label"></span>` +
+                `<span class="bt-taskbar-slot-timer"></span>` +
+                `<span class="bt-taskbar-slot-stop" title="Stop (coming soon)">⊗</span>`;
+            slot.querySelector('.bt-taskbar-slot-label').textContent = label;
+            frag.appendChild(slot);
+        }
+        this.taskbarEl.replaceChildren(frag);
+        // Prime the timers now so a freshly added slot doesn't wait a full
+        // tick to show its elapsed time.
+        this._tickLiveTimers();
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
@@ -1062,6 +1223,16 @@ function escapeHTML(str) {
 }
 function escapeAttr(str) {
     return escapeHTML(str).replace(/"/g, '&quot;');
+}
+
+// Compact elapsed-time formatting for the inline tool timer + taskbar slot.
+// `< 60s` shows seconds; minutes-and-up shows `<m>m<s>s`. Only callers that
+// have already crossed the 1s threshold reach here, so we never render "0s".
+function _formatElapsed(sec) {
+    if (sec < 60) return `${Math.round(sec)}s`;
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec - m * 60);
+    return s === 0 ? `${m}m` : `${m}m${s}s`;
 }
 
 // Chunked base64 encoder. `btoa(String.fromCharCode(...new Uint8Array(buf)))`

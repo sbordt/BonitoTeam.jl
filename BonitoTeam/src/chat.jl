@@ -309,8 +309,16 @@ TodoListMsg(chat::ChatModel, entries) =
 # ── Trait helpers ──────────────────────────────────────────────────────────
 # A live tool message is one whose `status` hasn't yet hit a terminal state.
 # The tool pill's pulsing glow + the taskbar slot both subscribe to this.
-is_live(m::ToolMsg) = !(m.status in ("completed", "failed"))
-is_live(t::TodoListMsg) = any(e -> e.status in ("pending", "in_progress"), t.entries)
+is_live(m::ToolMsg) =
+    m.finished_at === nothing && !(m.status in ("completed", "failed"))
+# `finished_at` always wins over entry inspection: if a turn ended with items
+# still flagged in_progress (claude forgot to mark them done), we stamp the
+# message done at the boundary — see `finalize_live_todos!`. We don't rewrite
+# the entries, because lying about claude's reported state in the UI is worse
+# than a stale "in_progress" tag on a no-longer-tracked message.
+is_live(t::TodoListMsg) =
+    t.finished_at === nothing &&
+    any(e -> e.status in ("pending", "in_progress"), t.entries)
 is_live(::ChatMsg) = false
 
 # A background-or-streamy task that deserves a taskbar slot. Default false;
@@ -524,7 +532,18 @@ function msg_to_dict(m::TodoListMsg, _chat_dir::AbstractString="")
     rows = join(["""<div class="bt-plan-entry">
         <span class="bt-plan-status">$(e.status == "completed" ? "✓" : e.status == "in_progress" ? "▶" : "○")</span>
         <span>$(e.content)</span></div>""" for e in m.entries])
-    Dict{String,Any}("type" => "plan", "id" => m.id, "html" => rows)
+    d = Dict{String,Any}("type" => "plan", "id" => m.id, "html" => rows,
+        "started_at" => m.started_at, "live" => is_live(m),
+        # Cheap label for the taskbar slot — "3/5 done" reads at a glance.
+        "summary" => todolist_summary(m.entries))
+    m.finished_at === nothing || (d["finished_at"] = m.finished_at)
+    return d
+end
+
+function todolist_summary(entries)
+    isempty(entries) && return "todos"
+    done = count(e -> e.status == "completed", entries)
+    return "$done/$(length(entries)) done"
 end
 
 # ── Edit preview ──────────────────────────────────────────────────────────────
@@ -1233,14 +1252,20 @@ function try_absorb_todo!(chat::ChatModel, new_entries)
     end
     target === nothing && return false
     target.entries = entries
+    is_live(target) || (target.finished_at = time())
     # Persist as a new chat.md plan section so a reload sees the latest state
     # (until we teach `load_history` to dedupe by `id`, this also keeps the
     # iteration trail visible on disk).
     target.chat === nothing || append_plan(target.chat.chat_session, target)
-    chat_emit(chat, msg_to_dict(target))      # JS keys by id — same bubble re-renders
-    is_live(target) || (target.finished_at = time())
+    # Emit a `plan_update` rather than a fresh `plan`: the JS dispatch keys
+    # the existing bubble by id and patches its html / live class / timer,
+    # instead of treating it as a new message arriving at the next index.
+    chat_emit(chat, plan_update_dict(target))
     return true
 end
+
+plan_update_dict(m::TodoListMsg) = merge(msg_to_dict(m),
+    Dict{String,Any}("type" => "plan_update"))
 
 # ── The chat consumer loop ──────────────────────────────────────────────────
 # ONE task per ChatModel drains `user_messages` and drives one prompt turn at a
@@ -1288,7 +1313,32 @@ function run_turn!(chat::ChatModel, user_msg::UserMessage)
             close(send!(chat, AgentMsg(chat, "[error: $(sprint(showerror, e))]")))
         end
     finally
+        finalize_live_todos!(chat)
         chat.busy_active[] = false
+    end
+    return nothing
+end
+
+# Stamp `finished_at` on every still-live `TodoListMsg` at turn end so a
+# claude that forgot to mark items done doesn't leave the bubble pulsing
+# forever (and doesn't block the next TodoWrite from starting a fresh list).
+# We deliberately don't rewrite the entries — claude's last reported per-item
+# status stays as-is. Only the message-level "is this still tracked?" flag
+# flips.
+function finalize_live_todos!(chat::ChatModel)
+    finalized = lock(chat.lock) do
+        list = TodoListMsg[]
+        for m in chat.msgs_store
+            m isa TodoListMsg || continue
+            is_live(m) || continue
+            m.finished_at = time()
+            push!(list, m)
+        end
+        list
+    end
+    isempty(finalized) && return
+    for m in finalized
+        chat_emit(chat, plan_update_dict(m))
     end
     return nothing
 end
@@ -2196,6 +2246,10 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         # Transient "reasoning…" indicator (toggled by the `thinking` comm event
         # in bonitoteam.js). Hidden until an agent thought is in flight.
         DOM.div("💭 reasoning…"; class="bt-thinking"),
+        # Taskbar — floats over the messages area, top-left of the chat panel.
+        # Populated entirely client-side by scanning live tool/todo pills (see
+        # `setupTaskbar` in bonitoteam.js); the server never tracks slot state.
+        DOM.div(class = "bt-taskbar"),
         chat_input_area(session, model),
         class="bt-app"))
 end

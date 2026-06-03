@@ -362,6 +362,99 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-status-failed",
         "background" => "rgba(239,68,68,0.12)", "color" => "#b91c1c"),
 
+    # ── Live tool/todo pulse ─────────────────────────────────────────────────
+    # Subtle box-shadow oscillation while a tool is mid-flight. Two layers:
+    # the rest-state shadow keeps `.bt-tool-msg`'s normal lift, the keyframes
+    # add a softly-pulsing ring on top. `prefers-reduced-motion` disables it
+    # for users who don't want movement.
+    CSS("@keyframes bt-pulse-glow",
+        CSS("0%, 100%",
+            "box-shadow" => "var(--bt-shadow-sm), 0 0 0 0 rgba(59,130,246,0.35)"),
+        CSS("50%",
+            "box-shadow" => "var(--bt-shadow-sm), 0 0 0 6px rgba(59,130,246,0.00)")),
+    CSS(".bt-tool-msg.bt-tool-live, .bt-plan-msg.bt-plan-live",
+        "animation" => "bt-pulse-glow 1.6s ease-in-out infinite",
+        "border-color" => "rgba(59,130,246,0.42)"),
+    CSS("@media (prefers-reduced-motion: reduce)",
+        CSS(".bt-tool-msg.bt-tool-live, .bt-plan-msg.bt-plan-live",
+            "animation" => "none")),
+
+    # ── Tool elapsed timer ───────────────────────────────────────────────────
+    # Small monospace span next to the status pill. JS sets `data-tool-started`
+    # on the bubble; a 1-second ticker writes `data-tool-elapsed-ms` and only
+    # renders text once we cross > 1s (so a fast Read never flashes "0s").
+    CSS(".bt-tool-timer",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "10.5px",
+        "color" => "var(--bt-text-muted)",
+        "flex-shrink" => "0",
+        "min-width" => "20px",
+        "text-align" => "right"),
+    CSS(".bt-tool-msg.bt-tool-live .bt-tool-timer",
+        "color" => "var(--bt-accent)"),
+
+    # ── Taskbar ──────────────────────────────────────────────────────────────
+    # Floats over the messages area, anchored top-left of the chat panel.
+    # `position: absolute` (NOT fixed and NOT sticky-in-scroll): it stays put
+    # relative to `.bt-app` while the messages scroll underneath, but doesn't
+    # poke out of the chat panel when other panels (sidebar, plotpane) resize.
+    # No background or border on the container — each slot is a free-floating
+    # capsule with its own surface, so multiple slots read as a stack rather
+    # than a bordered widget.
+    CSS(".bt-taskbar",
+        "position" => "absolute",
+        "top" => "8px", "left" => "8px",
+        "z-index" => "6",
+        "display" => "flex", "flex-direction" => "column",
+        "gap" => "6px",
+        "pointer-events" => "none",   # slots re-enable so we don't catch the messages scroll
+        "max-width" => "260px"),
+    CSS(".bt-taskbar:empty",
+        "display" => "none"),
+
+    # One slot per live tool/todo. Capsule shape, accent-tinted; click jumps
+    # back to the source bubble via scrollIntoView (set in bonitoteam.js).
+    CSS(".bt-taskbar-slot",
+        "pointer-events" => "auto",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "padding" => "4px 10px",
+        "border-radius" => "999px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid rgba(59,130,246,0.42)",
+        "box-shadow" => "var(--bt-shadow-sm)",
+        "font-size" => "11.5px",
+        "color" => "var(--bt-text)",
+        "cursor" => "pointer",
+        "user-select" => "none",
+        "max-width" => "100%",
+        "white-space" => "nowrap",
+        "transition" => "background 80ms, transform 80ms"),
+    CSS(".bt-taskbar-slot:hover",
+        "background" => "var(--bt-surface-2)",
+        "transform" => "translateX(2px)"),
+    CSS(".bt-taskbar-slot-icon",
+        "flex-shrink" => "0", "font-size" => "13px"),
+    CSS(".bt-taskbar-slot-label",
+        "flex" => "1 1 auto", "min-width" => "0",
+        "overflow" => "hidden", "text-overflow" => "ellipsis"),
+    CSS(".bt-taskbar-slot-timer",
+        "flex-shrink" => "0",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "10.5px",
+        "color" => "var(--bt-accent)"),
+    # Stop button: hidden until we've wired the actual cancel action server-
+    # side. Once landed it'll show on hover; the slot's own click stays
+    # scroll-to-source.
+    CSS(".bt-taskbar-slot-stop",
+        "display" => "none",
+        "flex-shrink" => "0",
+        "color" => "var(--bt-text-faint)",
+        "border-radius" => "999px",
+        "padding" => "0 4px",
+        "cursor" => "pointer"),
+    CSS(".bt-taskbar-slot-stop:hover",
+        "color" => "var(--bt-error)"),
+
     CSS(".bt-tool-body",
         "padding" => "0 12px 10px",
         "border-top" => "1px solid var(--bt-border)"),

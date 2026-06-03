@@ -2024,9 +2024,16 @@ function dashboard_dom(state::ServerState;
         busy_start!(busy, title)
         @async begin
             try
+                # `start_session=false` so the registration finishes fast and we
+                # can flip `current_view` early — the chat bring-up itself
+                # (ensure_project_session!) is then driven by
+                # `project_loading_view`, which shows a full-panel spinner while
+                # it runs. Otherwise the user stares at the dashboard for ~10s
+                # of ACP `session/load` with only a tiny pill at the top.
                 p = create_project_from_worker!(state, w_name, path;
                     name = proj_name,
                     resume_session_id = resume_session_id,
+                    start_session = false,
                     progress = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[]      = ""
                 discover_state[] = ""

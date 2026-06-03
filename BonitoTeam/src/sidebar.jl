@@ -441,7 +441,12 @@ LoadingState() = LoadingState(Set{String}(), Dict{String,String}(), Observable("
 function project_loading_view(state::ServerState, pid::String,
                                current_view::Observable{String},
                                ls::LoadingState)
-    map(state.workers) do workers
+    # Wrap the reactive body in a DOM.div: unified_main's outer
+    # `map(current_view) do pid ... end` expects each branch to return a
+    # Node, not an Observable{Node}. Returning the bare `map(state.workers)`
+    # threw `MethodError: Cannot convert Observable{Node} to Node` and the
+    # loading view never appeared while the bring-up ran.
+    body = map(state.workers) do workers
         p = get(state.projects[], pid, nothing)
         p === nothing && return DOM.div("Unknown project: $pid";
                                         class = "bt-empty",
@@ -491,6 +496,7 @@ function project_loading_view(state::ServerState, pid::String,
                     class = "bt-loading-sub");
             class = "bt-loading")
     end
+    return DOM.div(body; class = "bt-loading-wrap")
 end
 
 # Render the main panel given the current view + the bonito session. Pulled

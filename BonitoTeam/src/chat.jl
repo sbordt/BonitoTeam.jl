@@ -311,11 +311,11 @@ TodoListMsg(chat::ChatModel, entries) =
 # The tool pill's pulsing glow + the taskbar slot both subscribe to this.
 is_live(m::ToolMsg) =
     m.finished_at === nothing && !(m.status in ("completed", "failed"))
-# `finished_at` always wins over entry inspection: if a turn ended with items
-# still flagged in_progress (claude forgot to mark them done), we stamp the
-# message done at the boundary — see `finalize_live_todos!`. We don't rewrite
-# the entries, because lying about claude's reported state in the UI is worse
-# than a stale "in_progress" tag on a no-longer-tracked message.
+# `finished_at` flips to non-nothing inside `try_absorb_todo!` once the
+# absorbed entries become all-done — `is_live` checking that field is what
+# lets the next TodoWrite start a fresh bubble instead of absorbing into
+# the just-finished list. While entries are still in flight we trust
+# claude's per-item status to drive the live decision.
 is_live(t::TodoListMsg) =
     t.finished_at === nothing &&
     any(e -> e.status in ("pending", "in_progress"), t.entries)
@@ -1037,8 +1037,15 @@ Base.append!(m::SummaryMsg, t::AbstractString) = (m.text *= t; m.html = ""; m)
 Base.close(m::AgentMsg) = (ensure_html!(m); finalize_agent(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
 Base.close(m::ThoughtMsg) = (append_thought(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
 Base.close(m::UserMsg) = (append_user(m.chat.chat_session, m); nothing)
+# Persist only. The previous version also stamped `finished_at = time()`,
+# which made every just-created TodoListMsg immediately stop being "live"
+# and broke cross-turn absorption (the next TodoWrite found the prior
+# bubble as not-live and spawned a fresh one — visible in the chat
+# history as a parallel stack of duplicate todo bubbles, each with its
+# own timer ticking). `finished_at` is now set exclusively by
+# `try_absorb_todo!` when the absorbed entries become all-done.
 Base.close(m::TodoListMsg) =
-    (m.finished_at = time(); append_plan(m.chat.chat_session, m); nothing)
+    (append_plan(m.chat.chat_session, m); nothing)
 function Base.close(m::ToolMsg)
     if m.status in ("completed", "failed")
         m.finished_at === nothing && (m.finished_at = time())
@@ -1316,32 +1323,7 @@ function run_turn!(chat::ChatModel, user_msg::UserMessage)
             close(send!(chat, AgentMsg(chat, "[error: $(sprint(showerror, e))]")))
         end
     finally
-        finalize_live_todos!(chat)
         chat.busy_active[] = false
-    end
-    return nothing
-end
-
-# Stamp `finished_at` on every still-live `TodoListMsg` at turn end so a
-# claude that forgot to mark items done doesn't leave the bubble pulsing
-# forever (and doesn't block the next TodoWrite from starting a fresh list).
-# We deliberately don't rewrite the entries — claude's last reported per-item
-# status stays as-is. Only the message-level "is this still tracked?" flag
-# flips.
-function finalize_live_todos!(chat::ChatModel)
-    finalized = lock(chat.lock) do
-        list = TodoListMsg[]
-        for m in chat.msgs_store
-            m isa TodoListMsg || continue
-            is_live(m) || continue
-            m.finished_at = time()
-            push!(list, m)
-        end
-        list
-    end
-    isempty(finalized) && return
-    for m in finalized
-        chat_emit(chat, plan_update_dict(m))
     end
     return nothing
 end

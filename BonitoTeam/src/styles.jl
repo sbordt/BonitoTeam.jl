@@ -442,16 +442,21 @@ const ChatStyles = Bonito.Styles(
         "font-family" => "ui-monospace, monospace",
         "font-size" => "10.5px",
         "color" => "var(--bt-accent)"),
-    # Stop button: hidden until we've wired the actual cancel action server-
-    # side. Once landed it'll show on hover; the slot's own click stays
-    # scroll-to-source.
+    # Stop affordance — visible on slot-hover. A click sends `stop_tool`
+    # over comm; `StopToolCommand` translates that into a synthetic user
+    # message asking Claude to stop the bash/task. Honest UX: the slot
+    # keeps pulsing until the tool reports terminal status (we don't lie
+    # with a "Stopping…" state that the SDK can't guarantee).
     CSS(".bt-taskbar-slot-stop",
-        "display" => "none",
+        "opacity" => "0",
         "flex-shrink" => "0",
         "color" => "var(--bt-text-faint)",
         "border-radius" => "999px",
         "padding" => "0 4px",
-        "cursor" => "pointer"),
+        "cursor" => "pointer",
+        "transition" => "opacity 80ms, color 80ms"),
+    CSS(".bt-taskbar-slot:hover .bt-taskbar-slot-stop",
+        "opacity" => "1"),
     CSS(".bt-taskbar-slot-stop:hover",
         "color" => "var(--bt-error)"),
 

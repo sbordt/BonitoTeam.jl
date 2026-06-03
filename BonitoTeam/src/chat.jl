@@ -463,6 +463,9 @@ function tool_header_dict(m::ToolMsg, chat_dir::AbstractString="")
         "status" => m.status,
         "summary" => m.summary,
         "started_at" => m.started_at,
+        # Only background-y tools deserve a taskbar slot. A regular Read in
+        # `in_progress` pulses briefly but doesn't crowd the taskbar.
+        "taskbar" => is_taskbar_item(m),
     )
     m.finished_at === nothing || (d["finished_at"] = m.finished_at)
     augment_header!(d, m, chat_dir)
@@ -1990,6 +1993,15 @@ end
 # turn (notification, non-blocking).
 struct CancelCommand <: ChatCommand end
 
+# Wire `{type: "stop_tool", id: "<tool_id>"}` — user clicked the ⊗ on a
+# taskbar slot. Background bash / Task run on the worker outside of any
+# ACP-defined cancel primitive (the SDK doesn't surface a KillShell tool;
+# only `TaskStop` exists). The handler routes per concrete `ToolMsg`
+# subtype — see `request_tool_stop!` below for the per-variant strategy.
+struct StopToolCommand <: ChatCommand
+    tool_id::String
+end
+
 # Used when `msg` doesn't match any known shape — handler is a no-op.
 # Lets `chat_dispatch!` stay total without `return` plumbing.
 struct UnknownCommand <: ChatCommand end
@@ -2012,6 +2024,9 @@ function parse_chat_command(msg::AbstractDict)::ChatCommand
             atts isa AbstractVector ? collect(atts) : Any[])
     elseif type == "cancel"
         return CancelCommand()
+    elseif type == "stop_tool"
+        id = String(get(msg, "id", ""))
+        return isempty(id) ? UnknownCommand() : StopToolCommand(id)
     end
     return UnknownCommand()
 end
@@ -2170,6 +2185,53 @@ function handle_command!(model::ChatModel, ::Any, ::CancelCommand)
             end
         end
     end
+    return nothing
+end
+
+# ── Stop background tool ───────────────────────────────────────────────────
+# Find the tool by id, then dispatch on its concrete subtype so each tool
+# family decides its own honest stop strategy. We deliberately don't fake
+# anything: the SDK has no `KillShell`, only `TaskStop` for subagents and
+# `BashOutput` polling for background bashes. So we route a synthetic user
+# message asking Claude to stop the thing — visible in the chat history,
+# honest about what the agent is being asked to do. The slot keeps pulsing
+# until the actual tool transitions to terminal status (no fake "Stopping…"
+# state that might never resolve).
+function handle_command!(model::ChatModel, ::Any, cmd::StopToolCommand)
+    isempty(cmd.tool_id) && return nothing
+    target = lock(model.lock) do
+        idx = findfirst(m -> m isa ToolMsg && m.id == cmd.tool_id, model.msgs_store)
+        idx === nothing ? nothing : model.msgs_store[idx]
+    end
+    target === nothing && return nothing
+    request_tool_stop!(model, target)
+    return nothing
+end
+
+# Per-variant: each tool kind we surface in the taskbar gets its own arm.
+# The default (`::ToolMsg`) is a no-op — we'd never have shown a slot for a
+# one-shot tool, so a stop click on it is the user clicking a transient UI
+# affordance after the tool already finished. Silent ignore is correct.
+request_tool_stop!(::ChatModel, ::ToolMsg) = nothing
+
+function request_tool_stop!(model::ChatModel, t::BashToolMsg)
+    t.is_background || return
+    cmd_snippet = isempty(t.command) ? t.title : t.command
+    text = "Please stop the background bash command immediately. " *
+           "Tool id: `$(t.id)`. Command: `$(cmd_snippet)`. " *
+           "Use the most direct mechanism the SDK provides; if none does, " *
+           "just acknowledge the cancellation so the chat reflects it."
+    send_message!(model, UserMsg(text))
+    return nothing
+end
+
+function request_tool_stop!(model::ChatModel, t::TaskToolMsg)
+    t.is_background || return
+    name_clause = t.task_name === nothing ? "" : " (name: `$(t.task_name)`)"
+    text = "Please stop the background task immediately. " *
+           "Tool id: `$(t.id)`$(name_clause). " *
+           "Call `TaskStop` with that id."
+    send_message!(model, UserMsg(text))
     return nothing
 end
 

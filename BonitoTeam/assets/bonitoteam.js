@@ -616,6 +616,9 @@ class BonitoChat {
                     div.dataset.toolStarted = String(msg.started_at);
                 if (msg.finished_at != null)
                     div.dataset.toolFinished = String(msg.finished_at);
+                // Server-decided opt-in for the taskbar slot. Background bash
+                // / Task land here; regular tools don't.
+                if (msg.taskbar) div.dataset.toolTaskbar = '1';
                 const liveTool = !(msg.status === 'completed' || msg.status === 'failed') &&
                                   msg.finished_at == null;
                 if (liveTool) div.classList.add('bt-tool-live');
@@ -768,8 +771,23 @@ class BonitoChat {
             this.app.querySelector('.bt-taskbar') :
             this.container.parentElement.querySelector('.bt-taskbar');
         if (!this.taskbarEl) return;
-        // Delegated click: hop to the source pill via scrollIntoView.
+        // Delegated click on the taskbar:
+        //   - hitting the ⊗ stop affordance → notify the server, which
+        //     dispatches per-tool via `StopToolCommand` (synthetic user
+        //     message asking Claude to stop the background tool — we don't
+        //     fake an immediate-stop UI because the SDK has no kill primitive
+        //     for background bash, so the slot keeps living until the tool
+        //     itself transitions to terminal status).
+        //   - anywhere else on the slot → scroll back to the source pill.
         this._onTaskbarClick = (ev) => {
+            const stopBtn = ev.target.closest('.bt-taskbar-slot-stop');
+            if (stopBtn) {
+                ev.stopPropagation();
+                const slot = stopBtn.closest('.bt-taskbar-slot');
+                const id = slot?.dataset.targetId;
+                if (id) this.comm.notify({ type: 'stop_tool', id });
+                return;
+            }
             const slot = ev.target.closest('.bt-taskbar-slot');
             if (!slot) return;
             const id = slot.dataset.targetId;
@@ -808,10 +826,13 @@ class BonitoChat {
 
     _refreshTaskbar() {
         if (this.destroyed || !this.taskbarEl) return;
-        // Collect live source nodes in document order: tool pills + todo
-        // pills. Pull the data we need to render a slot, then re-render.
+        // Collect live source nodes in document order: tool pills that
+        // opted into the taskbar (background bash / Task) plus every live
+        // todo list. The `[data-tool-taskbar]` filter mirrors the server-
+        // side `is_taskbar_item` decision — a regular live Read pulses
+        // briefly but doesn't crowd the bar.
         const live = this.container.querySelectorAll(
-            'div.bt-tool-msg.bt-tool-live, div.bt-plan-msg.bt-plan-live');
+            'div.bt-tool-msg.bt-tool-live[data-tool-taskbar], div.bt-plan-msg.bt-plan-live');
         if (live.length === 0) {
             this.taskbarEl.replaceChildren();
             return;
@@ -831,11 +852,15 @@ class BonitoChat {
             slot.className = 'bt-taskbar-slot';
             slot.dataset.targetId = id;
             if (started) slot.dataset.started = started;
+            // Todo lists are passive trackers — no SDK primitive to "stop"
+            // them. Only tool slots get the ⊗ affordance.
+            const stop = isPlan ? '' :
+                `<span class="bt-taskbar-slot-stop" title="Ask Claude to stop this">⊗</span>`;
             slot.innerHTML =
                 `<span class="bt-taskbar-slot-icon">${icon}</span>` +
                 `<span class="bt-taskbar-slot-label"></span>` +
                 `<span class="bt-taskbar-slot-timer"></span>` +
-                `<span class="bt-taskbar-slot-stop" title="Stop (coming soon)">⊗</span>`;
+                stop;
             slot.querySelector('.bt-taskbar-slot-label').textContent = label;
             frag.appendChild(slot);
         }

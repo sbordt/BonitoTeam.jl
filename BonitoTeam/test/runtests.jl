@@ -93,3 +93,5 @@ include("test_sidebar_resumable.jl")
 include("test_queued_messages.jl")
 
 include("test_cancel_escalation.jl")
+
+include("test_tool_messages.jl")

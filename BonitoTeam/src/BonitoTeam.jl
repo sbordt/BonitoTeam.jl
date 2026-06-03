@@ -17,6 +17,10 @@ using Dates
 using TOML
 using Base64
 using SHA
+# Used by `current_bonito_install_spec()` to parse `[sources]` out of the
+# active project file so the install.jl template ships workers the exact
+# Bonito url+rev the server is itself running. Stdlib — zero cost.
+import Pkg
 
 # CommonMark for the chat-message renderer. Used in `chat.jl :: markdown_html`
 # (strict CommonMark fixes Julia's stdlib bug where `foo_bar_baz` italicizes

@@ -129,10 +129,13 @@ end
 # intact, so a raw fetch of any asset (bypassing these routes) fails loudly.
 function render_install_script(template::AbstractString,
                                  public_url::String, worker_secret::String)
+    bonito_url, bonito_rev = current_bonito_install_spec()
     replace(template,
         "{{SERVER_URL}}"    => public_url,
         "{{WORKER_SECRET}}" => worker_secret,
         "{{REV}}"           => current_repo_rev(),
+        "{{BONITO_URL}}"    => bonito_url,
+        "{{BONITO_REV}}"    => bonito_rev,
     )
 end
 
@@ -167,16 +170,117 @@ function current_repo_rev()
     # lives) is one level up. `.git` may be a directory (normal clone) or a
     # file (submodule / worktree); both count.
     repo_root = abspath(pkg, "..")
-    ispath(joinpath(repo_root, ".git")) || return "main"
+    return _git_head_ref_of(repo_root, "main")
+end
+
+# Helper: best-effort `(branch | sha)` for a working-tree path. Returns
+# `default` when the path isn't a git checkout or git refuses to answer.
+function _git_head_ref_of(path::AbstractString, default::AbstractString)
+    ispath(joinpath(path, ".git")) || return default
     try
-        branch = strip(read(`git -C $repo_root rev-parse --abbrev-ref HEAD`, String))
-        # Detached HEAD ⇒ `git rev-parse --abbrev-ref` prints "HEAD"; fall
-        # back to the exact sha so workers still land on the same code.
-        branch == "HEAD" && return strip(read(`git -C $repo_root rev-parse HEAD`, String))
+        branch = strip(read(`git -C $path rev-parse --abbrev-ref HEAD`, String))
+        branch == "HEAD" && return strip(read(`git -C $path rev-parse HEAD`, String))
         return String(branch)
     catch e
-        @debug "current_repo_rev: git resolve failed; defaulting to main" exception=e
-        return "main"
+        @debug "_git_head_ref_of: git resolve failed" path exception=e
+        return default
+    end
+end
+
+"""
+    current_bonito_install_spec() -> (url::String, rev::String)
+
+The `(url, rev)` pair the worker should pin Bonito at, so the worker's eval
+sessions (which `BonitoMCP` proxies through) use the SAME Bonito version
+the server ships its dashboard with — without that, a fresh worker installed
+via `curl … | sh` resolves Bonito off the registry and the remote-app
+protocol (proxy frames, dial-back, `id_prefix`) drifts vs. the server's.
+
+Resolution order, mirroring `current_repo_rev`:
+
+  1. `BONITOTEAM_BONITO_URL` + `BONITOTEAM_BONITO_REV` env vars
+     (ops can pin workers to a published tag while the server itself
+     dev-tracks a path).
+  2. The active project's `[sources]` `Bonito = {url, rev}` literal
+     (the normal case when the monorepo's Project.toml pins a feature
+     branch).
+  3. `[sources]` `Bonito = {path = "..."}` (the dev case where Bonito is
+     dev'd next to the monorepo): walk into the path and derive
+     `url = remote.origin.url`, `rev = current branch | sha`. This is
+     what makes `git checkout` on the dev's Bonito propagate to workers.
+  4. Fallback `(github.com/SimonDanisch/Bonito.jl, "main")`.
+"""
+function current_bonito_install_spec()
+    url_env = get(ENV, "BONITOTEAM_BONITO_URL", "")
+    rev_env = get(ENV, "BONITOTEAM_BONITO_REV", "")
+    (!isempty(url_env) && !isempty(rev_env)) && return (url_env, rev_env)
+
+    default_url = "https://github.com/SimonDanisch/Bonito.jl.git"
+    default_rev = "main"
+    bonito_uuid = Base.UUID("824d6782-a2ef-11e9-3a09-e5662e0c26f8")
+
+    # 1. Project file `[sources]` literal — the common monorepo case.
+    project_file = Base.active_project()
+    if project_file !== nothing
+        try
+            proj = Pkg.Types.read_project(project_file)
+            src = get(proj.sources, "Bonito", nothing)
+            if src !== nothing && haskey(src, "url")
+                return (String(src["url"]),
+                        String(get(src, "rev", default_rev)))
+            elseif src !== nothing && haskey(src, "path")
+                p = String(src["path"])
+                abs_p = isabspath(p) ? p :
+                        normpath(joinpath(dirname(project_file), p))
+                got = _spec_from_git_path(abs_p, default_url, default_rev)
+                got === nothing || return got
+            end
+        catch e
+            @debug "current_bonito_install_spec: read_project failed" exception=e
+        end
+    end
+
+    # 2. Manifest's resolved Bonito entry. Covers two cases the `[sources]`
+    # path above misses: (a) the outer dev project Pkg.develop'd Bonito so
+    # there's no project-level `[sources]` block, only a path in the
+    # manifest; (b) Bonito is `Pkg.add`'d directly from a git url+rev (so
+    # `git_source` / `git_revision` come through populated). For path-tracked,
+    # walk the working tree the same way as the `[sources]` path branch.
+    try
+        deps = Pkg.dependencies()
+        if haskey(deps, bonito_uuid)
+            info = deps[bonito_uuid]
+            if info.git_source !== nothing && info.git_revision !== nothing
+                return (String(info.git_source), String(info.git_revision))
+            end
+            if info.is_tracking_path && info.source isa AbstractString
+                got = _spec_from_git_path(String(info.source),
+                                          default_url, default_rev)
+                got === nothing || return got
+            end
+        end
+    catch e
+        @debug "current_bonito_install_spec: dependencies probe failed" exception=e
+    end
+
+    return (default_url, default_rev)
+end
+
+# Resolve a working-tree path into a `(remote_url, branch_or_sha)` pair.
+# Returns `nothing` if the path isn't a usable git checkout — callers fall
+# back to their own defaults.
+function _spec_from_git_path(path::AbstractString,
+                              default_url::AbstractString,
+                              default_rev::AbstractString)
+    isdir(path) || return nothing
+    try
+        remote = strip(read(`git -C $path config --get remote.origin.url`, String))
+        rev    = _git_head_ref_of(path, default_rev)
+        url    = isempty(remote) ? default_url : String(remote)
+        return (url, rev)
+    catch e
+        @debug "_spec_from_git_path: probe failed" path exception=e
+        return nothing
     end
 end
 

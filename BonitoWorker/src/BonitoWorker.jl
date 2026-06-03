@@ -246,23 +246,65 @@ function enable_linger!()
 end
 
 # Stop a bare-detached worker if one is holding the pidfile, so a mode switch
-# (background → service) doesn't leave the old process fighting the new one over
-# the server registration. Unix only (the service path is Linux-only anyway).
-function stop_running_worker!()
+# (background → service) or a re-install with `code_changed=true` doesn't
+# leave the old process fighting the new one over the server registration.
+# Tries graceful first (SIGTERM / taskkill), waits up to 10 s for exit, then
+# escalates to SIGKILL / taskkill /F if the worker is wedged on something.
+# After this returns, the pidfile is gone and a fresh `start()` is safe.
+function stop_running_worker!(; grace::Real = 10.0)
     pid = read_pidfile()
     pid === nothing && return
-    if pid != getpid() && process_running(pid) === true
-        try
-            ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(15))   # SIGTERM
-        catch
-        end
-        for _ in 1:30
+    pid == getpid() && return
+    if process_running(pid) === true
+        signal_worker_graceful(pid)
+        deadline = time() + grace
+        while time() < deadline
             process_running(pid) === true || break
             sleep(0.1)
+        end
+        # Still alive? Escalate.
+        if process_running(pid) === true
+            @warn "BonitoWorker: graceful stop timed out; force-killing" pid grace
+            signal_worker_force(pid)
+            for _ in 1:30
+                process_running(pid) === true || break
+                sleep(0.1)
+            end
         end
     end
     rm(pidfile_path(); force = true)
     return
+end
+
+@static if Sys.iswindows()
+    # `taskkill` ships in every Windows install; PID-targeted form is the
+    # closest WinAPI-free analogue of `kill -TERM`. `/T` includes child
+    # processes, so a worker that spawned subagents takes them with it.
+    function signal_worker_graceful(pid::Integer)
+        try
+            run(pipeline(`taskkill /PID $(pid) /T`, devnull, devnull); wait = false)
+        catch
+        end
+    end
+    function signal_worker_force(pid::Integer)
+        try
+            run(pipeline(`taskkill /F /PID $(pid) /T`, devnull, devnull); wait = false)
+        catch
+        end
+    end
+else
+    function signal_worker_graceful(pid::Integer)
+        try
+            ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(15))   # SIGTERM
+        catch
+        end
+    end
+    function signal_worker_force(pid::Integer)
+        try
+            ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(9))    # SIGKILL
+        catch
+        end
+    end
 end
 
 """
@@ -279,7 +321,11 @@ enabled (boot) + running. Re-running is safe:
 catches template bumps, a new `julia` path, a different PATH, etc.
 """
 function install_service!(; projects_root::AbstractString = pwd(),
-                            memory_max::AbstractString = "85%")
+                            memory_max::AbstractString = "85%",
+                            # When the underlying Pkg env moved forward but
+                            # the unit text is unchanged, we still need to
+                            # bounce the service so it picks up new code.
+                            code_changed::Bool = true)
     systemd_user_available() ||
         error("BonitoWorker: systemctl --user not available; cannot install a service")
     mkpath(systemd_user_dir())
@@ -297,8 +343,13 @@ function install_service!(; projects_root::AbstractString = pwd(),
     end
     run(`systemctl --user enable $SERVICE_NAME`)
     enable_linger!()
-    # `restart` applies a changed unit; `start` is a no-op if already running.
-    run(`systemctl --user $(changed ? "restart" : "start") $SERVICE_NAME`)
+    # `restart` applies a changed unit OR new code (since the process keeps
+    # the old `using BonitoMCP` modules loaded until it exits). `start` is a
+    # no-op when the service is already running, which silently strands the
+    # user on old code on re-install. Treat code_changed the same as unit-
+    # changed for the bounce decision.
+    must_restart = changed || code_changed
+    run(`systemctl --user $(must_restart ? "restart" : "start") $SERVICE_NAME`)
     return path, changed
 end
 
@@ -385,13 +436,16 @@ end
 
 # Apply a chosen run mode. `:service` reconciles the unit (idempotent upgrade);
 # `:background` tears down any service then spawns the detached process.
-function apply_run_mode!(mode::Symbol; projects_root::AbstractString = pwd())
+function apply_run_mode!(mode::Symbol; projects_root::AbstractString = pwd(),
+                          code_changed::Bool = true)
     if mode === :service
-        path, changed = install_service!(; projects_root)
+        path, changed = install_service!(; projects_root, code_changed)
         return (; mode, path, changed)
     else
         uninstall_service!()          # ensure no service competes with the bg process
-        proc, logfile = spawn_worker()
+        # `code_changed=true` triggers a stop+respawn even if the live PID is
+        # still healthy — needed to reload new BonitoMCP/BonitoWorker code.
+        proc, logfile = spawn_worker(; force_restart = code_changed)
         return (; mode, proc, logfile)
     end
 end
@@ -412,7 +466,13 @@ for re-pointing an existing install at a different server (just re-run it).
 function install!(; server_url::String,
                     secret::String,
                     projects_root::String = pwd(),
-                    run_mode::Symbol = :prompt)
+                    run_mode::Symbol = :prompt,
+                    # Did the underlying Pkg env actually move forward (per
+                    # `install.jl`'s before/after tree-sha diff)? When `true`,
+                    # the running worker / service is restarted so the new
+                    # code is actually loaded — otherwise the user only sees
+                    # the new package version after a manual kill.
+                    code_changed::Bool = true)
     worker_id = load_or_generate_worker_id()
     config = Dict(
         "server_url"    => server_url,
@@ -425,7 +485,8 @@ function install!(; server_url::String,
     @info "BonitoWorker: wrote config" path=cfg server_url projects_root=config["projects_root"]
 
     mode = run_mode == :prompt ? choose_run_mode() : run_mode
-    result = apply_run_mode!(mode; projects_root = abspath(projects_root))
+    result = apply_run_mode!(mode; projects_root = abspath(projects_root),
+                              code_changed = code_changed)
     println()
     if mode === :service
         verb = result.changed ? (service_installed() ? "installed/updated" : "installed") : "already up to date"
@@ -446,18 +507,21 @@ function install!(; server_url::String,
     # Background mode.
     proc = result.proc
     if proc === nothing
-        # spawn_worker found a live worker and skipped — config was still
-        # rewritten above, so the running worker picks up the new server/secret
-        # on its next reconnect (or restart it to apply immediately).
+        # spawn_worker found a healthy live worker and code didn't change, so
+        # we left it running. The config WAS rewritten above (line 484), so the
+        # running worker picks up new server/secret on its next reconnect; only
+        # a different binary (julia path / Pkg env shift not covered by
+        # code_changed) needs the manual restart hint below.
         println("==> BonitoTeam worker already running (pid $(running_worker_pid()))")
         println("    config updated : ", cfg)
         println("    log            : ", result.logfile)
         println("    server         : ", server_url)
         println()
-        println("    The existing worker keeps running. To apply the new config now,")
-        println("    restart it:")
+        println("    Code is already up to date; the running worker picks up the new")
+        println("    server/secret on its next reconnect. If you need a hard restart")
+        println("    anyway:")
         println()
-        println("      pkill -f 'BonitoWorker.start' ; julia --project=@bonito-team -e \"using BonitoWorker; BonitoWorker.start()\"")
+        println("      julia --project=@bonito-team -e \"using BonitoWorker; BonitoWorker.stop_running_worker!(); BonitoWorker.start()\"")
         println()
         return result
     end
@@ -478,16 +542,27 @@ end
 # the installer (the `curl … | julia -` pipe exits as soon as install.jl
 # returns). `detach` makes the child independent of the parent process group on
 # every OS; stdout+stderr append to `worker.log` in the config dir.
-function spawn_worker()
+#
+# `force_restart=true` (set by the installer when the Pkg env actually moved
+# forward) stops the live worker first and then respawns — without this the
+# pidfile keeps a stale process alive after a `git pull`-style update, and the
+# user never sees the new code load. The PID-lock invariant is preserved:
+# `stop_running_worker!` waits for exit before we spawn the replacement.
+function spawn_worker(; force_restart::Bool = false)
     logfile = joinpath(config_dir(), "worker.log")
-    # Don't launch a duplicate on top of a live worker (re-running the installer
-    # is the common trigger). The child's own `start()` also guards via pidfile,
-    # but skipping the spawn here keeps the install output honest ("already
-    # running" instead of "started pid N" for a process that immediately exits).
     other = running_worker_pid()
     if other !== nothing
-        @info "BonitoWorker: worker already running; not spawning a duplicate" pid = other
-        return nothing, logfile
+        if force_restart
+            @info "BonitoWorker: stopping live worker to load updated code" pid = other
+            stop_running_worker!()
+        else
+            # Don't launch a duplicate on top of a healthy live worker — the
+            # child's own `start()` also guards via pidfile, but skipping the
+            # spawn here keeps the install output honest ("already running"
+            # instead of "started pid N" for a process that immediately exits).
+            @info "BonitoWorker: worker already running; not spawning a duplicate" pid = other
+            return nothing, logfile
+        end
     end
     project = something(Base.active_project(), "@bonito-team")
     cmd = `$(julia_bin()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`

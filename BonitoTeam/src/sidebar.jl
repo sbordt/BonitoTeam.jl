@@ -57,8 +57,13 @@ end
 function sidebar_entry(label::AbstractString, icon::Bonito.Node,
                         target_value::AbstractString, title::AbstractString;
                         active::Bool = false, closeable::Bool = false,
-                        extra_class::AbstractString = "")
-    kids = Any[icon, DOM.span(label; class = "bt-side-name")]
+                        extra_class::AbstractString = "",
+                        tag::AbstractString = "")
+    kids = Any[icon]
+    # `[WW]` worker-initials pill rendered as a separate span so the title can
+    # ellipsize / wrap independently. Empty tag → no pill (e.g. Home entry).
+    isempty(tag) || push!(kids, DOM.span("[$tag]"; class = "bt-side-tag"))
+    push!(kids, DOM.span(label; class = "bt-side-name"))
     # A ✕ to close (stop) an active chat. Plain markup — the delegated
     # handler on the aside reads `.bt-side-close` and routes to close_trigger
     # rather than current_view, so no per-entry Observable is interpolated
@@ -184,31 +189,42 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
 
         entries = Any[sidebar_entry("Home", home_icon, "", "Dashboard";
                                     active = active_pid == "")]
-        # Base label is "name · worker" (disambiguates same-named projects on
-        # different workers). When two OPEN threads share that base (sibling
-        # threads of one folder), append a short thread tag so the switcher
-        # rows are distinguishable.
-        base(p) = "$(p.name) · $(haskey(workers, p.worker_id) ? workers[p.worker_id].name : p.worker_id)"
+        # New label format: `[WW] <title>` where WW is the worker's editable
+        # initials and title is the (possibly auto-backfilled) chat title.
+        # The `[WW]` lives in its own span so the title can ellipsize / wrap
+        # over two lines without breaking the tag. Two siblings of the same
+        # folder still need a tail thread-tag to disambiguate when their
+        # titles coincide.
+        wtag(p) = haskey(workers, p.worker_id) ?
+                    worker_initials(workers[p.worker_id]) :
+                    derive_initials(p.worker_id)
+        base(p) = project_display_title(p)
         base_counts = Dict{String,Int}()
         for p in open_projs; base_counts[base(p)] = get(base_counts, base(p), 0) + 1; end
         for p in open_projs
+            t = wtag(p)
             b = base(p)
             label = base_counts[b] > 1 ? "$b · $(thread_tag(p))" : b
+            tooltip = "[$t] $label · folder: $(p.name)"
             push!(entries,
-                  sidebar_entry(label, project_icon(p), p.id, label;
-                                active = active_pid == p.id, closeable = true))
+                  sidebar_entry(label, project_icon(p), p.id, tooltip;
+                                active = active_pid == p.id, closeable = true,
+                                tag = t))
         end
         if !isempty(resumable_projs)
             push!(entries, DOM.div("Running on worker"; class = "bt-side-section"))
             for p in resumable_projs
+                t = wtag(p)
                 b = base(p)
+                tooltip = "[$t] $b · folder: $(p.name) · resumable"
                 # Clicking pulls them up the normal way (current_view = pid),
                 # which `ensure_project_session!` resolves to a session/load resume.
                 push!(entries,
-                      sidebar_entry(b, project_icon(p), p.id, "$b · resumable";
+                      sidebar_entry(b, project_icon(p), p.id, tooltip;
                                     active = active_pid == p.id,
                                     closeable = false,
-                                    extra_class = "bt-side-resumable"))
+                                    extra_class = "bt-side-resumable",
+                                    tag = t))
             end
         end
         isempty(open_projs) && isempty(resumable_projs) && push!(entries,
@@ -290,7 +306,9 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-list",
         "display" => "flex", "flex-direction" => "column", "gap" => "2px"),
     CSS(".bt-side-item",
-        "display" => "flex", "align-items" => "center", "gap" => "10px",
+        # `align-items: flex-start` keeps the icon at the top of two-line
+        # titles instead of jumping down to vertical-center the row.
+        "display" => "flex", "align-items" => "flex-start", "gap" => "8px",
         "padding" => "6px 10px",
         "cursor" => "pointer",
         "border-left" => "3px solid transparent",
@@ -339,10 +357,40 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-active .bt-side-home-icon img",
         "filter" => "invert(38%) sepia(86%) saturate(2400%) hue-rotate(212deg) brightness(99%) contrast(95%)"),
     CSS(".bt-side-name",
-        "font-size" => "13px",
+        "font-size" => "12px",
+        "line-height" => "1.3",
         "color" => "var(--bt-text)",
-        "white-space" => "nowrap", "overflow" => "hidden",
+        "min-width" => "0",
+        "flex" => "1 1 auto",
+        # Two-line clamp so a long auto-inferred title wraps cleanly without
+        # blowing up the row height. Newer Chromium / WebKit honour
+        # `-webkit-line-clamp`; fallback for the rare browser that doesn't is
+        # nowrap-with-ellipsis (so the row stays single-line at worst).
+        "display" => "-webkit-box",
+        "-webkit-box-orient" => "vertical",
+        "-webkit-line-clamp" => "2",
+        "overflow" => "hidden",
+        "overflow-wrap" => "anywhere",
         "text-overflow" => "ellipsis"),
+    # `[WW]` worker-initials pill rendered in front of the title. Same shape
+    # / typography as the editable input in WorkerCard so the user sees the
+    # same chip everywhere a worker shows up.
+    CSS(".bt-side-tag",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "10px", "font-weight" => "600",
+        "color" => "var(--bt-text-muted)",
+        "letter-spacing" => "0.04em",
+        "background" => "var(--bt-surface-2)",
+        "border" => "1px solid var(--bt-border)",
+        "padding" => "1px 5px",
+        "border-radius" => "999px",
+        "align-self" => "flex-start",
+        "flex-shrink" => "0",
+        "user-select" => "none"),
+    # Active row: the tag is more contrasted so the row reads as the current chat.
+    CSS(".bt-side-active .bt-side-tag",
+        "color" => "var(--bt-text)",
+        "background" => "var(--bt-surface)"),
     # Close (✕) on an active-chat row: reveal on row hover, red on its own hover.
     CSS(".bt-side-close",
         "margin-left" => "auto", "flex-shrink" => "0",

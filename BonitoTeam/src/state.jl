@@ -15,6 +15,10 @@ mutable struct WorkerInfo
     # or two installs that both default to "localhost", no longer collide.
     worker_id::String
     name::String                       # display name (mutable; user-renameable)
+    # Short tag (1–4 chars; emoji ok) shown as `[XX]` in chat/project labels
+    # so the user can tell at a glance which machine a chat lives on.
+    # `nothing` → derive from `name` via `derive_initials`.
+    initials::Union{String,Nothing}
     url::String                        # ws://host:port
     secret::String
     ssh_target::Union{String,Nothing}  # for ssh-based rsync: "user@host". nothing → local rsync
@@ -68,11 +72,25 @@ mutable struct ProjectInfo
     # to retype it. Cleared (and persisted as nothing) once the prompt has
     # been delivered, so a session restart doesn't re-fire.
     auto_prompt::Union{String,Nothing}
+    # Editable human-readable title for the chat, shown in the sidebar and
+    # project card. Auto-set from the first meaningful user prompt in
+    # `send_message!` if it's still `nothing`; a user edit pins it. `nothing`
+    # → the sidebar/card falls back to `name` (folder basename).
+    title::Union{String,Nothing}
 end
 
 ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_id, server_path, worker_path, created,
-                nothing, nothing, :unsynced, nothing, nothing, nothing)
+                nothing, nothing, :unsynced, nothing, nothing, nothing, nothing)
+
+# Back-compat positional WorkerInfo constructor — keeps the pre-`initials`
+# call shape working for tests / fixtures that build a WorkerInfo by hand.
+# New code that wants a custom tag uses the full 13-arg form (or sets
+# `.initials` directly).
+WorkerInfo(worker_id, name, url, secret, ssh_target, hostname, home,
+           mcp_path, mcp_args, projects_root, status, last_check) =
+    WorkerInfo(worker_id, name, nothing, url, secret, ssh_target, hostname, home,
+               mcp_path, mcp_args, projects_root, status, last_check)
 
 """
     ServerState
@@ -220,6 +238,35 @@ workers_file(s::ServerState)    = joinpath(s.state_dir, "workers.json")
 projects_file(s::ServerState)   = joinpath(s.state_dir, "projects.json")
 discovered_file(s::ServerState) = joinpath(s.state_dir, "discovered.json")
 
+"""
+    derive_initials(name) -> String
+
+Two-character tag derived from a worker's display name. `"Mini-Server"` →
+`"MS"`, `"HP Laptop"` → `"HL"`, `"desktop"` → `"DE"`. Used as the auto
+fallback when `WorkerInfo.initials` is `nothing`. Whitespace / `-` / `_`
+are treated as word separators; for a single word we take the first two
+non-space characters and uppercase them; if even that's empty we return
+`"??"` so something always renders.
+"""
+function derive_initials(name::AbstractString)
+    parts = filter(!isempty, split(String(name), r"[\s_\-]+"))
+    if length(parts) >= 2
+        return uppercase(string(first(parts[1]), first(parts[2])))
+    elseif length(parts) == 1
+        s = parts[1]
+        length(s) >= 2 ? uppercase(string(s[1:2])) : uppercase(s) * "?"
+    else
+        return "??"
+    end
+end
+
+worker_initials(w::WorkerInfo) =
+    w.initials === nothing || isempty(w.initials) ? derive_initials(w.name) :
+                                                    w.initials
+
+project_display_title(p::ProjectInfo) =
+    p.title === nothing || isempty(p.title) ? p.name : p.title
+
 # Setting an Observable propagates to the browser via Bonito's WebSocket;
 # if a session is broken (e.g. a stale tab whose hashed asset URLs went 404
 # after a redeploy), Bonito surfaces that as a JSException from the
@@ -295,7 +342,8 @@ end
 
 function save_workers!(s::ServerState)
     data = [Dict("worker_id" => w.worker_id,
-                 "name" => w.name, "url" => w.url, "secret" => w.secret,
+                 "name" => w.name, "initials" => w.initials,
+                 "url" => w.url, "secret" => w.secret,
                  "ssh_target" => w.ssh_target,
                  "hostname" => w.hostname, "home" => w.home,
                  "mcp_path" => w.mcp_path, "mcp_args" => w.mcp_args,
@@ -315,7 +363,11 @@ function load_workers!(s::ServerState)
             # the next worker reconnect will overwrite this with the real
             # UUID from the worker's hello frame.
             wid = String(get(d, "worker_id", d["name"]))
-            w = WorkerInfo(wid, d["name"], d["url"], d["secret"],
+            init_raw = get(d, "initials", nothing)
+            initials = (init_raw === nothing || (init_raw isa AbstractString && isempty(init_raw))) ?
+                       nothing : String(init_raw)
+            w = WorkerInfo(wid, d["name"], initials,
+                           d["url"], d["secret"],
                            get(d, "ssh_target", nothing),
                            get(d, "hostname", ""), get(d, "home", ""),
                            get(d, "mcp_path", ""),
@@ -339,7 +391,8 @@ function save_projects!(s::ServerState)
                  "backup_status" => string(p.backup_status === :syncing ? :stale : p.backup_status),
                  "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at),
                  "resume_session_id" => p.resume_session_id,
-                 "auto_prompt"   => p.auto_prompt)
+                 "auto_prompt"   => p.auto_prompt,
+                 "title"         => p.title)
             for p in values(s.projects[])]
     atomic_write_json(projects_file(s), data)
 end
@@ -367,6 +420,9 @@ function load_projects!(s::ServerState)
             ap = get(d, "auto_prompt", nothing)
             p.auto_prompt = (ap === nothing || isempty(String(ap))) ?
                                        nothing : String(ap)
+            ti = get(d, "title", nothing)
+            p.title = (ti === nothing || (ti isa AbstractString && isempty(ti))) ?
+                                       nothing : String(ti)
             s.projects[][p.id] = p
         catch e
             @warn "skipping malformed project entry" entry=d exception=e

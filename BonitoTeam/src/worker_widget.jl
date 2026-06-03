@@ -17,6 +17,7 @@ mutable struct WorkerCard
     trigger_scan     :: Function
     remote_picker    :: RemoteFolderPicker
     name_obs         :: Observable{String}
+    initials_obs     :: Observable{String}
 end
 
 function WorkerCard(state::ServerState, worker_id::AbstractString;
@@ -29,14 +30,17 @@ function WorkerCard(state::ServerState, worker_id::AbstractString;
                      import_path::Observable{Dict{String,Any}},
                      do_import::Function,
                      trigger_scan::Function)
-    initial_name = haskey(state.workers[], worker_id) ?
-                    state.workers[][worker_id].name : worker_id
+    w0 = get(state.workers[], worker_id, nothing)
+    initial_name     = w0 === nothing ? worker_id : w0.name
+    initial_initials = w0 === nothing ? derive_initials(worker_id) :
+                                        worker_initials(w0)
     WorkerCard(state, String(worker_id),
                 error_obs, picker_state, discover_state,
                 busy, discover_busy, discover_results, import_path,
                 do_import, trigger_scan,
                 RemoteFolderPicker(worker_id),
-                Observable(initial_name))
+                Observable(initial_name),
+                Observable(initial_initials))
 end
 
 Base.hash(c::WorkerCard, h::UInt) = hash(c.worker_id, hash(:WorkerCard, h))
@@ -93,6 +97,39 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
         end
     end
 
+    # `[DT]` tag — short worker initials shown next to every chat/project that
+    # lives on this worker. Up to 4 chars (room for a short emoji). Empty
+    # input clears the override and the UI falls back to derive_initials(name).
+    initials_input = DOM.input(
+        type      = "text",
+        value     = c.initials_obs,
+        maxlength = 4,
+        class     = "bt-card-initials bt-card-initials-edit",
+        title     = "Worker tag (1–4 chars, emoji ok) — shown as [XX] in chat labels",
+        onblur    = js"event => $(c.initials_obs).notify(event.target.value)",
+        onkeydown = js"""event => {
+            if (event.key === 'Enter')  { event.target.blur(); }
+            if (event.key === 'Escape') {
+                event.target.value = event.target.defaultValue;
+                event.target.blur();
+            }
+        }""")
+    on(c.initials_obs) do v
+        new = strip(String(v))
+        w_now = get(state.workers[], wid, nothing)
+        cur = w_now === nothing ? derive_initials(wid) : worker_initials(w_now)
+        new == cur && return
+        try
+            set_worker_initials!(state, wid, new)
+            # Snap the input to the canonical render (derived if cleared).
+            c.initials_obs[] = worker_initials(state.workers[][wid])
+            c.error_obs[]    = ""
+        catch e
+            c.error_obs[] = "Initials update failed: $(sprint(showerror, e))"
+            c.initials_obs[] = cur
+        end
+    end
+
     status_dot_obs = map(status_obs) do s
         status_dot(s)
     end
@@ -128,7 +165,8 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
         DOM.div(DOM.span("offline"; class = "bt-pill bt-pill-muted"); class = offline_class))
 
     card_body = DOM.div(
-        DOM.div(status_dot_obs, name_input, remove_btn; class = "bt-card-title"),
+        DOM.div(status_dot_obs, initials_input, name_input, remove_btn;
+                class = "bt-card-title"),
         DOM.div(subtitle_obs; class = "bt-card-meta", title = title_attr);
         class = "bt-card-body")
 

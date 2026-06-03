@@ -155,10 +155,16 @@ function handle_worker_control(state::ServerState, ws)
                                             "registered_as" => display_name,
                                             "worker_id"     => worker_id)))
 
-        # Build / refresh the WorkerInfo from the hello frame.
+        # Build / refresh the WorkerInfo from the hello frame. Preserve a
+        # user-set `initials` override across reconnects (the worker doesn't
+        # know about it; it lives entirely on the server side).
+        prev_initials = let existing = get(state.workers[], worker_id, nothing)
+            existing === nothing ? nothing : existing.initials
+        end
         w = WorkerInfo(
             worker_id,
             display_name,
+            prev_initials,
             "<inbound-ws>",          # we no longer dial the worker; URL is moot
             state.worker_secret,
             nothing,                 # ssh_target reserved for future rsync-over-ssh
@@ -315,6 +321,34 @@ function rename_worker!(state::ServerState, worker_id::AbstractString,
     save_workers!(state)
     safe_notify!(state.workers)
     return state.workers[][worker_id]
+end
+
+# Per-worker `[XX]` tag shown next to chat / project labels in the sidebar.
+# Empty string clears the override (the UI then falls back to
+# `derive_initials(name)`). Capped at 4 chars to leave room for short
+# emoji sequences but not freeform text — that's what `name` is for.
+function set_worker_initials!(state::ServerState, worker_id::AbstractString,
+                              new_initials::AbstractString)
+    haskey(state.workers[], worker_id) || error("Unknown worker_id: $worker_id")
+    s = strip(String(new_initials))
+    state.workers[][worker_id].initials = isempty(s) ? nothing :
+        (length(s) > 4 ? String(first(s, 4)) : String(s))
+    save_workers!(state)
+    safe_notify!(state.workers)
+    return state.workers[][worker_id]
+end
+
+# Project chat title — what `[WW] <title>` renders in the sidebar/card.
+# Empty string clears the override (the UI falls back to `p.name`, the
+# folder basename).
+function set_project_title!(state::ServerState, project_id::AbstractString,
+                            new_title::AbstractString)
+    haskey(state.projects[], project_id) || error("Unknown project_id: $project_id")
+    s = strip(String(new_title))
+    state.projects[][project_id].title = isempty(s) ? nothing : String(s)
+    save_projects!(state)
+    safe_notify!(state.projects)
+    return state.projects[][project_id]
 end
 
 """

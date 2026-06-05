@@ -200,7 +200,9 @@ function start_session(t::LocalTransport, handler::ACP.Handler;
                               Dict("cwd" => t.cwd,
                                    "mcpServers" => mcp_list_payload(t.mcp_servers)))
     # Local sessions are always fresh (`session/new`) — no resume, no replay.
-    return ACP.Client(conn, result["sessionId"], t.cwd), ACP.Message[]
+    # The raw result rides on the Client (session config: models/modes/…).
+    return ACP.Client(conn, result["sessionId"], t.cwd, ACP._result_dict(result)),
+           ACP.Message[]
 end
 
 # 2. Worker: ask the worker to spawn claude-agent-acp and dial back, then
@@ -244,22 +246,24 @@ function start_session(t::WorkerTransport, handler::ACP.Handler;
 
     # Resuming → `session/load`, during which the agent re-streams the session's
     # history as session/update notifications; `replay_history` captures them.
-    # Fresh → `session/new`, no replay.
-    session_id, replay = if t.resume_session_id !== nothing
+    # Fresh → `session/new`, no replay. Either way the response carries the
+    # session-config blocks (models/modes/configOptions) — keep it raw on the
+    # Client for typed views downstream.
+    session_id, replay, result = if t.resume_session_id !== nothing
         @info "ACP: resuming session" cwd=t.worker_path resume=t.resume_session_id
-        msgs = ACP.replay_history(conn, Dict(
+        msgs, load_result = ACP.replay_history(conn, Dict(
             "sessionId"  => t.resume_session_id,
             "cwd"        => t.worker_path,
             "mcpServers" => mcp_list,
         ))
-        t.resume_session_id, msgs
+        t.resume_session_id, msgs, load_result
     else
-        result = ACP.send_request(conn, "session/new",
+        new_result = ACP.send_request(conn, "session/new",
                                   Dict("cwd" => t.worker_path, "mcpServers" => mcp_list))
-        result["sessionId"], ACP.Message[]
+        new_result["sessionId"], ACP.Message[], new_result
     end
 
-    return ACP.Client(conn, session_id, t.worker_path), replay
+    return ACP.Client(conn, session_id, t.worker_path, ACP._result_dict(result)), replay
 end
 
 # 3. Mock: (re-)open the loopback channels, hand them to the test
@@ -276,5 +280,6 @@ function start_session(t::MockTransport, handler::ACP.Handler;
     ACP.send_request(conn, "initialize", Dict("protocolVersion" => 1))
     result = ACP.send_request(conn, "session/new",
                               Dict("cwd" => t.cwd, "mcpServers" => []))
-    return ACP.Client(conn, result["sessionId"], t.cwd), ACP.Message[]
+    return ACP.Client(conn, result["sessionId"], t.cwd, ACP._result_dict(result)),
+           ACP.Message[]
 end

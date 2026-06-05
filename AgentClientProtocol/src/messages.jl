@@ -105,6 +105,15 @@ struct Plan <: Message
     entries::Vector{PlanEntry}
 end
 
+# Session-config changes mid-turn. Metadata, not content: they don't open a
+# bubble and don't close the currently-streaming message.
+struct ConfigUpdate <: Message
+    options::Vector{ConfigOption}        # complete updated state (spec)
+end
+struct ModeUpdate <: Message
+    mode_id::String
+end
+
 # A fresh streaming message, seeded with its first chunk.
 AgentMessage(t::AbstractString) = AgentMessage(String(t), Channel{String}(BUF))
 Thought(t::AbstractString)      = Thought(String(t), Channel{String}(BUF))
@@ -141,6 +150,8 @@ function drain_message!(m::ToolCall)
     return m
 end
 drain_message!(m::Plan) = m
+drain_message!(m::ConfigUpdate) = m
+drain_message!(m::ModeUpdate) = m
 
 # ── Wire → typed dispatch ────────────────────────────────────────────────────
 # One place maps Claude Code's tool name to a concrete `ToolCall` subtype.
@@ -303,6 +314,12 @@ function parse_update!(out, st, u::PlanUpdate)
     put!(out, Plan(u.entries))
     return nothing
 end
+
+# Config/mode changes are session metadata, not turn content — deliver them
+# WITHOUT closing the currently-streaming text bubble (unlike tools/plans,
+# which are content boundaries).
+parse_update!(out, st, u::ConfigOptionUpdateNotif) = (put!(out, ConfigUpdate(u.options)); nothing)
+parse_update!(out, st, u::CurrentModeUpdateNotif)  = (put!(out, ModeUpdate(u.mode_id)); nothing)
 
 parse_update!(::Any, ::Any, ::SessionUpdate) = nothing   # UnknownUpdate: ignore, don't disturb the stream
 

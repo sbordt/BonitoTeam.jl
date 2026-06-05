@@ -71,6 +71,14 @@ mutable struct ChatModel
     # class to this, so no separate busy_start/busy_end comm events are needed.
     busy_active::Observable{Bool}
 
+    # Session metadata for the chat header: a heterogeneous list of TYPED
+    # items rendered by `header_pill` dispatch. Today: the agent's
+    # `ACP.ConfigOption`s (model / permission mode / effort) parsed from the
+    # session-setup result; future agents add their own item types + a
+    # `header_pill` method — the header skeleton never changes. Reset on every
+    # bring-up (`start_chat_client!`); ephemeral, never persisted.
+    session_meta::Observable{Vector{Any}}
+
     # The single `run_chat!` consumer task. Started once (guarded) by
     # `start_chat_client!`; survives `restart_chat_session!` (which only swaps
     # the ACP client, not the consumer). Shared across per-session views.
@@ -106,6 +114,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(true),
         Observable(""),
         Observable(false),          # busy_active
+        Observable(Any[]),          # session_meta
         Ref{Union{Task,Nothing}}(nothing),   # consumer_task
         nothing,                    # parent: this is the shared instance itself
     )
@@ -129,6 +138,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.session_alive),
             map(identity, session, m.last_error),
             map(identity, session, m.busy_active),
+            map(identity, session, m.session_meta),
             m.consumer_task,           # shared → only the parent runs the loop
             m,    # parent → the shared instance we copied from
         )
@@ -1193,6 +1203,28 @@ function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
     return nothing
 end
 
+# Session-config changes mid-turn: pure header metadata — update the shared
+# observable, no chat bubble, no persistence (config is ephemeral per
+# connection; the next bring-up resets it from the session-setup result).
+function process!(chat::ChatModel, m::AgentClientProtocol.ConfigUpdate)
+    s = shared(chat)
+    # The spec payload is the COMPLETE config state: replace the ConfigOption
+    # items, preserve any other meta kinds a future parser may have added.
+    rest = [x for x in s.session_meta[] if !(x isa AgentClientProtocol.ConfigOption)]
+    s.session_meta[] = Any[m.options..., rest...]
+    return nothing
+end
+
+function process!(chat::ChatModel, m::AgentClientProtocol.ModeUpdate)
+    s = shared(chat)
+    s.session_meta[] = Any[map(s.session_meta[]) do x
+        x isa AgentClientProtocol.ConfigOption && x.id == "mode" ?
+            AgentClientProtocol.ConfigOption(x.id, x.name, x.description,
+                x.category, m.mode_id, x.choices) : x
+    end...]
+    return nothing
+end
+
 to_message(chat::ChatModel, m::AgentClientProtocol.AgentMessage) = AgentMsg(chat, m.text)
 # Compact-summary "user" messages get their own centered kind. ACP doesn't carry
 # Claude Code's `isCompactSummary` flag, so we route on the verbatim opening.
@@ -1641,6 +1673,12 @@ function start_chat_client!(model::ChatModel)
     # chat_dir/acp.jsonl — inspectable live via GET /acp-log/<project_id>.
     client, replay = start_session(model.transport, handler;
                                    on_frame = acp_frame_logger(model.chat_dir))
+    # Header metadata: typed views over the raw session-setup result. A future
+    # agent kind extends this line with additional parsers over the same dict.
+    # (What the header SHOWS is a separate, display-side decision — see
+    # `show_in_header`.)
+    shared(model).session_meta[] =
+        Any[AgentClientProtocol.parse_config_options(client.session_result)...]
     model.client[] = client
     new_session_id = client.session_id
     if isempty(replay)
@@ -2006,6 +2044,50 @@ function reconcile_replay!(model::ChatModel, replay)
 end
 
 # ── DOM building (split into header / messages / input / banner) ──────────
+# ── Header metadata line ─────────────────────────────────────────────────────
+# One `header_pill` method per metadata kind in `session_meta` — future agents
+# add a struct + a method here, never touch the header skeleton. Display-only:
+# plain text spans (tooltip carries the full description), joined with " · "
+# on a second header line below the title/sync row.
+
+function pill_tooltip(o::AgentClientProtocol.ConfigOption)
+    c = AgentClientProtocol.current_choice(o)
+    c === nothing && return "$(o.name): $(o.current_value)"
+    isnothing(c.description) || isempty(c.description) ?
+        "$(o.name): $(c.name)" : "$(o.name): $(c.name) — $(c.description)"
+end
+
+# The model label ("Opus 4.7 with 1M context") is self-explanatory; the other
+# options need their name as a prefix to read well ("mode: Default").
+header_pill(o::AgentClientProtocol.ConfigOption) =
+    DOM.span(o.category == "model" ? AgentClientProtocol.pill_label(o) :
+             "$(lowercase(o.name)): $(AgentClientProtocol.pill_label(o))";
+        class = "bt-header-meta-item", title = pill_tooltip(o))
+# Fallback so an unknown meta kind degrades to its string form, not an error.
+header_pill(x) = DOM.span(string(x); class = "bt-header-meta-item")
+
+# Display policy: which meta items make it into the header line. Of claude's
+# config options only the MODEL is shown — the agent reports mode/effort as
+# unhelpful "default"s (and we won't fire extra RPCs just to fix a label).
+# All of them stay parsed on `session_meta` for future use; future meta kinds
+# default to visible.
+show_in_header(o::AgentClientProtocol.ConfigOption) = o.category == "model"
+show_in_header(::Any) = true
+
+# The most informative item (the model) leads the line.
+meta_order(x) = x isa AgentClientProtocol.ConfigOption && x.category == "model" ? 0 : 1
+
+function header_meta_line(items)
+    shown = sort(filter(show_in_header, collect(Any, items)); by = meta_order)
+    isempty(shown) && return DOM.span()
+    parts = Any[]
+    for (i, x) in enumerate(shown)
+        i > 1 && push!(parts, " · ")
+        push!(parts, header_pill(x))
+    end
+    DOM.div(parts...; class = "bt-header-meta")
+end
+
 function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state::Observable)
     state = model.state
     project_id = model.project_id
@@ -2015,6 +2097,11 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         DOM.span(""; class=alive ? "bt-dot bt-dot-online" : "bt-dot bt-dot-offline",
             title=alive ? "session live" : "session ended")
     end
+
+    # Session config (model / mode / effort …) as a plain-text second header
+    # line; re-renders whenever the agent reports a change (bring-up,
+    # config_option_update).
+    meta_line = map(header_meta_line, model.session_meta)
 
     sync_status = Observable("")
     sync_button = DOM.button(map(s -> isempty(s) ? "Sync" : s, sync_status);
@@ -2063,6 +2150,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     end
 
     # No back arrow — the unified app's sidebar Home icon is the way home.
+    # The session-config meta line renders as a second row BELOW the main one.
     DOM.div(
         DOM.div(
             status_dot,
@@ -2071,7 +2159,8 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
                 class="bt-header-title"),
             xsync_control,
             sync_button;
-            class="bt-header-row");
+            class="bt-header-row"),
+        meta_line;
         class="bt-header")
 end
 

@@ -46,8 +46,11 @@ const ChatStyles = Bonito.Styles(
     # ── Header ───────────────────────────────────────────────────────────────
     # Outer spans full width (border-bottom looks correct); inner row caps at
     # the same content width as messages/input on desktop.
+    # Column: the main title/sync row, plus an optional session-config meta
+    # line below it (see `header_meta_line`).
     CSS(".bt-header",
-        "display" => "flex", "justify-content" => "center",
+        "display" => "flex", "flex-direction" => "column",
+        "justify-content" => "center",
         "padding" => "10px 16px",
         "background" => "var(--bt-surface)",
         "border-bottom" => "1px solid var(--bt-border)",
@@ -100,6 +103,18 @@ const ChatStyles = Bonito.Styles(
         "transition" => "background 80ms"),
     CSS(".bt-header-sync:hover",
         "background" => "var(--bt-surface-2)"),
+    # ── Session-config meta line (model / mode / effort — `header_meta_line`).
+    # Plain muted text below the title row; items joined with " · ", full
+    # descriptions in the per-item tooltip.
+    CSS(".bt-header-meta",
+        "font-size" => "12px",
+        "color" => "var(--bt-text-muted)",
+        "margin-top" => "2px",
+        "white-space" => "nowrap",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis"),
+    CSS(".bt-header-meta-item",
+        "cursor" => "default"),
 
     # ── Status dot (online/offline/streaming) ────────────────────────────────
     CSS(".bt-dot",

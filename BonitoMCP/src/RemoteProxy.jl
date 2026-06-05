@@ -239,17 +239,52 @@ register_app!(id::AbstractString, app::Bonito.App) =
 Bonito.HTTPServer.route!(b::RemoteBridge, p::Pair{String, <:Bonito.App}) =
     (b.routes[p.first] = p.second; nothing)
 
-# Render a registered app into a FRESH subsession of the bridge parent and pack
-# its init bundle. `render_subsession` = `sub = Session(parent); session_dom(sub,
-# app)`; `init=false` keeps the bootstrap script out — the host calls
-# `init_session` with the returned `init_url` bundle from the embed's `jsrender`.
-function render_embed(b::RemoteBridge, app_id::AbstractString)
+# A fully-packed `(sub_id, html, init_url)` rendered at `bt_show_app` time, keyed
+# by app id, for the FIRST `delegate` to return verbatim — so the agent's app is
+# rendered exactly ONCE. Crucially the bundle is packed at prerender time (right
+# after the render, see `render_and_pack`), so it's byte-identical to what a
+# fresh delegate would produce — the browser mounts the SAME subsession from the
+# SAME bundle. Consumed by the first delegate.
+const PRERENDERED = Dict{String,Tuple{String,String,String}}()
+
+# Render an app into a fresh subsession and pack its init bundle ATOMICALLY: the
+# `get_messages!`/`BinaryAsset` must follow the render immediately, so the bundle
+# is exactly the render's output (draining later would sweep in any messages the
+# session emitted in between — e.g. a WGLMakie scene loop — and desync it).
+# Bonito's `handle_render_error` turns a throwing `jsrender`/`App` body into an
+# error-DOM but records the cause on `sub.init_error[]`; we re-raise it, which is
+# what makes a broken app's error PROPAGATE to the worker and to `bt_show_app`'s
+# caller instead of only painting into the browser. Returns (sub_id, html, init_url).
+function render_and_pack(b::RemoteBridge, app_id::AbstractString)
     app = b.routes.routes[String(app_id)]
     sub, dom = Bonito.render_subsession(b.parent, app; init = false)
+    err = sub.init_error[]
+    if err !== nothing
+        try; close(sub); catch; end
+        throw(err)
+    end
     html     = sprint(io -> show(io, dom))
     msgs     = Bonito.get_messages!(sub)
     init_url = Bonito.url(sub, Bonito.BinaryAsset(sub, msgs))
-    return sub.id, html, init_url
+    return String(sub.id), html, init_url
+end
+
+# Called by `bt_show_app` right after `register_app!`: render once, cache the
+# packed bundle for the first display, and surface any render error to the agent
+# now (re-raised by `render_and_pack`).
+function prerender_app(id::AbstractString)
+    b = BRIDGE[]
+    b === nothing && error("RemoteProxy bridge not installed")
+    PRERENDERED[String(id)] = render_and_pack(b, String(id))
+    return nothing
+end
+
+# Render a registered app and return its init bundle. The first call after a
+# `bt_show_app` returns the pre-rendered bundle (no second render); later calls
+# (a new tab, a re-expand) render fresh.
+function render_embed(b::RemoteBridge, app_id::AbstractString)
+    cached = pop!(PRERENDERED, String(app_id), nothing)
+    return cached === nothing ? render_and_pack(b, String(app_id)) : cached
 end
 
 end # module RemoteProxy

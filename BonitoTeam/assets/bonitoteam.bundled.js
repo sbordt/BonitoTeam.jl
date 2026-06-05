@@ -561,7 +561,7 @@ class BonitoChat {
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 <span class="bt-tool-timer"></span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
-                ${msg.has_app ? `<button class="bt-tool-detach" type="button"
+                ${msg.kind === 'bonito_app' ? `<button class="bt-tool-detach" type="button"
                               title="Detach to floating window">⤢</button>` : ''}
             </div>
             ${preview}

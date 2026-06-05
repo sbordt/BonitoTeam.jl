@@ -525,8 +525,10 @@ BonitoTeam-side convenience over the raw bridge.)
 function show_remote_app!(model::ChatModel, eb::EvalBridge, code::AbstractString; title::AbstractString="Interactive app")
     id = string(Bonito.uuid4())
     call_ctrl(eb, "register"; app = id, code = String(code))
-    send!(model, GenericToolMsg(id, "bonito_app", String(title), "completed",
-                                 "live app", time(), time(), nothing))
+    # The app is registered under `id`, which is also this message's id — so the
+    # typed `BonitoAppMsg` carries its app id intrinsically (app_id = id).
+    send!(model, BonitoAppMsg(id, "bonito_app", String(title), "completed",
+                              "live app", time(), time(), "", id, nothing))
     # auto-open the body (JS expands → ToolRenderCommand → render_tool_body)
     chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => id,
         "status" => "completed", "title" => title, "summary" => "live app", "expand" => true))

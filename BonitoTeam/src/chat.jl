@@ -225,6 +225,7 @@ Abstract supertype for one tool-call bubble in the chat. Concrete subtypes:
   • `BashToolMsg`    — Claude's Bash tool; carries `is_background`
   • `TaskToolMsg`    — subagent `Task` / `Agent` tool; carries `task_name`
   • `MCPToolMsg`     — `mcp__<server>__<tool>` calls (our `bt_*` tools, others)
+  • `BonitoAppMsg`   — a live worker Bonito app (`bt_show_app` / `show_remote_app!`)
 
 All variants share `id` / `kind` / `title` / `status` / `summary`, plus
 `started_at` / `finished_at` epoch seconds used by the tool-pill timer.
@@ -289,6 +290,31 @@ mutable struct MCPToolMsg <: ToolMsg
     finished_at::Union{Float64,Nothing}
     server::String                        # "bonitoteam" / "playwright" / …
     tool_name::String                     # bare name (without `mcp__<server>__`)
+    chat::Union{ChatModel,Nothing}
+end
+
+# A live worker Bonito app (its own type, NOT a generic/MCP tool — it renders an
+# interactive embed and offers Detach, see render_tool_body / augment_header!
+# below). Recognised at BUILD time from the tool NAME (`bt_show_app`) or KIND
+# (`bonito_app`, the programmatic `show_remote_app!` path) — never by sniffing
+# the persisted result content, which isn't on disk yet for a just-completed
+# live tool (that race is why the detach button vanished on fresh apps). The
+# registered app id is resolved lazily at render time (it lives in the result
+# content for `bt_show_app`, or is the tool id itself for `show_remote_app!`).
+mutable struct BonitoAppMsg <: ToolMsg
+    id::String
+    kind::String                          # always "bonito_app"
+    title::String
+    status::String
+    summary::String
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
+    server::String                        # MCP server badge ("" for programmatic)
+    # The id the worker registered the app under. `show_remote_app!` registers
+    # under the message id (so it's known immediately); `bt_show_app` returns it
+    # in its result, captured ONCE on completion. Empty ⇒ fall back to `id` at
+    # render. Render/header read this field — NEVER the content.
+    app_id::String
     chat::Union{ChatModel,Nothing}
 end
 
@@ -510,26 +536,25 @@ function augment_header!(d::Dict, m::MCPToolMsg, chat_dir::AbstractString)
     isempty(m.tool_name) || (d["title"]  = m.tool_name)
     augment_generic_header!(d, chat_dir)
 end
+# A live worker app. Its `kind` is already "bonito_app" (the JS gates the ⤢
+# detach button on that), and its body always auto-opens. Both come from the
+# TYPE — no content is read to decide either.
+function augment_header!(d::Dict, m::BonitoAppMsg, chat_dir::AbstractString)
+    isempty(m.server) || (d["server"] = m.server)
+    d["expand"] = true
+    return d
+end
 
-# `kind == "edit"` and bt_show auto-expand are shared across all ToolMsg
-# variants and depend on persisted on-disk content, so they live here once.
+# `kind == "edit"` preview + `bt_show` auto-expand are shared across the generic
+# tool variants and depend on persisted on-disk content, so they live here once.
 function augment_generic_header!(d::Dict, chat_dir::AbstractString)
     if d["kind"] == "edit" && !isempty(chat_dir)
         prev = render_edit_preview(chat_dir, d["id"])
         prev === nothing || (d["preview"] = prev)
     end
-    # `has_app` ⇒ this tool renders a live worker embed, so the header gets the
-    # ⤢ detach button. Mirror render_tool_body's two embed paths EXACTLY: a tool
-    # tagged `bonito_app` (show_remote_app!), or a `bt_show_app` tool that left a
-    # `shown_app:` reference in its content (`find_app_reference`). `expand` keeps
-    # its own (separate) marker via `has_show_reference`.
-    has_app = d["kind"] == "bonito_app"
-    if !isempty(chat_dir)
-        content = load_tool_content(chat_dir, d["id"])
-        has_show_reference(content) && (d["expand"] = true)
-        (has_app || find_app_reference(content) !== nothing) && (has_app = true)
-    end
-    has_app && (d["has_app"] = true)
+    isempty(chat_dir) ||
+        has_show_reference(load_tool_content(chat_dir, d["id"])) &&
+            (d["expand"] = true)
     return d
 end
 
@@ -941,21 +966,19 @@ function render_show_file(st::ShowTool)
     end
 end
 
+# A live worker app embeds against the per-tab Session via the placeholder's
+# jsrender (not loaded from disk). The registered app id lives on the message
+# (`app_id`, captured once on completion); empty ⇒ the app was registered under
+# the message id (`show_remote_app!`). No content is read here.
+render_tool_body(state::ServerState, m::BonitoAppMsg, cwd::AbstractString,
+    chat_dir::AbstractString=cwd; project_id::AbstractString="") =
+    wrap_for_detach(m.id, remote_app_placeholder(m.id, project_id,
+                                                 isempty(m.app_id) ? m.id : m.app_id))
+
 function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     chat_dir::AbstractString=cwd;
     project_id::AbstractString="")
-    # A live interactive worker app (see remote_app.jl): its body is embedded
-    # against the per-tab Session by the placeholder's jsrender, not loaded from
-    # disk. `show_remote_app!` tags the tool `bonito_app`; the agent's bt_show_app
-    # leaves a `shown_app:` reference in the content (handled after load below).
-    # `show_remote_app!` registered the app on the bridge under tool_id;
-    # `bt_show_app` registered it under a separate id we pick up below.
-    m.kind == "bonito_app" &&
-        return wrap_for_detach(m.id, remote_app_placeholder(m.id, project_id, m.id))
     content = load_tool_content(chat_dir, m.id)
-    app_id = find_app_reference(content)
-    app_id === nothing ||
-        return wrap_for_detach(m.id, remote_app_placeholder(m.id, project_id, app_id))
     isempty(content) &&
         return DOM.div("(no body — tool details not persisted for this entry)",
             class="bt-tool-empty")
@@ -1185,7 +1208,21 @@ to_message(chat::ChatModel, m::AgentClientProtocol.Plan)           = TodoListMsg
 
 # Concrete-typed builders for the four ToolMsg variants. Each one knows which
 # tool-specific fields to lift out of its ACP source.
+# `bt_show_app` (an MCP call) and any tool already tagged `bonito_app`
+# (`show_remote_app!`) are live worker apps — route them to `BonitoAppMsg`,
+# decided purely from the tool name / kind (no content sniffing).
+is_bonito_app(tc::AgentClientProtocol.MCPCall)     = tc.tool_name == "bt_show_app"
+is_bonito_app(tc::AgentClientProtocol.GenericTool) = tc.kind == "bonito_app"
+is_bonito_app(::AgentClientProtocol.ToolCall)      = false
+
+bonito_app_msg(tc, server, chat) =
+    BonitoAppMsg(tc.id, "bonito_app", tc.title, tc.status,
+                 content_summary("bonito_app", tc.content),
+                 time(), nothing, server,
+                 something(find_app_reference(tc.content), ""), chat)
+
 build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.GenericTool) =
+    is_bonito_app(tc) ? bonito_app_msg(tc, "", chat) :
     GenericToolMsg(tc.id, tc.kind, tc.title, tc.status,
                    content_summary(tc.kind, tc.content),
                    time(), nothing, chat)
@@ -1204,6 +1241,7 @@ build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.TaskCall) =
                 tc.description, tc.run_in_background, tc.task_name, chat)
 
 build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.MCPCall) =
+    is_bonito_app(tc) ? bonito_app_msg(tc, tc.server, chat) :
     MCPToolMsg(tc.id, tc.kind, tc.title, tc.status,
                content_summary(tc.kind, tc.content),
                time(), nothing,
@@ -1239,14 +1277,35 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
         d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
             "status" => b.status, "title" => pretty_title, "summary" => b.summary)
         b.finished_at === nothing || (d["finished_at"] = b.finished_at)
-        # bt_show: once the content carries a `shown:` ref, tell JS to expand
-        # the preview by default — it was an explicit "show me this" request.
-        has_show_reference(snap.content) && (d["expand"] = true)
+        # Auto-expand the body: a live Bonito app always (it IS the point), or a
+        # `bt_show` tool once its content carries a `shown:` ref. `auto_expand_body`
+        # dispatches on the type — no content sniffing to decide.
+        (auto_expand_body(b) || has_show_reference(snap.content)) && (d["expand"] = true)
         chat_emit(b.chat, d)
         ship_edit_preview!(b)
     end
     close(b)
     return nothing
+end
+
+# Does this tool's body auto-open on render? Only a live Bonito app.
+auto_expand_body(::ToolMsg) = false
+auto_expand_body(::BonitoAppMsg) = true
+
+# A live worker app: run the generic tool update, but first capture the worker's
+# registered app id from the result content ONCE (bt_show_app returns it there),
+# so render/header read `b.app_id` and never touch content again.
+function process_update!(b::BonitoAppMsg, m::AgentClientProtocol.ToolCall)
+    if isempty(b.app_id)
+        for snap in m.updates
+            ref = find_app_reference(snap.content)
+            if ref !== nothing
+                b.app_id = ref
+                break
+            end
+        end
+    end
+    invoke(process_update!, Tuple{ToolMsg, AgentClientProtocol.ToolCall}, b, m)
 end
 
 # Background bash (`run_in_background`): the agent "completes" the tool_call the
@@ -1895,7 +1954,16 @@ end
 # stamped now so the timer doesn't tick. The typed variants persist their
 # subtype-specific fields too (so e.g. a replayed background bash still
 # rendered the right way).
+# Replayed live app — content is on disk (so the app id is available now); same
+# type-driven recognition as the live path (`is_bonito_app`).
+replayed_bonito_app_msg(tc, server) =
+    BonitoAppMsg(tc.id, "bonito_app", tc.title, tc.status,
+                 content_summary("bonito_app", tc.content),
+                 time(), time(), server,
+                 something(find_app_reference(tc.content), ""), nothing)
+
 replayed_tool_msg(tc::AgentClientProtocol.GenericTool) =
+    is_bonito_app(tc) ? replayed_bonito_app_msg(tc, "") :
     GenericToolMsg(tc.id, tc.kind, tc.title, tc.status,
                    content_summary(tc.kind, tc.content),
                    time(), time(), nothing)
@@ -1911,6 +1979,7 @@ replayed_tool_msg(tc::AgentClientProtocol.TaskCall) =
                 time(), time(),
                 tc.description, tc.run_in_background, tc.task_name, nothing)
 replayed_tool_msg(tc::AgentClientProtocol.MCPCall) =
+    is_bonito_app(tc) ? replayed_bonito_app_msg(tc, tc.server) :
     MCPToolMsg(tc.id, tc.kind, tc.title, tc.status,
                content_summary(tc.kind, tc.content),
                time(), time(),

@@ -168,6 +168,19 @@ function julia_show_app_handler(args::AbstractDict)
         return Dict{String,Any}("content"=>[Dict("type"=>"text",
             "text"=>"error building app: $(sprint(showerror, e))")], "isError"=>true)
     end
+    # Render the app ONCE now (cached for the first display): this surfaces a
+    # render-time failure — a throwing `jsrender` / `App` body — back to the
+    # AGENT as a tool error here, instead of only painting it into the browser
+    # when the bubble is expanded later. The display reuses this render, so the
+    # happy path renders exactly once.
+    try
+        Malt.remote_eval_fetch(s.worker, quote
+            Main.RemoteProxy.prerender_app($id)
+        end)
+    catch e
+        return Dict{String,Any}("content"=>[Dict("type"=>"text",
+            "text"=>"error rendering app: $(sprint(showerror, e))")], "isError"=>true)
+    end
     # The server's `find_app_reference` picks up this token and embeds the
     # bridge-registered app into the chat-bubble subsession (see remote_app.jl).
     return Dict{String,Any}(

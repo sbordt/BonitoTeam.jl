@@ -58,7 +58,10 @@ function fake_agent_project!(h, n::Int; name::AbstractString = "churn", code::Ab
         BT.persist_tool_content!(model.chat_dir,
             ACP.GenericTool(tid, "mcp", "bt_show_app", "completed",
                 ACP.ToolContent[ACP.TextContent("shown_app: $appid")], Channel{ACP.ToolCall}(1)))
-        BT.send!(model, BT.GenericToolMsg(tid, "mcp", "bt_show_app", "completed", "", time(), time(), nothing))
+        # Emit the real typed message a live `bt_show_app` produces — carries its
+        # registered app id intrinsically (no content sniffing).
+        BT.send!(model, BT.BonitoAppMsg(tid, "bonito_app", "bt_show_app", "completed",
+                                        "", time(), time(), "btworker", String(appid), nothing))
     end
     return p, model
 end

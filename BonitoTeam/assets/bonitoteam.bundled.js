@@ -52,6 +52,21 @@ class Collapsable {
         this.loaded = true;
     }
 }
+const TYPE_LABELS = {
+    user: 'User',
+    agent: 'Agent',
+    thought: 'Thoughts',
+    plan: 'Todos',
+    summary: 'Summaries'
+};
+const TYPE_ORDER = [
+    'user',
+    'agent',
+    'thought',
+    'plan',
+    'summary'
+];
+const filterKey = (msg)=>msg.type === 'tool' ? 'tool:' + (msg.tool || 'other') : msg.type;
 class BonitoChat {
     constructor(container, comm){
         this.container = container;
@@ -71,6 +86,10 @@ class BonitoChat {
         this.AT_BOTTOM_PX = 20;
         this.spacerTop = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
+        this.toolbarEl = container.parentElement.querySelector('.bt-chat-toolbar');
+        this.hiddenTypes = new Set();
+        this.seenTypes = new Set();
+        this.keyByIdx = new Map();
         this.busyEl = container.parentElement.querySelector('.bt-busy');
         this.thinkingEl = container.parentElement.querySelector('.bt-thinking');
         comm.on((msg)=>{
@@ -247,17 +266,21 @@ class BonitoChat {
             Math.min(this.totalCount - 1, e)
         ];
     }
+    effHeight(i) {
+        if (this.hiddenTypes.has(this.keyByIdx.get(i))) return 0;
+        return this.heights.get(i) ?? this.EST_HEIGHT;
+    }
     indexAt(offset) {
         let h = 0;
         for(let i = 0; i < this.totalCount; i++){
-            h += this.heights.get(i) ?? this.EST_HEIGHT;
+            h += this.effHeight(i);
             if (h > offset) return i;
         }
         return Math.max(0, this.totalCount - 1);
     }
     cumHeight(from, to) {
         let h = 0;
-        for(let i = from; i < to; i++)h += this.heights.get(i) ?? this.EST_HEIGHT;
+        for(let i = from; i < to; i++)h += this.effHeight(i);
         return h;
     }
     refresh() {
@@ -283,6 +306,7 @@ class BonitoChat {
             if (this.cache.has(idx)) return;
             const node = this.createNode(data);
             this.cache.set(idx, node);
+            this.keyByIdx.set(idx, filterKey(data));
             if (data.id) this.nodeById.set(data.id, node);
             this.observe(idx, node);
         });
@@ -346,6 +370,7 @@ class BonitoChat {
         if (!this.cache.has(idx)) {
             const node = this.createNode(msg);
             this.cache.set(idx, node);
+            this.keyByIdx.set(idx, filterKey(msg));
             if (msg.id) this.nodeById.set(msg.id, node);
             this.observe(idx, node);
         }
@@ -436,8 +461,56 @@ class BonitoChat {
         if (msg.taskbar) node.dataset.toolTaskbar = '1';
         this._refreshTaskbar();
     }
+    noteKey(msg) {
+        const key = filterKey(msg);
+        if (!key || this.seenTypes.has(key) || !this.toolbarEl) return;
+        this.seenTypes.add(key);
+        const isTool = key.startsWith('tool:');
+        const text = isTool ? key.slice(5) : TYPE_LABELS[key] ?? key;
+        const label = document.createElement('label');
+        label.className = 'bt-filter-toggle';
+        label.dataset.key = key;
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !this.hiddenTypes.has(key);
+        cb.addEventListener('change', ()=>this.setKeyHidden(key, !cb.checked));
+        label.append(cb, text);
+        const toggles = ()=>[
+                ...this.toolbarEl.querySelectorAll('.bt-filter-toggle')
+            ];
+        if (isTool) {
+            this.ensureToolGroupLabel();
+            const next = toggles().find((el)=>el.dataset.key.startsWith('tool:') && el.dataset.key.slice(5).localeCompare(text) > 0);
+            this.toolbarEl.insertBefore(label, next ?? null);
+        } else {
+            const order = (t)=>{
+                const i = TYPE_ORDER.indexOf(t);
+                return i < 0 ? TYPE_ORDER.length : i;
+            };
+            const next = toggles().find((el)=>!el.dataset.key.startsWith('tool:') && order(el.dataset.key) > order(key)) ?? this.toolbarEl.querySelector('.bt-filter-group-label');
+            this.toolbarEl.insertBefore(label, next ?? null);
+        }
+    }
+    ensureToolGroupLabel() {
+        if (this.toolbarEl.querySelector('.bt-filter-group-label')) return;
+        const span = document.createElement('span');
+        span.className = 'bt-filter-group-label';
+        span.textContent = 'Tools:';
+        this.toolbarEl.appendChild(span);
+    }
+    setKeyHidden(key, hidden) {
+        this.hiddenTypes[hidden ? 'add' : 'delete'](key);
+        for (const node of this.cache.values()){
+            if (node.dataset.filterKey === key) node.style.display = hidden ? 'none' : '';
+        }
+        this.refresh();
+        if (this.followMode) this._queueScrollToBottom();
+    }
     createNode(msg) {
         const div = document.createElement('div');
+        const fkey = filterKey(msg);
+        div.dataset.filterKey = fkey;
+        this.noteKey(msg);
         switch(msg.type){
             case 'user':
                 div.className = 'bt-user-msg';
@@ -530,6 +603,7 @@ class BonitoChat {
                     break;
                 }
         }
+        if (this.hiddenTypes.has(fkey)) div.style.display = 'none';
         return div;
     }
     unqueueOldestUser() {

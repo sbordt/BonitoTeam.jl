@@ -835,6 +835,38 @@ const ChatStyles = Bonito.Styles(
         "display" => "flex", "gap" => "8px", "align-items" => "flex-end",
         "width" => "100%"),
 
+    # ── Chat toolbar (below the composer) ───────────────────────────────────
+    # Hosts the message-type filter checkboxes (populated client-side by
+    # `noteType` in bonitoteam.js) and future per-chat options. Deliberately
+    # roomy (min-height) so it doesn't jump when the first checkbox appears.
+    CSS(".bt-chat-toolbar",
+        "flex-shrink" => "0",
+        "min-height" => "38px",
+        "box-sizing" => "border-box",
+        "display" => "flex", "align-items" => "center", "flex-wrap" => "wrap",
+        "gap" => "14px",
+        "padding" => "6px 14px",
+        "border-top" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "font-size" => "12px",
+        "color" => "var(--bt-text-muted)"),
+    CSS(".bt-filter-toggle",
+        "display" => "inline-flex", "align-items" => "center", "gap" => "5px",
+        "cursor" => "pointer",
+        "user-select" => "none",
+        "white-space" => "nowrap"),
+    CSS(".bt-filter-toggle input",
+        "cursor" => "pointer", "margin" => "0"),
+    CSS(".bt-filter-toggle:hover",
+        "color" => "var(--bt-text)"),
+    # "Tools:" group separator before the per-tool checkboxes. (Hiding itself
+    # is inline display:none managed by bonitoteam.js `setKeyHidden` — the
+    # per-tool key set is open, so no static rules.)
+    CSS(".bt-filter-group-label",
+        "margin-left" => "8px",
+        "font-weight" => "600",
+        "user-select" => "none"),
+
     # ── Attachment thumbnail strip ──────────────────────────────────────────
     # Sits above .bt-input-row. Hidden (display:none) when there's nothing
     # queued so the empty div doesn't add stray spacing. Thumbnails scroll

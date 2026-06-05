@@ -245,6 +245,7 @@ abstract type ToolMsg <: ChatMsg end
 mutable struct GenericToolMsg <: ToolMsg
     id::String
     kind::String
+    name::String                          # ACP tool name ("Read", "ToolSearch", …); "" if the agent sent no meta
     title::String
     status::String
     summary::String                       # cached header summary; full content on disk
@@ -252,6 +253,11 @@ mutable struct GenericToolMsg <: ToolMsg
     finished_at::Union{Float64,Nothing}
     chat::Union{ChatModel,Nothing}
 end
+
+# Back-compat 8-arg form (pre-`name`): used by test fixtures and any caller
+# without a tool name to hand over.
+GenericToolMsg(id, kind, title, status, summary, started_at, finished_at, chat) =
+    GenericToolMsg(id, kind, "", title, status, summary, started_at, finished_at, chat)
 
 mutable struct BashToolMsg <: ToolMsg
     id::String
@@ -503,12 +509,25 @@ end
 # `started_at` / `finished_at` are shared across every concrete variant.
 # Subtype-specific augmentations (e.g. the `server` badge for `MCPToolMsg`)
 # patch the dict in their own dispatch arm below.
+# Stable per-tool filter key, the identity the message-type filter toolbar
+# groups by. The ACP tool NAME, not the title (a Bash title is the literal
+# command line). Reloads land as `GenericToolMsg` with the persisted key in
+# `name` (see `append_tool`); pre-name chats fall back to the ACP kind.
+tool_key(m::GenericToolMsg) = isempty(m.name) ? m.kind : m.name
+tool_key(::BashToolMsg)     = "Bash"
+tool_key(::TaskToolMsg)     = "Task"
+tool_key(m::MCPToolMsg)     = m.tool_name          # bare name: "bt_show", "bt_julia_eval"
+tool_key(::BonitoAppMsg)    = "bt_show_app"
+
 function tool_header_dict(m::ToolMsg, chat_dir::AbstractString="")
     pretty_title, server = pretty_tool_title(m.title)
     d = Dict{String,Any}(
         "type" => "tool",
         "id" => m.id,
         "kind" => m.kind,
+        # Filter identity for the per-tool show/hide toolbar (see filterKey
+        # in bonitoteam.js).
+        "tool" => tool_key(m),
         "icon" => tool_icon(m.kind),
         "title" => pretty_title,
         # "" for non-MCP tools; the MCP server name otherwise so the JS
@@ -1255,7 +1274,7 @@ bonito_app_msg(tc, server, chat) =
 
 build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.GenericTool) =
     is_bonito_app(tc) ? bonito_app_msg(tc, "", chat) :
-    GenericToolMsg(tc.id, tc.kind, tc.title, tc.status,
+    GenericToolMsg(tc.id, tc.kind, tc.name, tc.title, tc.status,
                    content_summary(tc.kind, tc.content),
                    time(), nothing, chat)
 
@@ -2005,7 +2024,7 @@ replayed_bonito_app_msg(tc, server) =
 
 replayed_tool_msg(tc::AgentClientProtocol.GenericTool) =
     is_bonito_app(tc) ? replayed_bonito_app_msg(tc, "") :
-    GenericToolMsg(tc.id, tc.kind, tc.title, tc.status,
+    GenericToolMsg(tc.id, tc.kind, tc.name, tc.title, tc.status,
                    content_summary(tc.kind, tc.content),
                    time(), time(), nothing)
 replayed_tool_msg(tc::AgentClientProtocol.BashCall) =
@@ -2680,5 +2699,9 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         # `setupTaskbar` in bonitoteam.js); the server never tracks slot state.
         DOM.div(class = "bt-taskbar"),
         chat_input_area(session, model),
+        # Toolbar below the composer. Populated entirely client-side by
+        # BonitoChat (`noteType`): one show/hide checkbox per message type the
+        # first time that type occurs. Sized to host future controls too.
+        DOM.div(class = "bt-chat-toolbar"),
         class="bt-app"))
 end

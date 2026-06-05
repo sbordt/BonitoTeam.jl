@@ -252,6 +252,16 @@ mutable struct BashToolMsg <: ToolMsg
     finished_at::Union{Float64,Nothing}
     command::String
     is_background::Bool
+    # Background-task streaming (`run_in_background`): the agent's tool_call
+    # "completes" the moment the command is LAUNCHED, but the shell keeps running.
+    # The poller tails the agent's output file (`bg_output_path`, from byte
+    # `bg_offset`), accumulates into `bg_text`, and flips `bg_running` off when
+    # the file's fd closes (shell exited). `is_live` keys off `bg_running` so a
+    # launched-but-running task stays live instead of "finishing immediately".
+    bg_output_path::String
+    bg_offset::Int
+    bg_running::Bool
+    bg_text::String
     chat::Union{ChatModel,Nothing}
 end
 
@@ -311,6 +321,14 @@ TodoListMsg(chat::ChatModel, entries) =
 # The tool pill's pulsing glow + the taskbar slot both subscribe to this.
 is_live(m::ToolMsg) =
     m.finished_at === nothing && !(m.status in ("completed", "failed"))
+# A background bash's tool_call "completes" at LAUNCH but the shell runs on. Once
+# we know its output file, liveness is the poller's `bg_running` (the output
+# file's fd still open), NOT the tool_call status — so the bubble keeps pulsing
+# (and its taskbar slot + timer stay) until the shell actually exits.
+function is_live(m::BashToolMsg)
+    (m.is_background && !isempty(m.bg_output_path)) && return m.bg_running
+    return m.finished_at === nothing && !(m.status in ("completed", "failed"))
+end
 # `finished_at` flips to non-nothing inside `try_absorb_todo!` once the
 # absorbed entries become all-done — `is_live` checking that field is what
 # lets the next TodoWrite start a fresh bubble instead of absorbing into
@@ -500,9 +518,18 @@ function augment_generic_header!(d::Dict, chat_dir::AbstractString)
         prev = render_edit_preview(chat_dir, d["id"])
         prev === nothing || (d["preview"] = prev)
     end
-    isempty(chat_dir) ||
-        has_show_reference(load_tool_content(chat_dir, d["id"])) &&
-            (d["expand"] = true)
+    # `has_app` ⇒ this tool renders a live worker embed, so the header gets the
+    # ⤢ detach button. Mirror render_tool_body's two embed paths EXACTLY: a tool
+    # tagged `bonito_app` (show_remote_app!), or a `bt_show_app` tool that left a
+    # `shown_app:` reference in its content (`find_app_reference`). `expand` keeps
+    # its own (separate) marker via `has_show_reference`.
+    has_app = d["kind"] == "bonito_app"
+    if !isempty(chat_dir)
+        content = load_tool_content(chat_dir, d["id"])
+        has_show_reference(content) && (d["expand"] = true)
+        (has_app || find_app_reference(content) !== nothing) && (has_app = true)
+    end
+    has_app && (d["has_app"] = true)
     return d
 end
 
@@ -1023,7 +1050,19 @@ end
 # Grow a streaming text bubble in place and emit the delta. `m.chat` is the
 # sink captured when the bubble was created. AgentMsg clears its cached html
 # so a finalize-then-rerequest never serves the pre-streaming snapshot.
-Base.append!(m::AgentMsg, t::AbstractString) = (m.text *= t; m.html = ""; chat_emit(m.chat, wire_chunk(m, t)); m)
+# Stream a text delta into the bubble. We still ACCUMULATE `m.text` (cheap), but
+# once cancel is requested we stop shipping each chunk over the wire — under a
+# heavy token stream that per-chunk `chat_emit` to a (possibly slow) browser is
+# the one thing that keeps the turn "busy" after the user hit stop. The seal
+# (`close` → `wire_final`) still ships the final partial, so the bubble is
+# correct; we just don't stream the now-discarded tail.
+function Base.append!(m::AgentMsg, t::AbstractString)
+    m.text *= t
+    m.html = ""
+    c = m.chat === nothing ? nothing : m.chat.client[]
+    (c !== nothing && (@atomic c.conn.cancelling)) || chat_emit(m.chat, wire_chunk(m, t))
+    return m
+end
 Base.append!(m::UserMsg, t::AbstractString) = (m.text *= t; chat_emit(m.chat, wire_chunk(m, t)); m)
 # Summaries arrive whole on replay; live they can stream through `process_update!`
 # like a UserMessage. Append clears the HTML cache so the eventual close-time
@@ -1155,7 +1194,8 @@ build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.BashCall) =
     BashToolMsg(tc.id, tc.kind, tc.title, tc.status,
                 content_summary(tc.kind, tc.content),
                 time(), nothing,
-                tc.command, tc.run_in_background, chat)
+                tc.command, tc.run_in_background,
+                "", 0, false, "", chat)
 
 build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.TaskCall) =
     TaskToolMsg(tc.id, tc.kind, tc.title, tc.status,
@@ -1207,6 +1247,191 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
     end
     close(b)
     return nothing
+end
+
+# Background bash (`run_in_background`): the agent "completes" the tool_call the
+# instant the command is LAUNCHED and hands back an output-file path; the shell
+# keeps running. We do the normal persist + header updates but, instead of
+# finalizing on "completed", capture the output path and go live (`bg_running`) —
+# the background-task poller then streams the file and finalizes when the shell
+# exits. Non-background bashes fall through to the generic ToolMsg handling.
+function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
+    persist_tool_content!(b.chat.chat_dir, m)
+    for snap in m.updates
+        b.status  = snap.status
+        b.title   = snap.title
+        b.summary = content_summary(snap.kind, snap.content)
+        persist_tool_content!(b.chat.chat_dir, snap)
+        # Detect a background launch from the RESULT ("…running in background…
+        # Output is being written to: <path>"), NOT from rawInput's
+        # `run_in_background` — some agent builds don't forward it, so
+        # `is_background` reads false even for a real background bash. The result
+        # text is the reliable signal; flip `is_background` on so the taskbar +
+        # `is_live` treat it as the live task it is.
+        if isempty(b.bg_output_path)
+            path = parse_bg_output_path(snap.content)
+            if path !== nothing
+                @debug "background task detected from result" id = b.id path = basename(path)
+                b.is_background  = true
+                b.bg_output_path = path
+                b.bg_offset      = 0
+                b.bg_running     = true       # the poller now owns its lifecycle
+            end
+        end
+        # Foreground bash (or a failed launch): stamp finished_at on terminal.
+        # A live background task is left unstamped — the poller finalizes it.
+        if !b.bg_running && b.status in ("completed", "failed")
+            b.finished_at === nothing && (b.finished_at = time())
+        end
+        pretty_title, _ = pretty_tool_title(b.title)
+        d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
+            "status" => b.bg_running ? "in_progress" : b.status,
+            "title" => pretty_title, "summary" => b.summary)
+        if b.bg_running
+            d["background"] = true
+            # `wire_new` shipped `taskbar=false` (is_background was still false —
+            # rawInput omits run_in_background); now that we know it IS a
+            # background task, flip the taskbar slot on so it joins the bar.
+            d["taskbar"] = true
+        elseif b.finished_at !== nothing
+            d["finished_at"] = b.finished_at
+        end
+        chat_emit(b.chat, d)
+    end
+    # A live background task is finalized later (by `finalize_bg_task!` when the
+    # shell exits); only persist-to-chat.md here if it already terminated.
+    b.bg_running || close(b)
+    return nothing
+end
+
+# Pull the output-file path from a background-launch result, e.g.
+# "… Output is being written to: /tmp/…/<id>.output".
+function parse_bg_output_path(content)
+    for c in content
+        txt = try
+            hasproperty(c, :text) ? String(getproperty(c, :text)) :
+                (c isa AbstractDict ? String(get(c, "text", "")) : "")
+        catch
+            ""
+        end
+        mm = match(r"written to:\s*(\S+)", txt)
+        mm === nothing || return String(mm.captures[1])
+    end
+    return nothing
+end
+
+# ── Background-task output poller ───────────────────────────────────────────
+# ONE server-wide loop streams every live background bash. The agent backgrounds
+# the shell and only returns a file path (it does NOT stream), so we tail that
+# file ourselves. Per task we back off 0.5s → 1 → 2 → 4 → 5s (responsive while
+# fresh, cheap once settled). "Done" is the output file's fd closing — the shell
+# exited (see the worker's `file_held_open`); a non-Linux worker falls back to
+# output quiescence.
+const BG_POLL_BASE    = 0.5
+const BG_POLL_MAX     = 5.0
+const BG_QUIESCE_SECS = 20.0   # non-Linux fallback: no growth this long ⇒ done
+
+function start_background_task_poller!(state::ServerState)
+    Base.errormonitor(@async background_task_poll_loop(state))
+    return nothing
+end
+
+bg_worker_id(state::ServerState, model::ChatModel) =
+    let pid = model.project_id
+        (isempty(pid) || !haskey(state.projects[], pid)) ? nothing :
+            state.projects[][pid].worker_id
+    end
+
+function write_bg_content!(chat_dir::AbstractString, m::BashToolMsg)
+    body = isempty(strip(m.command)) ? m.bg_text : "\$ $(m.command)\n\n$(m.bg_text)"
+    open(tool_file(chat_dir, m.id), "w") do io
+        JSON.print(io, Dict("content" => [Dict("type" => "text", "text" => body)]))
+    end
+    return nothing
+end
+
+bg_line_count(m::BashToolMsg) = count(==('\n'), m.bg_text)
+
+function stream_bg_update!(model::ChatModel, m::BashToolMsg)
+    write_bg_content!(model.chat_dir, m)
+    n = bg_line_count(m)
+    m.summary = "running… $n line$(n == 1 ? "" : "s")"
+    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => m.id,
+        "status" => "in_progress", "summary" => m.summary,
+        "background" => true, "taskbar" => true))
+    return nothing
+end
+
+function finalize_bg_task!(model::ChatModel, m::BashToolMsg)
+    m.bg_running = false
+    m.status = "completed"
+    m.finished_at === nothing && (m.finished_at = time())
+    write_bg_content!(model.chat_dir, m)
+    try
+        append_tool(model.chat_session, m)
+    catch e
+        @warn "append_tool for finished bg task failed" id = m.id exception = e
+    end
+    n = bg_line_count(m)
+    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => m.id,
+        "status" => "completed", "summary" => "done · $n line$(n == 1 ? "" : "s")",
+        "finished_at" => m.finished_at))
+    return nothing
+end
+
+# Tail one task's output; stream new bytes to the bubble. Returns the worker's
+# tail result (or `nothing` on a transient error → retry next tick).
+function poll_background_task!(state::ServerState, model::ChatModel, m::BashToolMsg)
+    wid = bg_worker_id(state, model)
+    wid === nothing && return nothing
+    r = try
+        tail_worker_file(state, wid, m.bg_output_path; offset = m.bg_offset, timeout = 10.0)
+    catch e
+        @debug "tail_file failed (will retry)" id = m.id exception = e
+        return nothing
+    end
+    if r.exists && !isempty(r.chunk)
+        m.bg_text  *= r.chunk
+        m.bg_offset = r.offset
+        stream_bg_update!(model, m)
+    end
+    return r
+end
+
+function background_task_poll_loop(state::ServerState)
+    sched = Dict{String,NTuple{3,Float64}}()   # id → (next poll, interval, last-grew)
+    while true
+        try
+            for (_, model) in collect(state.chat_models)
+                for m in collect(model.msgs_store)
+                    (m isa BashToolMsg && m.is_background && m.bg_running &&
+                        !isempty(m.bg_output_path)) || continue
+                    nextt, interval, lastgrow = get(sched, m.id, (0.0, BG_POLL_BASE, time()))
+                    time() < nextt && continue
+                    before = m.bg_offset
+                    r = poll_background_task!(state, model, m)
+                    grew = m.bg_offset > before
+                    grew && (lastgrow = time())
+                    done = r !== nothing &&
+                        (r.open_known ? (r.exists && !r.open) :
+                                        (time() - lastgrow > BG_QUIESCE_SECS))
+                    if done
+                        finalize_bg_task!(model, m)
+                        delete!(sched, m.id)
+                    else
+                        sched[m.id] = (time() + interval, min(interval * 2, BG_POLL_MAX), lastgrow)
+                    end
+                end
+            end
+            for id in collect(keys(sched))
+                any(mm -> any(x -> x isa BashToolMsg && x.id == id && x.bg_running,
+                              mm.msgs_store), values(state.chat_models)) || delete!(sched, id)
+            end
+        catch e
+            @warn "background task poll loop tick failed" exception = e
+        end
+        sleep(0.25)
+    end
 end
 
 # Edit tools show an inline diff preview on the collapsed header. The diff is
@@ -1678,7 +1903,8 @@ replayed_tool_msg(tc::AgentClientProtocol.BashCall) =
     BashToolMsg(tc.id, tc.kind, tc.title, tc.status,
                 content_summary(tc.kind, tc.content),
                 time(), time(),
-                tc.command, tc.run_in_background, nothing)
+                tc.command, tc.run_in_background,
+                "", 0, false, "", nothing)   # bg fields: history → already done
 replayed_tool_msg(tc::AgentClientProtocol.TaskCall) =
     TaskToolMsg(tc.id, tc.kind, tc.title, tc.status,
                 content_summary(tc.kind, tc.content),
@@ -1708,7 +1934,7 @@ function reconcile_replay!(model::ChatModel, replay)
 end
 
 # ── DOM building (split into header / messages / input / banner) ──────────
-function chat_header(model::ChatModel, sync_modal_state::Observable)
+function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state::Observable)
     state = model.state
     project_id = model.project_id
     cwd = model.cwd
@@ -1723,7 +1949,7 @@ function chat_header(model::ChatModel, sync_modal_state::Observable)
         class="bt-header-sync",
         title="Pull this project from the worker to the server",
         onclick=js"event => $(sync_status).notify('__click__')")
-    on(sync_status) do s
+    on(session, sync_status) do s
         s == "__click__" || return
         sync_status[] = ""
         isempty(project_id) && (sync_status[] = "no project bound"; return)
@@ -1746,7 +1972,7 @@ function chat_header(model::ChatModel, sync_modal_state::Observable)
             class="bt-header-sync",
             title="Compare and sync this project with $other_label",
             onclick=js"event => $(xsync_status).notify('__click__')")
-        on(xsync_status) do s
+        on(session, xsync_status) do s
             s == "__click__" || return
             xsync_status[] = "comparing…"
             cur = state.projects[][project_id]
@@ -1777,10 +2003,10 @@ function chat_header(model::ChatModel, sync_modal_state::Observable)
         class="bt-header")
 end
 
-function chat_session_banner(model::ChatModel)
+function chat_session_banner(session::Bonito.Session, model::ChatModel)
     restart_btn = Bonito.Button("Restart session"; style=nothing,
         class="bt-btn bt-btn-secondary")
-    on(restart_btn.value) do clicked
+    on(session, restart_btn.value) do clicked
         clicked && @async restart_chat_session!(model)
     end
     map(model.session_alive, model.last_error) do alive, err
@@ -2122,49 +2348,47 @@ function handle_command!(model::ChatModel, ::Session, cmd::SendCommand)
     return nothing
 end
 
-# How long to wait for a graceful `session/cancel` to actually end the turn
-# before escalating to a forceful connection teardown. Generous enough that a
-# normal cancel (agent stops within a beat) never escalates.
-const CANCEL_FORCE_GRACE = 6.0
+# A re-cancel only escalates to a force-close after the agent has had a real
+# chance to honor the first one. Set well past the worst observed cold-start
+# honor latency (warm ≈ 0.1s, cold-fresh ≈ 3.9s, cold-resumed ≈ 6–18s) so an
+# impatient double-click never force-closes a turn that's about to honor.
+const CANCEL_ESCALATE_WAIT = 20.0
 
 function handle_command!(model::ChatModel, ::Any, ::CancelCommand)
     # Off-band, instant: cancel is a lone ACP notification, not a chat-state
     # mutation, so it never goes through the `run_chat!` consumer. Reading
     # `model.client[]` is a single-Ref read. (Session arg is unused here — typed
     # `::Any` so the cancel path is unit-testable without a live Bonito.Session.)
-    #
-    # The cancel makes ACP close the active turn's update channel; the
-    # turn's `prompt!` loop then ends, `run_turn!`'s `for` loop ends, its
-    # `finally` clears `busy_active`, and the per-turn parser seals the
-    # partial bubble. One `cancel!` is enough in the happy path.
     c = model.client[]
     c === nothing && return nothing
     s = shared(model)
-    AgentClientProtocol.cancel!(c)
 
-    # Escalation. Graceful cancel relies on the agent HONORING `session/cancel`.
-    # A wedged agent — e.g. resumed onto an orphaned tool call (the
-    # "No onPostToolUseHook" state after a worker died mid-eval) — can ignore it.
-    # The connection is still alive, so no `ConnectionClosed` ever fires; the
-    # turn (and the busy spinner) would stay stuck forever with the stop button
-    # doing nothing. So if we're still busy on the SAME client after a short
-    # grace, force the connection down: that breaks the wedged `prompt!` loop
-    # via `ConnectionClosed`, `run_turn!`'s `finally` clears busy, and the
-    # dead-session banner appears with a working Restart.
+    # A graceful `session/cancel` makes ACP close the active turn's update
+    # channel; the `prompt!` loop ends, `run_turn!`'s `finally` clears
+    # `busy_active`, and the partial bubble is sealed. We do NOT force-close on a
+    # timer: the agent's honor latency is large + unbounded on a cold/resumed turn,
+    # so a timer races it, and a premature mid-turn teardown leaves an orphaned
+    # tool_use that wedges every future resume (a doom loop). A clean cancel always
+    # honors eventually.
     #
-    # This fires ONLY on an explicit user cancel — never on a timer — so a
-    # legitimately long tool run (a multi-minute `bt_julia_eval`) the user still
-    # wants is never killed behind their back.
-    @async begin
-        sleep(CANCEL_FORCE_GRACE)
-        if s.busy_active[] && model.client[] === c
-            @warn "cancel not honored after grace; tearing down wedged session" project_id = model.project_id
-            s.last_error[] = "The agent didn't respond to cancel; session stopped. Click Restart to reconnect."
-            try
-                close(c)   # → ConnectionClosed in the wedged prompt! loop → busy cleared, banner shown
-            catch e
-                @warn "force-close after cancel failed" exception = e
-            end
+    # The hammer is reserved for a genuinely-wedged agent (resumed onto an
+    # already-orphaned tool call, ignores cancel, connection still alive so no
+    # `ConnectionClosed` fires) — and it's the USER's call: cancel AGAIN, after the
+    # agent's had a real chance (≥ CANCEL_ESCALATE_WAIT) and it's STILL busy. That
+    # distinguishes a deliberate "force it" from both an impatient double-click
+    # (< the wait → graceful re-send) and a slow-but-honoring cold cancel.
+    now      = time()
+    first_at = (@atomic c.conn.cancel_at)              # 0.0 ⇒ first cancel this turn
+    escalate = first_at > 0 && (now - first_at) ≥ CANCEL_ESCALATE_WAIT && s.busy_active[]
+    first_at > 0 || (@atomic c.conn.cancel_at = now)   # stamp the first cancel
+    AgentClientProtocol.cancel!(c)                      # graceful (idempotent re-send)
+    if escalate
+        @warn "deliberate re-cancel: agent not honoring — force-closing" project_id = model.project_id
+        s.last_error[] = "The agent didn't respond to cancel; session stopped. Click Restart to reconnect."
+        try
+            close(c)
+        catch e
+            @warn "force-close after cancel failed" exception = e
         end
     end
     return nothing
@@ -2266,7 +2490,7 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
     # `(current, other, comparison)`. `on_apply(src, dst)` runs the
     # directional overwrite in a Task and closes the modal when done.
     sync_modal_state = Observable{Union{Nothing,NamedTuple}}(nothing)
-    sync_modal = render_sync_modal(model.state, sync_modal_state,
+    sync_modal = render_sync_modal(session, model.state, sync_modal_state,
         (src, dst) -> @async begin
             try
                 sync_across_workers!(model.state, src, dst)
@@ -2278,8 +2502,8 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         end)
 
     Bonito.jsrender(session, DOM.div(
-        chat_header(model, sync_modal_state),
-        chat_session_banner(model),
+        chat_header(session, model, sync_modal_state),
+        chat_session_banner(session, model),
         sync_modal,
         messages_container,
         init_script,

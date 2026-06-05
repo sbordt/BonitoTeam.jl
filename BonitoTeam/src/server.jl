@@ -83,6 +83,11 @@ function serve(; host::String        = "0.0.0.0",
     add_install_routes!(srv, base_url, worker_secret)
     add_worker_ws_routes!(srv, state)
 
+    # ONE server-wide loop that tails every live background bash's output file
+    # and finalizes it when the shell exits (the agent backgrounds the shell and
+    # only hands back a file path — it doesn't stream). See chat.jl.
+    start_background_task_poller!(state)
+
     @info "BonitoTeam dashboard running" url=Bonito.online_url(srv, "") state=sd
     @info "Worker install — run on each agent machine" *
           "\n    Linux / macOS  : curl -fsSL $base_url/install | sh" *

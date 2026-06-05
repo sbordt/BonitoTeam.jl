@@ -356,6 +356,10 @@ function stop_session!(state::ServerState, p::ProjectInfo)
     model === nothing || close(model.transport)
     model === nothing || notify_chats!(state)   # drop from the active-chats sidebar
     release_project!(state, p)
+    # The reaped claude subprocess takes its MCP server + eval worker with it, so
+    # the eval bridge's worker session is gone — tear the bridge down explicitly
+    # (a WS drop alone no longer does; its lifetime is the worker session).
+    teardown_eval_bridge!(state, p.id)
     return nothing
 end
 
@@ -1594,17 +1598,17 @@ end
 FolderPicker(start::String = pwd()) = FolderPicker(
     Observable(js_path(abspath(start))), Observable(""), Observable(false), Observable(false))
 
-function folder_picker_render(p::FolderPicker)
+function folder_picker_render(session::Bonito.Session, p::FolderPicker)
     up_btn     = Bonito.Button("↑"; style=nothing, class = "bt-btn bt-btn-secondary",
                                title = "Up one level")
     choose_btn = Bonito.Button("Choose"; style=nothing, class = "bt-btn")
 
-    on(up_btn.value) do clicked
+    on(session, up_btn.value) do clicked
         clicked || return
         parent = js_path(dirname(rstrip(p.cur[], '/')))
         isempty(parent) || parent == p.cur[] || (p.cur[] = parent)
     end
-    on(choose_btn.value) do clicked
+    on(session, choose_btn.value) do clicked
         clicked || return
         p.selected[] = p.cur[]
     end
@@ -1691,29 +1695,29 @@ function fetch_remote_entries!(p::RemoteFolderPicker)
     end
 end
 
-function setup_remote_picker_listeners!(p::RemoteFolderPicker)
+function setup_remote_picker_listeners!(session::Bonito.Session, p::RemoteFolderPicker)
     p.listeners_set_up[] && return
     p.listeners_set_up[] = true
-    on(p.cur)      do _;   p.expanded[] && fetch_remote_entries!(p); end
-    on(p.expanded) do exp; exp && fetch_remote_entries!(p); end
+    on(session, p.cur)      do _;   p.expanded[] && fetch_remote_entries!(p); end
+    on(session, p.expanded) do exp; exp && fetch_remote_entries!(p); end
     return
 end
 
-function remote_folder_picker_render(p::RemoteFolderPicker)
-    setup_remote_picker_listeners!(p)
+function remote_folder_picker_render(session::Bonito.Session, p::RemoteFolderPicker)
+    setup_remote_picker_listeners!(session, p)
 
     up_btn     = Bonito.Button("↑"; style=nothing, class = "bt-btn bt-btn-secondary",
                                title = "Up one level")
     choose_btn = Bonito.Button("Choose"; style=nothing, class = "bt-btn")
 
-    on(up_btn.value) do clicked
+    on(session, up_btn.value) do clicked
         clicked || return
         cur = p.cur[]
         isempty(cur) && return
         parent = js_path(dirname(rstrip(cur, '/')))
         !isempty(parent) && parent != cur && (p.cur[] = parent)
     end
-    on(choose_btn.value) do clicked
+    on(session, choose_btn.value) do clicked
         clicked || return
         p.selected[] = p.cur[]
     end
@@ -1824,14 +1828,14 @@ end
 # project list without remounting every card on every state.projects notify.
 
 """
-    dashboard_dom(state; current_view = nothing) → DOM
+    dashboard_dom(session, state; current_view = nothing) → DOM
 
 Build the dashboard's DOM block. When `current_view` is provided (the
 unified app's view-selector observable), the project-creation flows
 auto-navigate to the new project's chat by setting it; otherwise creation
 just leaves the user on the dashboard.
 """
-function dashboard_dom(state::ServerState;
+function dashboard_dom(session::Bonito.Session, state::ServerState;
                         current_view::Union{Observable{String},Nothing} = nothing)
     error_obs = Observable("")
 
@@ -1850,7 +1854,7 @@ function dashboard_dom(state::ServerState;
     # Form fields
     np_name   = Observable("")
     np_picker = FolderPicker(state.working_dir)
-    on(np_picker.selected) do sel
+    on(session, np_picker.selected) do sel
         isempty(strip(np_name[])) || return
         isempty(sel) && return
         np_name[] = basename(rstrip(sel, '/'))
@@ -1864,7 +1868,7 @@ function dashboard_dom(state::ServerState;
     # actual transfer runs in the background; we update `busy` + notify(state.projects)
     # so the global progress card and the project card both reflect the syncing state.
     sync_request = Observable("")
-    on(sync_request) do pid
+    on(session, sync_request) do pid
         isempty(pid) && return
         sync_request[] = ""           # reset so the same card can re-fire
         haskey(state.projects[], pid) || return
@@ -1896,7 +1900,7 @@ function dashboard_dom(state::ServerState;
     # re-bind, start session). Long-running so it goes through the busy
     # card; the (stage, info) callback surfaces per-file progress.
     open_request = Observable(Dict{String,Any}())
-    on(open_request) do payload
+    on(session, open_request) do payload
         isempty(payload) && return
         pid    = String(get(payload, "project", ""))
         target = String(get(payload, "worker",  ""))
@@ -1934,7 +1938,7 @@ function dashboard_dom(state::ServerState;
     np_submit = Bonito.Button("Create"; style=nothing, class = "bt-btn")
     np_cancel = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
 
-    on(np_submit.value) do clicked
+    on(session, np_submit.value) do clicked
         clicked || return
         is_busy_idle(busy[]) || return   # guard: ignore clicks while busy
         nm = String(strip(np_name[]))
@@ -1956,7 +1960,7 @@ function dashboard_dom(state::ServerState;
             end
         end
     end
-    on(np_cancel.value) do clicked
+    on(session, np_cancel.value) do clicked
         clicked || return
         is_busy_idle(busy[]) || return   # don't cancel mid-create
         which_form[] = :none
@@ -1964,7 +1968,7 @@ function dashboard_dom(state::ServerState;
     end
 
     new_proj_btn = Bonito.Button("+ New project"; style=nothing, class = "bt-btn bt-btn-secondary")
-    on(new_proj_btn.value) do clicked
+    on(session, new_proj_btn.value) do clicked
         clicked || return
         if isempty(state.workers[])
             error_obs[] = "Register a worker before creating a project."
@@ -1978,7 +1982,7 @@ function dashboard_dom(state::ServerState;
     gh_submit = Bonito.Button("Open"; style=nothing, class = "bt-btn")
     gh_cancel = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
 
-    on(gh_submit.value) do clicked
+    on(session, gh_submit.value) do clicked
         clicked || return
         is_busy_idle(busy[]) || return
         url = String(strip(gh_url[]))
@@ -2002,7 +2006,7 @@ function dashboard_dom(state::ServerState;
             end
         end
     end
-    on(gh_cancel.value) do clicked
+    on(session, gh_cancel.value) do clicked
         clicked || return
         is_busy_idle(busy[]) || return
         which_form[] = :none
@@ -2010,7 +2014,7 @@ function dashboard_dom(state::ServerState;
     end
 
     gh_btn = Bonito.Button("+ From GitHub"; style=nothing, class = "bt-btn bt-btn-secondary")
-    on(gh_btn.value) do clicked
+    on(session, gh_btn.value) do clicked
         clicked || return
         if isempty(state.workers[])
             error_obs[] = "Register a worker before opening a GitHub project."
@@ -2030,9 +2034,12 @@ function dashboard_dom(state::ServerState;
     discover_state   = Observable("")                       # worker name whose panel is open
     discover_results = Observable(Dict{String,Any}[])
     discover_busy    = Observable(false)
-    # JS onclick notifies a {path, session_id} dict so the import handler can
-    # tell the worker to claude-agent-acp's session/load instead of /new.
-    import_path      = Observable(Dict{String,Any}())
+    # NOTE: the session-pick sink used to live here as a shared `import_path`
+    # Observable interpolated into the per-card discover panel — but the panel
+    # renders in a different (sub-)session than this `dashboard_dom` scope, so
+    # the client lookup failed ("Key N not found" → null.notify → silent Resume
+    # failure). It now lives as a SESSION-LOCAL `pick` inside
+    # `render_discover_panel`, bridged to `do_import`. See worker_widget.jl.
 
     function trigger_scan!(w_name::String)
         discover_busy[]    = true
@@ -2048,7 +2055,7 @@ function dashboard_dom(state::ServerState;
         end
     end
 
-    on(discover_state) do w_name
+    on(session, discover_state) do w_name
         isempty(w_name) || trigger_scan!(w_name)
     end
 
@@ -2070,6 +2077,7 @@ function dashboard_dom(state::ServerState;
         busy_start!(busy, title)
         @async begin
             try
+                @info "do_import: starting" worker=w_name path resume=resume_session_id
                 # `start_session=false` so the registration finishes fast and we
                 # can flip `current_view` early — the chat bring-up itself
                 # (ensure_project_session!) is then driven by
@@ -2081,11 +2089,14 @@ function dashboard_dom(state::ServerState;
                     resume_session_id = resume_session_id,
                     start_session = false,
                     progress = (stage, info) -> busy_event!(busy, stage, info))
+                @info "do_import: registered project, flipping view" id=p.id
                 error_obs[]      = ""
                 discover_state[] = ""
                 picker_state[]   = ""
                 current_view !== nothing && (current_view[] = p.id)
             catch e
+                # Never swallow silently: surface to the UI AND the server log.
+                @warn "do_import failed" worker=w_name path resume=resume_session_id exception=(e, catch_backtrace())
                 error_obs[] = "Failed to import: $(sprint(showerror, e))"
             finally
                 busy_clear!(busy)
@@ -2093,22 +2104,10 @@ function dashboard_dom(state::ServerState;
         end
     end
 
-    on(import_path) do payload
-        isempty(payload) && return
-        path = String(get(payload, "path", ""))
-        isempty(path) && return
-        sid_raw = get(payload, "session_id", nothing)
-        resume_session_id = (sid_raw === nothing || isempty(String(sid_raw))) ?
-                                nothing : String(sid_raw)
-        # The worker now travels in the payload (the folder→threads tree is
-        # always-visible, not a single "open" panel), so it identifies which
-        # worker the clicked row / "+ New thread" belongs to.
-        w_name = String(get(payload, "worker", ""))
-        import_path[] = Dict{String,Any}()    # reset so the same path can re-fire
-        is_busy_idle(busy[]) || return
-        isempty(w_name) && return
-        do_import(w_name, path; resume_session_id = resume_session_id)
-    end
+    # The session-pick handler (payload parse + busy-idle guard + do_import) now
+    # lives next to its SESSION-LOCAL `pick` observable in `render_discover_panel`
+    # (worker_widget.jl), bridged to this `do_import` — so the observable is
+    # registered in the same session that renders the panel.
 
     # session_row + discover_panel are now rendered inside WorkerCard
     # (see worker_widget.jl) — each worker's card owns its discover panel
@@ -2123,7 +2122,7 @@ function dashboard_dom(state::ServerState;
     new_proj_form() = DOM.div(
         DOM.label("Name"),   text_input(np_name, "e.g. my-project"),
         DOM.label("Source"), DOM.div(
-            folder_picker_render(np_picker),
+            folder_picker_render(session, np_picker),
             map(np_picker.selected) do sel
                 isempty(sel) ? DOM.div() :
                     DOM.div("✓ selected: $sel",
@@ -2205,7 +2204,6 @@ function dashboard_dom(state::ServerState;
                 busy             = busy,
                 discover_busy    = discover_busy,
                 discover_results = discover_results,
-                import_path      = import_path,
                 do_import        = do_import,
                 trigger_scan     = trigger_scan!)
         end
@@ -2260,31 +2258,13 @@ function dashboard_dom(state::ServerState;
         DOM.div(worker_keyed_list; class = "bt-cards"))
 
     # ── Project list ────────────────────────────────────────────────────────
-    # Per-project ProjectCard widgets, stable in `project_cards`, fed to a
-    # KeyedList keyed on `project_id`. A sync starting on one project only
-    # re-renders THAT card's body — the other cards' DOM (and their
-    # in-flight click handlers, open-chat dropdowns) stay mounted.
-    project_cards = Dict{String,ProjectCard}()
-    function get_project_card(pid::AbstractString)
-        get!(project_cards, String(pid)) do
-            ProjectCard(state, String(pid), error_obs, sync_request,
-                         open_request, current_view)
-        end
-    end
-    empty_projects_block = DOM.div(
-        "No projects yet — pick a worker above and click + Project, or import an existing Claude session via Discover.";
-        class = "bt-empty")
-    empty_projects_class = map(state.projects) do projects
-        isempty(projects) ? "bt-empty-wrap" : "bt-empty-wrap bt-hidden"
-    end
-    project_widgets_obs = map(state.projects) do projects
-        ProjectCard[get_project_card(p.id) for p in values(projects)]
-    end
-    project_keyed_list = KeyedList(project_widgets_obs;
-                                    key = c -> c.project_id)
-    project_list = DOM.div(
-        DOM.div(empty_projects_block; class = empty_projects_class),
-        DOM.div(project_keyed_list; class = "bt-cards"))
+    # The standalone dashboard "Projects" card list was removed: it duplicated
+    # the per-worker `▸ projects` tree (in each WorkerCard) and the left sidebar
+    # ("running on workers"). The only card-only feature was move-to-worker,
+    # which is being redesigned. Project creation stays on the dashboard via the
+    # + New project / + From GitHub buttons; the projects themselves live in the
+    # worker pills and the sidebar. (`ProjectCard`, `sync_request`,
+    # `open_request` remain defined for the future move-to-worker redesign.)
 
     # Two slide-in forms, one source of truth: which one is open right now.
     form_block = map(which_form) do which
@@ -2336,11 +2316,10 @@ function dashboard_dom(state::ServerState;
         worker_list,
 
         DOM.div(
-            DOM.h2("Projects"),
+            DOM.h2("New project"),
             new_proj_btn,
             gh_btn;
             class = "bt-section"),
-        project_list,
         form_block;
 
         class = "bt-dash")
@@ -2353,11 +2332,12 @@ end
 # `compare_projects`. The user picks a direction; `on_apply(src, dst)` runs the
 # directional overwrite via `sync_across_workers!`. Reuses the `bt-collision-*`
 # CSS that already ships in DashboardStyles.
-function render_sync_modal(state::ServerState,
+function render_sync_modal(session::Bonito.Session,
+                            state::ServerState,
                             sync_modal_state::Observable,
                             on_apply::Function)
     worker_label(id) = haskey(state.workers[], id) ? state.workers[][id].name : id
-    map(sync_modal_state) do c
+    map(session, sync_modal_state) do c
         c === nothing && return DOM.div()
         cur_label   = worker_label(c.current.worker_id)
         other_label = worker_label(c.other.worker_id)
@@ -2389,15 +2369,15 @@ function render_sync_modal(state::ServerState,
             title = "Copy $(other_label)'s files onto $cur_label, overwriting it")
         cancel_btn = Bonito.Button("Cancel"; style = nothing,
             class = "bt-btn bt-btn-ghost")
-        on(push_btn.value) do clicked
+        on(session, push_btn.value) do clicked
             clicked || return
             on_apply(c.current, c.other)
         end
-        on(pull_btn.value) do clicked
+        on(session, pull_btn.value) do clicked
             clicked || return
             on_apply(c.other, c.current)
         end
-        on(cancel_btn.value) do clicked
+        on(session, cancel_btn.value) do clicked
             clicked || return
             sync_modal_state[] = nothing
         end
@@ -2513,7 +2493,7 @@ function dashboard_app(state::ServerState)
         DOM.div(
             DashboardStyles,
             Bonito.ConnectionIndicator(),
-            dashboard_dom(view))
+            dashboard_dom(session, view))
     end
 end
 

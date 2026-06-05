@@ -154,7 +154,19 @@ function ensure_eval_dialed!(s::JuliaSession)
         # is only this one-time setup call.
         prefix = Malt.remote_eval_fetch(s.worker, quote
             using Bonito
-            isdefined(Main, :RemoteProxy) || include($(REMOTE_PROXY_PATH))
+            # Re-include if RemoteProxy is absent OR only PARTIALLY loaded. A failed
+            # include (e.g. the resolved Bonito lacks the remote-app proxy API the
+            # module touches at load time) leaves a PARTIAL module registered in
+            # Main — early defs present, late ones (`register_app!`, `render_embed`)
+            # missing — and the include THREW. The old bare `isdefined(Main,
+            # :RemoteProxy)` guard then skipped re-include forever, so the next call
+            # built a bridge on the broken module and the missing def surfaced later
+            # as a cryptic `register_app! not defined`. `render_embed` is the
+            # module's last def ⇒ its presence means a complete load; otherwise
+            # re-include, which re-throws the REAL load error if the env is wrong.
+            if !(isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :render_embed))
+                include($(REMOTE_PROXY_PATH))
+            end
             Main.RemoteProxy.ensure_bridge!()
         end)
         # Drive a self-reconnecting dial loop on the worker. Handshake carries
@@ -178,7 +190,7 @@ function ensure_eval_dialed!(s::JuliaSession)
         for _ in 1:120   # ~30s budget — covers cold include + first dial
             if Malt.remote_eval_fetch(s.worker,
                     :(isdefined(Main, :RemoteProxy) && Main.RemoteProxy.BRIDGE[] !== nothing &&
-                      Main.RemoteProxy.BRIDGE[].parent.connection.ws[] !== nothing))
+                      Main.RemoteProxy.BRIDGE[].driver.ws[] !== nothing))
                 ready = true; break
             end
             sleep(0.25)
@@ -322,6 +334,9 @@ end
 # completed (drained partial → stdout block + the value blocks) or running.
 function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
     deadline = timeout === nothing ? Inf : time() + timeout
+    # The loop also exits promptly when the eval task dies — e.g. an MCP
+    # `notifications/cancelled` SIGINTs it via `handle_cancelled!`, which makes
+    # `istaskdone` true and falls through to the completed (interrupted) result.
     while !istaskdone(s.in_flight) && time() < deadline
         sleep(0.05)
     end

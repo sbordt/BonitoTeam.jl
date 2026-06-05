@@ -5,7 +5,6 @@
 # instance stability beyond the key.
 
 mutable struct SessionRow
-    import_path :: Observable{Dict{String,Any}}
     worker_id   :: String   # which worker this thread lives on (import payload)
     path        :: String
     name        :: String
@@ -37,7 +36,7 @@ function SessionRow(c::WorkerCard, r::AbstractDict)
     # falls through silently.
     running = get(r, "running", nothing) === true
     row_key = string(path, '|', session_id)
-    SessionRow(c.import_path, c.worker_id, path, name, session_id, preview, meta, running, row_key)
+    SessionRow(c.worker_id, path, name, session_id, preview, meta, running, row_key)
 end
 
 Base.hash(s::SessionRow, h::UInt) = hash(s.row_key, hash(:SessionRow, h))
@@ -87,7 +86,6 @@ mutable struct SessionGroup
     rows_obs    :: Observable{Vector{SessionRow}}   # nested KeyedList input
     summary_obs :: Observable{String}               # "5 sessions · 12 subagents · Last used …"
     worker_id   :: String                           # for the "+ New thread" import
-    import_path :: Observable{Dict{String,Any}}     # shared import sink
 end
 
 Base.hash(g::SessionGroup, h::UInt) = hash(g.path, hash(:SessionGroup, h))
@@ -123,17 +121,22 @@ function group_summary_string(rs::Vector)
 end
 
 function Bonito.jsrender(session::Bonito.Session, g::SessionGroup)
-    # Start a brand-new thread (fresh claude session, no resume) in this
-    # folder. `preventDefault`/`stopPropagation` so the click doesn't toggle
-    # the enclosing <details>. Empty session_id ⇒ the import handler uses
-    # session/new and `find_thread` always makes a sibling.
+    # Start a brand-new thread (fresh claude session, no resume) in this folder.
+    # Like the session rows, this is a delegated `data-bt-action="session-pick"`
+    # button (empty session_id ⇒ the import handler uses session/new and
+    # `find_thread` always makes a sibling) — the panel-level listener in
+    # `render_discover_panel` reads these attrs and notifies its SESSION-LOCAL
+    # pick observable. The only inline JS is `preventDefault` so the click
+    # doesn't toggle the enclosing group <details>; it must NOT stopPropagation,
+    # or the event wouldn't bubble up to the panel's delegated listener.
     new_thread_btn = DOM.span("+ New thread";
-        class   = "bt-new-thread",
-        title   = "Start a fresh chat in this folder",
-        onclick = js"""event => {
-            event.preventDefault(); event.stopPropagation();
-            $(g.import_path).notify({path: $(js_path(g.path)), session_id: "", worker: $(g.worker_id)});
-        }""")
+        class             = "bt-new-thread",
+        title             = "Start a fresh chat in this folder",
+        dataBtAction      = "session-pick",
+        dataBtSessionPath = js_path(g.path),
+        dataBtSessionId   = "",
+        dataBtWorkerId    = g.worker_id,
+        onclick           = js"event => { event.preventDefault(); }")
     return Bonito.jsrender(session, DOM.details(
         DOM.summary(
             DOM.span(g.name; class = "bt-group-name"),

@@ -136,6 +136,19 @@ mutable struct Connection
     reader_task::Union{Task,Nothing}
     dispatcher_task::Union{Task,Nothing}
     closed::Bool
+
+    # Set true by `cancel!` for the active turn. The `prompt!` consumer then
+    # fast-discards remaining buffered `session/update`s instead of coalescing +
+    # rendering them, so a token backlog can't keep the dispatcher from reaching
+    # the `cancelled` response (strict-FIFO head-of-line). Reset to false when
+    # the next turn starts (`request_updates`). Atomic for cross-task visibility
+    # (set on the cancel task, read in the consumer loop).
+    @atomic cancelling::Bool
+    # `time()` of the FIRST cancel for the active turn (0.0 if none). Lets the
+    # chat layer tell a deliberate re-cancel ("force it, it's wedged") from an
+    # impatient double-click — only the former, after the agent's had a real
+    # chance, escalates to a force-close. Reset to 0.0 at each turn start.
+    @atomic cancel_at::Float64
 end
 
 function Connection(transport::Transport, handler::Handler = DiscardHandler())
@@ -144,7 +157,9 @@ function Connection(transport::Transport, handler::Handler = DiscardHandler())
                       handler,
                       nothing, nothing,          # active_updates, active_id
                       Channel{Any}(1024),
-                      ReentrantLock(), nothing, nothing, false)
+                      ReentrantLock(), nothing, nothing, false,
+                      false,                     # cancelling
+                      0.0)                       # cancel_at
     conn.dispatcher_task = @async dispatcher_loop(conn)
     conn.reader_task     = @async reader_loop(conn)
     return conn
@@ -222,6 +237,8 @@ end
 # Only one such request may be in flight per connection at a time — true here:
 # bring-up's `session/load` completes before the prompt consumer is started.
 function request_updates(conn::Connection, method::String, params)
+    @atomic conn.cancelling = false   # fresh turn renders normally
+    @atomic conn.cancel_at  = 0.0     # fresh turn: no cancel recorded yet
     id = lock(conn.lock) do
         i = conn.next_id; conn.next_id += 1; i
     end
@@ -277,8 +294,18 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
             # Belongs to the active request that streams (session/prompt or
             # session/load); deliver to its stream. If none is active (the agent
             # shouldn't stream otherwise), drop it.
+            #
+            # DROP the moment cancel is requested. This single dispatcher task
+            # processes the inbox strictly in order, so if it BLOCKS here on
+            # `put!` into a backed-up `active_updates` (slow browser / heavy token
+            # or tool-call stream), it can never reach the `cancelled` response
+            # sitting behind the backlog — the turn would look wedged for as long
+            # as the browser takes to drain. Once cancel is requested we don't
+            # render any more of this turn anyway (the consumer fast-discards),
+            # so dropping here keeps the dispatcher free to reach the response
+            # immediately, regardless of downstream speed.
             ch = conn.active_updates
-            ch === nothing || put!(ch, update)
+            (ch === nothing || (@atomic conn.cancelling)) || put!(ch, update)
         end
         # Other notifications silently ignored.
 

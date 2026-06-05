@@ -12,7 +12,6 @@ mutable struct WorkerCard
     busy             :: Observable            # BUSY_IDLE-shape NamedTuple
     discover_busy    :: Observable{Bool}
     discover_results :: Observable{Vector{Dict{String,Any}}}
-    import_path      :: Observable{Dict{String,Any}}
     do_import        :: Function
     trigger_scan     :: Function
     remote_picker    :: RemoteFolderPicker
@@ -27,7 +26,6 @@ function WorkerCard(state::ServerState, worker_id::AbstractString;
                      busy::Observable,
                      discover_busy::Observable{Bool},
                      discover_results::Observable{Vector{Dict{String,Any}}},
-                     import_path::Observable{Dict{String,Any}},
                      do_import::Function,
                      trigger_scan::Function)
     w0 = get(state.workers[], worker_id, nothing)
@@ -36,7 +34,7 @@ function WorkerCard(state::ServerState, worker_id::AbstractString;
                                         worker_initials(w0)
     WorkerCard(state, String(worker_id),
                 error_obs, picker_state, discover_state,
-                busy, discover_busy, discover_results, import_path,
+                busy, discover_busy, discover_results,
                 do_import, trigger_scan,
                 RemoteFolderPicker(worker_id),
                 Observable(initial_name),
@@ -64,7 +62,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     end
 
     new_proj_btn = Bonito.Button("+ Project"; style=nothing, class = "bt-btn bt-btn-secondary")
-    on(new_proj_btn.value) do clicked
+    on(session, new_proj_btn.value) do clicked
         clicked || return
         c.picker_state[]   = c.picker_state[] == wid ? "" : wid
         c.error_obs[]      = ""
@@ -83,7 +81,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
                 event.target.blur();
             }
         }""")
-    on(c.name_obs) do v
+    on(session, c.name_obs) do v
         new = strip(String(v))
         cur = haskey(state.workers[], wid) ? state.workers[][wid].name : wid
         isempty(new) && (c.name_obs[] = cur; return)
@@ -114,7 +112,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
                 event.target.blur();
             }
         }""")
-    on(c.initials_obs) do v
+    on(session, c.initials_obs) do v
         new = strip(String(v))
         w_now = get(state.workers[], wid, nothing)
         cur = w_now === nothing ? derive_initials(wid) : worker_initials(w_now)
@@ -138,7 +136,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     # destructive call without an explicit OK; only then does the trigger
     # Observable flip and the Julia handler run `remove_worker!`.
     remove_trigger = Observable(false)
-    on(remove_trigger) do go
+    on(session, remove_trigger) do go
         go || return
         try
             remove_worker!(state, wid)
@@ -176,7 +174,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     card_row = DOM.div(card_body, actions_block; class = "bt-card-row")
 
     is_picking_obs = map(s -> s == wid, c.picker_state)
-    picker_form    = render_remote_picker_form(c, wid)
+    picker_form    = render_remote_picker_form(session, c, wid)
     picker_class   = map(p -> p ? "bt-form-wrapper" : "bt-form-wrapper bt-hidden", is_picking_obs)
     picker_block   = DOM.div(picker_form; class = picker_class)
 
@@ -190,12 +188,12 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
         DOM.div(card, picker_block; class = "bt-worker-cell"))
 end
 
-function render_remote_picker_form(c::WorkerCard, wid::String)
+function render_remote_picker_form(session::Bonito.Session, c::WorkerCard, wid::String)
     create_btn = Bonito.Button("Create"; style=nothing, class = "bt-btn")
     cancel_btn = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
     rp = c.remote_picker
 
-    on(create_btn.value) do clicked
+    on(session, create_btn.value) do clicked
         clicked || return
         is_busy_idle(c.busy[]) || return
         chosen = String(strip(rp.selected[]))
@@ -206,7 +204,7 @@ function render_remote_picker_form(c::WorkerCard, wid::String)
         rp.selected[] = ""
         c.do_import(wid, chosen)
     end
-    on(cancel_btn.value) do clicked
+    on(session, cancel_btn.value) do clicked
         clicked || return
         is_busy_idle(c.busy[]) || return
         c.picker_state[] = ""
@@ -222,7 +220,7 @@ function render_remote_picker_form(c::WorkerCard, wid::String)
     DOM.div(
         DOM.label(label_obs),
         DOM.div(
-            remote_folder_picker_render(rp),
+            remote_folder_picker_render(session, rp),
             map(rp.selected) do sel
                 isempty(sel) ? DOM.div() :
                     DOM.div("✓ selected: $sel",
@@ -245,7 +243,7 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
     # other worker's panel.
     scan_busy = Observable(false)
     rescan_trigger = Observable(false)
-    on(rescan_trigger) do go
+    on(session, rescan_trigger) do go
         go || return
         scan_busy[] && return
         scan_busy[] = true
@@ -256,6 +254,31 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
         finally
             scan_busy[] = false
         end
+    end
+
+    # Resume / Import / + New thread all funnel through ONE session-local `pick`
+    # observable + the ONE delegated panel listener below. It's created in THIS
+    # render's session (like `rescan_trigger`), so `$(pick)` is guaranteed to be
+    # in GLOBAL_OBJECT_CACHE at click time. The previous code interpolated the
+    # SHARED `import_path` from `dashboard_dom`'s scope — registered in a
+    # DIFFERENT session than the card's — so the client lookup returned null and
+    # `.notify` threw "Key N not found", silently killing Resume while the
+    # optimistic "Resuming…" label still flipped. (bonito skill: never
+    # interpolate a shared Observable into a sub-session's render.) The bridge to
+    # the shared `c.do_import` keeps the actual import logic in one place.
+    pick = Observable(Dict{String,Any}())
+    on(session, pick) do payload
+        isempty(payload) && return
+        path = String(get(payload, "path", ""))
+        isempty(path) && return
+        sid_raw = get(payload, "session_id", nothing)
+        resume_session_id = (sid_raw === nothing || isempty(String(sid_raw))) ?
+                                nothing : String(sid_raw)
+        w_name = String(get(payload, "worker", ""))
+        pick[] = Dict{String,Any}()              # reset so the same row can re-fire
+        isempty(w_name) && return
+        is_busy_idle(c.busy[]) || return         # drop double-clicks while a start is in flight
+        c.do_import(w_name, path; resume_session_id = resume_session_id)
     end
     # Plain DOM (not Bonito.Button) so the onclick can `preventDefault` the
     # enclosing <details> summary toggle (Rescan should NOT collapse the panel
@@ -356,7 +379,7 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
             g = get!(session_groups, p) do
                 SessionGroup(p, basename(p),
                              Observable(rows), Observable(""),
-                             wid, c.import_path)
+                             wid)
             end
             g.rows_obs[]    = rows
             g.summary_obs[] = group_summary_string(rs)
@@ -390,23 +413,31 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
         DOM.div(groups_keyed_list; class = "bt-discover-section");
         class = "bt-discover-panel")
 
-    # One delegated click for the whole panel — N session rows queue ONE
-    # listener-install message instead of N per-row onclick rebinds.
-    Bonito.onload(session, panel, js"""(el) => {
-        el.addEventListener('click', (ev) => {
-            const btn = ev.target.closest('.bt-btn[data-bt-action="session-pick"]');
+    # One delegated click for the whole panel — every session row AND the
+    # per-group "+ New thread" button share ONE listener (matched by the
+    # `data-bt-action="session-pick"` attr) instead of N per-row onclick rebinds.
+    # Installed as an inline `js"…"` CHILD (serialized with this subtree), and it
+    # notifies the SESSION-LOCAL `pick` above — `$(pick)` resolves because it was
+    # created in this render's session, unlike the old cross-session
+    # `import_path` (see the `pick` comment).
+    click_listener = js"""
+        $(panel).addEventListener('click', (ev) => {
+            const btn = ev.target.closest('[data-bt-action="session-pick"]');
             if (!btn) return;
             // Optimistic UI: the controller-side import is async, so flip the
-            // label + dim immediately so the user sees the click landed.
+            // label + dim immediately so the user sees the click landed. (The
+            // "+ New thread" span has no Resume/Import label — leave its text.)
             btn.classList.add('bt-clicked');
-            btn.textContent = btn.textContent.trim() === 'Resume' ?
-                'Resuming…' : 'Importing…';
-            $(c.import_path).notify({
+            const t = btn.textContent.trim();
+            if (t === 'Resume')      btn.textContent = 'Resuming…';
+            else if (t === 'Import') btn.textContent = 'Importing…';
+            $(pick).notify({
                 path:       btn.dataset.btSessionPath || '',
                 session_id: btn.dataset.btSessionId   || '',
                 worker:     btn.dataset.btWorkerId    || '',
             });
         });
-    }""")
-    return panel
+    """
+    # `display: contents` so the wrapper is transparent to the card's layout.
+    return DOM.div(panel, click_listener; style = Styles("display" => "contents"))
 end

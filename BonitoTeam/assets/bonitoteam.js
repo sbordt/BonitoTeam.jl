@@ -561,6 +561,12 @@ class BonitoChat {
         // bt_show: the completion update is when we learn it's a "show me this"
         // tool — auto-expand its preview (idempotent; user can still collapse).
         if (msg.expand && node.collapsable) node.collapsable.setExpanded(true);
+        // A background bash/Task only learns it's a taskbar item when its launch
+        // result arrives (rawInput doesn't carry run_in_background), so the server
+        // flips `taskbar` on a later update. The taskbar filter keys off this
+        // attr — set it so `_refreshTaskbar` below adds the slot. (Set-only,
+        // matching createNode; nothing clears it.)
+        if (msg.taskbar) node.dataset.toolTaskbar = '1';
         // Live-set / timer / taskbar all sit on the same DOM data attrs the
         // ticker reads — rebuild now so the taskbar reflects this change
         // instantly instead of waiting for the next 1s tick.
@@ -632,15 +638,25 @@ class BonitoChat {
                     { toggleEl: div.querySelector('.bt-tool-toggle'),
                       fetchEachExpand: true, discardOnCollapse: true,
                       onExpand: () => this.comm.notify({type: 'tool.render', id}) });
-                // Full-chat-width toggle: extends the tool pill to span the
-                // whole message column, so wide content (diffs / tables /
-                // remote-app embeds) gets the room it needs. Independent of
-                // the body-expand collapsable above — the wide button must NOT
-                // toggle expand/collapse, so we stopPropagation on its click.
-                const wideBtn = div.querySelector('.bt-tool-wide');
+                // Detach (bonito_app only): pop the embed into the floating
+                // window. Lives on the ⤢ header button — the conventional "open
+                // in a window" glyph, and where users expect detach.
+                const detachBtn = div.querySelector('.bt-tool-detach');
+                if (detachBtn) detachBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    window._btPopup && window._btPopup.detach(id);
+                });
+                // Full-chat-width toggle, vertically centered on the bubble's
+                // right edge (CSS reveals it only while the body is expanded —
+                // there's no point widening an empty header). Extends the pill to
+                // span the whole message column so wide content (diffs / tables /
+                // remote-app embeds) gets room. Must NOT toggle expand/collapse,
+                // so stopPropagation.
+                const wideBtn = div.querySelector('.bt-tool-fullwidth');
                 if (wideBtn) wideBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
                     const active = div.classList.toggle('bt-tool-wide-active');
+                    wideBtn.textContent = active ? '«' : '»';
                     wideBtn.title = active ?
                         'Collapse to default width' : 'Expand to full chat width';
                 });
@@ -731,11 +747,15 @@ class BonitoChat {
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 <span class="bt-tool-timer"></span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
-                <button class="bt-tool-wide" type="button"
-                        title="Expand to full chat width">⤢</button>
+                ${msg.has_app
+                    ? `<button class="bt-tool-detach" type="button"
+                              title="Detach to floating window">⤢</button>`
+                    : ''}
             </div>
             ${preview}
-            <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
+            <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>
+            <button class="bt-tool-fullwidth" type="button"
+                    title="Expand to full chat width">»</button>`;
     }
 
     // ── Live tools / todos: pulse + timer + taskbar ──────────────────────

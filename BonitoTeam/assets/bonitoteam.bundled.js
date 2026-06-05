@@ -126,7 +126,10 @@ class BonitoChat {
             this._onVPResize = ()=>this.onViewportResize();
             window.visualViewport.addEventListener('resize', this._onVPResize);
         }
-        Promise.resolve().then(()=>this._setupInputs());
+        Promise.resolve().then(()=>{
+            this._setupInputs();
+            this._setupLiveTicker();
+        });
     }
     destroy() {
         this.destroyed = true;
@@ -168,6 +171,13 @@ class BonitoChat {
             this._onDrop && this.app.removeEventListener('drop', this._onDrop);
         }
         clearTimeout(this._attachErrorTimer);
+        if (this._tickerId) {
+            clearInterval(this._tickerId);
+            this._tickerId = null;
+        }
+        if (this.taskbarEl && this._onTaskbarClick) {
+            this.taskbarEl.removeEventListener('click', this._onTaskbarClick);
+        }
     }
     dispatch(msg) {
         if (typeof msg.n === 'number' && msg.n > this.totalCount) {
@@ -196,6 +206,8 @@ class BonitoChat {
                 return this.onThoughtBody(msg);
             case 'tool_update':
                 return this.onToolUpdate(msg);
+            case 'plan_update':
+                return this.onPlanUpdate(msg);
             case 'chunk':
                 return this.appendChunk(msg);
             case 'user_chunk':
@@ -395,6 +407,12 @@ class BonitoChat {
                 s.textContent = msg.status;
                 s.className = `bt-tool-status bt-status-${msg.status}`;
             }
+            const live = !(msg.status === 'completed' || msg.status === 'failed');
+            node.classList.toggle('bt-tool-live', live);
+        }
+        if (msg.finished_at != null) {
+            node.dataset.toolFinished = String(msg.finished_at);
+            node.classList.remove('bt-tool-live');
         }
         if (msg.title) {
             const t = node.querySelector('.bt-tool-title');
@@ -415,6 +433,8 @@ class BonitoChat {
             prev.innerHTML = msg.preview;
         }
         if (msg.expand && node.collapsable) node.collapsable.setExpanded(true);
+        if (msg.taskbar) node.dataset.toolTaskbar = '1';
+        this._refreshTaskbar();
     }
     createNode(msg) {
         const div = document.createElement('div');
@@ -454,6 +474,12 @@ class BonitoChat {
                 {
                     div.className = 'bt-tool-msg';
                     div.innerHTML = this.toolHTML(msg);
+                    if (msg.id) div.dataset.msgId = msg.id;
+                    if (msg.started_at != null) div.dataset.toolStarted = String(msg.started_at);
+                    if (msg.finished_at != null) div.dataset.toolFinished = String(msg.finished_at);
+                    if (msg.taskbar) div.dataset.toolTaskbar = '1';
+                    const liveTool = !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
+                    if (liveTool) div.classList.add('bt-tool-live');
                     const id = msg.id;
                     div.collapsable = new Collapsable(div.querySelector('.bt-tool-header'), div.querySelector('.bt-tool-body'), {
                         toggleEl: div.querySelector('.bt-tool-toggle'),
@@ -464,19 +490,32 @@ class BonitoChat {
                                 id
                             })
                     });
-                    const wideBtn = div.querySelector('.bt-tool-wide');
+                    const detachBtn = div.querySelector('.bt-tool-detach');
+                    if (detachBtn) detachBtn.addEventListener('click', (e)=>{
+                        e.stopPropagation();
+                        window._btPopup && window._btPopup.detach(id);
+                    });
+                    const wideBtn = div.querySelector('.bt-tool-fullwidth');
                     if (wideBtn) wideBtn.addEventListener('click', (e)=>{
                         e.stopPropagation();
                         const active = div.classList.toggle('bt-tool-wide-active');
+                        wideBtn.textContent = active ? '«' : '»';
                         wideBtn.title = active ? 'Collapse to default width' : 'Expand to full chat width';
                     });
                     if (msg.expand) queueMicrotask(()=>div.collapsable.setExpanded(true));
                     break;
                 }
             case 'plan':
-                div.className = 'bt-plan-msg';
-                div.innerHTML = msg.html || '';
-                break;
+                {
+                    div.className = 'bt-plan-msg';
+                    div.innerHTML = msg.html || '';
+                    if (msg.id) div.dataset.msgId = msg.id;
+                    if (msg.started_at != null) div.dataset.planStarted = String(msg.started_at);
+                    if (msg.finished_at != null) div.dataset.planFinished = String(msg.finished_at);
+                    if (msg.summary) div.dataset.planSummary = msg.summary;
+                    if (msg.live) div.classList.add('bt-plan-live');
+                    break;
+                }
             case 'summary':
                 {
                     div.className = 'bt-summary-msg';
@@ -520,12 +559,105 @@ class BonitoChat {
                 ${server}
                 <span class="bt-tool-title">${escapeHTML(msg.title || '')}</span>
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
+                <span class="bt-tool-timer"></span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
-                <button class="bt-tool-wide" type="button"
-                        title="Expand to full chat width">⤢</button>
+                ${msg.has_app ? `<button class="bt-tool-detach" type="button"
+                              title="Detach to floating window">⤢</button>` : ''}
             </div>
             ${preview}
-            <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
+            <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>
+            <button class="bt-tool-fullwidth" type="button"
+                    title="Expand to full chat width">»</button>`;
+    }
+    onPlanUpdate(msg) {
+        const node = this.nodeById.get(msg.id);
+        if (!node) return;
+        if (msg.html != null) node.innerHTML = msg.html;
+        if (msg.started_at != null) node.dataset.planStarted = String(msg.started_at);
+        if (msg.finished_at != null) {
+            node.dataset.planFinished = String(msg.finished_at);
+            node.classList.remove('bt-plan-live');
+        } else if (msg.live === false) {
+            node.classList.remove('bt-plan-live');
+        } else if (msg.live === true) {
+            node.classList.add('bt-plan-live');
+        }
+        if (msg.summary) node.dataset.planSummary = msg.summary;
+        this._refreshTaskbar();
+    }
+    _setupLiveTicker() {
+        this.taskbarEl = this.app ? this.app.querySelector('.bt-taskbar') : this.container.parentElement.querySelector('.bt-taskbar');
+        if (!this.taskbarEl) return;
+        this._onTaskbarClick = (ev)=>{
+            const stopBtn = ev.target.closest('.bt-taskbar-slot-stop');
+            if (stopBtn) {
+                ev.stopPropagation();
+                const slot = stopBtn.closest('.bt-taskbar-slot');
+                const id = slot?.dataset.targetId;
+                if (id) this.comm.notify({
+                    type: 'stop_tool',
+                    id
+                });
+                return;
+            }
+            const slot = ev.target.closest('.bt-taskbar-slot');
+            if (!slot) return;
+            const id = slot.dataset.targetId;
+            if (!id) return;
+            const target = this.nodeById.get(id);
+            if (target) target.scrollIntoView({
+                block: 'center',
+                behavior: 'smooth'
+            });
+        };
+        this.taskbarEl.addEventListener('click', this._onTaskbarClick);
+        this._tickerId = setInterval(()=>this._tickLiveTimers(), 1000);
+        this._refreshTaskbar();
+    }
+    _tickLiveTimers() {
+        if (this.destroyed) return;
+        const now = Date.now() / 1000;
+        for (const el of this.container.querySelectorAll('div.bt-tool-msg.bt-tool-live, div.bt-plan-msg.bt-plan-live')){
+            const started = parseFloat(el.dataset.toolStarted ?? el.dataset.planStarted ?? '0');
+            if (!started) continue;
+            const elapsed = now - started;
+            const timer = el.querySelector('.bt-tool-timer');
+            if (timer) timer.textContent = elapsed > 1 ? _formatElapsed(elapsed) : '';
+        }
+        for (const slot of this.taskbarEl.querySelectorAll('.bt-taskbar-slot')){
+            const started = parseFloat(slot.dataset.started ?? '0');
+            if (!started) continue;
+            const elapsed = now - started;
+            const t = slot.querySelector('.bt-taskbar-slot-timer');
+            if (t) t.textContent = elapsed > 1 ? _formatElapsed(elapsed) : '';
+        }
+    }
+    _refreshTaskbar() {
+        if (this.destroyed || !this.taskbarEl) return;
+        const live = this.container.querySelectorAll('div.bt-tool-msg.bt-tool-live[data-tool-taskbar], div.bt-plan-msg.bt-plan-live');
+        if (live.length === 0) {
+            this.taskbarEl.replaceChildren();
+            return;
+        }
+        const frag = document.createDocumentFragment();
+        for (const el of live){
+            const id = el.dataset.msgId;
+            if (!id) continue;
+            const isPlan = el.classList.contains('bt-plan-msg');
+            const icon = isPlan ? '📋' : el.querySelector('.bt-tool-kind')?.textContent || '⚙';
+            const label = isPlan ? el.dataset.planSummary || 'Todo list' : el.querySelector('.bt-tool-title')?.textContent || 'Tool';
+            const started = isPlan ? el.dataset.planStarted : el.dataset.toolStarted;
+            const slot = document.createElement('div');
+            slot.className = 'bt-taskbar-slot';
+            slot.dataset.targetId = id;
+            if (started) slot.dataset.started = started;
+            const stop = isPlan ? '' : `<span class="bt-taskbar-slot-stop" title="Ask Claude to stop this">⊗</span>`;
+            slot.innerHTML = `<span class="bt-taskbar-slot-icon">${icon}</span>` + `<span class="bt-taskbar-slot-label"></span>` + `<span class="bt-taskbar-slot-timer"></span>` + stop;
+            slot.querySelector('.bt-taskbar-slot-label').textContent = label;
+            frag.appendChild(slot);
+        }
+        this.taskbarEl.replaceChildren(frag);
+        this._tickLiveTimers();
     }
     atBottom() {
         const { scrollTop , scrollHeight , clientHeight  } = this.container;
@@ -795,6 +927,12 @@ function escapeHTML(str) {
 }
 function escapeAttr(str) {
     return escapeHTML(str).replace(/"/g, '&quot;');
+}
+function _formatElapsed(sec) {
+    if (sec < 60) return `${Math.round(sec)}s`;
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec - m * 60);
+    return s === 0 ? `${m}m` : `${m}m${s}s`;
 }
 function arrayBufferToBase64(buf) {
     const bytes = new Uint8Array(buf);

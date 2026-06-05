@@ -33,20 +33,15 @@ mutable struct EvalBridge
     pending_lock::ReentrantLock
     reqid::Threads.Atomic{Int}
     root_conn::Base.RefValue{Any}        # current browser root connection (worker→browser target)
-    # Set when the WS drops; cancelled if a reconnect arrives before it fires.
-    # Defers asset_host close + EVAL_WORKERS eviction so a transient drop doesn't
-    # tear down the per-worker registry that the reconnect would have reused.
-    teardown_armed::Threads.Atomic{Bool}
 end
 
 # Reconnects compare prefix (== BRIDGE[].parent.id on the worker): same prefix
 # means same BRIDGE[] / same routes, swap WS; different prefix means worker
-# restart, hard-replace.
+# restart, hard-replace. `ws === nothing` ⇒ disconnected, awaiting redial.
 make_eval_bridge(prefix::AbstractString, ws, host) = EvalBridge(
     String(prefix), ws, ReentrantLock(), host,
     Dict{Int,Channel{Any}}(), ReentrantLock(),
-    Threads.Atomic{Int}(0), Base.RefValue{Any}(nothing),
-    Threads.Atomic{Bool}(false))
+    Threads.Atomic{Int}(0), Base.RefValue{Any}(nothing))
 
 const EVAL_WORKERS = Dict{String, EvalBridge}()    # project_id => EvalBridge
 
@@ -56,17 +51,39 @@ function send_tagged(eb::EvalBridge, tag::UInt8, payload::AbstractVector{UInt8})
     @inbounds buf[1] = tag
     copyto!(buf, 2, payload, firstindex(payload), length(payload))
     lock(eb.wlock) do
-        try; HTTP.WebSockets.send(eb.ws, buf); catch; end
+        try
+            HTTP.WebSockets.send(eb.ws, buf)
+        catch e
+            # A send racing the dial-back socket dropping/swapping throws routinely;
+            # that's the only expected failure. Log (don't swallow) so a genuine
+            # transport fault is diagnosable.
+            @debug "eval bridge: frame send failed (socket closing?)" exception = e
+        end
     end
     return nothing
 end
 send_data(eb::EvalBridge, bytes::AbstractVector{UInt8}) = send_tagged(eb, TAG_DATA, bytes)
 send_ctrl(eb::EvalBridge, dict)                         = send_tagged(eb, TAG_CTRL, Bonito.MsgPack.pack(dict))
 
+# EvalBridge is the host-side proxy driver for Bonito's proxy framework: Bonito
+# routes browser→worker frames through `proxy_forward`, and serves proxied asset
+# byte ranges through `proxy_fetch`. We re-pack the DECODED frame as plain
+# (uncompressed) msgpack so the worker's bridge — which runs uncompressed —
+# handles it regardless of the browser connection's compression. `proxy_fetch`
+# runs on the HTTP asset-handler task (not the relay loop), so its `call_ctrl`
+# round-trip can't deadlock the relay.
+Bonito.proxy_forward(eb::EvalBridge, data) = send_data(eb, Bonito.MsgPack.pack(data))
+Bonito.proxy_fetch(eb::EvalBridge, key, start, stop) =
+    ctrl_bytes(call_ctrl(eb, "asset_read"; key = key, start = start, stop = stop))
+
 # A control request that expects a reply (delegate / asset_read). The dial-back
 # relay loop resolves it via `pending`; this runs on a DIFFERENT task (a chat
 # command or an HTTP asset handler), so the wait can't deadlock the relay.
 function call_ctrl(eb::EvalBridge, op::AbstractString; timeout = 30.0, kw...)
+    # Disconnected window (WS dropped, worker redialing): fail fast instead of
+    # sending into the void and waiting out the full timeout. The worker's
+    # dial_loop reconnects within its backoff; the caller can retry/re-render.
+    eb.ws === nothing && error("eval bridge disconnected (worker redialing); '$op' not sent")
     id = Threads.atomic_add!(eb.reqid, 1)
     ch = Channel{Any}(1)
     lock(eb.pending_lock) do; eb.pending[id] = ch; end
@@ -104,23 +121,15 @@ function handle_worker_control(eb::EvalBridge, msg::AbstractDict)
     elseif op == "asset_add"
         k = String(msg["key"])
         cached = ctrl_bytes(msg["cached"])
-        # Lazy fetch for non-eager assets — a control round-trip on a SEPARATE task
-        # (the HTTP asset handler), never on this relay loop, so no deadlock.
-        fetch = (s, e) -> ctrl_bytes(call_ctrl(eb, "asset_read"; key = k, start = s, stop = e))
+        # Non-eager assets are fetched lazily via `proxy_fetch(eb, …)` on the HTTP
+        # asset-handler task (never this relay loop), so no deadlock.
         Bonito.register_proxy_asset!(eb.asset_host,
-            Bonito.RemoteAsset(k, String(msg["mime"]), Int(msg["total"]), cached, fetch))
+            Bonito.RemoteAsset(k, String(msg["mime"]), Int(msg["total"]), cached, eb))
     elseif op == "asset_remove"
         Bonito.release_proxy_asset!(eb.asset_host, String(msg["key"]))
     end
     return
 end
-
-# Grace period before we tear an EvalBridge down after its WS dropped. The
-# worker's `dial_loop` retries with min 0.5 s and max 8 s backoff, so 30 s
-# easily covers a network blip; if the worker is truly gone after that, we
-# release the asset_host + clear EVAL_WORKERS so the next first-time dial-back
-# rebuilds cleanly.
-const EVAL_BRIDGE_RECONNECT_GRACE = 30.0
 
 # Fail every in-flight `call_ctrl` waiting on this bridge with a clean error —
 # called when the WS drops, so callers don't sit on a 30 s timeout for replies
@@ -141,6 +150,37 @@ end
 # `/eval-ws` handler. Handshake is "secret project_id prefix"; after that the
 # socket is a raw Bonito frame pipe. This task IS the worker→browser relay (and
 # the worker→host control reader) for the bridge's whole lifetime.
+# Process one inbound frame from the worker: DATA → queue for the browser (so a
+# slow browser can't block the relay loop); CTRL → handle inline (reply routing +
+# asset register, all fast). Extracted so the decoupling is unit-testable.
+function relay_frame!(eb::EvalBridge, outbound::Channel{Vector{UInt8}}, data::AbstractVector{UInt8})
+    isempty(data) && return nothing
+    tag = @inbounds data[1]
+    payload = @view data[2:end]
+    if tag == TAG_DATA
+        isopen(outbound) && put!(outbound, Vector{UInt8}(payload))
+    elseif tag == TAG_CTRL
+        handle_worker_control(eb, Bonito.MsgPack.unpack(Vector{UInt8}(payload)))
+    end
+    return nothing
+end
+
+# Drain queued worker→browser frames to the current root connection, IN ORDER, on
+# a dedicated task — so a slow `write` stalls only this writer, never the relay
+# loop's control-frame handling.
+function relay_writer(eb::EvalBridge, outbound::Channel{Vector{UInt8}})
+    for payload in outbound
+        rc = eb.root_conn[]
+        rc === nothing && continue
+        try
+            write(rc, payload)
+        catch e
+            @debug "eval relay: browser write failed (tab closing/slow?)" exception = e
+        end
+    end
+    return nothing
+end
+
 function handle_eval_ws(state::ServerState, ws)
     line = try; String(HTTP.WebSockets.receive(ws)); catch; return; end
     parts = split(strip(line), ' '; limit = 3)
@@ -156,45 +196,55 @@ function handle_eval_ws(state::ServerState, ws)
     # `prefix` against `BRIDGE[].parent.id` on the worker side. Same prefix ⇒
     # same `BRIDGE[]` (routes intact) ⇒ swap WS into the existing EvalBridge.
     # Different prefix ⇒ worker restarted ⇒ stale routes, hard-replace.
-    existing = get(EVAL_WORKERS, project_id, nothing)
-    eb = if existing !== nothing && existing.prefix == prefix
-        @info "eval worker reconnected" project_id prefix
-        # Fail any orphaned pending — those replies physically can't come back
-        # over the old WS, so the callers shouldn't wait for them.
-        fail_pending!(existing, "eval bridge reconnected; in-flight request dropped")
-        lock(existing.wlock) do
-            existing.ws = ws
+    #
+    # The get-and-install is done under `state.lock` so it's atomic w.r.t.
+    # `teardown_eval_bridge!` (which mutates EVAL_WORKERS under the same lock) —
+    # otherwise a concurrent teardown could delete the entry between our read and
+    # write. The heavy cleanup (fail_pending, asset-host close, wiring clear) is
+    # disjoint by prefix from the fresh bridge, so we do it AFTER releasing the
+    # lock rather than holding it across those other locks.
+    eb, to_fail, to_retire = lock(state.lock) do
+        existing = get(EVAL_WORKERS, project_id, nothing)
+        if existing !== nothing && existing.prefix == prefix
+            @info "eval worker reconnected" project_id prefix
+            lock(existing.wlock) do; existing.ws = ws; end
+            (existing, existing, nothing)          # fail its orphaned pending below
+        else
+            fresh = make_eval_bridge(prefix, ws, Bonito.HTTPAssetServer(state.srv))
+            EVAL_WORKERS[project_id] = fresh
+            @info "eval worker dialed back (ws) — raw bridge installed" project_id prefix
+            (fresh, nothing, existing)             # retire the old (different-prefix) bridge below
         end
-        existing.teardown_armed[] = false   # cancel any pending teardown
-        existing
-    else
-        if existing !== nothing
-            @info "eval worker replaced (new prefix; worker restarted?)" project_id old_prefix = existing.prefix new_prefix = prefix
-            # Old bridge's routes are stale — fail orphans, drop the asset host.
-            fail_pending!(existing, "eval bridge replaced by a new worker; in-flight request dropped")
-            try close(existing.asset_host) catch end
-        end
-        fresh = make_eval_bridge(prefix, ws, Bonito.HTTPAssetServer(state.srv))
-        EVAL_WORKERS[project_id] = fresh
-        @info "eval worker dialed back (ws) — raw bridge installed" project_id prefix
-        fresh
+    end
+    to_fail === nothing ||
+        fail_pending!(to_fail, "eval bridge reconnected; in-flight request dropped")
+    if to_retire !== nothing
+        @info "eval worker replaced (new prefix; worker restarted?)" project_id old_prefix = to_retire.prefix new_prefix = prefix
+        # Old bridge is a dead worker process — fail orphans, drop its asset host,
+        # and clear its host-side wiring so the fresh bridge re-attaches cleanly.
+        fail_pending!(to_retire, "eval bridge replaced by a new worker; in-flight request dropped")
+        try close(to_retire.asset_host) catch end
+        clear_bridge_wiring!(to_retire.prefix)
     end
 
+    # Worker→browser writes are DECOUPLED from this relay loop. The loop also
+    # delivers control REPLIES (delegate / asset_read), so a slow or CPU-bound
+    # browser (WGLMakie, or headless software-WebGL) that drains its socket slowly
+    # would otherwise block the loop on `write(rc, …)` and starve those replies →
+    # 30s `call_ctrl` timeouts ("delegate timed out" / stuck "loading…"). Data
+    # frames go onto a bounded queue drained by a dedicated `relay_writer`; the
+    # loop stays responsive to control frames regardless of browser speed. The
+    # bound also back-pressures a runaway stream (a full queue blocks the loop —
+    # degrading to the old behavior, never worse) so it can't grow without bound.
+    outbound = Channel{Vector{UInt8}}(2048)
+    writer = Base.errormonitor(@async relay_writer(eb, outbound))
     try
         for msg in ws
             # Per-frame guard: a single malformed/raising frame must NOT tear down
-            # the whole bridge relay (which would strand every pending control reply).
+            # the whole relay (which would strand every pending control reply).
             try
                 data = msg isa AbstractVector{UInt8} ? msg : Vector{UInt8}(codeunits(String(msg)))
-                isempty(data) && continue
-                tag = @inbounds data[1]
-                payload = @view data[2:end]
-                if tag == TAG_DATA
-                    rc = eb.root_conn[]
-                    rc === nothing || write(rc, Vector{UInt8}(payload))   # worker → browser
-                elseif tag == TAG_CTRL
-                    handle_worker_control(eb, Bonito.MsgPack.unpack(Vector{UInt8}(payload)))
-                end
+                relay_frame!(eb, outbound, data)
             catch e
                 @warn "eval dial-back: dropping bad frame" exception = (e, catch_backtrace())
             end
@@ -203,27 +253,59 @@ function handle_eval_ws(state::ServerState, ws)
         e isa HTTP.WebSockets.WebSocketError || e isa Base.IOError || e isa EOFError ||
             @warn "eval dial-back relay loop ended" exception = (e, catch_backtrace())
     finally
-        # WS dropped. Fail in-flight requests immediately (no point waiting for
-        # replies over a dead socket), then arm a deferred teardown — if the
-        # worker's dial_loop reconnects within the grace window, the reconnect
-        # branch above cancels it. Otherwise we drop the proxied assets and
-        # evict from EVAL_WORKERS, freeing the entry for a future fresh dial.
-        fail_pending!(eb, "eval bridge WS dropped; in-flight request abandoned")
-        eb.teardown_armed[] = true
-        Base.errormonitor(@async begin
-            sleep(EVAL_BRIDGE_RECONNECT_GRACE)
-            if eb.teardown_armed[]
-                eb.teardown_armed[] = false
-                try close(eb.asset_host) catch end
-                lock(state.lock) do
-                    get(EVAL_WORKERS, project_id, nothing) === eb &&
-                        delete!(EVAL_WORKERS, project_id)
-                end
-                @info "eval bridge teardown after no reconnect" project_id prefix
-            end
-        end)
+        close(outbound)   # stop the writer task
+        # WS dropped. Fail in-flight requests (no reply can arrive over a dead
+        # socket) and mark the bridge disconnected so `call_ctrl` fails fast
+        # instead of hanging the full timeout. We DON'T tear the bridge down here:
+        # its lifetime is the eval worker's Julia session, not this socket. The
+        # worker's `dial_loop` redials (same prefix → the reconnect branch swaps
+        # the WS back in, routes + registered apps intact). Teardown happens only
+        # with the worker session — see `teardown_eval_bridge!`. The identity
+        # guard avoids clobbering a WS a concurrent reconnect already swapped in.
+        fail_pending!(eb, "eval bridge WS dropped; awaiting redial")
+        lock(eb.wlock) do
+            eb.ws === ws && (eb.ws = nothing)
+        end
     end
     return
+end
+
+# Clear the host-side wiring registered under a bridge prefix: the
+# `attach_bridge_host!` guard tags and the per-mount subsession bookkeeping — so a
+# later bridge (same prefix, or the same still-open tab) re-attaches cleanly
+# instead of short-circuiting on a stale `BRIDGE_ATTACHED` tag. (MOUNTS subs are
+# already dead once the worker session is gone, so we just drop the entries.)
+function clear_bridge_wiring!(prefix::AbstractString)
+    lock(BRIDGE_ATTACH_LOCK) do
+        for tag in collect(BRIDGE_ATTACHED)
+            startswith(tag, string(prefix, '|')) && delete!(BRIDGE_ATTACHED, tag)
+        end
+    end
+    lock(MOUNTS_LOCK) do
+        for k in collect(keys(MOUNTS))
+            occursin(string('|', prefix, '|'), k) && delete!(MOUNTS, k)
+        end
+    end
+    return nothing
+end
+
+# Tear an eval bridge down — tied to the eval worker's Julia SESSION lifecycle,
+# NOT to its dial-back socket (a WS drop just awaits redial; see handle_eval_ws's
+# finally). Called from the normal project/worker teardown (`stop_session!`,
+# worker disconnect): releases the proxied asset host, fails in-flight control
+# requests, drops host-side wiring, and evicts from EVAL_WORKERS. Idempotent.
+function teardown_eval_bridge!(state::ServerState, project_id::AbstractString)
+    eb = lock(state.lock) do
+        e = get(EVAL_WORKERS, project_id, nothing)
+        e === nothing || delete!(EVAL_WORKERS, project_id)
+        e
+    end
+    eb === nothing && return nothing
+    fail_pending!(eb, "eval bridge torn down (worker session ended)")
+    try; close(eb.asset_host); catch; end
+    clear_bridge_wiring!(eb.prefix)
+    @info "eval bridge torn down with worker session" project_id prefix = eb.prefix
+    return nothing
 end
 
 # Env the server injects into the BonitoMCP MCP server so its eval worker can
@@ -286,14 +368,13 @@ function attach_bridge_host!(root::Bonito.Session, eb::EvalBridge)
     # relay loop (`handle_eval_ws`); point it at this tab's socket.
     eb.root_conn[] = Bonito.connection(root)
 
-    # browser → worker: the host already decodes each inbound frame to route it
-    # (route_to_remote needs the msg_type/session), so we forward the DECODED frame
-    # re-packed as plain (uncompressed) msgpack — `to_worker`, not `forward_bytes`.
-    # That makes the worker side compression-agnostic (the bridge runs
-    # uncompressed) regardless of the browser connection's compression. Routing is
-    # by the BRIDGE prefix — any sub.id / object id starts with it.
-    Bonito.register_remote!(root, Bonito.RemoteSession(eb.prefix;
-        to_worker = data -> send_data(eb, Bonito.MsgPack.pack(data))))
+    # browser → worker: the host decodes each inbound frame to route it
+    # (route_to_remote needs the msg_type/session), then `proxy_forward(eb, data)`
+    # re-packs the DECODED frame as plain (uncompressed) msgpack for the worker —
+    # making the worker side compression-agnostic regardless of the browser
+    # connection's compression. Routing is by the BRIDGE prefix — any sub.id /
+    # object id starts with it. `eb` IS the host driver (see `proxy_forward`).
+    Bonito.register_remote!(root, Bonito.RemoteSession(eb.prefix, eb))
 
     Bonito.on(root.on_close) do _
         Bonito.unregister_remote!(root, eb.prefix)

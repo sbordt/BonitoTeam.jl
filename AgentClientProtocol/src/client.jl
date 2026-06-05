@@ -153,10 +153,16 @@ function prompt!(client::Client, text::String;
     end
     params = Dict("sessionId" => client.session_id, "prompt" => blocks)
     updates, response = prompt_updates(client.conn, params)
+    conn = client.conn
     return Channel{Message}(BUF) do messages
         st = TurnState()
         try
             for u in updates
+                # Once cancel is issued, stop coalescing/rendering and just
+                # drain the backlog so the dispatcher can reach the `cancelled`
+                # response and end the turn promptly. `close(st)` below still
+                # seals whatever was rendered up to the cancel point.
+                (@atomic conn.cancelling) && continue
                 parse_update!(messages, st, u)
             end
         finally
@@ -203,7 +209,15 @@ function replay_history(conn::Connection, params)
 end
 
 # Cancel the active turn (notification, non-blocking).
+#
+# Two things happen: (1) we flip the connection's `cancelling` flag so the
+# `prompt!` consumer stops coalescing/rendering and just drains the buffered
+# update backlog — otherwise the agent's `cancelled` response is stuck behind
+# that backlog in strict-FIFO order and the turn looks wedged; (2) we send the
+# `session/cancel` notification so the agent actually winds the turn down and
+# resolves the prompt with `stopReason: cancelled`.
 function cancel!(client::Client)
+    @atomic client.conn.cancelling = true
     send_notification(client.conn, "session/cancel",
                       Dict("sessionId" => client.session_id))
 end

@@ -272,6 +272,9 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "13px",
         "box-shadow" => "var(--bt-shadow-sm)",
         "overflow" => "hidden",
+        # Positioning context for the absolute `.bt-tool-fullwidth` button that
+        # floats at the bubble's right-edge center.
+        "position" => "relative",
         # Transition so flipping the wide toggle animates smoothly rather than
         # snapping in at a different width and tearing the layout.
         "transition" => "max-width 160ms ease, align-self 160ms ease"),
@@ -281,9 +284,10 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-tool-msg.bt-tool-wide-active",
         "align-self" => "stretch",
         "max-width" => "100%"),
-    # The toggle button itself: small, neutral, right-aligned in the header
-    # (margin-left:auto pushes it past the status badge to the edge).
-    CSS(".bt-tool-wide",
+    # Detach button in the tool header (rendered only for bonito_app tools).
+    # ⤢ is the conventional "open in a window" glyph; clicking pops the embed
+    # into the floating window. Small, neutral, sits at the right of the header.
+    CSS(".bt-tool-detach",
         "margin-left" => "4px",
         "background" => "transparent",
         "border" => "none",
@@ -294,12 +298,35 @@ const ChatStyles = Bonito.Styles(
         "line-height" => "1",
         "border-radius" => "var(--bt-radius-sm)",
         "transition" => "background 80ms, color 80ms"),
-    CSS(".bt-tool-wide:hover",
+    CSS(".bt-tool-detach:hover",
         "background" => "var(--bt-surface-2)",
-        "color" => "var(--bt-text)"),
-    # Visual state when wide: invert glyph (collapse-to-default cue).
-    CSS(".bt-tool-msg.bt-tool-wide-active .bt-tool-wide",
         "color" => "var(--bt-accent)"),
+    # Full-chat-width toggle, vertically centered on the bubble's RIGHT edge.
+    # Hidden by default; revealed only while the tool body is expanded (the
+    # sibling rule below) — there's nothing to widen on a collapsed header.
+    CSS(".bt-tool-fullwidth",
+        "display" => "none",
+        "position" => "absolute", "right" => "4px", "top" => "50%",
+        "transform" => "translateY(-50%)",
+        "z-index" => "3",
+        "align-items" => "center", "justify-content" => "center",
+        "width" => "22px", "height" => "30px",
+        "background" => "var(--bt-surface-2)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "cursor" => "pointer",
+        "color" => "var(--bt-text-muted)",
+        "font-size" => "13px", "line-height" => "1",
+        "opacity" => "0.55",
+        "transition" => "opacity 80ms, background 80ms, color 80ms"),
+    CSS(".bt-tool-fullwidth:hover",
+        "opacity" => "1", "background" => "var(--bt-surface)",
+        "color" => "var(--bt-accent)"),
+    # Reveal the full-width toggle only while the body is expanded. `~` reaches
+    # the button (a later sibling of the header) once Collapsable flips
+    # `data-expanded="true"` on the header.
+    CSS(".bt-tool-header[data-expanded=\"true\"] ~ .bt-tool-fullwidth",
+        "display" => "flex"),
     CSS(".bt-tool-header",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "padding" => "8px 12px",

@@ -90,7 +90,13 @@ end
         tm = BT.GenericToolMsg(toolid, "mcp", "bt_show_app", "completed", "",
                                 0.0, 0.0, nothing)
         body = BT.render_tool_body(h.state, tm, model.cwd, model.chat_dir; project_id=pid)
-        @test body isa BT.RemoteAppPlaceholder
+        # render_tool_body wraps the live embed in the detach frame, so the
+        # RemoteAppPlaceholder is nested in the returned DOM rather than the body
+        # itself. Assert it produced the LIVE embed (placeholder bound to the
+        # EvalBridge), not the "(live app unavailable)" fallback.
+        bodystr = sprint(show, body)
+        @test occursin("RemoteAppPlaceholder", bodystr)
+        @test !occursin("unavailable", bodystr)
 
         host = Session(CapConn(); compression_enabled=false)
         rwa = BT.embed_remote_app(host, eb, appid)       # embeds the live worker app

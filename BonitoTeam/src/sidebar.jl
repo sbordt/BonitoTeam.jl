@@ -155,7 +155,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # was the one on screen, fall back to the dashboard. Interpolated once on
     # the aside's onload (below), never into the recyclable body.
     close_trigger = Observable("")
-    on(close_trigger) do pid
+    on(session, close_trigger) do pid
         isempty(pid) && return
         p = get(state.projects[], pid, nothing)
         p === nothing && return
@@ -407,36 +407,86 @@ const UnifiedShellStyles = Bonito.Styles(
     CSS("html, body",
         "height" => "100%", "margin" => "0", "padding" => "0",
         "overflow" => "hidden",
-        # Light off-white surrounding the centered shell on wide monitors —
+        # Light off-white surrounding the centered chat column on wide monitors —
         # subtle, just enough that the app reads as a contained surface
         # instead of dissolving into the page bg. Match the dashboard's bg
         # variable so theming stays in one place.
         "background" => "var(--bt-bg, #fafaf9)"),
-    # Centered application shell. On screens wider than `--bt-shell-max`
-    # (1280px default) the app is bounded and centered; on narrower screens
-    # `max-width` is a no-op and the shell fills the viewport. The 1px
-    # vertical borders give the contained app a subtle frame on wide
-    # monitors and disappear visually when the shell hits the viewport
-    # edges.
-    CSS(":root", "--bt-shell-max" => "1600px"),
+    # Width tokens for the chat/dashboard column. `--bt-main-max` is the bounded,
+    # centered width when the plotpane is CLOSED — chosen so home / a plotpane-less
+    # chat look identical to the old centered 1600px shell (1600 − 200px sidebar =
+    # 1400px). `--bt-main-min` is the floor the chat shrinks to once the plotpane
+    # has eaten all the surrounding whitespace and reached the "left wall".
+    CSS(":root",
+        "--bt-main-max" => "1400px",
+        "--bt-main-min" => "480px"),
+    # Full-viewport shell — NO centered cap. The centering moved down to `.bt-main`
+    # so the plotpane (a `.bt-stage` child, sibling of `.bt-main`) can extend past
+    # the chat into the right-hand whitespace the old centered shell used to waste.
     CSS(".bt-shell",
-        "max-width" => "var(--bt-shell-max)",
-        "margin"    => "0 auto",
-        # 100dvh, not 100vh: on mobile 100vh is the LARGEST viewport (URL
-        # bar collapsed), so when the bar is showing our last flex child
-        # (chat input / dashboard bottom) falls below the visible area.
-        # 100dvh shrinks with the bar.
+        # 100dvh, not 100vh (mobile URL-bar safe).
         "height"    => "100dvh",
         "display"   => "flex", "flex-direction" => "row",
-        "border-left"  => "1px solid var(--bt-border)",
-        "border-right" => "1px solid var(--bt-border)",
         "background"   => "var(--bt-bg)"),
+    # Everything to the right of the sidebar: the chat/dashboard column plus the
+    # plotpane. Fills the viewport minus the sidebar; `.bt-main` centers within
+    # whatever horizontal space the plotpane leaves it.
+    CSS(".bt-stage",
+        "flex" => "1 1 auto", "min-width" => "0",
+        "display" => "flex", "flex-direction" => "row",
+        "overflow" => "hidden"),
+    # The chat / dashboard column. `flex: 0 1 max` + `margin: 0 auto` ⇒ it caps at
+    # `--bt-main-max` and sits centered in the free space when the plotpane is
+    # closed (identical to the old look). As the plotpane grows, the free space
+    # shrinks so the column slides left; once the free space is gone it shrinks
+    # down to `--bt-main-min` — the two-stage "slide then shrink at the wall".
+    # Side borders give the contained-surface frame the shell used to provide.
     CSS(".bt-main",
-        "flex" => "1 1 auto",
-        "min-width" => "0",
+        "flex" => "0 1 var(--bt-main-max)",
+        "min-width" => "var(--bt-main-min)",
+        "margin" => "0 auto",
         "position" => "relative",
         "display" => "flex", "flex-direction" => "column",
-        "overflow" => "hidden"),
+        "overflow" => "hidden",
+        "border-left"  => "1px solid var(--bt-border)",
+        "border-right" => "1px solid var(--bt-border)"),
+    # When the plotpane is OPEN, the chat stops centering and becomes a fixed,
+    # resizable LEFT column — the plotpane (flex:1) then fills ALL the space to
+    # its right with no gap. The divider sets `--bt-chat-width` (clamped to the
+    # chat's sensible reading range). This is what makes "everything right of the
+    # chat is the plotpane/editor/drop zone" true.
+    CSS(".bt-stage:has(.bt-plotpane.bt-plotpane-visible) .bt-main",
+        "flex"   => "0 0 clamp(var(--bt-main-min), var(--bt-chat-width, 820px), var(--bt-main-max))",
+        "margin" => "0"),
+
+    # ── Keep-alive view stack ────────────────────────────────────────────────
+    # The dashboard and every opened chat are all mounted at once and stacked on
+    # top of each other (absolute inset:0); the nav handler toggles `display` so
+    # exactly one shows. Stacking (not a flow swap) is what lets us preserve each
+    # chat's DOM/embeds while only one is on screen.
+    CSS(".bt-main-views",
+        "position" => "relative",
+        "flex" => "1 1 auto", "min-height" => "0", "min-width" => "0"),
+    CSS(".bt-view",
+        "position" => "absolute", "inset" => "0",
+        "display" => "flex", "flex-direction" => "column", "min-width" => "0"),
+    # The chats container is just a positioning context; its panes are the
+    # absolutely-positioned, individually-toggled children. It is stacked ON TOP
+    # of the dashboard (later in DOM), so it MUST be click-transparent — otherwise
+    # the empty container (all panes hidden on home) swallows every click meant
+    # for the dashboard beneath it. Only a visible pane re-enables pointer events.
+    CSS(".bt-view-chats", "display" => "block", "pointer-events" => "none"),
+    CSS(".bt-chatpane",
+        "position" => "absolute", "inset" => "0",
+        "display" => "none", "flex-direction" => "column", "min-width" => "0",
+        "pointer-events" => "auto"),
+    # Overlay sits on top (loading / unknown card). Click-through when empty so
+    # it never blocks the chat behind it; its card re-enables pointer events.
+    CSS(".bt-view-overlay",
+        "position" => "absolute", "inset" => "0",
+        "pointer-events" => "none"),
+    CSS(".bt-view-overlay .bt-loading-wrap, .bt-view-overlay .bt-empty",
+        "pointer-events" => "auto"),
 )
 
 # Per-session bring-up bookkeeping for the loading view. `inflight` holds the
@@ -530,29 +580,85 @@ function project_loading_view(state::ServerState, pid::String,
     return DOM.div(body; class = "bt-loading-wrap")
 end
 
-# Render the main panel given the current view + the bonito session. Pulled
-# out so unified_app's body stays small.
-function unified_main(state::ServerState, current_view::Observable{String},
-                      ls::LoadingState)
-    map(current_view) do pid
-        if isempty(pid)
-            dashboard_dom(state; current_view = current_view)
-        elseif haskey(state.chat_models, pid)
-            # Wrap the ChatModel in a Node — Bonito's reactive Observable
-            # renderer (jsrender(::Session, ::Observable)) calls
-            # render_subsession on the Observable's *value*, which only
-            # accepts a Hyperscript.Node (or App). DOM.div(model) gives it
-            # a Node and lets Bonito recurse into the child to call
-            # jsrender(::Session, ::ChatModel). The flex sizing here is
-            # load-bearing: the chat shell (.bt-app) uses `height: 100%`,
-            # so without `flex: 1; min-height: 0; display:flex` on the
-            # wrapper the chat collapses to zero height inside the
-            # `.bt-main` flex column.
-            DOM.div(state.chat_models[pid];
-                style = Styles("flex"          => "1 1 auto",
-                               "min-height"    => "0",
-                               "display"       => "flex",
-                               "flex-direction"=> "column"))
+# Max number of chat panes kept mounted (DOM-preserved) at once. Beyond this,
+# the least-recently-viewed chat's pane is dropped — its live embeds tear down
+# and re-delegate on the next visit. Generous enough that normal back-and-forth
+# between a handful of chats never re-renders anything.
+const KEEP_ALIVE_CAP = 6
+
+# A stable, per-pid handle the chat-pane KeyedList renders. Memoized per session
+# (see `unified_main`) so the SAME object is handed to KeyedList across renders,
+# and the pane's DOM — with its live embeds, scroll position, and per-app
+# collapse state — is preserved across navigation. That preservation IS the
+# "resident per-chat state" requirement: switching chats just hides/shows panes.
+struct ChatPaneRef
+    state :: ServerState
+    pid   :: String
+end
+
+# Render one kept-alive chat pane. The pane is absolutely positioned to fill the
+# view area and toggled visible/hidden by the nav handler (see `unified_main`),
+# never re-rendered.
+function Bonito.jsrender(session::Bonito.Session, r::ChatPaneRef)
+    model = get(r.state.chat_models, r.pid, nothing)
+    # The flex sizing is load-bearing: the chat shell (.bt-app) is height:100%,
+    # so the wrapper must be a flex column that fills, or the chat collapses.
+    inner = model === nothing ? DOM.div() :
+        DOM.div(model; style = Styles("flex" => "1 1 auto", "min-height" => "0",
+                                      "display" => "flex", "flex-direction" => "column"))
+    pane = DOM.div(inner; class = "bt-chatpane", dataPanePid = r.pid)
+    # Self-initialize visibility on mount: a pane the KeyedList adds while its
+    # chat is ALREADY the active view must reveal itself (the nav handler ran
+    # before this pane existed). We read the active pid from the container's
+    # data attribute rather than interpolating the parent-session `current_view`
+    # Observable — interpolating a parent Observable into a KeyedList child's JS
+    # triggers "Key not found"/null.notify, because the child renders in a
+    # different session (see feedback_keyedlist_child_session_observable).
+    Bonito.onload(session, pane, js"""(el) => {
+        const root = el.closest('.bt-main-views');
+        const active = root ? (root.dataset.activeView || '') : '';
+        el.style.display = (el.dataset.panePid === active) ? 'flex' : 'none';
+    }""")
+    Bonito.jsrender(session, pane)
+end
+
+# Render the main panel given the current view + the bonito session. Pulled out
+# so unified_app's body stays small.
+#
+# Keep-alive architecture (replaces the old `map(current_view)` node-swap, which
+# tore the whole panel down on every navigation): the dashboard and every opened
+# chat are mounted SIMULTANEOUSLY and only their visibility is toggled. This (a)
+# preserves per-chat DOM/embeds/collapse state across navigation and (b) stops
+# the `null.bonitoKeyedList` flood — the dashboard's KeyedLists are never torn
+# down mid-update because the dashboard is never unmounted.
+function unified_main(session::Bonito.Session, state::ServerState,
+                      current_view::Observable{String}, ls::LoadingState)
+    # ── Dashboard pane: rendered ONCE, mounted forever ──────────────────────
+    dash_pane = DOM.div(
+        dashboard_dom(session, state; current_view = current_view);
+        class = "bt-view bt-view-dash")
+
+    # ── Chat panes: one per opened chat, DOM-preserved via KeyedList ────────
+    # `alive` is the LRU-ordered list of pids whose pane stays mounted. Memoized
+    # ChatPaneRefs (same object per pid) give KeyedList a stable identity so it
+    # preserves rather than rebuilds. A pid that's no longer cached (chat closed)
+    # drops out of the list ⇒ KeyedList detaches its pane.
+    alive = Observable(String[])
+    panes = Dict{String,ChatPaneRef}()
+    ref(pid) = get!(() -> ChatPaneRef(state, pid), panes, pid)
+    chatpanes_obs = map(alive) do pids
+        ChatPaneRef[ref(pid) for pid in pids if haskey(state.chat_models, pid)]
+    end
+    chats_host = DOM.div(KeyedList(chatpanes_obs; key = r -> r.pid);
+                         class = "bt-view bt-view-chats")
+
+    # ── Overlay: loading / unknown for a pid that has no pane yet ────────────
+    # Empty (invisible, click-through) once the chat is cached; until then it
+    # shows the loading card, which also kicks the bring-up and re-notifies
+    # `current_view` on success → we re-enter and the chat becomes a pane.
+    overlay = map(session, current_view) do pid
+        if isempty(pid) || haskey(state.chat_models, pid)
+            DOM.div(; style = Styles("display" => "none"))
         elseif haskey(state.projects[], pid)
             project_loading_view(state, pid, current_view, ls)
         else
@@ -560,6 +666,36 @@ function unified_main(state::ServerState, current_view::Observable{String},
                     style = Styles("padding" => "40px"))
         end
     end
+    overlay_pane = DOM.div(overlay; class = "bt-view-overlay")
+
+    # ── Navigation → promote to most-recently-used + evict beyond the cap ────
+    on(session, current_view) do pid
+        (isempty(pid) || !haskey(state.chat_models, pid)) && return
+        cur = alive[]
+        (!isempty(cur) && cur[end] == pid) && return     # already MRU, no churn
+        keep = vcat(filter(!=(pid), cur), pid)
+        length(keep) > KEEP_ALIVE_CAP && (keep = keep[(end - KEEP_ALIVE_CAP + 1):end])
+        alive[] = keep
+    end
+
+    container = DOM.div(dash_pane, chats_host, overlay_pane; class = "bt-main-views")
+
+    # Visibility: pure DOM toggling (no re-render, no teardown). Sets the active
+    # pid on the container (so a freshly-added pane can self-init via its onload)
+    # and shows the matching chat pane / the dashboard. Interpolating only
+    # `current_view` here is safe — this runs in the PARENT session that owns the
+    # container; it never crosses into a KeyedList child subsession.
+    Bonito.onjs(session, current_view, js"""(pid) => {
+        const root = document.querySelector('.bt-main-views');
+        if (!root) return;
+        root.dataset.activeView = pid || '';
+        const dash = root.querySelector('.bt-view-dash');
+        if (dash) dash.style.display = (!pid) ? 'flex' : 'none';
+        root.querySelectorAll('.bt-view-chats .bt-chatpane').forEach(p => {
+            p.style.display = (p.dataset.panePid === pid) ? 'flex' : 'none';
+        });
+    }""")
+    return container
 end
 
 """
@@ -581,19 +717,27 @@ function unified_app(state::ServerState)
         # LoadingState / project_loading_view). The retry handler clears the
         # recorded error and re-renders, which re-spawns the bring-up task.
         ls = LoadingState()
-        on(ls.retry) do retry_pid
+        on(session, ls.retry) do retry_pid
             isempty(retry_pid) && return
             delete!(ls.errors, retry_pid)
             safe_notify!(current_view)
         end
         sidebar = project_sidebar(session, view, current_view)
-        main_panel = unified_main(view, current_view, ls)
+        main_panel = unified_main(session, view, current_view, ls)
         # Chat-global floating "show-app target" + right-side plotpane column.
         # `Detach` on any bt_show_app bubble moves the embed DOM into the
         # popup (or plotpane, if that was the last location); close → restore
         # to bubble. Drag the popup title bar over the plotpane → docks.
         # Geometry + location persist per chat to disk.
         popup, plotpane, popup_controller_js = install_popup!(session, view, current_view)
+        # `.bt-stage` holds the centered chat column AND the plotpane side by side,
+        # filling the whole viewport-minus-sidebar. The plotpane being a sibling of
+        # `.bt-main` (not nested inside it) is what lets it grow into the right
+        # whitespace while `.bt-main` stays capped + centered.
+        stage = DOM.div(
+            DOM.div(main_panel; class = "bt-main"),
+            plotpane;
+            class = "bt-stage")
         shell = DOM.div(
             UnifiedShellStyles,
             DashboardStyles,
@@ -603,8 +747,7 @@ function unified_app(state::ServerState)
             Bonito.MarkdownCSS,
             Bonito.ConnectionIndicator(),
             sidebar,
-            DOM.div(main_panel; class = "bt-main"),
-            plotpane,
+            stage,
             popup;
             class = "bt-shell")
         # Install `window._btPopup` once the shell is in the DOM. The DOM nodes

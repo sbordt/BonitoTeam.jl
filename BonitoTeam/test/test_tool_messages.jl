@@ -222,7 +222,7 @@ end
 
     # Background bash is taskbar + live until terminal.
     bash_bg = BT.BashToolMsg("b1", "execute", "sleep", "in_progress", "",
-                              now_t, nothing, "sleep 10", true, nothing)
+                              now_t, nothing, "sleep 10", true, "", 0, false, "", nothing)
     @test BT.is_live(bash_bg) == true
     @test BT.is_taskbar_item(bash_bg) == true
     h = BT.tool_header_dict(bash_bg)
@@ -231,7 +231,7 @@ end
 
     # Same shape, foreground bash — neither taskbar nor (long-term) live UX.
     bash_fg = BT.BashToolMsg("b2", "execute", "ls", "in_progress", "",
-                              now_t, nothing, "ls -la", false, nothing)
+                              now_t, nothing, "ls -la", false, "", 0, false, "", nothing)
     @test BT.is_live(bash_fg) == true             # status-based liveness still applies
     @test BT.is_taskbar_item(bash_fg) == false
     @test BT.tool_header_dict(bash_fg)["taskbar"] == false
@@ -251,13 +251,13 @@ end
 
     # Terminal status → not live.
     bash_done = BT.BashToolMsg("b3", "execute", "echo", "completed", "ok",
-                                now_t, now_t, "echo hi", true, nothing)
+                                now_t, now_t, "echo hi", true, "", 0, false, "", nothing)
     @test BT.is_live(bash_done) == false
 
     # `finished_at` wins over status even when status is mid-flight (used by
     # absorbed TodoLists, but applies uniformly).
     bash_finished_early = BT.BashToolMsg("b4", "execute", "x", "in_progress", "",
-                                          now_t, now_t, "x", true, nothing)
+                                          now_t, now_t, "x", true, "", 0, false, "", nothing)
     @test BT.is_live(bash_finished_early) == false
 end
 
@@ -362,7 +362,7 @@ end
     @testset "background BashToolMsg queues a synthetic user message" begin
         chat = make_chat()
         t = BT.BashToolMsg("b1", "execute", "sleep 100", "in_progress", "",
-                            time(), nothing, "sleep 100", true, chat)
+                            time(), nothing, "sleep 100", true, "", 0, false, "", chat)
         push!(chat.msgs_store, t)
 
         BT.handle_command!(chat, nothing, BT.StopToolCommand("b1"))
@@ -377,7 +377,7 @@ end
     @testset "non-background bash → silent no-op" begin
         chat = make_chat()
         t = BT.BashToolMsg("b2", "execute", "ls", "in_progress", "",
-                            time(), nothing, "ls -la", false, chat)
+                            time(), nothing, "ls -la", false, "", 0, false, "", chat)
         push!(chat.msgs_store, t)
         BT.handle_command!(chat, nothing, BT.StopToolCommand("b2"))
         @test isempty(filter(m -> m isa BT.UserMsg, chat.msgs_store))

@@ -29,7 +29,8 @@ end
 function save_popup_state(chat_dir::AbstractString;
                           x::Integer, y::Integer,
                           width::Integer, height::Integer,
-                          location::AbstractString = "floating")
+                          location::AbstractString = "floating",
+                          chat_width::Integer = 0)
     f = popup_state_file(chat_dir)
     mkpath(dirname(f))
     tmp = f * ".tmp"
@@ -39,7 +40,10 @@ function save_popup_state(chat_dir::AbstractString;
                                 "y"        => Int(y),
                                 "width"    => Int(width),
                                 "height"   => Int(height),
-                                "location" => String(location)), 2)
+                                "location" => String(location),
+                                # 0 ⇒ no per-chat override, fall back to the CSS
+                                # default; the divider position is per chat.
+                                "chat_width" => Int(chat_width)), 2)
         end
         mv(tmp, f; force=true)
     catch e
@@ -71,17 +75,14 @@ popup window (Detach button) and back (popup close → restore-to-slot).
 """
 function wrap_for_detach(tool_id::AbstractString, body)
     tid = String(tool_id)
-    detach_btn = DOM.span("↗ Detach";
-        class   = "bt-detach-btn",
-        title   = "Move this app to the floating window",
-        onclick = js"""event => {
-            event.stopPropagation();
-            window._btPopup && window._btPopup.detach($(tid));
-        }""")
-    placeholder = DOM.span("In popup window — close it to bring this back";
+    # Detach now lives on the ⤢ button in the tool header (rendered for
+    # bonito_app tools by bonitoteam.js, calling window._btPopup.detach). Here we
+    # only keep the slot/embed structure the controller moves between surfaces,
+    # plus a placeholder that takes over the inline spot while it's detached.
+    placeholder = DOM.span("In floating window — close it to bring this back";
                           class = "bt-detach-placeholder")
     DOM.div(
-        DOM.div(detach_btn, placeholder; class = "bt-embed-controls"),
+        DOM.div(placeholder; class = "bt-embed-controls"),
         DOM.div(
             DOM.div(body; id = "bt-embed-$(tid)", class = "bt-embed");
             id = "bt-slot-$(tid)", class = "bt-slot");
@@ -121,7 +122,7 @@ function install_popup!(session::Bonito.Session,
     plotpane_v= Observable(false)                # plotpane column
     location  = Observable("floating")           # "floating" or "docked"
     close_t   = Observable(false)
-    plotpane_close_t = Observable(false)
+    chat_width = Observable(0)                    # per-chat chat-column width (0 ⇒ CSS default)
     title     = Observable("Detached app")
 
     loading = Ref(false)
@@ -140,6 +141,9 @@ function install_popup!(session::Bonito.Session,
             haskey(st, "width")    && (width[]    = Int(st["width"]))
             haskey(st, "height")   && (height[]   = Int(st["height"]))
             haskey(st, "location") && (location[] = String(st["location"]))
+            # Always assign chat_width (default 0) so navigating from a chat with
+            # a custom divider position to one without resets to the CSS default.
+            chat_width[] = haskey(st, "chat_width") ? Int(st["chat_width"]) : 0
         finally
             loading[] = false
         end
@@ -153,24 +157,33 @@ function install_popup!(session::Bonito.Session,
         chat_dir = String(state.chat_models[pid].chat_dir)
         save_popup_state(chat_dir;
             x = x[], y = y[], width = width[], height = height[],
-            location = location[])
+            location = location[], chat_width = chat_width[])
     end
     on(_ -> saver(), x);        on(_ -> saver(), y)
     on(_ -> saver(), width);    on(_ -> saver(), height)
-    on(_ -> saver(), location)
+    on(_ -> saver(), location); on(_ -> saver(), chat_width)
 
-    # The floating popup + plotpane are chat-global affordances — they belong
-    # to a chat's detached `bt_show_app` embed, not to the dashboard. Hide both
-    # whenever we navigate to home so a leftover embed from chat A doesn't
-    # linger on top of the project list. We deliberately DO NOT touch x/y/
-    # width/height here, so returning to the chat lands the popup at the
-    # exact position the user last dragged it to.
-    on(current_view) do pid
-        if isempty(pid)
-            visible[]    = false
-            plotpane_v[] = false
-        end
-    end
+    # Apply the per-chat chat-column width to `.bt-main` (parent session owns the
+    # column, so interpolating chat_width here is safe). 0 ⇒ clear the override so
+    # the CSS default (820px, clamped) applies; the plotpane fills the rest.
+    Bonito.onjs(session, chat_width, js"""(w) => {
+        const main = document.querySelector('.bt-main');
+        if (!main) return;
+        if (w && w > 0) main.style.setProperty('--bt-chat-width', w + 'px');
+        else            main.style.removeProperty('--bt-chat-width');
+    }""")
+
+    # Navigation drives the per-chat surface swap: `setChat` parks the previous
+    # chat's detached embed back into its (kept-alive) bubble, hides both
+    # surfaces, then re-detaches the new chat's app at its remembered location.
+    # This is what makes the floating-window / plotpane state resident per chat
+    # (home → both surfaces simply hide, since "" has no detached app). It runs
+    # in the parent session that owns the `window._btPopup` controller, so
+    # interpolating `current_view` here is safe (never a KeyedList child).
+    # x/y/width/height are deliberately left to the geometry loader above, so a
+    # returning chat lands its popup exactly where it was dragged.
+    Bonito.onjs(session, current_view,
+        js"(pid) => window._btPopup && window._btPopup.setChat(pid)")
 
     # Two mount slots, one per surface. The controller moves the embed
     # `bt-embed-<tool_id>` between them.
@@ -243,151 +256,160 @@ function install_popup!(session::Bonito.Session,
         ppvObs.on(applyPlotpaneVis);
         applyPlotpaneVis();
 
-        // ── Resize handle ────────────────────────────────────────────────────
-        // The plotpane width is a CSS var (`--bt-pp-width`) on the pane element,
-        // so the visible/transition rules in CSS just follow whatever we set.
-        // Min 280 px keeps the pane usable; we also leave at least MIN_CHAT_PX
-        // for the chat so dragging can't squeeze it to nothing.
-        const PP_MIN = 280;
-        const MIN_CHAT_PX = 480;
-        const PP_KEY = 'bt-pp-width';
+        // ── Divider: resizes the CHAT column ─────────────────────────────────
+        // The plotpane (flex:1) fills whatever the chat leaves, so the handle on
+        // its left edge sizes `--bt-chat-width` on `.bt-main`. Drag right → wider
+        // chat (narrower pane); drag left → narrower chat. Clamped to the chat's
+        // readable range, always leaving at least PANE_MIN for the pane.
+        const CHAT_MIN = 480, CHAT_MAX = 1400, PANE_MIN = 320;
+        const chatWidthObs = $(chat_width);   // per-chat divider width (persisted)
         const pp = document.getElementById('bt-plotpane-dropzone');
-        if (pp) {
-            // Restore the last persisted width (if any).
-            const saved = +localStorage.getItem(PP_KEY);
-            if (saved >= PP_MIN) pp.style.setProperty('--bt-pp-width', saved + 'px');
-
-            const handle = pp.querySelector('.bt-pp-resize');
-            if (handle) {
-                let startX = 0, startW = 0, shellW = 0;
-                const onMove = (e) => {
-                    // Pane grows when the cursor moves LEFT (handle is on the
-                    // pane's left edge), shrinks when it moves right.
-                    const proposed = startW - (e.clientX - startX);
-                    const max = Math.max(PP_MIN, shellW - MIN_CHAT_PX);
-                    const w = Math.max(PP_MIN, Math.min(max, proposed));
-                    pp.style.setProperty('--bt-pp-width', w + 'px');
-                };
-                const onUp = () => {
-                    window.removeEventListener('pointermove', onMove);
-                    window.removeEventListener('pointerup',   onUp);
-                    pp.classList.remove('bt-pp-resizing');
-                    const finalW = parseFloat(
-                        getComputedStyle(pp).getPropertyValue('--bt-pp-width')) || 0;
-                    if (finalW >= PP_MIN) localStorage.setItem(PP_KEY, Math.round(finalW));
-                };
-                handle.addEventListener('pointerdown', (e) => {
-                    e.preventDefault();
-                    const shell = document.querySelector('.bt-shell');
-                    shellW = shell ? shell.clientWidth : window.innerWidth;
-                    startX = e.clientX;
-                    startW = pp.getBoundingClientRect().width;
-                    pp.classList.add('bt-pp-resizing');
-                    window.addEventListener('pointermove', onMove);
-                    window.addEventListener('pointerup',   onUp);
-                });
-                // Double-click = reset to the CSS default (clears the override).
-                handle.addEventListener('dblclick', (e) => {
-                    e.preventDefault();
-                    pp.style.removeProperty('--bt-pp-width');
-                    localStorage.removeItem(PP_KEY);
-                });
-            }
+        const main = document.querySelector('.bt-main');
+        const handle = pp ? pp.querySelector('.bt-pp-resize') : null;
+        if (main && handle) {
+            let startX = 0, startW = 0, stageW = 0;
+            const clampW = (w) => Math.max(CHAT_MIN,
+                Math.min(Math.min(CHAT_MAX, stageW - PANE_MIN), w));
+            const onMove = (e) => {
+                main.style.setProperty('--bt-chat-width',
+                    clampW(startW + (e.clientX - startX)) + 'px');
+            };
+            const onUp = () => {
+                window.removeEventListener('pointermove', onMove);
+                window.removeEventListener('pointerup',   onUp);
+                pp && pp.classList.remove('bt-pp-resizing');
+                const finalW = Math.round(main.getBoundingClientRect().width);
+                if (finalW >= CHAT_MIN) chatWidthObs.notify(finalW);   // → Julia saver
+            };
+            handle.addEventListener('pointerdown', (e) => {
+                e.preventDefault();
+                const stage = document.querySelector('.bt-stage');
+                stageW = stage ? stage.clientWidth : window.innerWidth;
+                startX = e.clientX;
+                startW = main.getBoundingClientRect().width;
+                pp && pp.classList.add('bt-pp-resizing');
+                window.addEventListener('pointermove', onMove);
+                window.addEventListener('pointerup',   onUp);
+            });
+            // Double-click = reset to the default chat width.
+            handle.addEventListener('dblclick', (e) => {
+                e.preventDefault();
+                main.style.removeProperty('--bt-chat-width');
+                chatWidthObs.notify(0);
+            });
         }
 
+        // Per-chat detached state. Each chat (pid) independently remembers which
+        // of its bubble embeds is detached and where (floating | docked). The
+        // surfaces (floating window + plotpane) are SHARED chrome — only the
+        // active chat's embed is ever in them; the others are parked back in
+        // their own (kept-alive) bubbles. That's what makes detach/dock state
+        // "resident per chat": navigating swaps which embed occupies the surface.
         window._btPopup = {
-            _currentToolId: null,
-            // Open the bubble's embed at whichever surface the chat last left
-            // the container in. If something else is already detached, send it
-            // back to its bubble first.
-            detach(toolId) {
-                if (this._currentToolId && this._currentToolId !== toolId) {
-                    this.restore();
-                }
+            activePid: '',
+            byPid: {},                     // pid -> { toolId, location }
+            current() { return this.byPid[this.activePid] || null; },
+            _toSurface(toolId, location) {
                 const embed = document.getElementById('bt-embed-' + toolId);
-                if (!embed) {
-                    console.warn('[btPopup] detach: no embed for', toolId);
-                    return;
-                }
-                const targetId = locObs.value === 'docked' ? 'bt-plotpane-mount'
-                                                           : 'bt-popup-mount';
-                const mount = document.getElementById(targetId);
-                if (!mount) return;
+                const mount = document.getElementById(
+                    location === 'docked' ? 'bt-plotpane-mount' : 'bt-popup-mount');
+                if (!embed || !mount) return false;
                 Bonito.move_dom_node(embed, mount, null);
                 const slot = document.getElementById('bt-slot-' + toolId);
                 if (slot) slot.setAttribute('data-detached', '1');
-                this._currentToolId = toolId;
-                titleObs.notify('App · ' + toolId.slice(0, 8));
-                showFor(locObs.value);
+                return true;
             },
-            // Send the current embed back to its bubble; hide both surfaces.
-            restore() {
-                const toolId = this._currentToolId;
-                if (!toolId) return;
+            _toBubble(toolId) {
                 const embed = document.getElementById('bt-embed-' + toolId);
                 const slot  = document.getElementById('bt-slot-'  + toolId);
                 if (embed && slot) {
                     Bonito.move_dom_node(embed, slot, null);
                     slot.removeAttribute('data-detached');
                 }
-                this._currentToolId = null;
+            },
+            // Open the active chat's bubble embed at its last-used surface. If a
+            // different app in THIS chat was detached, send it back first.
+            detach(toolId) {
+                const pid = this.activePid, prev = this.byPid[pid];
+                if (prev && prev.toolId !== toolId) this._toBubble(prev.toolId);
+                const location = (prev && prev.location) || locObs.value || 'floating';
+                if (!this._toSurface(toolId, location)) {
+                    console.warn('[btPopup] detach: no embed for', toolId); return;
+                }
+                this.byPid[pid] = { toolId, location };
+                locObs.notify(location);
+                titleObs.notify('App · ' + toolId.slice(0, 8));
+                showFor(location);
+            },
+            // Send the active chat's embed back to its bubble; hide both surfaces.
+            restore() {
+                const rec = this.current();
+                if (rec) { this._toBubble(rec.toolId); delete this.byPid[this.activePid]; }
                 visObs.notify(false);
                 ppvObs.notify(false);
             },
             // floating → docked.
             dock() {
-                const toolId = this._currentToolId;
-                if (!toolId) return;
-                const embed = document.getElementById('bt-embed-' + toolId);
-                const mount = document.getElementById('bt-plotpane-mount');
-                if (!embed || !mount) return;
-                Bonito.move_dom_node(embed, mount, null);
-                locObs.notify('docked');
-                showFor('docked');
+                const rec = this.current(); if (!rec) return;
+                if (!this._toSurface(rec.toolId, 'docked')) return;
+                rec.location = 'docked'; locObs.notify('docked'); showFor('docked');
             },
             // docked → floating.
             undock() {
-                const toolId = this._currentToolId;
-                if (!toolId) return;
-                const embed = document.getElementById('bt-embed-' + toolId);
-                const mount = document.getElementById('bt-popup-mount');
-                if (!embed || !mount) return;
-                Bonito.move_dom_node(embed, mount, null);
-                locObs.notify('floating');
-                showFor('floating');
+                const rec = this.current(); if (!rec) return;
+                if (!this._toSurface(rec.toolId, 'floating')) return;
+                rec.location = 'floating'; locObs.notify('floating'); showFor('floating');
+            },
+            // Navigation hook (driven by current_view). Park the previous chat's
+            // detached embed back into its kept-alive bubble and hide the
+            // surfaces, then re-detach the new chat's app if it had one — so each
+            // chat's floating/docked app reappears exactly where it was left.
+            setChat(pid) {
+                pid = pid || '';
+                if (pid === this.activePid) return;
+                const old = this.byPid[this.activePid];
+                if (old) this._toBubble(old.toolId);
+                visObs.notify(false);
+                ppvObs.notify(false);
+                this.activePid = pid;
+                const rec = this.byPid[pid];
+                if (rec && this._toSurface(rec.toolId, rec.location)) {
+                    locObs.notify(rec.location);
+                    titleObs.notify('App · ' + rec.toolId.slice(0, 8));
+                    showFor(rec.location);
+                }
             },
         };
 
-        // Drag-to-dock. Tracks pointer drags that begin on the popup's title
-        // bar (but not its controls). On pointerdown we light up a slim drop
-        // strip on the right (otherwise the plotpane is collapsed when empty
-        // and there's nothing to drop onto); during move we highlight when
-        // over it; on release we dock if released over it. Runs in parallel
-        // with FloatingWindow's own drag — they don't conflict because each
-        // owns independent listeners.
+        // Drag-to-dock. Dragging the floating window's title bar over the whole
+        // area to the RIGHT of the chat (the region the plotpane fills) docks it.
+        // The ENTIRE drop region highlights — not a thin strip. A fixed-position
+        // overlay marks it (pointer-events:none so it never interferes with the
+        // FloatingWindow's own drag, which runs in parallel on its own listeners).
         document.addEventListener('pointerdown', (ev) => {
             const tb = ev.target.closest('.bn-fw-title');
             if (!tb || ev.target.closest('.bn-fw-controls')) return;
-            // No-op when nothing is detached — drag-to-dock only makes sense
-            // when there's an embed in the popup.
-            if (!window._btPopup._currentToolId) return;
-            const zone = document.getElementById('bt-plotpane-dropzone');
-            if (!zone) return;
-            zone.classList.add('bt-drop-ready');
-            const overZone = (e2) => {
-                const r = zone.getBoundingClientRect();
-                if (r.width === 0) return false;
-                return e2.clientX >= r.left && e2.clientX <= r.right &&
-                       e2.clientY >= r.top  && e2.clientY <= r.bottom;
-            };
-            const onMove = (e2) => zone.classList.toggle('bt-drop-active', overZone(e2));
+            if (!window._btPopup.current()) return;     // nothing detached → no-op
+            const main  = document.querySelector('.bt-main');
+            const stage = document.querySelector('.bt-stage');
+            if (!main || !stage) return;
+            const mr = main.getBoundingClientRect(), sr = stage.getBoundingClientRect();
+            const left = mr.right, right = sr.right;
+            if (right - left < 40) return;              // no room to dock into
+            const ov = document.createElement('div');
+            ov.className = 'bt-drop-overlay';
+            ov.style.left = left + 'px';  ov.style.top = sr.top + 'px';
+            ov.style.width = (right - left) + 'px';  ov.style.height = sr.height + 'px';
+            document.body.appendChild(ov);
+            const inZone = (e2) => e2.clientX >= left && e2.clientX <= right &&
+                                   e2.clientY >= sr.top && e2.clientY <= sr.bottom;
+            const onMove = (e2) => ov.classList.toggle('bt-drop-active', inZone(e2));
             const onUp = (e2) => {
                 document.removeEventListener('pointermove', onMove);
                 document.removeEventListener('pointerup',   onUp);
-                const wasOver = overZone(e2);
-                zone.classList.remove('bt-drop-ready');
-                zone.classList.remove('bt-drop-active');
-                if (wasOver) window._btPopup.dock();
+                const over = inZone(e2);
+                ov.remove();
+                if (over) window._btPopup.dock();
             };
             document.addEventListener('pointermove', onMove);
             document.addEventListener('pointerup',   onUp);
@@ -405,23 +427,14 @@ const PopupStyles = Bonito.Styles(
     Bonito.CSS(".bt-embed-controls",
         "display" => "flex", "align-items" => "center", "gap" => "10px",
         "padding" => "2px 0 6px"),
-    Bonito.CSS(".bt-detach-btn",
-        "cursor" => "pointer",
-        "color" => "var(--bt-accent)",
-        "font-size" => "11px", "font-weight" => "500",
-        "padding" => "2px 6px",
-        "border-radius" => "var(--bt-radius-sm)",
-        "user-select" => "none"),
-    Bonito.CSS(".bt-detach-btn:hover",
-        "background" => "var(--bt-surface-2)"),
+    # Detach lives on the tool header's ⤢ button now (see bonitoteam.js); the
+    # in-frame controls row only carries the "detached" placeholder.
     Bonito.CSS(".bt-detach-placeholder",
         "color" => "var(--bt-text-muted)",
         "font-size" => "11px", "font-style" => "italic",
         "display" => "none"),
     # Toggled by the JS controller (sets data-detached on the .bt-slot when an
-    # embed is in the popup); the `:has()` selectors below flip the controls.
-    Bonito.CSS(".bt-embed-frame:has(.bt-slot[data-detached]) .bt-detach-btn",
-        "display" => "none"),
+    # embed is in a surface); reveal the placeholder in the now-empty inline spot.
     Bonito.CSS(".bt-embed-frame:has(.bt-slot[data-detached]) .bt-detach-placeholder",
         "display" => "inline"),
     Bonito.CSS(".bt-popup-mount",
@@ -434,28 +447,25 @@ const PopupStyles = Bonito.Styles(
     # header (undock + close) above the mount slot. Width is user-resizable via
     # the left-edge drag handle (`.bt-pp-resize`) and persisted in localStorage,
     # so re-opening lands on the same width.
-    # Adaptive default: takes up to half the shell (up to 720px) — gives wide
-    # monitors a comfortably large pane instead of a fixed-cramped 480px — and
-    # never goes below 360px on small screens. The user's drag override sets
-    # `--bt-pp-width` on the pane element itself, winning over this default.
-    Bonito.CSS(":root", "--bt-pp-width" => "min(720px, max(360px, 50%))"),
+    # Plain px fallback only. The real default is computed (clamped to the
+    # stage) in `applyPlotpaneVis` and written as explicit px on the element —
+    # a complex min/max/% value here gets mangled to a zero basis by the `flex`
+    # The plotpane is collapsed to 0 when hidden, and fills ALL remaining stage
+    # width (flex:1) when visible — the chat column (sized by `--bt-chat-width`)
+    # is the only other flex child, so the pane takes everything to its right
+    # with no gap. The divider on its left edge resizes the CHAT, not the pane.
     Bonito.CSS(".bt-plotpane",
         "flex"        => "0 0 0",
         "width"       => "0",
+        "min-width"   => "0",
         "overflow"    => "hidden",
         "position"    => "relative",
         "display"     => "flex", "flex-direction" => "column",
         "background"  => "var(--bt-surface)",
-        "border-left" => "1px solid var(--bt-border)",
-        "transition"  => "flex-basis 200ms ease, width 200ms ease"),
+        "border-left" => "1px solid var(--bt-border)"),
     Bonito.CSS(".bt-plotpane.bt-plotpane-visible",
-        "flex"  => "0 0 var(--bt-pp-width)",
-        "width" => "var(--bt-pp-width)"),
-    # Disable the width transition while the user is actively dragging the
-    # resize handle, otherwise every pointermove animates into place and the
-    # pane lags the cursor.
-    Bonito.CSS(".bt-plotpane.bt-pp-resizing",
-        "transition" => "none"),
+        "flex"  => "1 1 0",
+        "width" => "auto"),
     # Drag handle on the left edge: thin column, full height, col-resize cursor.
     # Slightly visible on hover so the affordance is discoverable.
     Bonito.CSS(".bt-pp-resize",
@@ -493,18 +503,19 @@ const PopupStyles = Bonito.Styles(
         "background" => "var(--bt-bg)", "color" => "var(--bt-text)"),
     Bonito.CSS(".bt-plotpane-mount",
         "flex" => "1 1 auto", "overflow" => "auto"),
-    # Drop strip — shown while the user is dragging the popup, so they have
-    # something to drag onto even when the plotpane is empty/collapsed.
-    Bonito.CSS(".bt-plotpane.bt-drop-ready",
-        "flex"       => "0 0 56px",
-        "width"      => "56px",
-        "background" => "var(--bt-surface-2)",
-        # Visible "drop here" hint via diagonal stripes.
-        "background-image" =>
-            "repeating-linear-gradient(135deg, transparent 0 8px, rgba(0,0,0,0.04) 8px 16px)"),
-    # Drag-to-dock highlight: pointer is over the drop zone.
-    Bonito.CSS(".bt-plotpane.bt-drop-active",
-        "background-color" => "var(--bt-bg)",
-        "outline" => "2px dashed var(--bt-accent)",
-        "outline-offset" => "-6px"),
+    # Drag-to-dock highlight overlay: a fixed-position rectangle covering the
+    # WHOLE area right of the chat (where the plotpane fills), shown while the
+    # floating window is being dragged. pointer-events:none so it never blocks
+    # the float's own drag. Brightens when the pointer is over it (will dock).
+    Bonito.CSS(".bt-drop-overlay",
+        "position" => "fixed",
+        "z-index" => "50",
+        "pointer-events" => "none",
+        "box-sizing" => "border-box",
+        "background" => "rgba(59,130,246,0.06)",
+        "border" => "2px dashed var(--bt-accent)",
+        "border-radius" => "8px",
+        "transition" => "background 80ms"),
+    Bonito.CSS(".bt-drop-overlay.bt-drop-active",
+        "background" => "rgba(59,130,246,0.16)"),
 )

@@ -115,6 +115,29 @@ which the server proxies the app through. Omitting `env_path` spins up a separat
 temp-env session whose Bonito may differ from the server's and fail to proxy.
 The app renders live in the browser — sliders, buttons, WGLMakie plots etc. stay
 interactive. Use bt_show instead for a static file/plot snapshot.
+
+Build apps the Bonito way — these rules matter MORE here than in a regular
+Bonito server because every `bt_show_app` call mounts a fresh chat-side
+sub-session, and stale subscribers on shared state will pile up across calls
+and eventually wedge the worker:
+
+  * Construct ALL Observables INSIDE `App() do session ... end`. A
+    `const X = Observable(...)` at module/eval scope is shared across every
+    `bt_show_app` invocation, every browser tab, and every threaded writer —
+    listeners accumulate, dead-session callbacks block on closed sockets, and
+    notify() can hang the writing task.
+
+  * To bridge external state (e.g. a `Threads.@spawn` background loop pushing
+    samples) into an App, ALWAYS use `map(f, session, parent_obs)` — the
+    session-scoped overload registers the parent→child callback on
+    `session.deregister_callbacks` so it auto-tears down when the chat
+    sub-session closes. Plain `map(f, parent_obs)` and `on(parent_obs)` leave
+    callbacks attached forever; after a few `bt_show_app` rounds the parent's
+    listener list is full of dead bridges and the writer task wedges.
+
+  * Inter-thread stop flags need `Threads.Atomic{Bool}` (or `@atomic`), not
+    `Ref{Bool}` — visibility of plain Ref writes across threads under load
+    is not guaranteed and the background task may never see your stop signal.
 """
 
 function julia_show_app_handler(args::AbstractDict)

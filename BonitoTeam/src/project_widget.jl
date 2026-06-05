@@ -18,7 +18,7 @@ Base.:(==)(a::ProjectCard, b::ProjectCard) = a.project_id == b.project_id
 function Bonito.jsrender(session::Bonito.Session, c::ProjectCard)
     state, pid = c.state, c.project_id
 
-    project_obs = map(state.projects) do projects
+    project_obs = map(session, state.projects) do projects
         get(projects, pid, nothing)
     end
 
@@ -29,7 +29,7 @@ function Bonito.jsrender(session::Bonito.Session, c::ProjectCard)
         p0 === nothing ? "" : project_display_title(p0)
     end
     title_obs = Observable(initial_title)
-    on(title_obs) do v
+    on(session, title_obs) do v
         new = strip(String(v))
         haskey(state.projects[], pid) || return
         cur = project_display_title(state.projects[][pid])

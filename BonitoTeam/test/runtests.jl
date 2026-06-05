@@ -92,6 +92,42 @@ include("test_sidebar_resumable.jl")
 
 include("test_queued_messages.jl")
 
+include("test_clean_cancel.jl")
+
 include("test_cancel_escalation.jl")
 
+include("test_cancel_stress.jl")
+
 include("test_tool_messages.jl")
+
+# ── Remote-app proxy bridge (BonitoMCP RemoteProxy ↔ BonitoTeam EvalBridge) ──
+# Server-side EvalBridge unit test — disconnect fast-fail, fail_pending!, reply
+# routing. Pure headless (a bare HTTPAssetServer stands in for the asset host).
+include("test_eval_bridge.jl")
+
+# Headless worker-bridge unit test — no eval worker / Malt / browser needed.
+# Guards render_embed (namespaced subsession + init bundle), the observable
+# round-trip, the control plane (delegate/register/close), and reconnect
+# survival: the pieces a "reuse Bonito's ProxyConnection / render_proxied"
+# refactor would touch.
+include(joinpath(@__DIR__, "..", "..", "BonitoMCP", "test", "test_remote_proxy.jl"))
+
+# Full live e2e: real dev_server + bt_show_app MCP handler + eval-worker dial-back
+# + embed + browser round-trip + asset lifecycle/teardown. Heavy (~30s) and needs
+# a worker that can dial back, so it's opt-in.
+if get(ENV, "BT_RUN_E2E", "") == "1"
+    include("test_real_e2e.jl")
+else
+    @info "runtests: skipping test_real_e2e.jl (set BT_RUN_E2E=1 to run the live worker-dial-back e2e)"
+end
+
+# Real-browser fake-agent churn test: WGLMakie apps + open/collapse in Electron —
+# guards the bt_show_app open/collapse trashing (relay head-of-line blocking). Self-
+# gates on BT_RUN_E2E (needs a worker + Electron).
+include("test_bonito_app_churn.jl")
+
+# Real-browser resident-layout test: plotpane-fills-whitespace + two-stage resize,
+# keep-alive DOM preservation across navigation (no re-delegate / no
+# null.bonitoKeyedList), per-chat floating/plotpane/divider-width residence, and
+# interactivity surviving a hide/show. Self-gates on BT_RUN_E2E.
+include("test_resident_layout.jl")

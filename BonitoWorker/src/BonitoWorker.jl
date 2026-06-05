@@ -677,6 +677,8 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 @async handle_list_dir(ws, cmd)
             elseif t == "inspect_path"
                 @async handle_inspect_path(ws, cmd)
+            elseif t == "tail_file"
+                @async handle_tail_file(ws, cmd)
             elseif t == "scan_sessions"
                 @async handle_scan_sessions(ws, cmd)
             elseif t == "clone_repo"
@@ -815,6 +817,67 @@ function handle_inspect_path(ws, cmd::AbstractDict)
         WebSockets.send(ws, JSON.json(response))
     catch e
         @warn "inspect_path response failed" exception=e
+    end
+end
+
+# Is `path` still held open by some process? This is the reliable "background
+# task still running" signal: a backgrounded shell keeps its `> output` redirect
+# open until it exits, so a quiet-but-open file (e.g. mid `sleep 60`) reads as
+# running, and the fd closing the instant the shell exits reads as done — no
+# completion sentinel needed. Linux only (scans `/proc/*/fd`); returns `nothing`
+# on other OSes so the server can fall back to mtime quiescence.
+function file_held_open(path::AbstractString)::Union{Bool,Nothing}
+    Sys.islinux() || return nothing
+    target = try realpath(path) catch; abspath(path) end
+    for pid in readdir("/proc")
+        all(isdigit, pid) || continue
+        fddir = joinpath("/proc", pid, "fd")
+        try
+            for fd in readdir(fddir)
+                lnk = try realpath(joinpath(fddir, fd)) catch; "" end
+                lnk == target && return true
+            end
+        catch
+            # process vanished mid-scan or fd not readable — skip
+        end
+    end
+    return false
+end
+
+# Stream a file from byte `offset`, plus whether it's still being written
+# (`open`). `open_known=false` ⇒ we couldn't tell (non-Linux) and the server
+# should use mtime quiescence instead.
+function handle_tail_file(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    raw_path   = String(get(cmd, "path", ""))
+    offset     = Int(get(cmd, "offset", 0))
+    max_bytes  = Int(get(cmd, "max_bytes", 65536))
+    response = try
+        if !isfile(raw_path)
+            Dict("type" => "tail_file_response", "request_id" => request_id,
+                 "exists" => false, "offset" => offset, "chunk" => "",
+                 "open" => false, "open_known" => true)
+        else
+            sz    = filesize(raw_path)
+            off   = clamp(offset, 0, sz)
+            chunk = open(raw_path, "r") do io
+                seek(io, off)
+                String(read(io, min(max_bytes, sz - off)))
+            end
+            held = file_held_open(raw_path)
+            Dict("type" => "tail_file_response", "request_id" => request_id,
+                 "exists" => true, "offset" => off + sizeof(chunk), "chunk" => chunk,
+                 "open" => held === true, "open_known" => held !== nothing,
+                 "mtime" => mtime(raw_path))
+        end
+    catch e
+        Dict("type" => "tail_file_response", "request_id" => request_id,
+             "error" => sprint(showerror, e))
+    end
+    try
+        WebSockets.send(ws, JSON.json(response))
+    catch e
+        @warn "tail_file response failed" exception=e
     end
 end
 

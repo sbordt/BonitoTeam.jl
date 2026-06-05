@@ -3,17 +3,20 @@ module RemoteProxy
 # Worker-side bridge for proxying a Bonito.App's session through to the BonitoTeam
 # server, which fronts the browser.
 #
-# Transport: the worker dials the server over ONE websocket and pipes the Bonito
-# protocol over it RAW — no Malt on this socket. Each WS frame is `[tag][payload]`:
-#   * `D` (data)    — a Bonito frame. Inbound (browser→worker) frames go straight
-#                     onto `parent.inbox`, where Bonito's stock inbox-reader runs
-#                     the normal decompress+unpack+dispatch. Outbound frames are
-#                     whatever `parent.connection.write` produces, sent verbatim.
-#   * `C` (control) — a tiny msgpack dict for the handful of request/response ops
-#                     that genuinely need it: `delegate` an app (render a subsession,
-#                     return its init bundle), `asset_read` (lazy range fetch), and
-#                     `close` a subsession. Asset register/release events are pushed
-#                     as `asset_add`/`asset_remove` control frames.
+# This is the REMOTE driver for Bonito's transport-agnostic proxy framework (see
+# Bonito/src/connection/proxy.jl + asset-serving/proxy.jl). The worker session is
+# a stock `Bonito.ProxyConnection` whose driver — `BridgeDriver` here — relays the
+# proxy verbs over ONE dial-back websocket, RAW (no Malt on this socket):
+#   * `proxy_send`         → a Bonito frame, tagged `D` (worker → browser)
+#   * `proxy_asset_add/remove` → an `asset_add`/`asset_remove` control frame (`C`)
+# Inbound (browser→worker) `D` frames go straight onto `parent.inbox`, where
+# Bonito's stock inbox-reader runs the normal decompress + unpack + dispatch.
+#
+# `C` (control) frames are the few request/response ops that aren't a plain Bonito
+# frame: `delegate` an app (render a subsession, return its init bundle),
+# `asset_read` (lazy range fetch), `register` (eval + register an app), `close` a
+# subsession. The worker reuses Bonito's `render_subsession` / `get_messages!` /
+# `ProxyAssetServer` — none of that is re-implemented here.
 #
 # Bootstrapping (include this module, build the bridge, start the dial) happens
 # over BonitoMCP's OWN Malt link to its worker — Malt stays there, never on this
@@ -25,59 +28,45 @@ using Bonito.HTTP.WebSockets: WebSockets
 const TAG_DATA = UInt8('D')
 const TAG_CTRL = UInt8('C')
 
-# ── Worker-side connection: a Bonito websocket connection whose frames ride the
-#    dial-back socket directly. ───────────────────────────────────────────────
-mutable struct BridgeConnection <: Bonito.AbstractWebsocketConnection
-    prefix::String              # `id_prefix` namespace for this bridge
-    ws::Ref{Any}                # the dial-back websocket, set by `serve_bridge`
-    wlock::ReentrantLock        # serialize concurrent frame sends
-    open::Threads.Atomic{Bool}
-    session::Union{Nothing, Bonito.Session}
+# ── Worker-side proxy driver: relays Bonito's proxy verbs onto the dial-back ws ──
+mutable struct BridgeDriver
+    ws::Ref{Any}            # current dial-back websocket (set by serve_bridge); nothing ⇒ disconnected
+    wlock::ReentrantLock    # serialize concurrent frame sends
 end
-BridgeConnection(prefix::AbstractString) =
-    BridgeConnection(String(prefix), Ref{Any}(nothing), ReentrantLock(),
-                     Threads.Atomic{Bool}(true), nothing)
+BridgeDriver() = BridgeDriver(Ref{Any}(nothing), ReentrantLock())
 
-Bonito.id_prefix(c::BridgeConnection) = c.prefix
-Base.isopen(c::BridgeConnection) =
-    c.open[] && c.ws[] !== nothing && !WebSockets.isclosed(c.ws[])
-
-function send_frame(c::BridgeConnection, tag::UInt8, payload::AbstractVector{UInt8})
-    ws = c.ws[]
+function send_frame(d::BridgeDriver, tag::UInt8, payload::AbstractVector{UInt8})
+    ws = d.ws[]
     ws === nothing && return nothing
     buf = Vector{UInt8}(undef, length(payload) + 1)
     @inbounds buf[1] = tag
     copyto!(buf, 2, payload, firstindex(payload), length(payload))
-    lock(c.wlock) do
-        try; WebSockets.send(ws, buf); catch; end
+    lock(d.wlock) do
+        try
+            WebSockets.send(ws, buf)
+        catch e
+            # A send racing socket teardown/reconnect throws routinely; that's the
+            # only expected failure. Log (don't swallow) so a real fault is visible.
+            @debug "RemoteProxy: frame send failed (socket closing?)" exception = e
+        end
     end
     return nothing
 end
+send_control(d::BridgeDriver, dict) = send_frame(d, TAG_CTRL, Bonito.MsgPack.pack(dict))
 
-# Bonito calls this to ship a serialized frame to the "browser" — here, raw down
-# the dial-back socket. No Malt, no channel, no per-frame serialization tax.
-Base.write(c::BridgeConnection, bytes::AbstractVector{UInt8}) =
-    (c.open[] && send_frame(c, TAG_DATA, bytes); nothing)
+# Bonito proxy verbs (worker side). `proxy_send` ships a serialized Bonito frame;
+# the asset verbs push the host the net 0→1 / 1→0 transitions as control frames.
+Bonito.proxy_send(d::BridgeDriver, bytes) = send_frame(d, TAG_DATA, bytes)
+Bonito.proxy_asset_add(d::BridgeDriver, key, mime, total, cached) =
+    send_control(d, Dict("op" => "asset_add", "key" => key, "mime" => mime,
+                         "total" => total, "cached" => cached))
+Bonito.proxy_asset_remove(d::BridgeDriver, key) =
+    send_control(d, Dict("op" => "asset_remove", "key" => key))
 
-send_control(c::BridgeConnection, dict) =
-    send_frame(c, TAG_CTRL, Bonito.MsgPack.pack(dict))
-
-function Base.close(c::BridgeConnection)
-    c.open[] = false
-    ws = c.ws[]
-    ws === nothing || try; close(ws); catch; end
-    return nothing
-end
-
-# No browser-side JS to emit (the browser talks to the host, which bridges); just
-# capture the session backref. The inbox-reader Bonito spawned at `Session(conn)`
-# drains `parent.inbox`, which `serve_bridge` feeds.
-Bonito.setup_connection(s::Bonito.Session{BridgeConnection}) =
-    (s.connection.session = s; nothing)
-
-# ── The bridge: one long-lived root session + an app route table per worker ──
+# ── The bridge: one long-lived proxied root session + an app route table ─────
 mutable struct RemoteBridge
     parent::Bonito.Session
+    driver::BridgeDriver
     routes::Bonito.Routes
 end
 
@@ -86,30 +75,24 @@ const BRIDGE = Ref{Union{Nothing, RemoteBridge}}(nothing)
 """
     RemoteBridge(; compression=false)
 
-Build the worker-side bridge: a long-lived root `Session` whose connection writes
-frames down the dial-back socket and whose inbox is fed by `serve_bridge`, with a
-shared `ProxyAssetServer` whose register/release events are pushed to the host as
-`asset_add`/`asset_remove` control frames. Subsessions (one per embed) inherit the
-connection + asset_server + compression through Bonito's normal parent/sub path.
+Build the worker-side bridge: a long-lived proxied root `Session` (a stock
+`Bonito.ProxyConnection` + `ProxyAssetServer` over a shared `BridgeDriver`).
+Subsessions (one per embed) inherit the connection + asset_server + compression
+through Bonito's normal parent/sub path; the driver relays every frame and asset
+event down the dial-back socket.
 """
 function RemoteBridge(; compression::Bool = false)
     prefix = string(Bonito.uuid4())
-    conn = BridgeConnection(prefix)
-    assets = Bonito.ProxyAssetServer(
-        (key, mime, total, cached) -> send_control(conn,
-            Dict("op" => "asset_add", "key" => key, "mime" => mime,
-                 "total" => total, "cached" => cached)),
-        key -> send_control(conn, Dict("op" => "asset_remove", "key" => key)))
-    # Mirror `render_proxied`: the session id IS the connection's namespace prefix,
-    # so the host's `route_to_remote` and the browser's id-cache agree.
-    parent = Bonito.Session(conn; id = prefix, asset_server = assets,
+    driver = BridgeDriver()
+    conn   = Bonito.ProxyConnection(prefix, driver)
+    parent = Bonito.Session(conn; id = prefix,
+                            asset_server = Bonito.ProxyAssetServer(driver),
                             compression_enabled = compression)
-    Bonito.setup_connection(parent)
     # The parent never gets its own `JSDoneLoading` (it's not a page), but its
     # writes reach the browser through the host relay — mark it ready so
-    # `close_subsession` can emit `free_session` through the bridge on teardown.
+    # `close`ing a subsession can emit `free_session` through the bridge.
     isready(parent.connection_ready) || put!(parent.connection_ready, true)
-    return RemoteBridge(parent, Bonito.Routes())
+    return RemoteBridge(parent, driver, Bonito.Routes())
 end
 
 """
@@ -122,9 +105,8 @@ the dial handshake so the host knows the namespace before any frame flows.
 function ensure_bridge!(; compression::Bool = false)
     if BRIDGE[] === nothing
         BRIDGE[] = RemoteBridge(; compression)
-        # Log every (re)build with the prefix so the worker log shows when this
-        # happens — a rebuild discards prior `register_app!` routes, which is
-        # otherwise invisible (no `delete!` is called, the whole Dict is gone).
+        # Log every (re)build with the prefix — a rebuild discards prior
+        # `register_app!` routes, which is otherwise invisible.
         @info "RemoteProxy: BRIDGE built" prefix = BRIDGE[].parent.id
     end
     return BRIDGE[].parent.id
@@ -134,16 +116,12 @@ end
     dial_loop(wsurl, handshake; min_backoff=0.5, max_backoff=8.0)
 
 Run the dial-and-serve loop until BRIDGE[] goes away. Each iteration opens a
-fresh websocket to `wsurl`, sends the `handshake` line, and runs
-`serve_bridge`. When the socket dies (clean EOF, network drop, host restart),
-we sleep with exponential backoff and dial again — so a transient WS drop
-doesn't leave the bridge silently disconnected (the previous one-shot dial
-made every later `call_ctrl` time out at 30 s).
-
-Successful connect resets the backoff so a brief blip → fast reconnect.
-BRIDGE[].routes survives the drop, so already-registered apps keep working
-on the new socket — host needs to recognise the dial-back as a *reconnect*
-(same `prefix`) rather than spinning up a new `EvalBridge`.
+fresh websocket to `wsurl`, sends the `handshake` line, and runs `serve_bridge`.
+When the socket dies (clean EOF, network drop, host restart), we sleep with
+exponential backoff and dial again — so a transient WS drop doesn't leave the
+bridge silently disconnected. `BRIDGE[].routes` survives the drop, so
+already-registered apps keep working on the new socket (the host recognises the
+dial-back as a *reconnect* by `prefix` and swaps the WS rather than rebuilding).
 """
 function dial_loop(wsurl::AbstractString, handshake::AbstractString;
                    min_backoff::Float64 = 0.5, max_backoff::Float64 = 8.0)
@@ -160,8 +138,7 @@ function dial_loop(wsurl::AbstractString, handshake::AbstractString;
             @warn "RemoteProxy: dial failed; will retry" wsurl backoff exception = e
         end
         # `connected` is the right signal — `serve_bridge` returning is normal
-        # (peer EOF), but if we never got past `open`, that's a real failure
-        # and we want backoff to grow.
+        # (peer EOF); never getting past `open` is a real failure → grow backoff.
         backoff = connected ? min_backoff : min(backoff * 2, max_backoff)
         sleep(backoff)
     end
@@ -172,15 +149,16 @@ end
 """
     serve_bridge(ws)
 
-Run the bridge's frame loop on the dial-back websocket `ws` (called by the worker
-right after it dials, over BonitoMCP's Malt link). Sets the connection's socket,
-then pumps inbound frames: `D` → `parent.inbox` (stock dispatch), `C` → control.
+Run the bridge's frame loop on the dial-back websocket `ws`. Points the driver at
+the socket, then pumps inbound frames: `D` → `parent.inbox` (stock dispatch),
+`C` → control. Clears the driver's socket on exit; does NOT tear the bridge down
+(its lifetime is the worker's Julia session, not this socket).
 """
 function serve_bridge(ws)
     b = BRIDGE[]
     b === nothing && error("RemoteProxy: bridge not built before serve_bridge")
-    c = b.parent.connection
-    c.ws[] = ws
+    d = b.driver
+    d.ws[] = ws
     try
         for msg in ws
             data = msg isa AbstractVector{UInt8} ? msg :
@@ -206,47 +184,45 @@ function serve_bridge(ws)
         e isa WebSockets.WebSocketError || e isa EOFError || e isa Base.IOError ||
             @warn "RemoteProxy.serve_bridge loop ended" exception = (e, catch_backtrace())
     finally
-        c.ws[] = nothing
+        d.ws[] = nothing
     end
     return
 end
 
 # Control request/response (the only ops that aren't a plain frame).
 #
-# The request-shaped ops (`delegate`, `asset_read`, `register`) carry an `id`
-# the host waits on. Any exception below MUST come back as a reply with an
-# `err` field — otherwise the host's `call_ctrl` would only learn about the
-# failure after a 30 s `Base.timedwait`, freezing the chat tool-render path
-# in the meantime. Notifications (`close`) carry no id; their exceptions just
-# get logged by serve_bridge's catch.
+# The request-shaped ops (`delegate`, `asset_read`, `register`) carry an `id` the
+# host waits on. Any exception below MUST come back as a reply with an `err` field
+# — otherwise the host's `call_ctrl` only learns about the failure after a 30s
+# timeout, freezing the chat tool-render path. Notifications (`close`) carry no id.
 function handle_control(b::RemoteBridge, msg::AbstractDict)
     op = msg["op"]
-    c = b.parent.connection
+    d = b.driver
     id = get(msg, "id", nothing)
     try
         if op == "delegate"
             sub_id, html, init_url = render_embed(b, String(msg["app"]))
-            send_control(c, Dict("op" => "reply", "id" => id,
+            send_control(d, Dict("op" => "reply", "id" => id,
                                  "val" => Any[sub_id, html, init_url]))
         elseif op == "asset_read"
             bytes = Bonito.read_proxy_asset(b.parent.asset_server.registry,
                         String(msg["key"]), Int(msg["start"]), Int(msg["stop"]))
-            send_control(c, Dict("op" => "reply", "id" => id, "val" => bytes))
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => bytes))
         elseif op == "register"
             app = Base.include_string(Main, String(msg["code"]))
             register_app!(String(msg["app"]), app)
-            send_control(c, Dict("op" => "reply", "id" => id, "val" => String(msg["app"])))
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => String(msg["app"])))
         elseif op == "close"
             s = Bonito.get_session(b.parent, String(msg["sub"]))
             s === nothing || close(s)
         end
     catch e
-        # Surface the failure to the host so its 30 s timedwait turns into a
-        # fast, informative error. Then rethrow so serve_bridge's @warn keeps
-        # the worker-side stacktrace for diagnosis.
+        # Surface the failure to the host so its 30s timedwait turns into a fast,
+        # informative error. Then rethrow so serve_bridge's @warn keeps the
+        # worker-side stacktrace for diagnosis.
         if id !== nothing
             try
-                send_control(c, Dict("op" => "reply", "id" => id,
+                send_control(d, Dict("op" => "reply", "id" => id,
                                      "err" => sprint(showerror, e)))
             catch
             end
@@ -256,17 +232,17 @@ function handle_control(b::RemoteBridge, msg::AbstractDict)
     return
 end
 
-# ── App registration + per-embed render (unchanged in spirit) ───────────────
+# ── App registration + per-embed render ──────────────────────────────────────
 register_app!(id::AbstractString, app::Bonito.App) =
     (Bonito.HTTPServer.route!(BRIDGE[], String(id) => app); nothing)
 
 Bonito.HTTPServer.route!(b::RemoteBridge, p::Pair{String, <:Bonito.App}) =
     (b.routes[p.first] = p.second; nothing)
 
-# Render a registered app into a FRESH subsession of the bridge parent and pack its
-# init bundle. `render_subsession` is `sub = Session(parent); session_dom(sub, app)`;
-# `init=false` keeps the bootstrap script out — the host calls `init_session` with
-# the returned `init_url` bundle from the embed's `jsrender`.
+# Render a registered app into a FRESH subsession of the bridge parent and pack
+# its init bundle. `render_subsession` = `sub = Session(parent); session_dom(sub,
+# app)`; `init=false` keeps the bootstrap script out — the host calls
+# `init_session` with the returned `init_url` bundle from the embed's `jsrender`.
 function render_embed(b::RemoteBridge, app_id::AbstractString)
     app = b.routes.routes[String(app_id)]
     sub, dom = Bonito.render_subsession(b.parent, app; init = false)

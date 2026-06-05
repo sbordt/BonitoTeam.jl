@@ -1,10 +1,12 @@
-# Headless test: a user cancel must ALWAYS recover the UI, even when the agent
-# ignores `session/cancel` (a wedged session — e.g. resumed onto an orphaned
-# tool call after a worker died mid-eval). The connection stays alive, so no
-# `ConnectionClosed` ever fires on its own; without escalation the busy spinner
-# would stick forever. `handle_command!(::CancelCommand)` escalates: graceful
-# cancel first, then a forceful connection teardown after `CANCEL_FORCE_GRACE`
-# if still busy — which breaks the wedged `prompt!` loop and clears busy.
+# Headless test: force-close is the LAST resort for a genuinely wedged agent
+# (resumed onto an orphaned tool call — ignores `session/cancel`, connection
+# stays alive so no `ConnectionClosed` ever fires). It must be:
+#   • never automatic on a timer — that races legitimate cold/resumed cancels
+#     (honor latency 6–18s+) and a premature mid-turn teardown leaves an orphaned
+#     tool_use that wedges every future resume (a doom loop);
+#   • never triggered by an impatient double-click — that's the same trap;
+#   • triggered ONLY by a deliberate re-cancel after the agent has had a real
+#     chance (≥ CANCEL_ESCALATE_WAIT) and the turn is still busy.
 
 using Test
 using JSON
@@ -12,9 +14,8 @@ using BonitoTeam
 const BT  = BonitoTeam
 const ACP = BonitoTeam.AgentClientProtocol
 
-# A transport that completes bring-up (initialize + session/new) but then WEDGES:
-# it never replies to `session/prompt` and ignores `session/cancel`. That is the
-# server-visible shape of a hung agent on a live connection.
+# Completes bring-up but then WEDGES: never replies to `session/prompt`, ignores
+# `session/cancel`. The server-visible shape of a hung agent on a live connection.
 function wedged_transport()
     on_setup = (outgoing::Channel{String}, incoming::Channel{String}) -> begin
         Base.errormonitor(@async try
@@ -27,8 +28,7 @@ function wedged_transport()
                 elseif method == "session/new" && id !== nothing
                     put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
                         "result"=>Dict("sessionId"=>"wedged-sess"))))
-                # session/prompt: deliberately NO reply, NO updates → prompt! blocks.
-                # session/cancel: a notification with no id → deliberately ignored.
+                # session/prompt + session/cancel: deliberately ignored.
                 end
             end
         catch e
@@ -39,29 +39,33 @@ function wedged_transport()
     return BT.MockTransport(on_setup)
 end
 
-@testset "cancel escalation recovers a wedged turn" begin
+@testset "cancel: graceful, double-click safe, force only on deliberate re-cancel" begin
     state = BT.ServerState(; state_dir = mktempdir(),
                              working_dir = mktempdir(), worker_secret = "x")
     model = BT.ChatModel(state, mktempdir(); transport = wedged_transport())
-    BT.start_chat_client!(model)             # brings up the (mock) client + consumer task
-
-    # Fire a turn. The consumer picks it up, calls prompt!, which blocks forever
-    # against the wedged mock → busy goes true and stays true.
+    BT.start_chat_client!(model)
     BT.send_message!(model, BT.UserMsg("hello?"))
+    @test timedwait(() -> model.busy_active[], 5.0) === :ok   # turn in flight
 
-    @test timedwait(() -> model.busy_active[], 5.0) === :ok   # turn is in flight, spinner on
+    c = model.client[]
 
-    # Graceful cancel (ignored by the mock) + escalation. After CANCEL_FORCE_GRACE
-    # the handler force-closes the connection, which breaks the wedged loop. The
-    # session arg is unused by the cancel handler, so `nothing` is fine.
+    # FIRST cancel — graceful. Mock ignores it; busy STAYS (no auto-teardown).
     BT.handle_command!(model, nothing, BT.CancelCommand())
+    @test timedwait(() -> !model.busy_active[], 2.0) === :timed_out
+    @test model.session_alive[] == true
 
-    # The core guarantee: busy clears within the grace + a beat for teardown to
-    # propagate, and the session lands in the recoverable dead state (so the UI
-    # shows the Restart banner). The exact `last_error` wording is best-effort —
-    # the consumer's own ConnectionClosed handler may overwrite the escalation's
-    # message with "ACP connection closed"; both surface a working Restart.
-    @test timedwait(() -> !model.busy_active[], BT.CANCEL_FORCE_GRACE + 4.0) === :ok
+    # RAPID second cancel (impatient double-click, well within the wait) — STILL
+    # graceful. Must not force-close a turn that might be about to honor.
+    BT.handle_command!(model, nothing, BT.CancelCommand())
+    @test timedwait(() -> !model.busy_active[], 2.0) === :timed_out
+    @test model.session_alive[] == true
+
+    # DELIBERATE re-cancel: simulate the agent having had its full chance by
+    # backdating the first-cancel stamp past the escalation wait. NOW a re-cancel
+    # force-closes → ConnectionClosed breaks the wedged loop → busy clears.
+    @atomic c.conn.cancel_at = time() - (BT.CANCEL_ESCALATE_WAIT + 1.0)
+    BT.handle_command!(model, nothing, BT.CancelCommand())
+    @test timedwait(() -> !model.busy_active[], 5.0) === :ok
     @test model.session_alive[] == false
     @test !isempty(model.last_error[])
 end

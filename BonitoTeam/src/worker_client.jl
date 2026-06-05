@@ -195,6 +195,15 @@ function handle_worker_control(state::ServerState, ws)
         safe_notify!(state.projects)
         @info "Worker connected" worker_id=worker_id name=display_name hostname=w.hostname
 
+        # Reconcile this worker's projects against its filesystem: drop any whose
+        # `worker_path` is gone (scratch dirs cleared on reboot). Async so the
+        # inspect round-trips never block registration.
+        Base.errormonitor(@async try
+            prune_missing_projects!(state, worker_id)
+        catch e
+            @warn "prune_missing_projects! failed" worker = worker_id exception = e
+        end)
+
         # Bring-up is LAZY: we no longer spawn a chat (claude process) for every
         # project the moment a worker connects. A chat starts only when the user
         # opens one of its threads (ensure_project_session! via the loading view
@@ -232,6 +241,8 @@ function handle_worker_control(state::ServerState, ws)
                     deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                 elseif t == "inspect_path_response"
                     deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                elseif t == "tail_file_response"
+                    deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                 end
             catch e
                 @warn "Worker control frame error" exception=e
@@ -258,6 +269,7 @@ it (the bug that made duplicate workers mutually destructive). The `=== ws`
 identity check is the guard.
 """
 function teardown_worker_control!(state::ServerState, worker_id::AbstractString, ws)
+    affected = String[]
     is_current = lock(state.lock) do
         current = get(state.worker_control_ws, worker_id, nothing)
         current === ws || return false           # superseded — leave the live one alone
@@ -268,11 +280,18 @@ function teardown_worker_control!(state::ServerState, worker_id::AbstractString,
         for p in values(state.projects[])
             if p.worker_id == worker_id
                 delete!(state.chat_models, p.id)
+                push!(affected, p.id)
             end
         end
         return true
     end
     if is_current
+        # The worker host is gone → its eval workers (and their bridges) are gone.
+        # Tear them down explicitly outside the lock (close asset host is I/O); a
+        # WS drop alone no longer does this — the bridge follows the worker session.
+        for pid in affected
+            teardown_eval_bridge!(state, pid)
+        end
         safe_notify!(state.workers)
         notify_chats!(state)    # evicted chats drop out of the active-chats sidebar
         release_projects_for_worker!(state, worker_id)
@@ -605,6 +624,69 @@ function inspect_worker_path(state::ServerState, worker_name::String,
     summary = get(resp, "summary", nothing)
     summary isa AbstractDict || error("inspect_path: missing summary")
     return Dict{String,Any}(summary)
+end
+
+# Stream a worker file from byte `offset`. Returns the new chunk + offset and
+# whether the file is still held open (the background-task "still running"
+# signal — see the worker's `file_held_open`). `open_known=false` means the
+# worker couldn't tell (non-Linux) and the caller should fall back to mtime.
+function tail_worker_file(state::ServerState, worker_id::AbstractString,
+                           path::AbstractString; offset::Int = 0,
+                           max_bytes::Int = 65536, timeout::Real = 15.0)
+    haskey(state.worker_control_ws, worker_id) ||
+        error("Worker '$worker_id' is not connected")
+    rid, ch = register_rpc!(state)
+    send_command(state, worker_id, Dict(
+        "type" => "tail_file", "request_id" => rid,
+        "path" => String(path), "offset" => offset, "max_bytes" => max_bytes))
+    resp = take_pending!(state, ch, rid, timeout, "tail_file on '$worker_id'")
+    resp isa AbstractDict || error("tail_file: unexpected response shape")
+    haskey(resp, "error") && error("tail_file on '$worker_id': $(resp["error"])")
+    return (exists     = Bool(get(resp, "exists", false)),
+            offset     = Int(get(resp, "offset", offset)),
+            chunk      = String(get(resp, "chunk", "")),
+            open       = Bool(get(resp, "open", true)),
+            open_known = Bool(get(resp, "open_known", false)),
+            mtime      = Float64(get(resp, "mtime", 0.0)))
+end
+
+# Is a project's `worker_path` DEFINITIVELY gone on a connected worker? True only
+# when the worker explicitly reports the path isn't a directory; a timeout /
+# disconnect / any other error is UNCERTAIN → false. We never prune on doubt —
+# that would delete a perfectly valid project.
+function worker_path_missing(state::ServerState, worker_id::AbstractString,
+                              path::AbstractString)::Bool
+    haskey(state.worker_control_ws, worker_id) || return false
+    try
+        inspect_worker_path(state, worker_id, path; timeout = 10.0)
+        return false                       # path exists
+    catch e
+        msg = sprint(showerror, e)
+        return occursin("not a directory", msg) || occursin("path is empty", msg)
+    end
+end
+
+# Drop this worker's registered projects whose `worker_path` no longer exists
+# (e.g. `/tmp/jl_*` scratch dirs cleared on reboot). Conservative: only
+# definitively-missing paths, and never an in-use (locked) project. Returns the
+# number pruned. Runs the inspect round-trips serially — fine off the hot path.
+function prune_missing_projects!(state::ServerState, worker_id::AbstractString)
+    candidates = [(id, p.worker_path) for (id, p) in collect(state.projects[])
+                  if p.worker_id == worker_id && p.locked_by === nothing]
+    dead = String[]
+    for (id, wp) in candidates
+        worker_path_missing(state, worker_id, wp) && push!(dead, id)
+    end
+    isempty(dead) && return 0
+    lock(state.lock) do
+        for id in dead
+            haskey(state.projects[], id) && delete!(state.projects[], id)
+        end
+        save_projects!(state)
+    end
+    safe_notify!(state.projects)
+    @info "pruned project(s) with missing worker paths" worker = worker_id count = length(dead) ids = dead
+    return length(dead)
 end
 
 """

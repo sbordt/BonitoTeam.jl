@@ -58,6 +58,15 @@ DATA_DIR="/var/lib/bonitoteam"
 CONFIG_DIR="/etc/bonitoteam"
 SERVER_BIN="$MONOREPO_DIR/BonitoTeam/bin/bonitoteam-server"
 JULIA_BIN="$(command -v julia || true)"
+# `command -v` only sees PATH, but the service user installs Julia via juliaup
+# (~/.juliaup/bin/julia), which is on PATH only inside their interactive shell —
+# not when the installer runs under sudo / a bare environment. Fall back to the
+# well-known juliaup / juliaup-symlink locations in the service user's home.
+if [[ -z "$JULIA_BIN" ]]; then
+    for cand in "$SERVICE_HOME/.juliaup/bin/julia" "$SERVICE_HOME/.local/bin/julia"; do
+        [[ -x "$cand" ]] && { JULIA_BIN="$cand"; break; }
+    done
+fi
 
 echo "==> BonitoTeam server installer"
 echo "    Monorepo     : $MONOREPO_DIR"
@@ -66,10 +75,10 @@ echo "    Service user : $SERVICE_USER"
 # ── Sanity checks ─────────────────────────────────────────────────────────────
 step "Sanity checks"
 [[ -f "$SERVER_BIN" ]] || { echo "ERROR: $SERVER_BIN not found — run from the cloned repo"; exit 1; }
-[[ -n "$JULIA_BIN" ]]  || { echo "ERROR: julia not found in PATH — install Julia first"; exit 1; }
+[[ -n "$JULIA_BIN" ]]  || { echo "ERROR: julia not found (checked PATH and $SERVICE_HOME/.juliaup/bin) — install Julia (juliaup) first"; exit 1; }
 command -v sudo > /dev/null || { echo "ERROR: sudo not found"; exit 1; }
 chmod +x "$MONOREPO_DIR/BonitoTeam/bin/"*
-ok "julia: $(julia --version)"
+ok "julia: $("$JULIA_BIN" --version)"
 
 # ── Stop service before any changes ───────────────────────────────────────────
 # Either the old service is running (if we abort before this point) or it's
@@ -94,7 +103,7 @@ ok "owned by $SERVICE_USER"
 # The per-package Project.toml files (BonitoTeam/Project.toml etc.) are
 # metadata for declaring deps and must NEVER be used as a runtime env.
 step "Julia env (monorepo root)"
-julia "--project=$MONOREPO_DIR" --startup-file=no \
+"$JULIA_BIN" "--project=$MONOREPO_DIR" --startup-file=no \
     -e 'import Pkg; Pkg.instantiate()'
 ok "instantiated"
 

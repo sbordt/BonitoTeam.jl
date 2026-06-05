@@ -100,6 +100,8 @@ include("test_cancel_stress.jl")
 
 include("test_tool_messages.jl")
 
+include("test_acp_log.jl")
+
 # ── Remote-app proxy bridge (BonitoMCP RemoteProxy ↔ BonitoTeam EvalBridge) ──
 # Server-side EvalBridge unit test — disconnect fast-fail, fail_pending!, reply
 # routing. Pure headless (a bare HTTPAssetServer stands in for the asset host).

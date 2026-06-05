@@ -81,6 +81,7 @@ function serve(; host::String        = "0.0.0.0",
     # AND EADDRINUSE → port+1 retry without us tracking the actual port.
     base_url = something(public_url, Bonito.online_url(srv, ""))
     add_install_routes!(srv, base_url, worker_secret)
+    add_acp_log_routes!(srv, state)
     add_worker_ws_routes!(srv, state)
 
     # ONE server-wide loop that tails every live background bash's output file
@@ -128,6 +129,70 @@ function add_install_routes!(srv::Bonito.Server, public_url::String, worker_secr
         HTTP.Response(200, ["Content-Type" => ctype], body=body)
     end)
 end
+
+# ── ACP wire-frame log routes ────────────────────────────────────────────────
+#
+# /acp-log            — HTML index of projects that have an acp.jsonl
+# /acp-log/<pid>      — the raw JSONL (one {"ts","dir","msg"} envelope per
+#                       line), append-only, written by `acp_frame_logger`.
+#                       Refresh the tab to see new frames.
+#
+# Served straight from disk (state_dir/chats/<pid>/acp.jsonl) so logs are
+# readable even when no live ChatModel exists for the project. Legacy
+# project-id-less chats (<cwd>/.bonitoTeam) are deliberately NOT exposed.
+function add_acp_log_routes!(srv::Bonito.Server, state::ServerState)
+    index_handler = function(context)
+        chats_root = joinpath(state.state_dir, "chats")
+        ids = isdir(chats_root) ?
+            filter(id -> isfile(joinpath(chats_root, id, "acp.jsonl")),
+                   sort!(readdir(chats_root))) :
+            String[]
+        items = map(ids) do id
+            p = get(state.projects[], id, nothing)
+            label = esc_html(p === nothing ? id : "$(p.name) ($id)")
+            "<li><a href=\"/acp-log/$id\">$label</a></li>"
+        end
+        body = isempty(items) ?
+            "<p>No ACP logs yet — open a chat and send a message.</p>" :
+            "<ul>" * join(items) * "</ul>"
+        html = "<!doctype html><html><head><meta charset=\"utf-8\">" *
+               "<title>ACP wire logs</title></head>" *
+               "<body><h1>ACP wire logs</h1>$body</body></html>"
+        HTTP.Response(200, ["Content-Type" => "text/html; charset=utf-8"], body=html)
+    end
+    # Both slash variants — String routes match the URI path exactly, so
+    # "/acp-log/" (what a browser autocompletes to) needs its own entry.
+    Bonito.route!(srv, "/acp-log"  => index_handler)
+    Bonito.route!(srv, "/acp-log/" => index_handler)
+    Bonito.route!(srv, ACP_LOG_ROUTE_RE => function(context)
+        acp_log_response(state, String(context.match.captures[1]))
+    end)
+end
+
+# `request.target` includes the query string, hence the `($|\?)` arm; the
+# `/?` tolerates a trailing slash after the id. The charset (no `.`, no `/`)
+# makes path traversal impossible.
+const ACP_LOG_ROUTE_RE = r"^/acp-log/([A-Za-z0-9_-]+)/?(?:$|\?)"
+
+# Plain function (no live HTTP server needed) so tests can call it directly.
+function acp_log_response(state::ServerState, project_id::AbstractString)
+    # Defense-in-depth: the route regex already constrains the charset, but
+    # never join an unvalidated id into a filesystem path.
+    occursin(r"^[A-Za-z0-9_-]+$", project_id) ||
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "invalid project id\n")
+    path = joinpath(state.state_dir, "chats", String(project_id), "acp.jsonl")
+    isfile(path) ||
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "no ACP log for project '$project_id'\n")
+    return HTTP.Response(200,
+        ["Content-Type"  => "text/plain; charset=utf-8",
+         "Cache-Control" => "no-cache"],
+        body = read(path, String))
+end
+
+esc_html(s::AbstractString) = replace(s,
+    "&" => "&amp;", "<" => "&lt;", ">" => "&gt;", "\"" => "&quot;")
 
 # Substitute the server URL + shared secret + git rev into a templated install
 # script. install.jl guards against being run with the `{{ }}` placeholders

@@ -56,6 +56,38 @@ end
 
 session_file(chat_dir::AbstractString) = joinpath(String(chat_dir), "chat.md")
 
+# ── ACP wire-frame log ──────────────────────────────────────────────────────
+# Raw ACP JSON-RPC traffic (both directions), one envelope per line:
+#   {"ts": "2026-06-05T12:34:56.789Z", "dir": "in"|"out", "msg": <frame>}
+# Append-only, lives next to chat.md; served read-only via /acp-log/<pid>.
+
+acp_log_file(chat_dir::AbstractString) = joinpath(String(chat_dir), "acp.jsonl")
+
+"""
+    acp_frame_logger(chat_dir) -> Function
+
+Build an `on_frame` tap (see `AgentClientProtocol.Connection`) that appends
+every ACP frame to `chat_dir/acp.jsonl`. Per-call open-append: frames are
+low-rate (claude-agent-acp chunks are paragraph-sized), and holding no handle
+means restarts / external deletion need no lifecycle handling. The lock
+serializes the reader task (`:in`) against sender tasks (`:out`).
+"""
+function acp_frame_logger(chat_dir::AbstractString)
+    path = acp_log_file(chat_dir)
+    lk = ReentrantLock()
+    return function (dir::Symbol, msg::AbstractDict)
+        ts = Dates.format(now(UTC), dateformat"yyyy-mm-dd\THH:MM:SS.sss\Z")
+        lock(lk) do
+            open(path, "a") do io
+                JSON.print(io, Dict{String,Any}(
+                    "ts" => ts, "dir" => String(dir), "msg" => msg))
+                println(io)
+            end
+        end
+        return nothing
+    end
+end
+
 # Per-tool JSON snapshot of the latest ACP params (the wire format itself), so
 # tool bodies survive restarts and don't have to live in process memory.
 function tools_dir(chat_dir::AbstractString)

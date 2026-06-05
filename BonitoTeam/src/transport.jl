@@ -173,8 +173,14 @@ mcp_list_payload(mcp_servers) =
           "env"     => [Dict("name" => k, "value" => v) for (k,v) in s.env])
      for s in mcp_servers]
 
+# All three bring-ups accept `on_frame` — the optional ACP wire tap passed
+# through to `ACP.Connection` (see `acp_frame_logger`). Threading it here
+# (rather than per-transport state) keeps the tap per-session: a restart
+# builds a fresh Connection and re-arms the tap with it.
+
 # 1. Local: spawn claude-agent-acp, then drive initialize + session/new.
-function start_session(t::LocalTransport, handler::ACP.Handler)
+function start_session(t::LocalTransport, handler::ACP.Handler;
+                       on_frame::Union{Function,Nothing} = nothing)
     isfile(t.agent_bin) || error("claude-agent-acp not found at: $(t.agent_bin)")
     env = merge(Dict(k => v for (k,v) in ENV),
                 Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
@@ -183,7 +189,7 @@ function start_session(t::LocalTransport, handler::ACP.Handler)
     proc = open(Cmd(`$(t.agent_bin)`; env, dir = t.cwd), "r+")
     t.inner[] = ACP.SubprocessTransport(proc)
 
-    conn = ACP.Connection(t, handler)
+    conn = ACP.Connection(t, handler; on_frame)
     ACP.send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
         "clientCapabilities" => Dict("fs" => Dict(
@@ -199,7 +205,8 @@ end
 
 # 2. Worker: ask the worker to spawn claude-agent-acp and dial back, then
 #    drive initialize + session/new (or session/load when resuming).
-function start_session(t::WorkerTransport, handler::ACP.Handler)
+function start_session(t::WorkerTransport, handler::ACP.Handler;
+                       on_frame::Union{Function,Nothing} = nothing)
     haskey(t.state.worker_control_ws, t.worker_id) ||
         error("Worker '$(t.worker_id)' is not connected")
 
@@ -227,7 +234,7 @@ function start_session(t::WorkerTransport, handler::ACP.Handler)
     t.ws[] = take_pending!(t.state, ch, sid, 30.0,
                           "open_session on '$(t.worker_id)'")
 
-    conn = ACP.Connection(t, handler)
+    conn = ACP.Connection(t, handler; on_frame)
     ACP.send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
         "clientCapabilities" => Dict("fs" => Dict(
@@ -260,11 +267,12 @@ end
 #    Channels are recreated each call because `restart_chat_session!`
 #    closes the old transport (killing the old responder) before bringing
 #    up a new one.
-function start_session(t::MockTransport, handler::ACP.Handler)
+function start_session(t::MockTransport, handler::ACP.Handler;
+                       on_frame::Union{Function,Nothing} = nothing)
     if !isopen(t.outgoing); t.outgoing = Channel{String}(t.capacity); end
     if !isopen(t.incoming); t.incoming = Channel{String}(t.capacity); end
     t.on_setup(t.outgoing, t.incoming)
-    conn = ACP.Connection(t, handler)
+    conn = ACP.Connection(t, handler; on_frame)
     ACP.send_request(conn, "initialize", Dict("protocolVersion" => 1))
     result = ACP.send_request(conn, "session/new",
                               Dict("cwd" => t.cwd, "mcpServers" => []))

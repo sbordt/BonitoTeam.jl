@@ -1637,7 +1637,10 @@ function start_chat_client!(model::ChatModel)
     # `msgs_store` (e.g. project synced to a different worker), so we arm a
     # one-shot history prelude that the next prompt consumes (`with_prelude`).
     prev_session_id = model.chat_session.session_id
-    client, replay = start_session(model.transport, handler)
+    # `on_frame` taps every raw ACP frame (both directions) into
+    # chat_dir/acp.jsonl — inspectable live via GET /acp-log/<project_id>.
+    client, replay = start_session(model.transport, handler;
+                                   on_frame = acp_frame_logger(model.chat_dir))
     model.client[] = client
     new_session_id = client.session_id
     if isempty(replay)

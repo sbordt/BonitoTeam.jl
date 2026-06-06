@@ -768,41 +768,28 @@ const ChatStyles = Bonito.Styles(
         "pointer-events" => "none",
         "z-index" => "-1"),
 
-    # ── Mount curtain ────────────────────────────────────────────────────────
-    # Covers the chat while the initial geometry settles (estimate→measured
-    # heights, image mounts) — see `_mountCurtain` in bonitoteam.js. Fades
-    # out over the final layout.
-    # Layout mirrors the bring-up pane: `.bt-loading-wrap` is a PLAIN block
-    # (no centering), so its `.bt-loading` content sits at the top of the
-    # view, offset only by its own 40px padding. Column + stretch keeps the
-    # inner block full-width and top-aligned — between the two phases only
-    # the sub-text appears to change.
-    CSS(".bt-chat-curtain",
-        "position" => "absolute", "inset" => "0",
-        "z-index" => "30",
-        "background" => "var(--bt-bg)",
-        "display" => "flex", "flex-direction" => "column",
-        "align-items" => "stretch", "justify-content" => "flex-start",
-        "opacity" => "1",
-        "transition" => "opacity 200ms ease"),
-    # In the bring-up pane `.bt-loading` sits in a plain BLOCK wrap, so its
-    # `flex: 1 1 auto` is inert and it hugs its content at the top. Inside
-    # the curtain's flex column it would stretch + re-center — pin it back
-    # to content height so both phases put the text at the same spot.
-    CSS(".bt-chat-curtain .bt-loading",
-        "flex" => "0 0 auto"),
-    CSS(".bt-chat-curtain.bt-curtain-hide",
-        "opacity" => "0",
-        "pointer-events" => "none"),
+    # (The per-chat mount curtain used to live here — the dashboard's load
+    # overlay now covers the pane until settle; see `chat_waiting_view` in
+    # sidebar.jl and `_startSettle` in bonitoteam.js.)
 
     # ── Busy indicator ───────────────────────────────────────────────────────
+    # Lives inside `.bt-messages` (between the bottom spacer and the
+    # overscroll tail) so it shows directly under the last message. The
+    # container already pads 16px, so no own horizontal padding; opted out
+    # of scroll anchoring like the spacers/tail (the chase owns scrollTop).
+    # margin-top -10px cancels the flex row gap that precedes each of the
+    # three indicator children (zero-height or not, every flex item costs a
+    # gap slot — three indicators after the bottom spacer would push the
+    # visible one 30px under the last message). Safe: indicators are plain
+    # content the virtual-scroll height math never tracks.
     CSS(".bt-busy",
         "flex-shrink" => "0", "height" => "0", "overflow" => "hidden",
+        "overflow-anchor" => "none", "margin-top" => "-10px",
         "display" => "flex", "gap" => "4px", "align-items" => "center",
-        "padding" => "0 16px",
+        "padding" => "0",
         "transition" => "height 150ms ease, padding 150ms ease"),
     CSS(".bt-busy.bt-busy-active",
-        "height" => "28px", "padding" => "4px 16px"),
+        "height" => "28px", "padding" => "4px 0"),
     CSS(".bt-busy-dot",
         "width" => "7px", "height" => "7px", "border-radius" => "50%",
         "background" => "var(--bt-accent)",
@@ -813,18 +800,39 @@ const ChatStyles = Bonito.Styles(
         CSS("0%, 100%", "opacity" => "0.3", "transform" => "scale(0.8)"),
         CSS("50%",      "opacity" => "1",   "transform" => "scale(1.2)")),
 
+    # ── Idle "waiting" indicator ─────────────────────────────────────────────
+    # Visible when the busy dots are NOT (keyed off `.bt-busy`'s class via
+    # the adjacent-sibling rule — busy_start/busy_end flips and the
+    # server-rendered remount class drive both elements in lockstep) AND
+    # the chat has agent replies on display: `bt-waiting-on` is toggled by
+    # `_updateWaiting` in bonitoteam.js — set once an agent message exists
+    # and the Agent filter shows them. An empty chat (nothing asked yet) or
+    # a filtered-out agent stream gets no dangling "waiting" line. Same
+    # placement rules as `.bt-busy` above (inside `.bt-messages`).
+    CSS(".bt-waiting",
+        "flex-shrink" => "0", "height" => "0", "overflow" => "hidden",
+        "overflow-anchor" => "none", "margin-top" => "-10px",
+        "display" => "flex", "align-items" => "center",
+        "padding" => "0", "font-size" => "12.5px", "font-style" => "italic",
+        "color" => "var(--bt-text-muted)",
+        "transition" => "height 150ms ease, padding 150ms ease"),
+    CSS(".bt-busy:not(.bt-busy-active) + .bt-waiting.bt-waiting-on",
+        "height" => "22px", "padding" => "2px 0"),
+
     # ── Transient "reasoning…" indicator ──────────────────────────────────────
     # Shown for the lifetime of an agent thought (most are redacted/empty, so
     # this is usually the only visible trace of the model thinking). Collapsed
     # to zero height until `.bt-thinking-active` is toggled by the JS.
+    # Same placement rules as `.bt-busy` above (inside `.bt-messages`).
     CSS(".bt-thinking",
         "flex-shrink" => "0", "height" => "0", "overflow" => "hidden",
+        "overflow-anchor" => "none", "margin-top" => "-10px",
         "display" => "flex", "align-items" => "center",
-        "padding" => "0 16px", "font-size" => "12.5px", "font-style" => "italic",
+        "padding" => "0", "font-size" => "12.5px", "font-style" => "italic",
         "color" => "var(--bt-text-muted)",
         "transition" => "height 150ms ease, padding 150ms ease"),
     CSS(".bt-thinking.bt-thinking-active",
-        "height" => "22px", "padding" => "2px 16px"),
+        "height" => "22px", "padding" => "2px 0"),
     CSS(".bt-collapsable-loading",
         "color" => "var(--bt-text-faint)",
         "font-style" => "italic", "font-size" => "12px",
@@ -928,11 +936,11 @@ const ChatStyles = Bonito.Styles(
         "font-weight" => "600",
         "user-select" => "none"),
 
-    # ── Native image display (bt_show + "Depict Images Natively in Chat") ──
-    # The bt-tool-native class strips the pill chrome so the body's <img>
-    # sits bare in the chat flow like an agent reply; bonitoteam.js applies
-    # it (and auto-mounts the body) when the toggle is on and the tool's
-    # show_mime is image/*.
+    # ── Native media display (bt_show + "Native Images" / "Native Videos") ──
+    # The bt-tool-native class strips the pill chrome so the body's <img> or
+    # <video> sits bare in the chat flow like an agent reply; bonitoteam.js
+    # applies it (and auto-mounts the body) when the matching toggle is on
+    # and the tool's show_mime is image/* / video/*.
     CSS(".bt-tool-msg.bt-tool-native",
         "background" => "none",
         "border" => "none",
@@ -959,6 +967,11 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-tool-native .bt-tool-body img:hover",
         "transform" => "scale(1.015)",
         "box-shadow" => "var(--bt-shadow-md)"),
+    # Videos get the same dressing but NOT the hover lift — a zoom under
+    # the pointer while scrubbing/watching reads as jitter, not polish.
+    CSS(".bt-tool-native .bt-tool-body video",
+        "border-radius" => "var(--bt-radius-sm)",
+        "box-shadow" => "var(--bt-shadow-sm)"),
 
     # ── Attachment thumbnail strip ──────────────────────────────────────────
     # Sits above .bt-input-row. Hidden (display:none) when there's nothing

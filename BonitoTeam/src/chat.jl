@@ -913,12 +913,12 @@ has_show_reference(content) = find_show_reference(content) !== nothing
 
 # ── bt_show: render a worker file inline (ShowTool) ─────────────────────────
 # A `shown: <path> …` text block (emitted by the `bt_show` MCP tool) becomes a
-# `ShowTool`. Its `jsrender` kicks off an async fetch of the file to the
-# server and hands the result to Bonito's `jsrender(::Task)` — a spinner shows
-# until the bytes land, then the right element renders. Video plays because
-# Bonito's asset server now honours HTTP Range requests, and we point
-# `<video src>` at a served `Bonito.Asset` URL (not a multi-MB `data:` blob).
-# No bytes pass through claude; the path is the only thing on the wire.
+# `ShowTool`. Its `jsrender` fetches the file to the server (blocking the
+# per-render task — the Collapsable's "loading…" placeholder shows meanwhile)
+# and renders the right element. Video plays because Bonito's asset server
+# honours HTTP Range requests, and we point `<video src>` at a served
+# `Bonito.Asset` URL (not a multi-MB `data:` blob). No bytes pass through
+# claude; the path is the only thing on the wire.
 
 # Pull the path out of a `shown: <path>` header (tolerates a trailing
 # ` (<mime>, <size>)` from older tool output). `nothing` if not a show ref.
@@ -962,14 +962,18 @@ struct ShowTool
     path::String        # path as the WORKER sees it (absolute, or relative to its cwd)
 end
 
-# If the file is already on the server (first fetch done, or RemoteSync mirror),
-# render synchronously — no spinner flash on collapse/re-expand. Only the very
-# first show, when the bytes still have to come off the worker, goes through the
-# async `jsrender(::Task)` spinner path.
+# Always render synchronously: the fetch (minutes for a multi-GB video)
+# blocks only the per-render @async task in `handle_command!(::ToolRender-
+# Command)`, and the finished element ships through that handler's
+# `dom_in_js` → `_btToolSlot` mount, which finds nodes the virtual scroll
+# holds DETACHED. The earlier `@async` + `jsrender(::Task)` spinner path
+# swapped the result in via Bonito's Observable machinery, whose
+# document-scoped uuid lookup polls for 30s and then gives up — a video
+# whose fetch outlived that window (or whose node was off-window at swap
+# time) kept its spinner forever; only a manual re-render, by then on the
+# isfile fast path, showed it.
 Bonito.jsrender(session::Bonito.Session, st::ShowTool) =
-    isfile(show_server_path(st)) ?
-    Bonito.jsrender(session, render_show_file(st)) :
-    Bonito.jsrender(session, Base.errormonitor(@async render_show_file(st)))
+    Bonito.jsrender(session, render_show_file(st))
 
 # The server-side path a ShowTool's file resolves to — no IO. Files under the
 # project tree map straight onto the server mirror (cwd ⟷ worker_path); an
@@ -985,17 +989,34 @@ function show_server_path(st::ShowTool)
     end
 end
 
+# Single-flight per destination: concurrent `tool.render` calls for the same
+# file (native-toggle spam, several tabs) would otherwise both stream into the
+# same `<dst>.partial` and corrupt it. The loser blocks until the winner's
+# fetch lands, re-checks isfile, and returns without a second transfer.
+# Entries are kept (one small lock per distinct shown file) — dropping them
+# would re-open the two-writers window for a fetch that errors and retries.
+const SHOW_FETCH_LOCKS = ReentrantLock()
+const SHOW_FETCH_INFLIGHT = Dict{String,ReentrantLock}()
+
 # Resolve `st.path` to a file on the SERVER's disk, fetching it from the worker
-# if we don't already have it. Throws if it can't be obtained.
+# if we don't already have it. Blocks for the transfer (multi-GB videos take
+# a while — receive_file streams into `<dst>.partial` and renames, so isfile
+# never sees a torso). Throws if it can't be obtained.
 function fetch_show_file(st::ShowTool)
     server_dst = show_server_path(st)
     isfile(server_dst) && return server_dst        # already mirrored or cached
-    proj = get(st.state.projects[], st.project_id, nothing)
-    proj === nothing && error("bt_show: file not on server and no worker to fetch from: $(st.path)")
-    worker_src = isabspath(st.path) ? st.path : joinpath(proj.worker_path, st.path)
-    mkpath(dirname(server_dst))
-    fetch_file_from_worker(st.state, proj.worker_id, worker_src, server_dst; handoff_timeout=60.0)
-    return server_dst
+    dst_lock = lock(SHOW_FETCH_LOCKS) do
+        get!(ReentrantLock, SHOW_FETCH_INFLIGHT, server_dst)
+    end
+    lock(dst_lock) do
+        isfile(server_dst) && return server_dst    # the racer fetched it
+        proj = get(st.state.projects[], st.project_id, nothing)
+        proj === nothing && error("bt_show: file not on server and no worker to fetch from: $(st.path)")
+        worker_src = isabspath(st.path) ? st.path : joinpath(proj.worker_path, st.path)
+        mkpath(dirname(server_dst))
+        fetch_file_from_worker(st.state, proj.worker_id, worker_src, server_dst; handoff_timeout=60.0)
+        return server_dst
+    end
 end
 
 # MIME inferred from extension → the right element. Media point `src` at a
@@ -2693,25 +2714,44 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         chat_dispatch!(model, session, msg)
     end
 
+    # Spinner class follows the shared busy_active observable so the
+    # `bt-busy-active` class is set correctly on remount — the comm
+    # `busy_start` / `busy_end` events only forward to FUTURE bridges,
+    # so a tab that opens mid-prompt would otherwise miss the start.
+    busy_class = map(b -> b ? "bt-busy bt-busy-active" : "bt-busy", model.busy_active)
+
     messages_container = DOM.div(
         DOM.div(class="bt-spacer-top"),
         DOM.div(class="bt-spacer-bottom"),
+        # Busy dots + transient "reasoning…" indicator live INSIDE the
+        # scroll content, after the bottom spacer (message nodes insert
+        # before it) and before the overscroll tail — so they show up
+        # directly under the last message, not below the tail's empty
+        # space down by the composer. Like the tail, they're plain
+        # content the virtual-scroll geometry never tracks.
+        DOM.div(DOM.div(class="bt-busy-dot"),
+            DOM.div(class="bt-busy-dot"),
+            DOM.div(class="bt-busy-dot");
+            class=busy_class),
+        # Idle indicator — visible when the busy dots are NOT (CSS
+        # adjacent-sibling rule on `.bt-busy`, so it MUST stay the dots'
+        # immediate next sibling) AND the chat has agent replies on display
+        # (`bt-waiting-on`, toggled by `_updateWaiting` in bonitoteam.js).
+        # The slot under the last message thus says what the agent is
+        # doing: dots/reasoning mid-turn, waiting between turns — and
+        # nothing at all in a chat that hasn't been asked anything yet.
+        DOM.div("Waiting for your next instruction"; class="bt-waiting"),
+        # Transient "reasoning…" indicator (toggled by the `thinking` comm
+        # event in bonitoteam.js). Hidden until an agent thought is in flight.
+        DOM.div("💭 reasoning…"; class="bt-thinking"),
         # Overscroll tail: empty space the user can scroll into below the
         # last message (~30% of the pane; JS sizes it from clientHeight).
-        # Message nodes are inserted BEFORE the bottom spacer, so the tail
-        # stays last.
         DOM.div(class="bt-messages-tail");
         class="bt-messages")
 
     init_script = js"""
         $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm)))
     """
-
-    # Spinner class follows the shared busy_active observable so the
-    # `bt-busy-active` class is set correctly on remount — the comm
-    # `busy_start` / `busy_end` events only forward to FUTURE bridges,
-    # so a tab that opens mid-prompt would otherwise miss the start.
-    busy_class = map(b -> b ? "bt-busy bt-busy-active" : "bt-busy", model.busy_active)
 
     # Cross-worker sync modal state + apply. `nothing` ⇒ hidden; otherwise
     # `(current, other, comparison)`. `on_apply(src, dst)` runs the
@@ -2734,13 +2774,6 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         sync_modal,
         messages_container,
         init_script,
-        DOM.div(DOM.div(class="bt-busy-dot"),
-            DOM.div(class="bt-busy-dot"),
-            DOM.div(class="bt-busy-dot");
-            class=busy_class),
-        # Transient "reasoning…" indicator (toggled by the `thinking` comm event
-        # in bonitoteam.js). Hidden until an agent thought is in flight.
-        DOM.div("💭 reasoning…"; class="bt-thinking"),
         # Taskbar — floats over the messages area, top-left of the chat panel.
         # Populated entirely client-side by scanning live tool/todo pills (see
         # `setupTaskbar` in bonitoteam.js); the server never tracks slot state.
@@ -2750,24 +2783,12 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         # BonitoChat (`noteType`): one show/hide checkbox per message type the
         # first time that type occurs. Sized to host future controls too.
         DOM.div(class = "bt-chat-toolbar"),
-        # Mount curtain, rendered server-side so it PAINTS WITH THE PANE —
-        # the pane swap from the bring-up view lands directly on this, with
-        # no plain-background gap before the chat module loads. Top-aligned
-        # to mirror the bring-up pane exactly (only the sub-text differs).
-        # BonitoChat adopts it and fades it out once the geometry settles.
-        DOM.div(
-            DOM.div(
-                DOM.div(class = "bt-loading-spinner"),
-                DOM.div("Opening $(curtain_title(model))…"; class = "bt-loading-title"),
-                DOM.div("Loading the chat…"; class = "bt-loading-sub");
-                class = "bt-loading"),
-            class = "bt-chat-curtain"),
+        # NOTE: there is deliberately NO mount curtain here. The dashboard's
+        # load overlay (`chat_waiting_view`, sidebar.jl) covers this pane
+        # from the moment the user clicks until the chat module reports the
+        # geometry settled (`bt-chat-settling` / `bt-chat-settled` events
+        # from `_startSettle` in bonitoteam.js) — one continuous loading
+        # surface instead of the old bring-up pane → bare gap → per-chat
+        # curtain relay.
         class="bt-app"))
-end
-
-# The display name the loading curtain shows — the project's registered name
-# (matching the bring-up pane), falling back to the working-dir basename.
-function curtain_title(model::ChatModel)
-    p = get(model.state.projects[], model.project_id, nothing)
-    p === nothing ? basename(rstrip(model.cwd, '/')) : p.name
 end

@@ -154,26 +154,42 @@ class BonitoChat {
         this.filterRow  = null;
         this.optionsRow = null;
         this.nativeImages = true;       // bt_show image results: bare by default
+        this.nativeVideos = true;       // bt_show video results: ditto
         if (this.toolbarEl) {
             this.filterRow = document.createElement('div');
             this.filterRow.className = 'bt-toolbar-filters';
             this.optionsRow = document.createElement('div');
             this.optionsRow.className = 'bt-toolbar-options';
             this.toolbarEl.append(this.filterRow, this.optionsRow);
-            const label = document.createElement('label');
-            label.className = 'bt-filter-toggle';
-            const cb = document.createElement('input');
-            cb.type = 'checkbox';
-            cb.checked = this.nativeImages;
-            cb.addEventListener('change', () => this._setNativeImages(cb.checked));
-            label.append(cb, 'Native Images');
-            this.optionsRow.appendChild(label);
+            const addOption = (text, checked, onChange) => {
+                const label = document.createElement('label');
+                label.className = 'bt-filter-toggle';
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.checked = checked;
+                cb.addEventListener('change', () => onChange(cb.checked));
+                label.append(cb, text);
+                this.optionsRow.appendChild(label);
+            };
+            addOption('Native Images', this.nativeImages,
+                      (on) => this._setNativeMedia('image/', on));
+            addOption('Native Videos', this.nativeVideos,
+                      (on) => this._setNativeMedia('video/', on));
         }
-        this.busyEl       = container.parentElement.querySelector('.bt-busy');
+        // Busy dots + thinking indicator are scroll CONTENT — they sit
+        // between the bottom spacer and the overscroll tail so they appear
+        // directly under the last message (not below the tail, down by the
+        // composer). Plain content like the tail: the virtual-scroll
+        // geometry never tracks them.
+        this.busyEl       = container.querySelector('.bt-busy');
+        // Idle "waiting for your next instruction" text: pure CSS — visible
+        // exactly when .bt-busy is NOT active (adjacent-sibling rule). The
+        // JS only holds it for the RO chase below.
+        this.waitingEl    = container.querySelector('.bt-waiting');
         // Transient "reasoning…" indicator: shown for the lifetime of an agent
         // thought, then removed. Most thoughts are redacted (empty) so this is
         // usually all the user sees of the model's thinking.
-        this.thinkingEl   = container.parentElement.querySelector('.bt-thinking');
+        this.thinkingEl   = container.querySelector('.bt-thinking');
         // Overscroll tail: empty space below the last message the user can
         // scroll into (~30% of the pane; sized in the container RO).
         this.tailEl       = container.querySelector('.bt-messages-tail');
@@ -186,9 +202,10 @@ class BonitoChat {
         this.measureEl = document.createElement('div');
         this.measureEl.className = 'bt-measure';
         container.parentElement.appendChild(this.measureEl);
-        // Adopt the server-rendered curtain immediately: the settle watch
-        // (and its hard cap) must run even if the comm bootstrap stalls.
-        this._mountCurtain();
+        // Start the settle watch immediately: its hard cap must dismiss the
+        // load overlay (sidebar.jl chat_waiting_view) even if the comm
+        // bootstrap stalls.
+        this._startSettle();
 
         // Single subscription. `comm` is a Bonito Observable bridged via
         // WS; every message Julia sets via `model.comm[] = {...}` arrives here.
@@ -207,7 +224,7 @@ class BonitoChat {
             this.applyCount(cur.n);
         } else if (cur && cur.type === 'msgs.range') {
             // Re-mount of a chat that already has messages cached.
-            this._mountCurtain();
+            this._startSettle();
             this.onRange(cur);
             this._startPrefetch();
         }
@@ -278,18 +295,25 @@ class BonitoChat {
         container.addEventListener('scroll', this._onScroll, { passive: true });
 
         // Re-scroll whenever the messages container changes size
-        // while in follow mode. Covers: bt-busy 0↔28px transition
-        // on each agent turn, mobile soft-keyboard slide-in/out,
-        // browser address bar collapse, window resize, attachment
-        // bar growing. Without this, the last message + input area
-        // slide below the fold and the user has no way back without
-        // manual scroll.
+        // while in follow mode. Covers: mobile soft-keyboard
+        // slide-in/out, browser address bar collapse, window resize,
+        // attachment bar growing. Without this, the last message +
+        // input area slide below the fold and the user has no way
+        // back without manual scroll.
+        // ALSO observes the busy/thinking indicators: they live inside
+        // the scroll content, so their 150ms height transition changes
+        // scrollHeight — not the container's box — and the container
+        // observation alone would miss it. Observing them keeps the
+        // chase pinned to the bottom across every frame of the grow.
         this._containerRO = new ResizeObserver(() => {
             if (this.destroyed) return;
             this._sizeTail();
             if (this.followMode) this._queueScrollToBottom();
         });
         this._containerRO.observe(this.container);
+        if (this.busyEl)     this._containerRO.observe(this.busyEl);
+        if (this.waitingEl)  this._containerRO.observe(this.waitingEl);
+        if (this.thinkingEl) this._containerRO.observe(this.thinkingEl);
 
         if (window.visualViewport) {
             this._onVPResize = () => this.onViewportResize();
@@ -351,7 +375,10 @@ class BonitoChat {
         }
         clearTimeout(this._attachErrorTimer);
         clearTimeout(this._prefetchTimer);
-        if (this._curtainEl) { this._curtainEl.remove(); this._curtainEl = null; }
+        // Torn down mid-settle: clear the in-progress flag so a successor
+        // overlay doesn't read a stale "settling" state off the pane (the
+        // overlay's own timeout failsafe covers the never-settled case).
+        if (!this._settleDone && this._paneEl) delete this._paneEl.dataset.btSettling;
         if (this.measureEl) { this.measureEl.remove(); this.measureEl = null; }
         if (this._tickerId) {
             clearInterval(this._tickerId);
@@ -376,9 +403,10 @@ class BonitoChat {
             case 'msgs.range':   return this.onRange(msg);
             case 'busy_start':
                 this.busyEl?.classList.add('bt-busy-active');
-                // bt-busy grows from 0 to 28px over 150ms; the container
-                // ResizeObserver re-scrolls on each frame, but only if
-                // followMode is on — which it should be when a turn starts.
+                // bt-busy grows from 0 to 28px over 150ms; its own RO
+                // (it's observed alongside the container) re-scrolls on
+                // each frame, but only if followMode is on — which it
+                // should be when a turn starts.
                 if (this.followMode) this._queueScrollToBottom();
                 return;
             case 'busy_end':
@@ -413,95 +441,97 @@ class BonitoChat {
 
     applyCount(n) {
         if (n <= 0) {
-            // Empty chat: nothing to settle — lift the (server-rendered)
-            // curtain right away.
-            this._mountCurtain();
-            this._revealCurtain();
+            // Empty chat: nothing to settle — dismiss the load overlay
+            // right away.
+            this._startSettle();
+            this._settle();
             return;
         }
         this.totalCount  = n;
         this.initialLoad = true;
-        this._mountCurtain();
+        this._startSettle();
         this.refresh();
         this._startPrefetch();
     }
 
-    // ── Mount curtain ─────────────────────────────────────────────────────
+    // ── Settle watch (drives the load overlay) ────────────────────────────
     // The first second after mount is geometry soup: the visible window
     // renders, estimate heights correct to measurements, bt_show images
-    // mount and resize their nodes — the scrollbar visibly pumps. Cover the
-    // chat with an opaque curtain until the geometry goes QUIET (scrollHeight
-    // unchanged for ~10 frames once the initial scroll passes are done),
-    // then pin the bottom and fade in on the settled layout. Image loads
-    // reset the quiet counter via their height changes, so image-heavy
-    // chats simply hold the curtain a little longer. Hard cap so a broken
-    // image can never strand it.
-    _mountCurtain() {
-        if (this._curtainEl || this._curtainDone) return;
-        const host = this.container.parentElement;   // .bt-app (position:relative)
-        if (!host) return;
-        // The curtain is rendered server-side (chat.jl) so it paints with
-        // the pane — phase 1's swap lands directly on it, no plain gap.
-        // Adopt it; create a replica only as a fallback. Layout mirrors
-        // the bring-up pane (plain block wrap → content at the top), so
-        // only the sub-text appears to change between the two phases.
-        let cur = host.querySelector('.bt-chat-curtain');
-        if (!cur) {
-            cur = document.createElement('div');
-            cur.className = 'bt-chat-curtain';
-            const inner = document.createElement('div');
-            inner.className = 'bt-loading';
-            const spin  = document.createElement('div');
-            spin.className = 'bt-loading-spinner';
-            const title = document.createElement('div');
-            title.className = 'bt-loading-title';
-            const name = host.querySelector('.bt-header-title')?.textContent?.trim();
-            title.textContent = name ? `Opening ${name}…` : 'Opening chat…';
-            const sub = document.createElement('div');
-            sub.className = 'bt-loading-sub';
-            sub.textContent = 'Loading the chat…';
-            inner.append(spin, title, sub);
-            cur.appendChild(inner);
-            host.appendChild(cur);
+    // mount and resize their nodes — the scrollbar visibly pumps. The
+    // dashboard's load overlay (sidebar.jl chat_waiting_view) covers the
+    // pane through all of it; this module owns settle DETECTION and tells
+    // the overlay when to move on:
+    //   bt-chat-settling  (watch started — overlay flips to "Rendering
+    //                      messages…")
+    //   bt-chat-settled   (geometry quiet — overlay fades out)
+    // Both are window events carrying the pane pid, mirrored as
+    // data-bt-settling / data-bt-settled flags on the .bt-chatpane so an
+    // overlay that mounts AFTER an event fired (kept-alive revisit) reads
+    // the state synchronously. Settle = scrollHeight unchanged for ~10
+    // frames once the initial scroll passes are done; image loads reset
+    // the quiet counter via their height changes, so image-heavy chats
+    // simply hold the overlay a little longer. Hard cap so a broken image
+    // can never strand it.
+    _startSettle() {
+        if (this._settleWatch || this._settleDone) return;
+        this._settleWatch  = true;
+        this._settleT0     = performance.now();
+        this._settleLastH  = -1;
+        this._settleStable = 0;
+        this._paneEl = this.container.closest('.bt-chatpane');
+        if (this._paneEl) {
+            delete this._paneEl.dataset.btSettled;
+            this._paneEl.dataset.btSettling = '1';
         }
-        this._curtainEl     = cur;
-        this._curtainT0     = performance.now();
-        this._curtainLastH  = -1;
-        this._curtainStable = 0;
+        this._announceSettle('bt-chat-settling');
         const watch = () => {
-            if (this.destroyed) return;
+            if (this.destroyed || this._settleDone) return;
             const h = this.container.scrollHeight;
-            if (h === this._curtainLastH) this._curtainStable++;
-            else { this._curtainStable = 0; this._curtainLastH = h; }
-            const elapsed = performance.now() - this._curtainT0;
+            if (h === this._settleLastH) this._settleStable++;
+            else { this._settleStable = 0; this._settleLastH = h; }
+            const elapsed = performance.now() - this._settleT0;
             // Quiet geometry alone isn't enough: a tool body still being
             // fetched (native bt_show images come from the worker) shows a
             // "loading…" placeholder with STABLE height, and a mounted
             // <img> may not have decoded yet — both would pop in right
             // after an early reveal ("saw the box flash"). Hold for them
-            // too; the hard cap still guarantees the curtain lifts.
-            const pendingBody = this.container.querySelector('.bt-collapsable-loading');
+            // too; the hard cap still guarantees the overlay lifts.
+            // EXCEPT video bodies: a multi-GB bt_show fetch takes minutes,
+            // not frames — the overlay must not ride out its hard cap on
+            // every reload. Videos pop in when ready; the follow chase
+            // absorbs the height jump.
+            const pendingBody = [...this.container.querySelectorAll('.bt-collapsable-loading')]
+                .some(el => !(el.closest('.bt-tool-msg')?.dataset.showMime || '')
+                    .startsWith('video/'));
             const pendingImg  = [...this.container.querySelectorAll('img')]
                 .some(img => !img.complete);
-            const settled = this._curtainStable >= 10 &&
+            const settled = this._settleStable >= 10 &&
                             elapsed > 400 && !this.initialLoad &&
                             !pendingBody && !pendingImg;
-            if (settled || elapsed > 5000) this._revealCurtain();
+            if (settled || elapsed > 5000) this._settle();
             else requestAnimationFrame(watch);
         };
         requestAnimationFrame(watch);
     }
 
-    _revealCurtain() {
-        const cur = this._curtainEl;
-        if (!cur) return;
-        this._curtainEl = null;
-        this._curtainDone = true;
-        // Land exactly at the bottom of the SETTLED layout before showing it.
+    _settle() {
+        if (this._settleDone) return;
+        this._settleDone  = true;
+        this._settleWatch = false;
+        // Land exactly at the bottom of the SETTLED layout before the
+        // overlay reveals it.
         this.setFollowMode(true);
         this.scrollToBottom();
-        cur.classList.add('bt-curtain-hide');
-        setTimeout(() => cur.remove(), 250);
+        if (this._paneEl) {
+            delete this._paneEl.dataset.btSettling;
+            this._paneEl.dataset.btSettled = '1';
+        }
+        this._announceSettle('bt-chat-settled');
+    }
+
+    _announceSettle(name) {
+        const pid = this._paneEl?.dataset.panePid || '';
+        window.dispatchEvent(new CustomEvent(name, { detail: pid }));
     }
 
     // ── Background history prefetch ──────────────────────────────────────
@@ -918,12 +948,12 @@ class BonitoChat {
             prev.innerHTML = msg.preview;
         }
         // bt_show: the completion update is when we learn it's a "show me
-        // this" tool (and its mime). Native-image mode takes precedence:
+        // this" tool (and its mime). Native-media mode takes precedence:
         // chrome off + body mounted; otherwise auto-expand the pill
         // (idempotent; user can still collapse). Detached nodes defer the
         // expand to insertion (see insertSorted).
         if (msg.show_mime) node.dataset.showMime = msg.show_mime;
-        if (this.nativeImages && this._isNativeCandidate(node)) {
+        if (this._wantsNative(node)) {
             this._applyNative(node);
         } else if (msg.expand && node.collapsable) {
             if (node.isConnected) node.collapsable.setExpanded(true);
@@ -951,6 +981,9 @@ class BonitoChat {
         const key = filterKey(msg);
         if (!key || this.seenTypes.has(key) || !this.filterRow) return;
         this.seenTypes.add(key);
+        // First agent reply in the chat → the idle "waiting" line below the
+        // last message earns its right to show (see _updateWaiting).
+        if (key === 'agent') this._updateWaiting();
         const isTool = key.startsWith('tool:');
         const text   = isTool ? key.slice(5) : (TYPE_LABELS[key] ?? key);
         const label = document.createElement('label');
@@ -987,14 +1020,21 @@ class BonitoChat {
         this.filterRow.appendChild(span);
     }
 
-    // ── Native image display (bt_show results) ───────────────────────────
-    // When "Depict Images Natively in Chat" is on, a bt_show whose mime is
-    // image/* renders bare in the chat flow: the pill's chrome is hidden
-    // via the bt-tool-native class and the body is auto-expanded through
-    // the normal Collapsable → tool.render path (the server fills the slot
-    // with the <img>). Display-only, per-tab — like the filters.
-    _isNativeCandidate(node) {
-        return (node.dataset.showMime || '').startsWith('image/');
+    // ── Native media display (bt_show results) ───────────────────────────
+    // When "Native Images" / "Native Videos" is on, a bt_show whose mime is
+    // image/* / video/* renders bare in the chat flow: the pill's chrome is
+    // hidden via the bt-tool-native class and the body is auto-expanded
+    // through the normal Collapsable → tool.render path (the server fills
+    // the slot with the <img>/<video>). Display-only, per-tab — like the
+    // filters.
+
+    // Does the current display-option state want this node native? Keys on
+    // the wire show_mime; mimes outside image/video are never native.
+    _wantsNative(node) {
+        const mime = node.dataset.showMime || '';
+        if (mime.startsWith('image/')) return this.nativeImages;
+        if (mime.startsWith('video/')) return this.nativeVideos;
+        return false;
     }
 
     _applyNative(node) {
@@ -1015,10 +1055,13 @@ class BonitoChat {
         node.collapsable?.setExpanded(false);   // discardOnCollapse frees the body
     }
 
-    _setNativeImages(on) {
-        this.nativeImages = on;
+    // Flip one media class ('image/' or 'video/') and re-depict every cached
+    // node of that class; the other class is untouched.
+    _setNativeMedia(prefix, on) {
+        if (prefix === 'image/') this.nativeImages = on;
+        else                     this.nativeVideos = on;
         for (const node of this.cache.values()) {
-            if (!this._isNativeCandidate(node)) continue;
+            if (!(node.dataset.showMime || '').startsWith(prefix)) continue;
             on ? this._applyNative(node) : this._removeNative(node);
         }
         this.refresh();
@@ -1034,8 +1077,22 @@ class BonitoChat {
         for (const node of this.cache.values()) {
             if (node.dataset.filterKey === key) node.style.display = hidden ? 'none' : '';
         }
+        // Hiding the agent stream also hides the idle "waiting" line that
+        // would otherwise dangle under messages that aren't there.
+        if (key === 'agent') this._updateWaiting();
         this.refresh();
         if (this.followMode) this._queueScrollToBottom();
+    }
+
+    // The idle "waiting for your next instruction" line only makes sense
+    // under an agent reply: keep it off for empty chats (nothing was asked
+    // yet) and while the Agent filter hides the messages it would sit
+    // under. The CSS show-rule requires `bt-waiting-on` on top of the
+    // not-busy sibling condition, so busy/idle switching stays pure CSS.
+    _updateWaiting() {
+        if (!this.waitingEl) return;
+        const on = this.seenTypes.has('agent') && !this.hiddenTypes.has('agent');
+        this.waitingEl.classList.toggle('bt-waiting-on', on);
     }
 
     // ── DOM node creation ────────────────────────────────────────────────
@@ -1128,10 +1185,10 @@ class BonitoChat {
                     wideBtn.title = active ?
                         'Collapse to default width' : 'Expand to full chat width';
                 });
-                // The show's mime (bt_show results) — the native-image toggle
-                // keys on it.
+                // The show's mime (bt_show results) — the native-media
+                // toggles key on it.
                 if (msg.show_mime) div.dataset.showMime = msg.show_mime;
-                if (this.nativeImages && this._isNativeCandidate(div)) {
+                if (this._wantsNative(div)) {
                     // Native display: chrome off + body auto-mounted on
                     // first insertion.
                     div.classList.add('bt-tool-native');

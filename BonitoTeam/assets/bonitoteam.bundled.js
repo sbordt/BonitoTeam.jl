@@ -81,6 +81,7 @@ class BonitoChat {
         this.EST_HEIGHT = 80;
         this.OVERSCAN = 8;
         this.initialLoad = false;
+        this.ITEM_GAP = parseFloat(getComputedStyle(container).rowGap) || 0;
         this.followMode = true;
         this.unreadCount = 0;
         this.AT_BOTTOM_PX = 20;
@@ -101,6 +102,7 @@ class BonitoChat {
             this.applyCount(cur.n);
         } else if (cur && cur.type === 'msgs.range') {
             this.onRange(cur);
+            this._startPrefetch();
         }
         comm.notify({
             type: 'init'
@@ -122,8 +124,28 @@ class BonitoChat {
             passive: true
         });
         this._markUserInput = markUserInput;
+        this._scrollbarDrag = false;
+        this._dragTotal = null;
+        this._onContainerMouseDown = ()=>{
+            this._scrollbarDrag = true;
+            this._dragTotal = this.container.scrollHeight;
+            markUserInput();
+        };
+        this._onWindowMouseUp = ()=>{
+            if (!this._scrollbarDrag) return;
+            this._scrollbarDrag = false;
+            this._dragTotal = null;
+            markUserInput();
+            this._queueRefresh();
+        };
+        container.addEventListener('mousedown', this._onContainerMouseDown, {
+            passive: true
+        });
+        window.addEventListener('mouseup', this._onWindowMouseUp, {
+            passive: true
+        });
         this._onScroll = ()=>{
-            const userDriven = performance.now() - this._lastUserInputT < 400;
+            const userDriven = this._scrollbarDrag || performance.now() - this._lastUserInputT < 400;
             const atBot = this.atBottom();
             if (userDriven) {
                 this.setFollowMode(atBot);
@@ -161,6 +183,12 @@ class BonitoChat {
             this.container.removeEventListener('touchmove', this._markUserInput);
             this.container.removeEventListener('keydown', this._markUserInput);
         }
+        if (this._onContainerMouseDown) {
+            this.container.removeEventListener('mousedown', this._onContainerMouseDown);
+        }
+        if (this._onWindowMouseUp) {
+            window.removeEventListener('mouseup', this._onWindowMouseUp);
+        }
         if (this._scrollRafId !== null && this._scrollRafId !== undefined) {
             cancelAnimationFrame(this._scrollRafId);
         }
@@ -190,6 +218,7 @@ class BonitoChat {
             this._onDrop && this.app.removeEventListener('drop', this._onDrop);
         }
         clearTimeout(this._attachErrorTimer);
+        clearTimeout(this._prefetchTimer);
         if (this._tickerId) {
             clearInterval(this._tickerId);
             this._tickerId = null;
@@ -251,6 +280,35 @@ class BonitoChat {
         this.totalCount = n;
         this.initialLoad = true;
         this.refresh();
+        this._startPrefetch();
+    }
+    _startPrefetch() {
+        if (this._prefetchStarted) return;
+        this._prefetchStarted = true;
+        this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 600);
+    }
+    _prefetchTick() {
+        if (this.destroyed) return;
+        let e = -1;
+        for(let i = Math.min(this._prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--){
+            if (!this.cache.has(i)) {
+                e = i;
+                break;
+            }
+        }
+        if (e < 0) return;
+        let s = e;
+        while(s > 0 && !this.cache.has(s - 1) && e - s < 63)s--;
+        this._prefetchCursor = s - 1;
+        this.comm.notify({
+            type: 'msgs.request',
+            range: [
+                s,
+                e
+            ]
+        });
+        clearTimeout(this._prefetchTimer);
+        this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 2000);
     }
     visibleRange() {
         if (this.totalCount === 0) return [
@@ -268,7 +326,7 @@ class BonitoChat {
     }
     effHeight(i) {
         if (this.hiddenTypes.has(this.keyByIdx.get(i))) return 0;
-        return this.heights.get(i) ?? this.EST_HEIGHT;
+        return (this.heights.get(i) ?? this.EST_HEIGHT) + this.ITEM_GAP;
     }
     indexAt(offset) {
         let h = 0;
@@ -285,19 +343,26 @@ class BonitoChat {
     }
     refresh() {
         if (this.totalCount === 0) return;
+        const wasAtBottom = this.atBottom();
+        const preHeight = this.container.scrollHeight;
         const [s, e] = this.visibleRange();
-        const missing = [];
-        for(let i = s; i <= e; i++)if (!this.cache.has(i)) missing.push(i);
-        if (missing.length > 0) {
-            this.comm.notify({
-                type: 'msgs.request',
-                range: [
-                    missing[0],
-                    missing[missing.length - 1]
-                ]
-            });
+        if (!this._scrollbarDrag) {
+            const missing = [];
+            for(let i = s; i <= e; i++)if (!this.cache.has(i)) missing.push(i);
+            if (missing.length > 0) {
+                this.comm.notify({
+                    type: 'msgs.request',
+                    range: [
+                        missing[0],
+                        missing[missing.length - 1]
+                    ]
+                });
+            }
         }
         this.updateDOM(s, e);
+        if (wasAtBottom && !this._scrollbarDrag && this.container.scrollHeight !== preHeight) {
+            this.container.scrollTop = this.container.scrollHeight;
+        }
     }
     onRange({ start , msgs  }) {
         const messages = msgs ?? [];
@@ -310,6 +375,11 @@ class BonitoChat {
             if (data.id) this.nodeById.set(data.id, node);
             this.observe(idx, node);
         });
+        if (this._prefetchStarted) {
+            clearTimeout(this._prefetchTimer);
+            this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 30);
+        }
+        if (this._scrollbarDrag) return;
         this.updateDOM(...this.visibleRange());
         if (this.initialLoad) {
             this.initialLoad = true;
@@ -332,12 +402,21 @@ class BonitoChat {
     observe(idx, node) {
         const ro = new ResizeObserver(([e])=>{
             const h = e.contentRect.height;
-            if (h > 0) {
+            if (h > 0 && this.heights.get(idx) !== h) {
                 this.heights.set(idx, h);
+                if (!this._scrollbarDrag) this._queueRefresh();
             }
         });
         ro.observe(node);
         this.ros.set(idx, ro);
+    }
+    _queueRefresh() {
+        if (this._refreshQueued || this.destroyed) return;
+        this._refreshQueued = true;
+        requestAnimationFrame(()=>{
+            this._refreshQueued = false;
+            if (!this.destroyed) this.refresh();
+        });
     }
     updateDOM(s, e) {
         if (s > e) return;
@@ -357,6 +436,19 @@ class BonitoChat {
         }
         this.spacerTop.style.height = this.cumHeight(0, s) + 'px';
         this.spacerBottom.style.height = this.cumHeight(e + 1, this.totalCount) + 'px';
+        if (this._scrollbarDrag && this._dragTotal != null) {
+            const delta = this.container.scrollHeight - this._dragTotal;
+            if (delta !== 0) {
+                const curB = parseFloat(this.spacerBottom.style.height) || 0;
+                const newB = Math.max(0, curB - delta);
+                this.spacerBottom.style.height = newB + 'px';
+                const rem = delta - (curB - newB);
+                if (rem !== 0) {
+                    const curT = parseFloat(this.spacerTop.style.height) || 0;
+                    this.spacerTop.style.height = Math.max(0, curT - rem) + 'px';
+                }
+            }
+        }
     }
     insertSorted(idx, node) {
         const sorted = [

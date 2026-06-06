@@ -104,6 +104,13 @@ class BonitoChat {
         this.EST_HEIGHT    = 80;
         this.OVERSCAN      = 8;
         this.initialLoad   = false;
+        // The .bt-messages flex column separates children with a row gap.
+        // The virtual height math must count it per item or the virtual
+        // geometry drifts ~gap px per message from the real scrollHeight —
+        // in long chats that drift exceeds the overscan and the bottom
+        // "bounces" away while scrolling down. Read it from the computed
+        // style so a CSS change can't silently re-introduce the drift.
+        this.ITEM_GAP = parseFloat(getComputedStyle(container).rowGap) || 0;
 
         // ── Scroll UX state ────────────────────────────────────────────
         // followMode: when true, new messages auto-scroll the viewport
@@ -163,6 +170,7 @@ class BonitoChat {
         } else if (cur && cur.type === 'msgs.range') {
             // Re-mount of a chat that already has messages cached.
             this.onRange(cur);
+            this._startPrefetch();
         }
         comm.notify({type: 'init'});
 
@@ -180,8 +188,39 @@ class BonitoChat {
         container.addEventListener('keydown',    markUserInput, { passive: true });
         this._markUserInput = markUserInput;
 
+        // Scrollbar drags emit NO wheel/touch/key events — only mousedown on
+        // the container (the scrollbar is part of its hit area) and then
+        // scroll events while the button is held, possibly for much longer
+        // than the 400ms recency window. Track the held state explicitly so
+        // a drag is always classified as user-driven; otherwise the chase
+        // treats it as a layout shift and yanks the thumb back to the
+        // bottom ("scrollbar feels stuck"). mouseup lands on window — the
+        // pointer often leaves the container before release.
+        this._scrollbarDrag = false;
+        this._dragTotal     = null;   // scrollHeight frozen for the drag's duration
+        this._onContainerMouseDown = () => {
+            this._scrollbarDrag = true;
+            // Freeze the scrollbar geometry: while estimates are being
+            // corrected to measurements mid-drag, scrollHeight would
+            // otherwise fluctuate every tick and the thumb visibly
+            // "flickers". updateDOM compensates the bottom spacer against
+            // this snapshot; release re-trues everything in one go.
+            this._dragTotal = this.container.scrollHeight;
+            markUserInput();
+        };
+        this._onWindowMouseUp      = () => {
+            if (!this._scrollbarDrag) return;
+            this._scrollbarDrag = false;
+            this._dragTotal = null;
+            markUserInput();   // the release tick still counts as user input
+            this._queueRefresh();   // re-true spacers to the corrected heights
+        };
+        container.addEventListener('mousedown', this._onContainerMouseDown, { passive: true });
+        window.addEventListener('mouseup', this._onWindowMouseUp, { passive: true });
+
         this._onScroll = () => {
-            const userDriven = (performance.now() - this._lastUserInputT) < 400;
+            const userDriven = this._scrollbarDrag ||
+                (performance.now() - this._lastUserInputT) < 400;
             const atBot      = this.atBottom();
             if (userDriven) {
                 // User-driven scroll → followMode reflects whether
@@ -236,6 +275,12 @@ class BonitoChat {
             this.container.removeEventListener('touchmove',  this._markUserInput);
             this.container.removeEventListener('keydown',  this._markUserInput);
         }
+        if (this._onContainerMouseDown) {
+            this.container.removeEventListener('mousedown', this._onContainerMouseDown);
+        }
+        if (this._onWindowMouseUp) {
+            window.removeEventListener('mouseup', this._onWindowMouseUp);
+        }
         if (this._scrollRafId !== null && this._scrollRafId !== undefined) {
             cancelAnimationFrame(this._scrollRafId);
         }
@@ -265,6 +310,7 @@ class BonitoChat {
             this._onDrop      && this.app.removeEventListener('drop',      this._onDrop);
         }
         clearTimeout(this._attachErrorTimer);
+        clearTimeout(this._prefetchTimer);
         if (this._tickerId) {
             clearInterval(this._tickerId);
             this._tickerId = null;
@@ -328,6 +374,38 @@ class BonitoChat {
         this.totalCount  = n;
         this.initialLoad = true;
         this.refresh();
+        this._startPrefetch();
+    }
+
+    // ── Background history prefetch ──────────────────────────────────────
+    // Trickle-load the ENTIRE history into the node cache after mount, so
+    // scrolling/seeking never lands on blank spacer. Bottom-up (the
+    // direction users scroll into), 64 messages per request, each chunk
+    // paced on the previous response — user-driven fetches and streaming
+    // always win the wire. Cached-only during scrollbar drags by design
+    // (onRange skips DOM work mid-drag), so blanks fill in on release.
+    _startPrefetch() {
+        if (this._prefetchStarted) return;
+        this._prefetchStarted = true;
+        this._prefetchTimer = setTimeout(() => this._prefetchTick(), 600);
+    }
+
+    _prefetchTick() {
+        if (this.destroyed) return;
+        // Highest missing index at or below the cursor.
+        let e = -1;
+        for (let i = Math.min(this._prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--) {
+            if (!this.cache.has(i)) { e = i; break; }
+        }
+        if (e < 0) return;                       // fully cached — done
+        let s = e;
+        while (s > 0 && !this.cache.has(s - 1) && (e - s) < 63) s--;
+        this._prefetchCursor = s - 1;
+        this.comm.notify({type: 'msgs.request', range: [s, e]});
+        // onRange reschedules the next tick when the response lands; this
+        // timer is only the safety net for a lost/empty response.
+        clearTimeout(this._prefetchTimer);
+        this._prefetchTimer = setTimeout(() => this._prefetchTick(), 2000);
     }
 
     visibleRange() {
@@ -339,14 +417,16 @@ class BonitoChat {
         return [s, Math.min(this.totalCount - 1, e)];
     }
 
-    // Effective height: 0 for filtered-out keys, else the measured height
-    // (or the estimate). The ONLY way spacer/offset math may read heights —
-    // a hidden bubble is display:none (real height 0), so the virtual and
-    // real geometries agree. `observe`'s h>0 guard keeps the last measured
-    // height through a hide/show cycle, so re-showing restores exact sizes.
+    // Effective height: 0 for filtered-out keys (display:none flex items
+    // produce no gap either), else the measured height (or the estimate)
+    // PLUS the flex row gap that follows each rendered item. The ONLY way
+    // spacer/offset math may read heights — keeping it gap-aware makes a
+    // measured node's virtual contribution match its real pixels exactly.
+    // `observe`'s h>0 guard keeps the last measured height through a
+    // hide/show cycle, so re-showing restores exact sizes.
     effHeight(i) {
         if (this.hiddenTypes.has(this.keyByIdx.get(i))) return 0;
-        return this.heights.get(i) ?? this.EST_HEIGHT;
+        return (this.heights.get(i) ?? this.EST_HEIGHT) + this.ITEM_GAP;
     }
 
     indexAt(offset) {
@@ -366,15 +446,38 @@ class BonitoChat {
 
     refresh() {
         if (this.totalCount === 0) return;
+        // Bottom anchoring: updateDOM resizes the spacers, which moves
+        // scrollHeight under a scrollTop pinned at the bottom — without
+        // compensation the bottom edge "bounces" away from the user
+        // (scrollHeight changes fire no scroll event, and overflow-anchor
+        // is off on the spacers). If we were at the bottom before the
+        // re-window and the geometry shifted, re-pin. Within-AT_BOTTOM_PX
+        // already means "at the bottom" everywhere else (followMode), so
+        // pinning here matches the existing semantics.
+        const wasAtBottom = this.atBottom();
+        const preHeight   = this.container.scrollHeight;
         const [s, e] = this.visibleRange();
 
-        const missing = [];
-        for (let i = s; i <= e; i++) if (!this.cache.has(i)) missing.push(i);
-        if (missing.length > 0) {
-            this.comm.notify({type: 'msgs.request',
-                              range: [missing[0], missing[missing.length - 1]]});
+        // While the scrollbar is held, do NOT fetch: every arriving range
+        // inserts + measures new nodes mid-drag and the resulting geometry
+        // churn makes the thumb flicker. A drag navigates CACHED content
+        // only (uncached regions show as spacer); the release handler's
+        // refresh fetches whatever the thumb landed on.
+        if (!this._scrollbarDrag) {
+            const missing = [];
+            for (let i = s; i <= e; i++) if (!this.cache.has(i)) missing.push(i);
+            if (missing.length > 0) {
+                this.comm.notify({type: 'msgs.request',
+                                  range: [missing[0], missing[missing.length - 1]]});
+            }
         }
         this.updateDOM(s, e);
+        // Never pin while the user is actively dragging the scrollbar —
+        // the drag IS the authority on where scrollTop should be.
+        if (wasAtBottom && !this._scrollbarDrag &&
+            this.container.scrollHeight !== preHeight) {
+            this.container.scrollTop = this.container.scrollHeight;
+        }
     }
 
     onRange({ start, msgs }) {
@@ -388,6 +491,17 @@ class BonitoChat {
             if (data.id) this.nodeById.set(data.id, node);
             this.observe(idx, node);
         });
+        // Any arriving range advances the background prefetch (pacing: one
+        // chunk in flight at a time, ~30ms apart). Runs through drags too —
+        // caching is the drag-safe part.
+        if (this._prefetchStarted) {
+            clearTimeout(this._prefetchTimer);
+            this._prefetchTimer = setTimeout(() => this._prefetchTick(), 30);
+        }
+        // Ranges still in flight when a scrollbar drag started: cache the
+        // nodes (above) but don't touch the DOM/geometry until release —
+        // mid-drag insertion is the thumb flicker.
+        if (this._scrollbarDrag) return;
         this.updateDOM(...this.visibleRange());
         if (this.initialLoad) {
             // Initial mount: scroll to bottom and lock follow mode on.
@@ -415,10 +529,31 @@ class BonitoChat {
     observe(idx, node) {
         const ro = new ResizeObserver(([e]) => {
             const h = e.contentRect.height;
-            if (h > 0) { this.heights.set(idx, h); }
+            if (h > 0 && this.heights.get(idx) !== h) {
+                this.heights.set(idx, h);
+                // Apply the correction NOW (rAF-batched) instead of letting
+                // it ambush the next scroll tick: the spacers re-true while
+                // refresh()'s bottom anchoring keeps the viewport pinned,
+                // so estimate→measured corrections are invisible. EXCEPT
+                // mid-scrollbar-drag: corrections then wait for release —
+                // re-spacing under a held thumb is exactly the flicker.
+                if (!this._scrollbarDrag) this._queueRefresh();
+            }
         });
         ro.observe(node);
         this.ros.set(idx, ro);
+    }
+
+    // rAF-batched refresh: many ResizeObserver measurements land in the
+    // same frame (initial range render, streaming reflows) — coalesce them
+    // into one re-window + respace.
+    _queueRefresh() {
+        if (this._refreshQueued || this.destroyed) return;
+        this._refreshQueued = true;
+        requestAnimationFrame(() => {
+            this._refreshQueued = false;
+            if (!this.destroyed) this.refresh();
+        });
     }
 
     updateDOM(s, e) {
@@ -437,6 +572,26 @@ class BonitoChat {
         }
         this.spacerTop.style.height    = this.cumHeight(0, s) + 'px';
         this.spacerBottom.style.height = this.cumHeight(e + 1, this.totalCount) + 'px';
+        // During a scrollbar drag, hold the TOTAL scrollHeight at its
+        // drag-start value: estimate→measurement corrections re-balance
+        // between the spacers instead of resizing the scrollbar, so the
+        // thumb tracks the pointer smoothly. Spill into the top spacer
+        // when the bottom one clamps at 0 (drags near the bottom — bar
+        // stability beats content stability mid-drag). One forced-layout
+        // read; the release handler re-trues the geometry honestly.
+        if (this._scrollbarDrag && this._dragTotal != null) {
+            const delta = this.container.scrollHeight - this._dragTotal;
+            if (delta !== 0) {
+                const curB = parseFloat(this.spacerBottom.style.height) || 0;
+                const newB = Math.max(0, curB - delta);
+                this.spacerBottom.style.height = newB + 'px';
+                const rem = delta - (curB - newB);   // unabsorbed remainder
+                if (rem !== 0) {
+                    const curT = parseFloat(this.spacerTop.style.height) || 0;
+                    this.spacerTop.style.height = Math.max(0, curT - rem) + 'px';
+                }
+            }
+        }
     }
 
     insertSorted(idx, node) {

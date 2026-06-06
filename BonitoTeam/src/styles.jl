@@ -727,22 +727,73 @@ const ChatStyles = Bonito.Styles(
         "margin-top" => "0"),
     CSS(".bt-agent-msg .markdown-body > *:last-child, .bt-agent-msg .markdown > *:last-child",
         "margin-bottom" => "0"),
-    CSS(".bt-agent-msg pre",
+    # The doubled `.bt-agent-msg .markdown-body …` arms are deliberate: they
+    # out-rank Bonito's markdown.css (`.markdown-body pre`, specificity 0,1,1)
+    # regardless of stylesheet order. Without them, markdown.css's GitHub
+    # light-gray pre background (#f6f8fa) could win the tie while our light
+    # `color` (meant for the dark block) still applied → near-invisible code
+    # ("opacity overlay" bug).
+    CSS(".bt-agent-msg pre, .bt-agent-msg .markdown-body pre",
         "background" => "#0f172a", "color" => "#e2e8f0",
         "border-radius" => "var(--bt-radius-sm)",
         "padding" => "10px 14px",
         "overflow-x" => "auto",
         "font-size" => "12px", "line-height" => "1.5",
         "margin" => "8px 0"),
-    CSS(".bt-agent-msg code",
+    CSS(".bt-agent-msg code, .bt-agent-msg .markdown-body code",
         "background" => "rgba(15,23,42,0.06)",
         "border-radius" => "3px",
         "padding" => "1px 5px",
         "font-size" => "12.5px",
         "font-family" => "ui-monospace, monospace"),
-    CSS(".bt-agent-msg pre code",
+    CSS(".bt-agent-msg pre code, .bt-agent-msg .markdown-body pre code",
         "background" => "none", "padding" => "0",
         "color" => "inherit"),
+
+    # Overscroll tail — empty space below the last message the user can
+    # scroll into (sized to ~30% of the pane by `_sizeTail`). All "bottom"
+    # math (atBottom / scrollToBottom / pins) targets the CONTENT bottom,
+    # treating the tail as beyond-the-end.
+    CSS(".bt-messages-tail",
+        "flex-shrink" => "0", "overflow-anchor" => "none"),
+
+    # Off-screen measuring host (`_measureNodes`): prefetched message nodes
+    # are laid out here — same width as the messages content box — to get
+    # real heights before they're ever rendered. Hidden but NOT display:none
+    # (children must lay out); zero own height so it never affects the page.
+    CSS(".bt-measure",
+        "position" => "absolute", "left" => "0", "top" => "0",
+        "height" => "0", "overflow" => "hidden",
+        "visibility" => "hidden",
+        "pointer-events" => "none",
+        "z-index" => "-1"),
+
+    # ── Mount curtain ────────────────────────────────────────────────────────
+    # Covers the chat while the initial geometry settles (estimate→measured
+    # heights, image mounts) — see `_mountCurtain` in bonitoteam.js. Fades
+    # out over the final layout.
+    # Layout mirrors the bring-up pane: `.bt-loading-wrap` is a PLAIN block
+    # (no centering), so its `.bt-loading` content sits at the top of the
+    # view, offset only by its own 40px padding. Column + stretch keeps the
+    # inner block full-width and top-aligned — between the two phases only
+    # the sub-text appears to change.
+    CSS(".bt-chat-curtain",
+        "position" => "absolute", "inset" => "0",
+        "z-index" => "30",
+        "background" => "var(--bt-bg)",
+        "display" => "flex", "flex-direction" => "column",
+        "align-items" => "stretch", "justify-content" => "flex-start",
+        "opacity" => "1",
+        "transition" => "opacity 200ms ease"),
+    # In the bring-up pane `.bt-loading` sits in a plain BLOCK wrap, so its
+    # `flex: 1 1 auto` is inert and it hugs its content at the top. Inside
+    # the curtain's flex column it would stretch + re-center — pin it back
+    # to content height so both phases put the text at the same spot.
+    CSS(".bt-chat-curtain .bt-loading",
+        "flex" => "0 0 auto"),
+    CSS(".bt-chat-curtain.bt-curtain-hide",
+        "opacity" => "0",
+        "pointer-events" => "none"),
 
     # ── Busy indicator ───────────────────────────────────────────────────────
     CSS(".bt-busy",
@@ -839,17 +890,27 @@ const ChatStyles = Bonito.Styles(
     # Hosts the message-type filter checkboxes (populated client-side by
     # `noteType` in bonitoteam.js) and future per-chat options. Deliberately
     # roomy (min-height) so it doesn't jump when the first checkbox appears.
+    # Two rows: the dynamic message-filter checkboxes (top) and static
+    # display options (bottom, e.g. "Depict Images Natively in Chat").
     CSS(".bt-chat-toolbar",
         "flex-shrink" => "0",
         "min-height" => "38px",
         "box-sizing" => "border-box",
-        "display" => "flex", "align-items" => "center", "flex-wrap" => "wrap",
-        "gap" => "14px",
-        "padding" => "6px 14px",
+        "display" => "flex", "flex-direction" => "column",
+        # Roomy row separation so the display options read as their own
+        # group, distinct from the filter checkboxes above.
+        "gap" => "10px",
+        "padding" => "8px 14px",
         "border-top" => "1px solid var(--bt-border)",
         "background" => "var(--bt-surface)",
         "font-size" => "12px",
         "color" => "var(--bt-text-muted)"),
+    CSS(".bt-toolbar-filters",
+        "display" => "flex", "align-items" => "center", "flex-wrap" => "wrap",
+        "gap" => "14px", "min-height" => "18px"),
+    CSS(".bt-toolbar-options",
+        "display" => "flex", "align-items" => "center", "flex-wrap" => "wrap",
+        "gap" => "14px"),
     CSS(".bt-filter-toggle",
         "display" => "inline-flex", "align-items" => "center", "gap" => "5px",
         "cursor" => "pointer",
@@ -866,6 +927,38 @@ const ChatStyles = Bonito.Styles(
         "margin-left" => "8px",
         "font-weight" => "600",
         "user-select" => "none"),
+
+    # ── Native image display (bt_show + "Depict Images Natively in Chat") ──
+    # The bt-tool-native class strips the pill chrome so the body's <img>
+    # sits bare in the chat flow like an agent reply; bonitoteam.js applies
+    # it (and auto-mounts the body) when the toggle is on and the tool's
+    # show_mime is image/*.
+    CSS(".bt-tool-msg.bt-tool-native",
+        "background" => "none",
+        "border" => "none",
+        "box-shadow" => "none",
+        "overflow" => "visible"),
+    CSS(".bt-tool-native .bt-tool-header", "display" => "none"),
+    # The expanded-state reveal rule (`.bt-tool-header[data-expanded="true"]
+    # ~ .bt-tool-fullwidth`, 0,2,1) out-ranks a plain `.bt-tool-native
+    # .bt-tool-fullwidth` (0,2,0) — and native mode IS expanded. Match its
+    # shape with the native class prefixed so hiding wins.
+    CSS(".bt-tool-native .bt-tool-fullwidth, " *
+        ".bt-tool-native .bt-tool-header[data-expanded=\"true\"] ~ .bt-tool-fullwidth",
+        "display" => "none"),
+    CSS(".bt-tool-native .bt-tool-body",
+        "border-top" => "none",
+        "padding" => "0"),
+    CSS(".bt-tool-native .bt-tool-body img",
+        "border-radius" => "var(--bt-radius-sm)",
+        "box-shadow" => "var(--bt-shadow-sm)",
+        # Subtle hover lift: barely-there zoom + deeper shadow. transform
+        # doesn't reflow the layout, so the virtual-scroll heights are
+        # untouched by hovering.
+        "transition" => "transform 150ms ease, box-shadow 150ms ease"),
+    CSS(".bt-tool-native .bt-tool-body img:hover",
+        "transform" => "scale(1.015)",
+        "box-shadow" => "var(--bt-shadow-md)"),
 
     # ── Attachment thumbnail strip ──────────────────────────────────────────
     # Sits above .bt-input-row. Hidden (display:none) when there's nothing

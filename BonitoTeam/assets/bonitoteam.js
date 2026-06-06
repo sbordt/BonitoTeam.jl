@@ -87,6 +87,9 @@ const TYPE_LABELS = { user: 'User', agent: 'Agent', thought: 'Thoughts',
 const TYPE_ORDER  = ['user', 'agent', 'thought', 'plan', 'summary'];
 const filterKey = (msg) =>
     msg.type === 'tool' ? 'tool:' + (msg.tool || 'other') : msg.type;
+// Filter keys that start HIDDEN: their checkbox appears unchecked when the
+// key first occurs. ToolSearch calls are tool-discovery noise — opt-in.
+const DEFAULT_HIDDEN = ['tool:ToolSearch'];
 
 class BonitoChat {
     constructor(container, comm) {
@@ -143,14 +146,49 @@ class BonitoChat {
         // AND zeroes their entries in the height math (effHeight), so
         // spacers/scroll mapping stay exact. Per-tab — rebuilt on remount.
         this.toolbarEl   = container.parentElement.querySelector('.bt-chat-toolbar');
-        this.hiddenTypes = new Set();   // filter keys currently hidden
+        this.hiddenTypes = new Set(DEFAULT_HIDDEN);   // filter keys currently hidden
         this.seenTypes   = new Set();   // keys that already have a checkbox
         this.keyByIdx    = new Map();   // idx → filter key (drives effHeight)
+        // Two toolbar rows: the dynamic filter checkboxes on top, static
+        // display options below ("Depict Images Natively in Chat", …).
+        this.filterRow  = null;
+        this.optionsRow = null;
+        this.nativeImages = true;       // bt_show image results: bare by default
+        if (this.toolbarEl) {
+            this.filterRow = document.createElement('div');
+            this.filterRow.className = 'bt-toolbar-filters';
+            this.optionsRow = document.createElement('div');
+            this.optionsRow.className = 'bt-toolbar-options';
+            this.toolbarEl.append(this.filterRow, this.optionsRow);
+            const label = document.createElement('label');
+            label.className = 'bt-filter-toggle';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = this.nativeImages;
+            cb.addEventListener('change', () => this._setNativeImages(cb.checked));
+            label.append(cb, 'Native Images');
+            this.optionsRow.appendChild(label);
+        }
         this.busyEl       = container.parentElement.querySelector('.bt-busy');
         // Transient "reasoning…" indicator: shown for the lifetime of an agent
         // thought, then removed. Most thoughts are redacted (empty) so this is
         // usually all the user sees of the model's thinking.
         this.thinkingEl   = container.parentElement.querySelector('.bt-thinking');
+        // Overscroll tail: empty space below the last message the user can
+        // scroll into (~30% of the pane; sized in the container RO).
+        this.tailEl       = container.querySelector('.bt-messages-tail');
+        this._sizeTail();
+        // Off-screen measuring host: prefetched nodes get REAL heights here
+        // before they're ever rendered, so the virtual geometry is exact
+        // everywhere and scrollbar drags see a stable scrollHeight (see
+        // `_measureNodes`). Width is synced to the messages content box so
+        // text wrapping (and thus heights) match the live layout.
+        this.measureEl = document.createElement('div');
+        this.measureEl.className = 'bt-measure';
+        container.parentElement.appendChild(this.measureEl);
+        // Adopt the server-rendered curtain immediately: the settle watch
+        // (and its hard cap) must run even if the comm bootstrap stalls.
+        this._mountCurtain();
 
         // Single subscription. `comm` is a Bonito Observable bridged via
         // WS; every message Julia sets via `model.comm[] = {...}` arrives here.
@@ -169,6 +207,7 @@ class BonitoChat {
             this.applyCount(cur.n);
         } else if (cur && cur.type === 'msgs.range') {
             // Re-mount of a chat that already has messages cached.
+            this._mountCurtain();
             this.onRange(cur);
             this._startPrefetch();
         }
@@ -197,22 +236,22 @@ class BonitoChat {
         // bottom ("scrollbar feels stuck"). mouseup lands on window — the
         // pointer often leaves the container before release.
         this._scrollbarDrag = false;
-        this._dragTotal     = null;   // scrollHeight frozen for the drag's duration
         this._onContainerMouseDown = () => {
             this._scrollbarDrag = true;
-            // Freeze the scrollbar geometry: while estimates are being
-            // corrected to measurements mid-drag, scrollHeight would
-            // otherwise fluctuate every tick and the thumb visibly
-            // "flickers". updateDOM compensates the bottom spacer against
-            // this snapshot; release re-trues everything in one go.
-            this._dragTotal = this.container.scrollHeight;
             markUserInput();
         };
         this._onWindowMouseUp      = () => {
             if (!this._scrollbarDrag) return;
             this._scrollbarDrag = false;
-            this._dragTotal = null;
             markUserInput();   // the release tick still counts as user input
+            // Auto-expands deferred during the drag (image bodies inflate
+            // scrollHeight — poison for a held thumb): mount them now.
+            for (const node of this.cache.values()) {
+                if (node.isConnected && node.dataset.btAutoExpand) {
+                    delete node.dataset.btAutoExpand;
+                    node.collapsable?.setExpanded(true);
+                }
+            }
             this._queueRefresh();   // re-true spacers to the corrected heights
         };
         container.addEventListener('mousedown', this._onContainerMouseDown, { passive: true });
@@ -247,6 +286,7 @@ class BonitoChat {
         // manual scroll.
         this._containerRO = new ResizeObserver(() => {
             if (this.destroyed) return;
+            this._sizeTail();
             if (this.followMode) this._queueScrollToBottom();
         });
         this._containerRO.observe(this.container);
@@ -311,6 +351,8 @@ class BonitoChat {
         }
         clearTimeout(this._attachErrorTimer);
         clearTimeout(this._prefetchTimer);
+        if (this._curtainEl) { this._curtainEl.remove(); this._curtainEl = null; }
+        if (this.measureEl) { this.measureEl.remove(); this.measureEl = null; }
         if (this._tickerId) {
             clearInterval(this._tickerId);
             this._tickerId = null;
@@ -370,11 +412,96 @@ class BonitoChat {
     // ── Range / virtual scroll ────────────────────────────────────────────
 
     applyCount(n) {
-        if (n <= 0) return;
+        if (n <= 0) {
+            // Empty chat: nothing to settle — lift the (server-rendered)
+            // curtain right away.
+            this._mountCurtain();
+            this._revealCurtain();
+            return;
+        }
         this.totalCount  = n;
         this.initialLoad = true;
+        this._mountCurtain();
         this.refresh();
         this._startPrefetch();
+    }
+
+    // ── Mount curtain ─────────────────────────────────────────────────────
+    // The first second after mount is geometry soup: the visible window
+    // renders, estimate heights correct to measurements, bt_show images
+    // mount and resize their nodes — the scrollbar visibly pumps. Cover the
+    // chat with an opaque curtain until the geometry goes QUIET (scrollHeight
+    // unchanged for ~10 frames once the initial scroll passes are done),
+    // then pin the bottom and fade in on the settled layout. Image loads
+    // reset the quiet counter via their height changes, so image-heavy
+    // chats simply hold the curtain a little longer. Hard cap so a broken
+    // image can never strand it.
+    _mountCurtain() {
+        if (this._curtainEl || this._curtainDone) return;
+        const host = this.container.parentElement;   // .bt-app (position:relative)
+        if (!host) return;
+        // The curtain is rendered server-side (chat.jl) so it paints with
+        // the pane — phase 1's swap lands directly on it, no plain gap.
+        // Adopt it; create a replica only as a fallback. Layout mirrors
+        // the bring-up pane (plain block wrap → content at the top), so
+        // only the sub-text appears to change between the two phases.
+        let cur = host.querySelector('.bt-chat-curtain');
+        if (!cur) {
+            cur = document.createElement('div');
+            cur.className = 'bt-chat-curtain';
+            const inner = document.createElement('div');
+            inner.className = 'bt-loading';
+            const spin  = document.createElement('div');
+            spin.className = 'bt-loading-spinner';
+            const title = document.createElement('div');
+            title.className = 'bt-loading-title';
+            const name = host.querySelector('.bt-header-title')?.textContent?.trim();
+            title.textContent = name ? `Opening ${name}…` : 'Opening chat…';
+            const sub = document.createElement('div');
+            sub.className = 'bt-loading-sub';
+            sub.textContent = 'Loading the chat…';
+            inner.append(spin, title, sub);
+            cur.appendChild(inner);
+            host.appendChild(cur);
+        }
+        this._curtainEl     = cur;
+        this._curtainT0     = performance.now();
+        this._curtainLastH  = -1;
+        this._curtainStable = 0;
+        const watch = () => {
+            if (this.destroyed) return;
+            const h = this.container.scrollHeight;
+            if (h === this._curtainLastH) this._curtainStable++;
+            else { this._curtainStable = 0; this._curtainLastH = h; }
+            const elapsed = performance.now() - this._curtainT0;
+            // Quiet geometry alone isn't enough: a tool body still being
+            // fetched (native bt_show images come from the worker) shows a
+            // "loading…" placeholder with STABLE height, and a mounted
+            // <img> may not have decoded yet — both would pop in right
+            // after an early reveal ("saw the box flash"). Hold for them
+            // too; the hard cap still guarantees the curtain lifts.
+            const pendingBody = this.container.querySelector('.bt-collapsable-loading');
+            const pendingImg  = [...this.container.querySelectorAll('img')]
+                .some(img => !img.complete);
+            const settled = this._curtainStable >= 10 &&
+                            elapsed > 400 && !this.initialLoad &&
+                            !pendingBody && !pendingImg;
+            if (settled || elapsed > 5000) this._revealCurtain();
+            else requestAnimationFrame(watch);
+        };
+        requestAnimationFrame(watch);
+    }
+
+    _revealCurtain() {
+        const cur = this._curtainEl;
+        if (!cur) return;
+        this._curtainEl = null;
+        this._curtainDone = true;
+        // Land exactly at the bottom of the SETTLED layout before showing it.
+        this.setFollowMode(true);
+        this.scrollToBottom();
+        cur.classList.add('bt-curtain-hide');
+        setTimeout(() => cur.remove(), 250);
     }
 
     // ── Background history prefetch ──────────────────────────────────────
@@ -401,6 +528,10 @@ class BonitoChat {
         let s = e;
         while (s > 0 && !this.cache.has(s - 1) && (e - s) < 63) s--;
         this._prefetchCursor = s - 1;
+        // Marks the in-flight chunk so onRange can treat its arrival as
+        // SILENT (cache-only): prefetch must not re-window/scroll per chunk
+        // — that's a visible flicker storm right after mount.
+        this._prefetchPending = [s, e];
         this.comm.notify({type: 'msgs.request', range: [s, e]});
         // onRange reschedules the next tick when the response lands; this
         // timer is only the safety net for a lost/empty response.
@@ -482,6 +613,7 @@ class BonitoChat {
 
     onRange({ start, msgs }) {
         const messages = msgs ?? [];          // tolerate the legacy `messages` field
+        const fresh = [];
         messages.forEach((data, i) => {
             const idx = start + i;
             if (this.cache.has(idx)) return;
@@ -490,13 +622,30 @@ class BonitoChat {
             this.keyByIdx.set(idx, filterKey(data));
             if (data.id) this.nodeById.set(data.id, node);
             this.observe(idx, node);
+            fresh.push([idx, node]);
         });
+        this._measureNodes(fresh);
         // Any arriving range advances the background prefetch (pacing: one
         // chunk in flight at a time, ~30ms apart). Runs through drags too —
         // caching is the drag-safe part.
         if (this._prefetchStarted) {
             clearTimeout(this._prefetchTimer);
             this._prefetchTimer = setTimeout(() => this._prefetchTick(), 30);
+        }
+        // Prefetch chunks are SILENT: cache-only, no scroll, and a DOM
+        // re-window only when the chunk actually overlaps the visible
+        // window. Per-chunk updateDOM + scroll-to-bottom was a visible
+        // flicker storm (scrollbar resizing, content shifting) right after
+        // mount while ~15 chunks streamed in.
+        const pf = this._prefetchPending;
+        if (pf && start === pf[0]) {
+            this._prefetchPending = null;
+            const [vs, ve] = this.visibleRange();
+            const end = start + messages.length - 1;
+            if (end >= vs && start <= ve && !this._scrollbarDrag) {
+                this.updateDOM(vs, ve);
+            }
+            return;
         }
         // Ranges still in flight when a scrollbar drag started: cache the
         // nodes (above) but don't touch the DOM/geometry until release —
@@ -523,6 +672,31 @@ class BonitoChat {
             }, 300);
         } else if (this.followMode) {
             this._queueScrollToBottom();
+        }
+    }
+
+    // Measure freshly-created (detached) nodes in the hidden off-screen
+    // host: one batch insert, one layout pass, real heights for everything
+    // the prefetcher caches. Estimates then only ever exist for the few
+    // frames before a chunk arrives — scrollbar geometry stays truthful,
+    // which is what keeps direct thumb drags smooth (no drift to correct,
+    // no freeze needed). Nodes already in the live DOM are skipped.
+    _measureNodes(pairs) {
+        if (!this.measureEl || pairs.length === 0) return;
+        const cs = getComputedStyle(this.container);
+        const w = this.container.clientWidth -
+            (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+        if (w <= 0) return;   // hidden pane — measuring would record garbage
+        this.measureEl.style.width = w + 'px';
+        const toMeasure = pairs.filter(([idx, node]) =>
+            !node.isConnected && !this.heights.has(idx));
+        for (const [, node] of toMeasure) this.measureEl.appendChild(node);
+        for (const [idx, node] of toMeasure) {
+            const h = node.offsetHeight;
+            if (h > 0) this.heights.set(idx, h);
+        }
+        for (const [, node] of toMeasure) {
+            if (node.parentNode === this.measureEl) this.measureEl.removeChild(node);
         }
     }
 
@@ -572,32 +746,29 @@ class BonitoChat {
         }
         this.spacerTop.style.height    = this.cumHeight(0, s) + 'px';
         this.spacerBottom.style.height = this.cumHeight(e + 1, this.totalCount) + 'px';
-        // During a scrollbar drag, hold the TOTAL scrollHeight at its
-        // drag-start value: estimate→measurement corrections re-balance
-        // between the spacers instead of resizing the scrollbar, so the
-        // thumb tracks the pointer smoothly. Spill into the top spacer
-        // when the bottom one clamps at 0 (drags near the bottom — bar
-        // stability beats content stability mid-drag). One forced-layout
-        // read; the release handler re-trues the geometry honestly.
-        if (this._scrollbarDrag && this._dragTotal != null) {
-            const delta = this.container.scrollHeight - this._dragTotal;
-            if (delta !== 0) {
-                const curB = parseFloat(this.spacerBottom.style.height) || 0;
-                const newB = Math.max(0, curB - delta);
-                this.spacerBottom.style.height = newB + 'px';
-                const rem = delta - (curB - newB);   // unabsorbed remainder
-                if (rem !== 0) {
-                    const curT = parseFloat(this.spacerTop.style.height) || 0;
-                    this.spacerTop.style.height = Math.max(0, curT - rem) + 'px';
-                }
-            }
-        }
+        // NOTE: no drag-time scrollHeight freeze here. An earlier freeze
+        // (pin total at drag-start, absorb deltas in the spacers) turned
+        // estimate-vs-real drift into PHANTOM BLANK at the end of the
+        // scroll range — "the view hits bottom while the bar still has
+        // track left". The real fix is upstream: prefetched nodes are
+        // measured off-screen (`_measureNodes`), so heights are real
+        // everywhere and drags see a stable scrollHeight to begin with.
     }
 
     insertSorted(idx, node) {
         const sorted = [...this.rendered].filter(i => i > idx).sort((a,b) => a-b);
         const before = sorted.length ? this.cache.get(sorted[0]) : this.spacerBottom;
         this.container.insertBefore(node, before);
+        // Deferred auto-expand (bt_show / native images): the node is now in
+        // the document, so the tool.render reply has a live slot to mount
+        // into. One-shot — clear the flag before expanding. NOT during a
+        // scrollbar drag: bodies mounting mid-drag inflate scrollHeight and
+        // the thumb's mapping stretches out from under the pointer ("bar
+        // gets stuck before the bottom") — the release sweep handles them.
+        if (node.dataset && node.dataset.btAutoExpand && !this._scrollbarDrag) {
+            delete node.dataset.btAutoExpand;
+            node.collapsable?.setExpanded(true);
+        }
     }
 
     // ── New messages + streaming ──────────────────────────────────────────
@@ -746,9 +917,18 @@ class BonitoChat {
             }
             prev.innerHTML = msg.preview;
         }
-        // bt_show: the completion update is when we learn it's a "show me this"
-        // tool — auto-expand its preview (idempotent; user can still collapse).
-        if (msg.expand && node.collapsable) node.collapsable.setExpanded(true);
+        // bt_show: the completion update is when we learn it's a "show me
+        // this" tool (and its mime). Native-image mode takes precedence:
+        // chrome off + body mounted; otherwise auto-expand the pill
+        // (idempotent; user can still collapse). Detached nodes defer the
+        // expand to insertion (see insertSorted).
+        if (msg.show_mime) node.dataset.showMime = msg.show_mime;
+        if (this.nativeImages && this._isNativeCandidate(node)) {
+            this._applyNative(node);
+        } else if (msg.expand && node.collapsable) {
+            if (node.isConnected) node.collapsable.setExpanded(true);
+            else node.dataset.btAutoExpand = '1';
+        }
         // A background bash/Task only learns it's a taskbar item when its launch
         // result arrives (rawInput doesn't carry run_in_background), so the server
         // flips `taskbar` on a later update. The taskbar filter keys off this
@@ -769,7 +949,7 @@ class BonitoChat {
     // independent of arrival order. No-op when the toolbar isn't mounted.
     noteKey(msg) {
         const key = filterKey(msg);
-        if (!key || this.seenTypes.has(key) || !this.toolbarEl) return;
+        if (!key || this.seenTypes.has(key) || !this.filterRow) return;
         this.seenTypes.add(key);
         const isTool = key.startsWith('tool:');
         const text   = isTool ? key.slice(5) : (TYPE_LABELS[key] ?? key);
@@ -781,30 +961,67 @@ class BonitoChat {
         cb.checked = !this.hiddenTypes.has(key);
         cb.addEventListener('change', () => this.setKeyHidden(key, !cb.checked));
         label.append(cb, text);
-        const toggles = () => [...this.toolbarEl.querySelectorAll('.bt-filter-toggle')];
+        const toggles = () => [...this.filterRow.querySelectorAll('.bt-filter-toggle')];
         if (isTool) {
             this.ensureToolGroupLabel();
             const next = toggles().find(el =>
                 el.dataset.key.startsWith('tool:') &&
                 el.dataset.key.slice(5).localeCompare(text) > 0);
-            this.toolbarEl.insertBefore(label, next ?? null);
+            this.filterRow.insertBefore(label, next ?? null);
         } else {
             const order = t => { const i = TYPE_ORDER.indexOf(t); return i < 0 ? TYPE_ORDER.length : i; };
             // Before the first base toggle that sorts after us; else before
             // the Tools: group; else at the end.
             const next = toggles().find(el =>
                 !el.dataset.key.startsWith('tool:') && order(el.dataset.key) > order(key))
-                ?? this.toolbarEl.querySelector('.bt-filter-group-label');
-            this.toolbarEl.insertBefore(label, next ?? null);
+                ?? this.filterRow.querySelector('.bt-filter-group-label');
+            this.filterRow.insertBefore(label, next ?? null);
         }
     }
 
     ensureToolGroupLabel() {
-        if (this.toolbarEl.querySelector('.bt-filter-group-label')) return;
+        if (this.filterRow.querySelector('.bt-filter-group-label')) return;
         const span = document.createElement('span');
         span.className = 'bt-filter-group-label';
         span.textContent = 'Tools:';
-        this.toolbarEl.appendChild(span);
+        this.filterRow.appendChild(span);
+    }
+
+    // ── Native image display (bt_show results) ───────────────────────────
+    // When "Depict Images Natively in Chat" is on, a bt_show whose mime is
+    // image/* renders bare in the chat flow: the pill's chrome is hidden
+    // via the bt-tool-native class and the body is auto-expanded through
+    // the normal Collapsable → tool.render path (the server fills the slot
+    // with the <img>). Display-only, per-tab — like the filters.
+    _isNativeCandidate(node) {
+        return (node.dataset.showMime || '').startsWith('image/');
+    }
+
+    _applyNative(node) {
+        node.classList.add('bt-tool-native');
+        if (node.isConnected) {
+            node.collapsable?.setExpanded(true);
+        } else {
+            // Cached but not in the document (virtual-scroll window /
+            // prefetch): defer the expand to insertion so the tool.render
+            // reply has a slot to mount into.
+            node.dataset.btAutoExpand = '1';
+        }
+    }
+
+    _removeNative(node) {
+        node.classList.remove('bt-tool-native');
+        delete node.dataset.btAutoExpand;
+        node.collapsable?.setExpanded(false);   // discardOnCollapse frees the body
+    }
+
+    _setNativeImages(on) {
+        this.nativeImages = on;
+        for (const node of this.cache.values()) {
+            if (!this._isNativeCandidate(node)) continue;
+            on ? this._applyNative(node) : this._removeNative(node);
+        }
+        this.refresh();
     }
 
     // Toggle a key's visibility: inline display on every matching node (an
@@ -911,10 +1128,24 @@ class BonitoChat {
                     wideBtn.title = active ?
                         'Collapse to default width' : 'Expand to full chat width';
                 });
-                // Auto-expand (e.g. bt_show). Deferred to a microtask so the
-                // node is inserted into the document before tool.render's
-                // dom_in_js tries to mount into its `[data-tool-id]` slot.
-                if (msg.expand) queueMicrotask(() => div.collapsable.setExpanded(true));
+                // The show's mime (bt_show results) — the native-image toggle
+                // keys on it.
+                if (msg.show_mime) div.dataset.showMime = msg.show_mime;
+                if (this.nativeImages && this._isNativeCandidate(div)) {
+                    // Native display: chrome off + body auto-mounted on
+                    // first insertion.
+                    div.classList.add('bt-tool-native');
+                    div.dataset.btAutoExpand = '1';
+                } else if (msg.expand) {
+                    // Auto-expand (e.g. bt_show) — DEFERRED until the node
+                    // first enters the document (insertSorted). The history
+                    // prefetcher creates nodes detached; expanding those
+                    // immediately fired tool.render whose dom_in_js reply
+                    // found no slot in the document — the body stayed on
+                    // "loading…" forever (and every off-screen bt_show in
+                    // history cost a render round-trip up front).
+                    div.dataset.btAutoExpand = '1';
+                }
                 break;
             }
             case 'plan': {
@@ -1146,6 +1377,17 @@ class BonitoChat {
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
+    // The overscroll tail (empty space below the last message) is PLAIN
+    // CONTENT: "bottom" everywhere is the real scroll bottom, tail fully
+    // visible. No bottom-math special-cases — an earlier content-bottom-
+    // excluding-tail model needed tail-awareness in four places and the
+    // missed interactions made the scrollbar fight the user.
+    _sizeTail() {
+        if (!this.tailEl) return;
+        this.tailEl.style.height =
+            Math.round(this.container.clientHeight * 0.3) + 'px';
+    }
+
     atBottom() {
         const { scrollTop, scrollHeight, clientHeight } = this.container;
         // Tight (AT_BOTTOM_PX = 20) so "user manually scrolled to the
@@ -1163,6 +1405,12 @@ class BonitoChat {
     // returns a stale value mid-layout; deferring to rAF guarantees
     // we measure post-layout.
     _queueScrollToBottom() {
+        // A held scrollbar is ABSOLUTE authority over scrollTop: no chase,
+        // no re-anchor, no reveal-scroll may fire mid-drag (container
+        // resizes from toolbar growth, streaming chunks, and range
+        // arrivals all funnel through here — any of them would snap the
+        // thumb out of the user's hand).
+        if (this._scrollbarDrag) return;
         if (this._scrollQueued || this.destroyed) return;
         this._scrollQueued = true;
         this._scrollRafId = requestAnimationFrame(() => {
@@ -1173,14 +1421,17 @@ class BonitoChat {
     }
 
     scrollToBottom() {
-        // Belt + suspenders: set scrollTop AND scrollIntoView on the
-        // bottom spacer. scrollTop alone uses the container's reported
-        // scrollHeight which can be stale during streaming; scrollIntoView
-        // tells the browser "make this element's bottom edge visible"
-        // and lets it compute the right position from current layout.
+        if (this._scrollbarDrag) return;   // the drag owns scrollTop
+        // Belt + suspenders: set scrollTop AND scrollIntoView on the LAST
+        // child (the overscroll tail — plain content, see _sizeTail).
+        // scrollTop alone uses the container's reported scrollHeight which
+        // can be stale during streaming; scrollIntoView tells the browser
+        // "make this element's bottom edge visible" and lets it compute
+        // the right position from current layout.
         this.container.scrollTop = this.container.scrollHeight;
-        if (this.spacerBottom) {
-            this.spacerBottom.scrollIntoView({ block: 'end', behavior: 'auto' });
+        const anchor = this.tailEl || this.spacerBottom;
+        if (anchor) {
+            anchor.scrollIntoView({ block: 'end', behavior: 'auto' });
         }
         // Don't rely on the `scroll` event to drive the post-scroll range
         // fetch — Electron's offscreen renderer (and a few other headless
@@ -1552,15 +1803,36 @@ function arrayBufferToBase64(buf) {
 // via `js"$(ChatLib).then(lib => lib.connect($(node), $(comm)))"`. The
 // MutationObserver auto-cleans the BonitoChat instance when its container
 // leaves the document, so no Julia-side lifecycle plumbing is needed.
+// Live chat instances, so `window._btToolSlot` can find tool-body slots on
+// nodes the virtual scroll currently holds DETACHED (cached but not in the
+// document). The server's tool.render reply mounts via this helper — filling
+// a detached node is fine, the content shows when the node is re-inserted.
+// Without it, a reply racing an eviction was silently dropped and the body
+// stayed on "loading…".
+const CHAT_INSTANCES = new Set();
+window._btToolSlot = (id) => {
+    const direct = document.querySelector(
+        `.bt-tool-body[data-tool-id="${CSS.escape(id)}"]`);
+    if (direct) return direct;
+    for (const chat of CHAT_INSTANCES) {
+        const node = chat.nodeById.get(id);
+        const slot = node && node.querySelector('.bt-tool-body');
+        if (slot) return slot;
+    }
+    return null;
+};
+
 export function connect(node, comm) {
     const chat = new BonitoChat(node, comm);
     node.__bt_chat = chat;     // devtools/test inspection hook
+    CHAT_INSTANCES.add(chat);
 
     const parent = node.parentNode;
     if (parent) {
         const mo = new MutationObserver(() => {
             if (!node.isConnected) {
                 try { chat.destroy(); } catch (_) {}
+                CHAT_INSTANCES.delete(chat);
                 mo.disconnect();
             }
         });

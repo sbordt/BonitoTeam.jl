@@ -581,9 +581,15 @@ function augment_generic_header!(d::Dict, chat_dir::AbstractString)
         prev = render_edit_preview(chat_dir, d["id"])
         prev === nothing || (d["preview"] = prev)
     end
-    isempty(chat_dir) ||
-        has_show_reference(load_tool_content(chat_dir, d["id"])) &&
-            (d["expand"] = true)
+    if !isempty(chat_dir)
+        content = load_tool_content(chat_dir, d["id"])
+        # bt_show references auto-expand the pill; inline image content
+        # (Read on a PNG, …) only ships its mime — the client's Native
+        # Images mode decides the depiction.
+        has_show_reference(content) && (d["expand"] = true)
+        mime = tool_media_mime(content)
+        mime === nothing || (d["show_mime"] = mime)
+    end
     return d
 end
 
@@ -921,6 +927,30 @@ function parse_show_path(text::AbstractString)
     header = nl === nothing ? text : text[1:prevind(text, nl)]
     m = match(r"^shown:\s+(.+?)(?:\s+\([^)]*\))?\s*$", header)
     m === nothing ? nothing : String(m.captures[1])
+end
+
+# Pull the mime out of the `shown: <path> (<mime>, <size>)` reference. The
+# wire ships it as `show_mime` so the client can decide how to depict the
+# show (e.g. the "Native Images" toggle keys on image/*). `nothing` for
+# refs without the parenthesized tail or a mime-shaped token.
+function parse_show_mime(text::AbstractString)
+    nl = findfirst('\n', text)
+    header = nl === nothing ? text : text[1:prevind(text, nl)]
+    m = match(r"\(([a-z0-9.+-]+/[a-z0-9.+-]+)\s*,", header)
+    m === nothing ? nothing : String(m.captures[1])
+end
+
+# The displayable-media mime of a tool's content, if any: a bt_show
+# reference's mime, or the mime of inline image content (e.g. the Read tool
+# on a PNG ships an ACP ImageContent block). This is what the wire's
+# `show_mime` field carries — the client's "Native Images" mode keys on it.
+function tool_media_mime(content)
+    ref = find_show_reference(content)
+    ref === nothing || return parse_show_mime(ref)
+    for c in content
+        c isa ImageContent && return c.mime_type
+    end
+    return nothing
 end
 
 # A bt_show reference, rendered inline. Pure data — the fetch starts at render
@@ -1331,7 +1361,13 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
         # Auto-expand the body: a live Bonito app always (it IS the point), or a
         # `bt_show` tool once its content carries a `shown:` ref. `auto_expand_body`
         # dispatches on the type — no content sniffing to decide.
-        (auto_expand_body(b) || has_show_reference(snap.content)) && (d["expand"] = true)
+        (auto_expand_body(b) || has_show_reference(snap.content)) &&
+            (d["expand"] = true)
+        # Displayable media (bt_show mime, or inline image content from
+        # e.g. Read on a PNG) — the client's Native Images mode keys on
+        # this; ship it with the update that carries the result.
+        mime = tool_media_mime(snap.content)
+        mime === nothing || (d["show_mime"] = mime)
         chat_emit(b.chat, d)
         ship_edit_preview!(b)
     end
@@ -2462,12 +2498,17 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
     Base.errormonitor(@async try
         body = render_tool_body(model.state, msg,
             model.cwd, model.chat_dir; project_id=model.project_id)
+        # `_btToolSlot` (bonitoteam.js) also finds slots on nodes the virtual
+        # scroll holds DETACHED (cache window / prefetch) — a plain
+        # document.querySelector misses those and the body would be stuck on
+        # "loading…". Fallback covers a not-yet-loaded chat module.
         Bonito.dom_in_js(
             session,
             body,
             js"""(elem) => {
-    const slot = document.querySelector(
-        '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
+    const slot = window._btToolSlot ? window._btToolSlot($(cmd.tool_id)) :
+        document.querySelector(
+            '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
     if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
 }"""
         )
@@ -2484,8 +2525,9 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
                 DOM.div("tool body unavailable: $(sprint(showerror, e))";
                         class = "bt-tool-error"),
                 js"""(elem) => {
-    const slot = document.querySelector(
-        '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
+    const slot = window._btToolSlot ? window._btToolSlot($(cmd.tool_id)) :
+        document.querySelector(
+            '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
     if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
 }""")
         catch
@@ -2653,7 +2695,12 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
 
     messages_container = DOM.div(
         DOM.div(class="bt-spacer-top"),
-        DOM.div(class="bt-spacer-bottom");
+        DOM.div(class="bt-spacer-bottom"),
+        # Overscroll tail: empty space the user can scroll into below the
+        # last message (~30% of the pane; JS sizes it from clientHeight).
+        # Message nodes are inserted BEFORE the bottom spacer, so the tail
+        # stays last.
+        DOM.div(class="bt-messages-tail");
         class="bt-messages")
 
     init_script = js"""
@@ -2703,5 +2750,24 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         # BonitoChat (`noteType`): one show/hide checkbox per message type the
         # first time that type occurs. Sized to host future controls too.
         DOM.div(class = "bt-chat-toolbar"),
+        # Mount curtain, rendered server-side so it PAINTS WITH THE PANE —
+        # the pane swap from the bring-up view lands directly on this, with
+        # no plain-background gap before the chat module loads. Top-aligned
+        # to mirror the bring-up pane exactly (only the sub-text differs).
+        # BonitoChat adopts it and fades it out once the geometry settles.
+        DOM.div(
+            DOM.div(
+                DOM.div(class = "bt-loading-spinner"),
+                DOM.div("Opening $(curtain_title(model))…"; class = "bt-loading-title"),
+                DOM.div("Loading the chat…"; class = "bt-loading-sub");
+                class = "bt-loading"),
+            class = "bt-chat-curtain"),
         class="bt-app"))
+end
+
+# The display name the loading curtain shows — the project's registered name
+# (matching the bring-up pane), falling back to the working-dir basename.
+function curtain_title(model::ChatModel)
+    p = get(model.state.projects[], model.project_id, nothing)
+    p === nothing ? basename(rstrip(model.cwd, '/')) : p.name
 end

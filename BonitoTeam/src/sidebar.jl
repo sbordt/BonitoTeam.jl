@@ -739,12 +739,16 @@ function unified_app(state::ServerState)
             plotpane;
             class = "bt-stage")
         shell = DOM.div(
+            # MarkdownCSS FIRST: it's the base sheet our styles override.
+            # Stylesheet order breaks specificity ties — with MarkdownCSS
+            # last, its `.markdown-body pre` light-gray background beat the
+            # chat's dark code blocks (see ChatStyles' agent-pre comment).
+            Bonito.MarkdownCSS,
             UnifiedShellStyles,
             DashboardStyles,
             ChatStyles,
             SidebarStyles,
             PopupStyles,
-            Bonito.MarkdownCSS,
             Bonito.ConnectionIndicator(),
             sidebar,
             stage,

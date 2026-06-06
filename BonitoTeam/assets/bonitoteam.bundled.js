@@ -67,6 +67,9 @@ const TYPE_ORDER = [
     'summary'
 ];
 const filterKey = (msg)=>msg.type === 'tool' ? 'tool:' + (msg.tool || 'other') : msg.type;
+const DEFAULT_HIDDEN = [
+    'tool:ToolSearch'
+];
 class BonitoChat {
     constructor(container, comm){
         this.container = container;
@@ -88,11 +91,35 @@ class BonitoChat {
         this.spacerTop = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
         this.toolbarEl = container.parentElement.querySelector('.bt-chat-toolbar');
-        this.hiddenTypes = new Set();
+        this.hiddenTypes = new Set(DEFAULT_HIDDEN);
         this.seenTypes = new Set();
         this.keyByIdx = new Map();
+        this.filterRow = null;
+        this.optionsRow = null;
+        this.nativeImages = true;
+        if (this.toolbarEl) {
+            this.filterRow = document.createElement('div');
+            this.filterRow.className = 'bt-toolbar-filters';
+            this.optionsRow = document.createElement('div');
+            this.optionsRow.className = 'bt-toolbar-options';
+            this.toolbarEl.append(this.filterRow, this.optionsRow);
+            const label = document.createElement('label');
+            label.className = 'bt-filter-toggle';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = this.nativeImages;
+            cb.addEventListener('change', ()=>this._setNativeImages(cb.checked));
+            label.append(cb, 'Native Images');
+            this.optionsRow.appendChild(label);
+        }
         this.busyEl = container.parentElement.querySelector('.bt-busy');
         this.thinkingEl = container.parentElement.querySelector('.bt-thinking');
+        this.tailEl = container.querySelector('.bt-messages-tail');
+        this._sizeTail();
+        this.measureEl = document.createElement('div');
+        this.measureEl.className = 'bt-measure';
+        container.parentElement.appendChild(this.measureEl);
+        this._mountCurtain();
         comm.on((msg)=>{
             if (this.destroyed) return;
             if (msg && typeof msg === 'object') this.dispatch(msg);
@@ -101,6 +128,7 @@ class BonitoChat {
         if (cur && cur.type === 'msgs.count' && cur.n > 0) {
             this.applyCount(cur.n);
         } else if (cur && cur.type === 'msgs.range') {
+            this._mountCurtain();
             this.onRange(cur);
             this._startPrefetch();
         }
@@ -125,17 +153,20 @@ class BonitoChat {
         });
         this._markUserInput = markUserInput;
         this._scrollbarDrag = false;
-        this._dragTotal = null;
         this._onContainerMouseDown = ()=>{
             this._scrollbarDrag = true;
-            this._dragTotal = this.container.scrollHeight;
             markUserInput();
         };
         this._onWindowMouseUp = ()=>{
             if (!this._scrollbarDrag) return;
             this._scrollbarDrag = false;
-            this._dragTotal = null;
             markUserInput();
+            for (const node of this.cache.values()){
+                if (node.isConnected && node.dataset.btAutoExpand) {
+                    delete node.dataset.btAutoExpand;
+                    node.collapsable?.setExpanded(true);
+                }
+            }
             this._queueRefresh();
         };
         container.addEventListener('mousedown', this._onContainerMouseDown, {
@@ -160,6 +191,7 @@ class BonitoChat {
         });
         this._containerRO = new ResizeObserver(()=>{
             if (this.destroyed) return;
+            this._sizeTail();
             if (this.followMode) this._queueScrollToBottom();
         });
         this._containerRO.observe(this.container);
@@ -219,6 +251,14 @@ class BonitoChat {
         }
         clearTimeout(this._attachErrorTimer);
         clearTimeout(this._prefetchTimer);
+        if (this._curtainEl) {
+            this._curtainEl.remove();
+            this._curtainEl = null;
+        }
+        if (this.measureEl) {
+            this.measureEl.remove();
+            this.measureEl = null;
+        }
         if (this._tickerId) {
             clearInterval(this._tickerId);
             this._tickerId = null;
@@ -276,11 +316,72 @@ class BonitoChat {
         }
     }
     applyCount(n) {
-        if (n <= 0) return;
+        if (n <= 0) {
+            this._mountCurtain();
+            this._revealCurtain();
+            return;
+        }
         this.totalCount = n;
         this.initialLoad = true;
+        this._mountCurtain();
         this.refresh();
         this._startPrefetch();
+    }
+    _mountCurtain() {
+        if (this._curtainEl || this._curtainDone) return;
+        const host = this.container.parentElement;
+        if (!host) return;
+        let cur = host.querySelector('.bt-chat-curtain');
+        if (!cur) {
+            cur = document.createElement('div');
+            cur.className = 'bt-chat-curtain';
+            const inner = document.createElement('div');
+            inner.className = 'bt-loading';
+            const spin = document.createElement('div');
+            spin.className = 'bt-loading-spinner';
+            const title = document.createElement('div');
+            title.className = 'bt-loading-title';
+            const name = host.querySelector('.bt-header-title')?.textContent?.trim();
+            title.textContent = name ? `Opening ${name}…` : 'Opening chat…';
+            const sub = document.createElement('div');
+            sub.className = 'bt-loading-sub';
+            sub.textContent = 'Loading the chat…';
+            inner.append(spin, title, sub);
+            cur.appendChild(inner);
+            host.appendChild(cur);
+        }
+        this._curtainEl = cur;
+        this._curtainT0 = performance.now();
+        this._curtainLastH = -1;
+        this._curtainStable = 0;
+        const watch = ()=>{
+            if (this.destroyed) return;
+            const h = this.container.scrollHeight;
+            if (h === this._curtainLastH) this._curtainStable++;
+            else {
+                this._curtainStable = 0;
+                this._curtainLastH = h;
+            }
+            const elapsed = performance.now() - this._curtainT0;
+            const pendingBody = this.container.querySelector('.bt-collapsable-loading');
+            const pendingImg = [
+                ...this.container.querySelectorAll('img')
+            ].some((img)=>!img.complete);
+            const settled = this._curtainStable >= 10 && elapsed > 400 && !this.initialLoad && !pendingBody && !pendingImg;
+            if (settled || elapsed > 5000) this._revealCurtain();
+            else requestAnimationFrame(watch);
+        };
+        requestAnimationFrame(watch);
+    }
+    _revealCurtain() {
+        const cur = this._curtainEl;
+        if (!cur) return;
+        this._curtainEl = null;
+        this._curtainDone = true;
+        this.setFollowMode(true);
+        this.scrollToBottom();
+        cur.classList.add('bt-curtain-hide');
+        setTimeout(()=>cur.remove(), 250);
     }
     _startPrefetch() {
         if (this._prefetchStarted) return;
@@ -300,6 +401,10 @@ class BonitoChat {
         let s = e;
         while(s > 0 && !this.cache.has(s - 1) && e - s < 63)s--;
         this._prefetchCursor = s - 1;
+        this._prefetchPending = [
+            s,
+            e
+        ];
         this.comm.notify({
             type: 'msgs.request',
             range: [
@@ -366,6 +471,7 @@ class BonitoChat {
     }
     onRange({ start , msgs  }) {
         const messages = msgs ?? [];
+        const fresh = [];
         messages.forEach((data, i)=>{
             const idx = start + i;
             if (this.cache.has(idx)) return;
@@ -374,10 +480,25 @@ class BonitoChat {
             this.keyByIdx.set(idx, filterKey(data));
             if (data.id) this.nodeById.set(data.id, node);
             this.observe(idx, node);
+            fresh.push([
+                idx,
+                node
+            ]);
         });
+        this._measureNodes(fresh);
         if (this._prefetchStarted) {
             clearTimeout(this._prefetchTimer);
             this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 30);
+        }
+        const pf = this._prefetchPending;
+        if (pf && start === pf[0]) {
+            this._prefetchPending = null;
+            const [vs, ve] = this.visibleRange();
+            const end = start + messages.length - 1;
+            if (end >= vs && start <= ve && !this._scrollbarDrag) {
+                this.updateDOM(vs, ve);
+            }
+            return;
         }
         if (this._scrollbarDrag) return;
         this.updateDOM(...this.visibleRange());
@@ -397,6 +518,22 @@ class BonitoChat {
             }, 300);
         } else if (this.followMode) {
             this._queueScrollToBottom();
+        }
+    }
+    _measureNodes(pairs) {
+        if (!this.measureEl || pairs.length === 0) return;
+        const cs = getComputedStyle(this.container);
+        const w = this.container.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+        if (w <= 0) return;
+        this.measureEl.style.width = w + 'px';
+        const toMeasure = pairs.filter(([idx, node])=>!node.isConnected && !this.heights.has(idx));
+        for (const [, node] of toMeasure)this.measureEl.appendChild(node);
+        for (const [idx, node] of toMeasure){
+            const h = node.offsetHeight;
+            if (h > 0) this.heights.set(idx, h);
+        }
+        for (const [, node] of toMeasure){
+            if (node.parentNode === this.measureEl) this.measureEl.removeChild(node);
         }
     }
     observe(idx, node) {
@@ -436,19 +573,6 @@ class BonitoChat {
         }
         this.spacerTop.style.height = this.cumHeight(0, s) + 'px';
         this.spacerBottom.style.height = this.cumHeight(e + 1, this.totalCount) + 'px';
-        if (this._scrollbarDrag && this._dragTotal != null) {
-            const delta = this.container.scrollHeight - this._dragTotal;
-            if (delta !== 0) {
-                const curB = parseFloat(this.spacerBottom.style.height) || 0;
-                const newB = Math.max(0, curB - delta);
-                this.spacerBottom.style.height = newB + 'px';
-                const rem = delta - (curB - newB);
-                if (rem !== 0) {
-                    const curT = parseFloat(this.spacerTop.style.height) || 0;
-                    this.spacerTop.style.height = Math.max(0, curT - rem) + 'px';
-                }
-            }
-        }
     }
     insertSorted(idx, node) {
         const sorted = [
@@ -456,6 +580,10 @@ class BonitoChat {
         ].filter((i)=>i > idx).sort((a, b)=>a - b);
         const before = sorted.length ? this.cache.get(sorted[0]) : this.spacerBottom;
         this.container.insertBefore(node, before);
+        if (node.dataset && node.dataset.btAutoExpand && !this._scrollbarDrag) {
+            delete node.dataset.btAutoExpand;
+            node.collapsable?.setExpanded(true);
+        }
     }
     appendNewMessage(msg) {
         const idx = this.totalCount - 1;
@@ -549,13 +677,19 @@ class BonitoChat {
             }
             prev.innerHTML = msg.preview;
         }
-        if (msg.expand && node.collapsable) node.collapsable.setExpanded(true);
+        if (msg.show_mime) node.dataset.showMime = msg.show_mime;
+        if (this.nativeImages && this._isNativeCandidate(node)) {
+            this._applyNative(node);
+        } else if (msg.expand && node.collapsable) {
+            if (node.isConnected) node.collapsable.setExpanded(true);
+            else node.dataset.btAutoExpand = '1';
+        }
         if (msg.taskbar) node.dataset.toolTaskbar = '1';
         this._refreshTaskbar();
     }
     noteKey(msg) {
         const key = filterKey(msg);
-        if (!key || this.seenTypes.has(key) || !this.toolbarEl) return;
+        if (!key || this.seenTypes.has(key) || !this.filterRow) return;
         this.seenTypes.add(key);
         const isTool = key.startsWith('tool:');
         const text = isTool ? key.slice(5) : TYPE_LABELS[key] ?? key;
@@ -568,27 +702,51 @@ class BonitoChat {
         cb.addEventListener('change', ()=>this.setKeyHidden(key, !cb.checked));
         label.append(cb, text);
         const toggles = ()=>[
-                ...this.toolbarEl.querySelectorAll('.bt-filter-toggle')
+                ...this.filterRow.querySelectorAll('.bt-filter-toggle')
             ];
         if (isTool) {
             this.ensureToolGroupLabel();
             const next = toggles().find((el)=>el.dataset.key.startsWith('tool:') && el.dataset.key.slice(5).localeCompare(text) > 0);
-            this.toolbarEl.insertBefore(label, next ?? null);
+            this.filterRow.insertBefore(label, next ?? null);
         } else {
             const order = (t)=>{
                 const i = TYPE_ORDER.indexOf(t);
                 return i < 0 ? TYPE_ORDER.length : i;
             };
-            const next = toggles().find((el)=>!el.dataset.key.startsWith('tool:') && order(el.dataset.key) > order(key)) ?? this.toolbarEl.querySelector('.bt-filter-group-label');
-            this.toolbarEl.insertBefore(label, next ?? null);
+            const next = toggles().find((el)=>!el.dataset.key.startsWith('tool:') && order(el.dataset.key) > order(key)) ?? this.filterRow.querySelector('.bt-filter-group-label');
+            this.filterRow.insertBefore(label, next ?? null);
         }
     }
     ensureToolGroupLabel() {
-        if (this.toolbarEl.querySelector('.bt-filter-group-label')) return;
+        if (this.filterRow.querySelector('.bt-filter-group-label')) return;
         const span = document.createElement('span');
         span.className = 'bt-filter-group-label';
         span.textContent = 'Tools:';
-        this.toolbarEl.appendChild(span);
+        this.filterRow.appendChild(span);
+    }
+    _isNativeCandidate(node) {
+        return (node.dataset.showMime || '').startsWith('image/');
+    }
+    _applyNative(node) {
+        node.classList.add('bt-tool-native');
+        if (node.isConnected) {
+            node.collapsable?.setExpanded(true);
+        } else {
+            node.dataset.btAutoExpand = '1';
+        }
+    }
+    _removeNative(node) {
+        node.classList.remove('bt-tool-native');
+        delete node.dataset.btAutoExpand;
+        node.collapsable?.setExpanded(false);
+    }
+    _setNativeImages(on) {
+        this.nativeImages = on;
+        for (const node of this.cache.values()){
+            if (!this._isNativeCandidate(node)) continue;
+            on ? this._applyNative(node) : this._removeNative(node);
+        }
+        this.refresh();
     }
     setKeyHidden(key, hidden) {
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
@@ -667,7 +825,13 @@ class BonitoChat {
                         wideBtn.textContent = active ? '«' : '»';
                         wideBtn.title = active ? 'Collapse to default width' : 'Expand to full chat width';
                     });
-                    if (msg.expand) queueMicrotask(()=>div.collapsable.setExpanded(true));
+                    if (msg.show_mime) div.dataset.showMime = msg.show_mime;
+                    if (this.nativeImages && this._isNativeCandidate(div)) {
+                        div.classList.add('bt-tool-native');
+                        div.dataset.btAutoExpand = '1';
+                    } else if (msg.expand) {
+                        div.dataset.btAutoExpand = '1';
+                    }
                     break;
                 }
             case 'plan':
@@ -825,11 +989,16 @@ class BonitoChat {
         this.taskbarEl.replaceChildren(frag);
         this._tickLiveTimers();
     }
+    _sizeTail() {
+        if (!this.tailEl) return;
+        this.tailEl.style.height = Math.round(this.container.clientHeight * 0.3) + 'px';
+    }
     atBottom() {
         const { scrollTop , scrollHeight , clientHeight  } = this.container;
         return scrollHeight - scrollTop - clientHeight < this.AT_BOTTOM_PX;
     }
     _queueScrollToBottom() {
+        if (this._scrollbarDrag) return;
         if (this._scrollQueued || this.destroyed) return;
         this._scrollQueued = true;
         this._scrollRafId = requestAnimationFrame(()=>{
@@ -839,9 +1008,11 @@ class BonitoChat {
         });
     }
     scrollToBottom() {
+        if (this._scrollbarDrag) return;
         this.container.scrollTop = this.container.scrollHeight;
-        if (this.spacerBottom) {
-            this.spacerBottom.scrollIntoView({
+        const anchor = this.tailEl || this.spacerBottom;
+        if (anchor) {
+            anchor.scrollIntoView({
                 block: 'end',
                 behavior: 'auto'
             });
@@ -1109,9 +1280,21 @@ function arrayBufferToBase64(buf) {
     }
     return btoa(binary);
 }
+const CHAT_INSTANCES = new Set();
+window._btToolSlot = (id)=>{
+    const direct = document.querySelector(`.bt-tool-body[data-tool-id="${CSS.escape(id)}"]`);
+    if (direct) return direct;
+    for (const chat of CHAT_INSTANCES){
+        const node = chat.nodeById.get(id);
+        const slot = node && node.querySelector('.bt-tool-body');
+        if (slot) return slot;
+    }
+    return null;
+};
 function connect(node, comm) {
     const chat = new BonitoChat(node, comm);
     node.__bt_chat = chat;
+    CHAT_INSTANCES.add(chat);
     const parent = node.parentNode;
     if (parent) {
         const mo = new MutationObserver(()=>{
@@ -1119,6 +1302,7 @@ function connect(node, comm) {
                 try {
                     chat.destroy();
                 } catch (_) {}
+                CHAT_INSTANCES.delete(chat);
                 mo.disconnect();
             }
         });

@@ -103,21 +103,35 @@ ok "owned by $SERVICE_USER"
 # The per-package Project.toml files (BonitoTeam/Project.toml etc.) are
 # metadata for declaring deps and must NEVER be used as a runtime env.
 step "Julia env (monorepo root)"
+# resolve() first: the per-package Project.tomls evolve (e.g. a new stdlib dep),
+# so the root Manifest can be out of sync — instantiate() alone would then fail
+# to precompile ("package X does not have Y in its dependencies").
 "$JULIA_BIN" "--project=$MONOREPO_DIR" --startup-file=no \
-    -e 'import Pkg; Pkg.instantiate()'
-ok "instantiated"
+    -e 'import Pkg; Pkg.resolve(); Pkg.instantiate()'
+ok "resolved + instantiated"
 
 # ── Worker secret ─────────────────────────────────────────────────────────────
+# The server persists its secret at $DATA_DIR/state/worker_secret and reuses it
+# across restarts (no env vars). Seed it so existing workers keep authenticating:
+# an explicit --secret wins; otherwise migrate a pre-CLI secret from the old
+# $CONFIG_DIR/server.env if present; otherwise leave it to the server to generate.
 step "Worker secret"
-if [[ -z "$SECRET" ]] && sudo test -f "$CONFIG_DIR/server.env" 2>/dev/null; then
-    SECRET=$(sudo grep '^BONITOTEAM_WORKER_SECRET=' "$CONFIG_DIR/server.env" \
-             | cut -d= -f2- || true)
-    [[ -n "$SECRET" ]] && info "reusing existing secret from $CONFIG_DIR/server.env"
+SECRET_FILE="$DATA_DIR/state/worker_secret"
+if [[ -n "$SECRET" ]]; then
+    printf '%s' "$SECRET" | sudo tee "$SECRET_FILE" > /dev/null
+    ok "set from --secret"
+elif sudo test -s "$SECRET_FILE"; then
+    ok "reusing $SECRET_FILE"
+elif sudo test -f "$CONFIG_DIR/server.env"; then
+    OLD=$(sudo grep '^BONITOTEAM_WORKER_SECRET=' "$CONFIG_DIR/server.env" | cut -d= -f2- || true)
+    if [[ -n "$OLD" ]]; then
+        printf '%s' "$OLD" | sudo tee "$SECRET_FILE" > /dev/null
+        ok "migrated from old $CONFIG_DIR/server.env"
+    fi
+else
+    info "none yet — the server generates one on first start"
 fi
-if [[ -z "$SECRET" ]]; then
-    SECRET=$(openssl rand -hex 32)
-    ok "generated new 256-bit secret"
-fi
+sudo test -f "$SECRET_FILE" && { sudo chown "$SERVICE_USER:$SERVICE_USER" "$SECRET_FILE"; sudo chmod 600 "$SECRET_FILE"; }
 
 # ── Public URL ────────────────────────────────────────────────────────────────
 step "Public URL"
@@ -128,21 +142,6 @@ if [[ -z "$PUBLIC_URL" ]]; then
     info "auto-detected — pass --public-url to override (e.g. cloudflare tunnel hostname)"
 fi
 ok "$PUBLIC_URL"
-
-# ── Config file ───────────────────────────────────────────────────────────────
-step "Config: $CONFIG_DIR/server.env"
-sudo mkdir -p "$CONFIG_DIR"
-sudo tee "$CONFIG_DIR/server.env" > /dev/null << EOF
-BONITOTEAM_WORKER_SECRET=$SECRET
-BONITOTEAM_PUBLIC_URL=$PUBLIC_URL
-BONITOTEAM_PORT=$PORT
-BONITOTEAM_HOST=0.0.0.0
-BONITOTEAM_STATE_DIR=$DATA_DIR/state
-BONITOTEAM_WORKING_DIR=$DATA_DIR/projects
-EOF
-sudo chown "root:$SERVICE_USER" "$CONFIG_DIR/server.env"
-sudo chmod 640 "$CONFIG_DIR/server.env"
-ok "written (mode 640, group $SERVICE_USER)"
 
 # ── systemd service ───────────────────────────────────────────────────────────
 step "systemd service: bonitoteam-server"
@@ -155,9 +154,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$SERVICE_USER
-EnvironmentFile=$CONFIG_DIR/server.env
 Environment=PATH=$(dirname "$JULIA_BIN"):/usr/local/bin:/usr/bin:/bin
-ExecStart=$SERVER_BIN
+ExecStart=$SERVER_BIN --host 0.0.0.0 --port $PORT --public-url $PUBLIC_URL --state-dir $DATA_DIR/state --working-dir $DATA_DIR/projects
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

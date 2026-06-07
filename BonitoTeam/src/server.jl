@@ -96,6 +96,71 @@ function serve(; host::String        = "0.0.0.0",
     return state
 end
 
+# ── Package entry point ──────────────────────────────────────────────────────
+# `julia --project=<monorepo root> -m BonitoTeam [flags]` starts the server and
+# blocks. No env vars: defaults are baked in (port 8038, host 0.0.0.0) and the
+# worker secret is generated + persisted in the state dir on first run, so
+# workers keep authenticating across restarts. Override any default with a flag:
+#
+#   julia --project=. -m BonitoTeam
+#   julia --project=. -m BonitoTeam --port 8080
+#   julia --project=. -m BonitoTeam --public-url https://team.example.com --secret <hex>
+#
+# Flags: --port --host --public-url --secret --state-dir --working-dir
+function (@main)(args::Vector{String})
+    opts = parse_server_args(args)
+    sd_arg = get(opts, "state-dir", "")
+    state_dir = isempty(sd_arg) ?
+        joinpath(homedir(), ".local", "share", "bonitoteam-server") : sd_arg
+    secret = get(opts, "secret", "")
+    isempty(secret) && (secret = persisted_worker_secret(state_dir))
+    serve(;
+        worker_secret = secret,
+        host          = get(opts, "host", "0.0.0.0"),
+        port          = parse(Int, get(opts, "port", "8038")),
+        public_url    = get(opts, "public-url", ""),
+        state_dir     = state_dir,
+        working_dir   = get(opts, "working-dir", ""),
+    )
+    wait()
+    return 0
+end
+
+# Tiny CLI parser: accepts `--key value` and `--key=value`; errors on anything
+# else so a typo fails loudly instead of silently using a default.
+function parse_server_args(args::Vector{String})
+    opts = Dict{String,String}()
+    i = 1
+    while i <= length(args)
+        a = args[i]
+        startswith(a, "--") ||
+            error("unexpected argument `$a` (use --key value or --key=value)")
+        body = a[3:end]
+        if occursin('=', body)
+            k, v = split(body, '='; limit = 2)
+            opts[String(k)] = String(v); i += 1
+        else
+            i < length(args) || error("missing value for --$body")
+            opts[body] = args[i + 1]; i += 2
+        end
+    end
+    return opts
+end
+
+# Read the persisted worker secret, generating + storing one (mode 600) on first
+# run so workers keep authenticating across restarts with no env vars to manage.
+function persisted_worker_secret(state_dir::AbstractString)
+    mkpath(state_dir)
+    f = joinpath(state_dir, "worker_secret")
+    if isfile(f)
+        s = strip(read(f, String)); isempty(s) || return String(s)
+    end
+    s = bytes2hex(rand(UInt8, 32))
+    write(f, s); chmod(f, 0o600)
+    @info "BonitoTeam: generated a new worker secret" file = f
+    return s
+end
+
 # HTTP routes
 #
 # /install        — sniffs `User-Agent` and serves either the bash or PS1

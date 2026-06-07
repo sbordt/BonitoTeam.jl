@@ -24,9 +24,12 @@ Concrete subtypes:
 Each transport overloads `ACP.send(t, line)`, `ACP.recv(t)`, and
 `Base.close(t)` for line-level I/O, and `start_session(t, handler)`
 to drive the standard `initialize` + `session/new` (or `session/load`)
-sequence and return a live `ACP.Client`. `handler` is an `ACP.Handler`
-subtype (see `ChatHandler` in chat.jl) that owns the routing of
-agent→client requests and `session/update` notifications.
+sequence and return `(client::ACP.Client, replay::Vector{ACP.Message})` —
+`replay` is the resumed session's history captured during `session/load`
+(empty for a fresh `session/new`). `handler` is an `ACP.Handler`
+subtype — for the chat that's `ACP.FSRequestHandler`, which serves the
+agent→client `fs/*` RPCs. Session updates are NOT handled here; they
+arrive as the `Channel{Message}` returned by `ACP.prompt!` per turn.
 """
 abstract type ChatTransport <: ACP.Transport end
 
@@ -76,7 +79,26 @@ WorkerTransport(state::ServerState, worker_id::AbstractString,
                      resume_session_id, Ref{Any}(nothing))
 
 function ACP.send(t::WorkerTransport, line::AbstractString)
-    HTTP.WebSockets.send(t.ws[], rstrip(line, '\n'))
+    ws = t.ws[]
+    ws === nothing && return nothing
+    # The worker session can end (ws write-closed) between a line being queued
+    # and delivered — e.g. a `session/cancel` notification arriving just after
+    # the agent's connection dropped ("ACP session ended"). A closed transport
+    # has nothing to deliver; the connection's death is detected on the recv
+    # side (returns ""), which tears down the read loop and fails any pending
+    # requests. So drop the write instead of throwing the bare HTTP
+    # `send() requires !(ws.writeclosed)` ArgumentError up through chat_dispatch!.
+    HTTP.WebSockets.isclosed(ws) && return nothing
+    try
+        HTTP.WebSockets.send(ws, rstrip(line, '\n'))
+    catch e
+        # Race: write side closed between the isclosed check and the send.
+        if e isa ArgumentError || e isa Base.IOError || e isa HTTP.WebSockets.WebSocketError
+            @debug "WorkerTransport.send: connection closed mid-write, dropping line" exception = e
+            return nothing
+        end
+        rethrow(e)
+    end
     return nothing
 end
 
@@ -151,8 +173,14 @@ mcp_list_payload(mcp_servers) =
           "env"     => [Dict("name" => k, "value" => v) for (k,v) in s.env])
      for s in mcp_servers]
 
+# All three bring-ups accept `on_frame` — the optional ACP wire tap passed
+# through to `ACP.Connection` (see `acp_frame_logger`). Threading it here
+# (rather than per-transport state) keeps the tap per-session: a restart
+# builds a fresh Connection and re-arms the tap with it.
+
 # 1. Local: spawn claude-agent-acp, then drive initialize + session/new.
-function start_session(t::LocalTransport, handler::ACP.Handler)
+function start_session(t::LocalTransport, handler::ACP.Handler;
+                       on_frame::Union{Function,Nothing} = nothing)
     isfile(t.agent_bin) || error("claude-agent-acp not found at: $(t.agent_bin)")
     env = merge(Dict(k => v for (k,v) in ENV),
                 Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
@@ -161,7 +189,7 @@ function start_session(t::LocalTransport, handler::ACP.Handler)
     proc = open(Cmd(`$(t.agent_bin)`; env, dir = t.cwd), "r+")
     t.inner[] = ACP.SubprocessTransport(proc)
 
-    conn = ACP.Connection(t, handler)
+    conn = ACP.Connection(t, handler; on_frame)
     ACP.send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
         "clientCapabilities" => Dict("fs" => Dict(
@@ -171,12 +199,16 @@ function start_session(t::LocalTransport, handler::ACP.Handler)
     result = ACP.send_request(conn, "session/new",
                               Dict("cwd" => t.cwd,
                                    "mcpServers" => mcp_list_payload(t.mcp_servers)))
-    return ACP.Client(conn, result["sessionId"], t.cwd)
+    # Local sessions are always fresh (`session/new`) — no resume, no replay.
+    # The raw result rides on the Client (session config: models/modes/…).
+    return ACP.Client(conn, result["sessionId"], t.cwd, ACP._result_dict(result)),
+           ACP.Message[]
 end
 
 # 2. Worker: ask the worker to spawn claude-agent-acp and dial back, then
 #    drive initialize + session/new (or session/load when resuming).
-function start_session(t::WorkerTransport, handler::ACP.Handler)
+function start_session(t::WorkerTransport, handler::ACP.Handler;
+                       on_frame::Union{Function,Nothing} = nothing)
     haskey(t.state.worker_control_ws, t.worker_id) ||
         error("Worker '$(t.worker_id)' is not connected")
 
@@ -204,7 +236,7 @@ function start_session(t::WorkerTransport, handler::ACP.Handler)
     t.ws[] = take_pending!(t.state, ch, sid, 30.0,
                           "open_session on '$(t.worker_id)'")
 
-    conn = ACP.Connection(t, handler)
+    conn = ACP.Connection(t, handler; on_frame)
     ACP.send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
         "clientCapabilities" => Dict("fs" => Dict(
@@ -212,21 +244,26 @@ function start_session(t::WorkerTransport, handler::ACP.Handler)
         "clientInfo"         => Dict("name"    => "BonitoTeam.WorkerTransport",
                                       "version" => "0.1.0")))
 
-    session_id = if t.resume_session_id !== nothing
+    # Resuming → `session/load`, during which the agent re-streams the session's
+    # history as session/update notifications; `replay_history` captures them.
+    # Fresh → `session/new`, no replay. Either way the response carries the
+    # session-config blocks (models/modes/configOptions) — keep it raw on the
+    # Client for typed views downstream.
+    session_id, replay, result = if t.resume_session_id !== nothing
         @info "ACP: resuming session" cwd=t.worker_path resume=t.resume_session_id
-        ACP.send_request(conn, "session/load", Dict(
+        msgs, load_result = ACP.replay_history(conn, Dict(
             "sessionId"  => t.resume_session_id,
             "cwd"        => t.worker_path,
             "mcpServers" => mcp_list,
         ))
-        t.resume_session_id
+        t.resume_session_id, msgs, load_result
     else
-        result = ACP.send_request(conn, "session/new",
+        new_result = ACP.send_request(conn, "session/new",
                                   Dict("cwd" => t.worker_path, "mcpServers" => mcp_list))
-        result["sessionId"]
+        new_result["sessionId"], ACP.Message[], new_result
     end
 
-    return ACP.Client(conn, session_id, t.worker_path)
+    return ACP.Client(conn, session_id, t.worker_path, ACP._result_dict(result)), replay
 end
 
 # 3. Mock: (re-)open the loopback channels, hand them to the test
@@ -234,13 +271,15 @@ end
 #    Channels are recreated each call because `restart_chat_session!`
 #    closes the old transport (killing the old responder) before bringing
 #    up a new one.
-function start_session(t::MockTransport, handler::ACP.Handler)
+function start_session(t::MockTransport, handler::ACP.Handler;
+                       on_frame::Union{Function,Nothing} = nothing)
     if !isopen(t.outgoing); t.outgoing = Channel{String}(t.capacity); end
     if !isopen(t.incoming); t.incoming = Channel{String}(t.capacity); end
     t.on_setup(t.outgoing, t.incoming)
-    conn = ACP.Connection(t, handler)
+    conn = ACP.Connection(t, handler; on_frame)
     ACP.send_request(conn, "initialize", Dict("protocolVersion" => 1))
     result = ACP.send_request(conn, "session/new",
                               Dict("cwd" => t.cwd, "mcpServers" => []))
-    return ACP.Client(conn, result["sessionId"], t.cwd)
+    return ACP.Client(conn, result["sessionId"], t.cwd, ACP._result_dict(result)),
+           ACP.Message[]
 end

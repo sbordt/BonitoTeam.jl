@@ -65,6 +65,14 @@ function serve(; host::String        = "0.0.0.0",
         w.status = :offline
     end
 
+    # Survive long browser disconnects (phone goes into pocket, laptop sleeps,
+    # network blip) by keeping SOFT_CLOSED sessions alive for an hour, so the
+    # browser can reconnect to the SAME session with all of its Observable
+    # state — current view, popup geometry, chat consumer task — intact.
+    # The new-tab case still falls back to the localStorage last-route memory
+    # wired in the sidebar onload.
+    Bonito.set_cleanup_time!(1.0)   # hours
+
     # Single-page app: sidebar + dashboard/chat swap. No per-project routes.
     srv = Bonito.Server(unified_app(state), host, port; proxy_url = ".")
     state.srv = srv
@@ -73,7 +81,13 @@ function serve(; host::String        = "0.0.0.0",
     # AND EADDRINUSE → port+1 retry without us tracking the actual port.
     base_url = something(public_url, Bonito.online_url(srv, ""))
     add_install_routes!(srv, base_url, worker_secret)
+    add_acp_log_routes!(srv, state)
     add_worker_ws_routes!(srv, state)
+
+    # ONE server-wide loop that tails every live background bash's output file
+    # and finalizes it when the shell exits (the agent backgrounds the shell and
+    # only hands back a file path — it doesn't stream). See chat.jl.
+    start_background_task_poller!(state)
 
     @info "BonitoTeam dashboard running" url=Bonito.online_url(srv, "") state=sd
     @info "Worker install — run on each agent machine" *
@@ -116,15 +130,228 @@ function add_install_routes!(srv::Bonito.Server, public_url::String, worker_secr
     end)
 end
 
-# Substitute the server URL + shared secret into a templated install script.
-# install.jl guards against being run with the `{{ }}` placeholders intact, so
-# a raw fetch of any asset (bypassing these routes) fails loudly.
+# ── ACP wire-frame log routes ────────────────────────────────────────────────
+#
+# /acp-log            — HTML index of projects that have an acp.jsonl
+# /acp-log/<pid>      — the raw JSONL (one {"ts","dir","msg"} envelope per
+#                       line), append-only, written by `acp_frame_logger`.
+#                       Refresh the tab to see new frames.
+#
+# Served straight from disk (state_dir/chats/<pid>/acp.jsonl) so logs are
+# readable even when no live ChatModel exists for the project. Legacy
+# project-id-less chats (<cwd>/.bonitoTeam) are deliberately NOT exposed.
+function add_acp_log_routes!(srv::Bonito.Server, state::ServerState)
+    index_handler = function(context)
+        chats_root = joinpath(state.state_dir, "chats")
+        ids = isdir(chats_root) ?
+            filter(id -> isfile(joinpath(chats_root, id, "acp.jsonl")),
+                   sort!(readdir(chats_root))) :
+            String[]
+        items = map(ids) do id
+            p = get(state.projects[], id, nothing)
+            label = esc_html(p === nothing ? id : "$(p.name) ($id)")
+            "<li><a href=\"/acp-log/$id\">$label</a></li>"
+        end
+        body = isempty(items) ?
+            "<p>No ACP logs yet — open a chat and send a message.</p>" :
+            "<ul>" * join(items) * "</ul>"
+        html = "<!doctype html><html><head><meta charset=\"utf-8\">" *
+               "<title>ACP wire logs</title></head>" *
+               "<body><h1>ACP wire logs</h1>$body</body></html>"
+        HTTP.Response(200, ["Content-Type" => "text/html; charset=utf-8"], body=html)
+    end
+    # Both slash variants — String routes match the URI path exactly, so
+    # "/acp-log/" (what a browser autocompletes to) needs its own entry.
+    Bonito.route!(srv, "/acp-log"  => index_handler)
+    Bonito.route!(srv, "/acp-log/" => index_handler)
+    Bonito.route!(srv, ACP_LOG_ROUTE_RE => function(context)
+        acp_log_response(state, String(context.match.captures[1]))
+    end)
+end
+
+# `request.target` includes the query string, hence the `($|\?)` arm; the
+# `/?` tolerates a trailing slash after the id. The charset (no `.`, no `/`)
+# makes path traversal impossible.
+const ACP_LOG_ROUTE_RE = r"^/acp-log/([A-Za-z0-9_-]+)/?(?:$|\?)"
+
+# Plain function (no live HTTP server needed) so tests can call it directly.
+function acp_log_response(state::ServerState, project_id::AbstractString)
+    # Defense-in-depth: the route regex already constrains the charset, but
+    # never join an unvalidated id into a filesystem path.
+    occursin(r"^[A-Za-z0-9_-]+$", project_id) ||
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "invalid project id\n")
+    path = joinpath(state.state_dir, "chats", String(project_id), "acp.jsonl")
+    isfile(path) ||
+        return HTTP.Response(404, ["Content-Type" => "text/plain; charset=utf-8"],
+                             body = "no ACP log for project '$project_id'\n")
+    return HTTP.Response(200,
+        ["Content-Type"  => "text/plain; charset=utf-8",
+         "Cache-Control" => "no-cache"],
+        body = read(path, String))
+end
+
+esc_html(s::AbstractString) = replace(s,
+    "&" => "&amp;", "<" => "&lt;", ">" => "&gt;", "\"" => "&quot;")
+
+# Substitute the server URL + shared secret + git rev into a templated install
+# script. install.jl guards against being run with the `{{ }}` placeholders
+# intact, so a raw fetch of any asset (bypassing these routes) fails loudly.
 function render_install_script(template::AbstractString,
                                  public_url::String, worker_secret::String)
+    bonito_url, bonito_rev = current_bonito_install_spec()
     replace(template,
         "{{SERVER_URL}}"    => public_url,
         "{{WORKER_SECRET}}" => worker_secret,
+        "{{REV}}"           => current_repo_rev(),
+        "{{BONITO_URL}}"    => bonito_url,
+        "{{BONITO_REV}}"    => bonito_rev,
     )
+end
+
+"""
+    current_repo_rev() -> String
+
+Branch (or sha) the server is currently running from, used to template the
+worker `install.jl` so a fresh `curl … | sh` lands the workers on the exact
+same revision the server is serving. Lets a dev iterate on a feature branch
+without users needing to know its name — they just re-run the curl one-liner.
+
+Resolves in order:
+
+  1. `BONITOTEAM_INSTALL_REV` env var (escape hatch for ops who want to pin
+     workers to a stable tag while running the server from `main`).
+  2. The monorepo's checked-out branch (best-effort via `git rev-parse
+     --abbrev-ref HEAD`; falls back to the exact sha when the repo is in
+     detached-HEAD state).
+  3. Fallback `"main"` if we can't locate the monorepo (e.g. the package
+     was installed via `Pkg.add` from the registry — no git working tree).
+
+Called per request so a `git checkout` on the server side propagates to the
+next worker install without restarting.
+"""
+function current_repo_rev()
+    override = get(ENV, "BONITOTEAM_INSTALL_REV", "")
+    isempty(override) || return override
+
+    pkg = pkgdir(@__MODULE__)
+    pkg === nothing && return "main"
+    # `pkgdir` returns `<monorepo>/BonitoTeam`; the monorepo (where `.git`
+    # lives) is one level up. `.git` may be a directory (normal clone) or a
+    # file (submodule / worktree); both count.
+    repo_root = abspath(pkg, "..")
+    return _git_head_ref_of(repo_root, "main")
+end
+
+# Helper: best-effort `(branch | sha)` for a working-tree path. Returns
+# `default` when the path isn't a git checkout or git refuses to answer.
+function _git_head_ref_of(path::AbstractString, default::AbstractString)
+    ispath(joinpath(path, ".git")) || return default
+    try
+        branch = strip(read(`git -C $path rev-parse --abbrev-ref HEAD`, String))
+        branch == "HEAD" && return strip(read(`git -C $path rev-parse HEAD`, String))
+        return String(branch)
+    catch e
+        @debug "_git_head_ref_of: git resolve failed" path exception=e
+        return default
+    end
+end
+
+"""
+    current_bonito_install_spec() -> (url::String, rev::String)
+
+The `(url, rev)` pair the worker should pin Bonito at, so the worker's eval
+sessions (which `BonitoMCP` proxies through) use the SAME Bonito version
+the server ships its dashboard with — without that, a fresh worker installed
+via `curl … | sh` resolves Bonito off the registry and the remote-app
+protocol (proxy frames, dial-back, `id_prefix`) drifts vs. the server's.
+
+Resolution order, mirroring `current_repo_rev`:
+
+  1. `BONITOTEAM_BONITO_URL` + `BONITOTEAM_BONITO_REV` env vars
+     (ops can pin workers to a published tag while the server itself
+     dev-tracks a path).
+  2. The active project's `[sources]` `Bonito = {url, rev}` literal
+     (the normal case when the monorepo's Project.toml pins a feature
+     branch).
+  3. `[sources]` `Bonito = {path = "..."}` (the dev case where Bonito is
+     dev'd next to the monorepo): walk into the path and derive
+     `url = remote.origin.url`, `rev = current branch | sha`. This is
+     what makes `git checkout` on the dev's Bonito propagate to workers.
+  4. Fallback `(github.com/SimonDanisch/Bonito.jl, "main")`.
+"""
+function current_bonito_install_spec()
+    url_env = get(ENV, "BONITOTEAM_BONITO_URL", "")
+    rev_env = get(ENV, "BONITOTEAM_BONITO_REV", "")
+    (!isempty(url_env) && !isempty(rev_env)) && return (url_env, rev_env)
+
+    default_url = "https://github.com/SimonDanisch/Bonito.jl.git"
+    default_rev = "main"
+    bonito_uuid = Base.UUID("824d6782-a2ef-11e9-3a09-e5662e0c26f8")
+
+    # 1. Project file `[sources]` literal — the common monorepo case.
+    project_file = Base.active_project()
+    if project_file !== nothing
+        try
+            proj = Pkg.Types.read_project(project_file)
+            src = get(proj.sources, "Bonito", nothing)
+            if src !== nothing && haskey(src, "url")
+                return (String(src["url"]),
+                        String(get(src, "rev", default_rev)))
+            elseif src !== nothing && haskey(src, "path")
+                p = String(src["path"])
+                abs_p = isabspath(p) ? p :
+                        normpath(joinpath(dirname(project_file), p))
+                got = _spec_from_git_path(abs_p, default_url, default_rev)
+                got === nothing || return got
+            end
+        catch e
+            @debug "current_bonito_install_spec: read_project failed" exception=e
+        end
+    end
+
+    # 2. Manifest's resolved Bonito entry. Covers two cases the `[sources]`
+    # path above misses: (a) the outer dev project Pkg.develop'd Bonito so
+    # there's no project-level `[sources]` block, only a path in the
+    # manifest; (b) Bonito is `Pkg.add`'d directly from a git url+rev (so
+    # `git_source` / `git_revision` come through populated). For path-tracked,
+    # walk the working tree the same way as the `[sources]` path branch.
+    try
+        deps = Pkg.dependencies()
+        if haskey(deps, bonito_uuid)
+            info = deps[bonito_uuid]
+            if info.git_source !== nothing && info.git_revision !== nothing
+                return (String(info.git_source), String(info.git_revision))
+            end
+            if info.is_tracking_path && info.source isa AbstractString
+                got = _spec_from_git_path(String(info.source),
+                                          default_url, default_rev)
+                got === nothing || return got
+            end
+        end
+    catch e
+        @debug "current_bonito_install_spec: dependencies probe failed" exception=e
+    end
+
+    return (default_url, default_rev)
+end
+
+# Resolve a working-tree path into a `(remote_url, branch_or_sha)` pair.
+# Returns `nothing` if the path isn't a usable git checkout — callers fall
+# back to their own defaults.
+function _spec_from_git_path(path::AbstractString,
+                              default_url::AbstractString,
+                              default_rev::AbstractString)
+    isdir(path) || return nothing
+    try
+        remote = strip(read(`git -C $path config --get remote.origin.url`, String))
+        rev    = _git_head_ref_of(path, default_rev)
+        url    = isempty(remote) ? default_url : String(remote)
+        return (url, rev)
+    catch e
+        @debug "_spec_from_git_path: probe failed" path exception=e
+        return nothing
+    end
 end
 
 # WebSocket routes (worker-side connection terminus). Each closure captures
@@ -137,4 +364,7 @@ function add_worker_ws_routes!(srv::Bonito.Server, state::ServerState)
         handle_worker_acp(state, ws))
     Bonito.HTTPServer.websocket_route!(srv, "/transfer-ws" => (_ctx, ws) ->
         handle_transfer_ws(state, ws))
+    # Eval workers (BonitoMCP) dial here to be driven for interactive app proxying.
+    Bonito.HTTPServer.websocket_route!(srv, "/eval-ws" => (_ctx, ws) ->
+        handle_eval_ws(state, ws))
 end

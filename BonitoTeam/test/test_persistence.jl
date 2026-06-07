@@ -22,7 +22,7 @@ function roundtrip(msgs::Vector)
                 BonitoTeam.finalize_agent(session, m)
             elseif m isa BonitoTeam.ToolMsg
                 BonitoTeam.append_tool(session, m)
-            elseif m isa BonitoTeam.PlanMsg
+            elseif m isa BonitoTeam.TodoListMsg
                 BonitoTeam.append_plan(session, m)
             end
         end
@@ -83,8 +83,9 @@ end
     end
 
     @testset "tool message round-trips (kind/status/id/title/summary)" begin
-        loaded = roundtrip([BonitoTeam.ToolMsg("t1", "execute", "ls -la",
-                                               "completed", "12 files")])
+        loaded = roundtrip([BonitoTeam.GenericToolMsg("t1", "execute", "ls -la",
+                                                      "completed", "12 files",
+                                                      0.0, 0.0, nothing)])
         @test length(loaded) == 1
         t = loaded[1]
         @test t isa BonitoTeam.ToolMsg
@@ -96,13 +97,13 @@ end
     end
 
     @testset "plan message round-trips" begin
-        loaded = roundtrip([BonitoTeam.PlanMsg([
+        loaded = roundtrip([BonitoTeam.TodoListMsg([
             BonitoTeam.PlanEntry("step one", "", "completed"),
             BonitoTeam.PlanEntry("step two", "", "pending"),
         ])])
         @test length(loaded) == 1
         p = loaded[1]
-        @test p isa BonitoTeam.PlanMsg
+        @test p isa BonitoTeam.TodoListMsg
         @test [(e.content, e.status) for e in p.entries] ==
               [("step one", "completed"), ("step two", "pending")]
     end
@@ -110,7 +111,8 @@ end
     @testset "mixed conversation preserves order" begin
         loaded = roundtrip([
             BonitoTeam.UserMsg("hi"),
-            BonitoTeam.ToolMsg("t1", "execute", "ls", "completed", "ok"),
+            BonitoTeam.GenericToolMsg("t1", "execute", "ls", "completed", "ok",
+                                      0.0, 0.0, nothing),
             BonitoTeam.AgentMsg("a1", "## Result\n\nAll done."),
         ])
         @test length(loaded) == 3

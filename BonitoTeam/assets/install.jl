@@ -19,13 +19,25 @@
 import Pkg
 
 const REPO   = "https://github.com/SimonDanisch/BonitoTeam.jl"
-const REV    = "main"
+# Templated by the server (`render_install_script`) to whatever branch /
+# tag / sha the server is itself running from — so a dev iterating on a
+# feature branch can `curl … | sh` workers onto the same code without
+# users needing to know its name. See server.jl :: current_repo_rev.
+const REV    = "{{REV}}"
 const SERVER = "{{SERVER_URL}}"
 const SECRET = "{{WORKER_SECRET}}"
+# Bonito (the UI / proxy library) is pinned to the SERVER's version so
+# remote-app frames / dial-back / id_prefix all match across the wire.
+# Templated from the server's `[sources]` Bonito = {url, rev} entry —
+# see server.jl :: current_bonito_install_spec.
+const BONITO_URL = "{{BONITO_URL}}"
+const BONITO_REV = "{{BONITO_REV}}"
 
 # Guard against running the raw template (the `{{ }}` are intact only if this
 # file wasn't fetched through the server's rendering route).
-if startswith(SERVER, "{{") || startswith(SECRET, "{{")
+if startswith(SERVER, "{{") || startswith(SECRET, "{{") ||
+        startswith(REV, "{{") || startswith(BONITO_URL, "{{") ||
+        startswith(BONITO_REV, "{{")
     error("install.jl must be fetched from a running BonitoTeam server: " *
           "`curl -fsSL <server-url>/install.jl | julia -`")
 end
@@ -84,15 +96,53 @@ end
 # All three come from the same repo/rev so they resolve as one set.
 println("\n==> Installing into shared @bonito-team env")
 Pkg.activate("bonito-team"; shared = true)
-Pkg.add([
-    Pkg.PackageSpec(url = REPO, subdir = "RemoteSync",   rev = REV),
-    Pkg.PackageSpec(url = REPO, subdir = "BonitoWorker", rev = REV),
-    Pkg.PackageSpec(url = REPO, subdir = "BonitoMCP",    rev = REV),
-])
+const SPECS = [
+    Pkg.PackageSpec(name = "RemoteSync",   url = REPO, subdir = "RemoteSync",   rev = REV),
+    Pkg.PackageSpec(name = "BonitoWorker", url = REPO, subdir = "BonitoWorker", rev = REV),
+    Pkg.PackageSpec(name = "BonitoMCP",    url = REPO, subdir = "BonitoMCP",    rev = REV),
+    # Ship Bonito at the server's exact version. BonitoMCP doesn't declare it
+    # as a dep (so a user's own project can supply theirs for bt_julia_eval),
+    # but `bt_show_app`'s temp-env path (`seed_temp_env_with_bonito!`) looks
+    # this up via `Pkg.dependencies()` against the @bonito-team env — without
+    # it we'd fall through to whatever the registry has and the remote-app
+    # protocol drifts. Pinned to the server-templated url+rev.
+    Pkg.PackageSpec(name = "Bonito", url = BONITO_URL, rev = BONITO_REV),
+]
+
+# Capture the pre-install tree-shas for the three packages so we can detect
+# whether re-running the installer actually moved them forward. `Pkg.add` on
+# an already-installed package is a no-op against the manifest-pinned sha;
+# `Pkg.update` is the call that fetches the current HEAD of `rev`. We run
+# both — `add` for the fresh-install path, `update` to force a refresh on
+# re-install. Without the explicit `update` the installer silently keeps the
+# user on the manifest's frozen sha forever.
+function _tree_shas()
+    deps = Pkg.dependencies()
+    Dict(p.name => p.tree_hash for p in values(deps)
+         if p.name in ("RemoteSync", "BonitoWorker", "BonitoMCP", "Bonito"))
+end
+before = _tree_shas()
+Pkg.add(SPECS)        # idempotent: handles the fresh-install path
+Pkg.update(SPECS)     # forces a re-pin against `rev`'s current HEAD
 Pkg.precompile()
+after = _tree_shas()
+
+# Diff: which packages actually moved? Used by `BonitoWorker.install!` to
+# decide whether a live background worker / running service needs to be
+# restarted to pick up the new code.
+code_changed = any(get(before, k, nothing) != get(after, k, nothing)
+                   for k in keys(after))
+if code_changed
+    bumped = [k for k in sort(collect(keys(after)))
+              if get(before, k, nothing) != get(after, k, nothing)]
+    println("    code updated   : ", join(bumped, ", "))
+else
+    println("    code unchanged : already at $(REV) HEAD")
+end
 
 # ── Configure + launch ───────────────────────────────────────────────────────
 import BonitoWorker
 BonitoWorker.install!(; server_url    = SERVER,
                          secret        = SECRET,
-                         projects_root = pwd())
+                         projects_root = pwd(),
+                         code_changed  = code_changed)

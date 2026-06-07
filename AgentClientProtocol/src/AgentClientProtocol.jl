@@ -5,6 +5,7 @@ using Base64
 
 include("types.jl")
 include("connection.jl")
+include("messages.jl")
 include("client.jl")
 
 export Client, MCPServer, ImageAttachment, prompt!, cancel!
@@ -15,10 +16,14 @@ export SessionUpdate, AgentMessageChunk, UserMessageChunk, AgentThoughtChunk
 export ToolCallNotif, ToolCallUpdateNotif, PlanUpdate, UnknownUpdate
 export TextContent, ImageContent, DiffContent, ToolCallLocation, PlanEntry
 export parse_tool_content_item, parse_session_update, parse_location
+# Typed tool-call family — downstream consumers dispatch on these instead of
+# probing strings on the generic ACP `tool.kind`.
+export ToolCall, GenericTool, BashCall, TodoWriteCall, TaskCall, MCPCall
 
-# `send`, `recv`, `on_update`, `on_request` are dispatched verbs that callers
-# overload on their concrete Transport / Handler types. Intentionally NOT
-# exported — `send` would collide with `Sockets.send`, and the handler verbs
-# are package-namespaced to avoid clashes with user code.
+# `send`, `recv`, `on_request` are dispatched verbs that callers overload on
+# their concrete Transport / Handler types. Intentionally NOT exported — `send`
+# would collide with `Sockets.send`, and `on_request` is package-namespaced to
+# avoid clashes with user code. `prompt_updates`/`parse_update!`/`TurnState` are
+# internal to `prompt!` and likewise unexported.
 
 end

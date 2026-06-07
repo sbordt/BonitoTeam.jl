@@ -67,7 +67,7 @@ record(name, ok) = push!(results, name => ok)
 try
     p1_idx = TH.eval_js(ctx, """(() => {
         const items = document.querySelectorAll('.bt-side-item .bt-side-name');
-        for (let i = 0; i < items.length; i++) if (items[i].innerText === 'Project1') return i;
+        for (let i = 0; i < items.length; i++) if (items[i].innerText.split(' · ')[0] === 'Project1') return i;
         return -1; })()""")
     TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[$p1_idx].click()""")
     @assert TH.wait_for(ctx, "document.querySelector('.bt-text-input') !== null") "no chat"
@@ -93,23 +93,18 @@ try
                        return slot && slot.querySelector('img') !== null;
                    })()
                """; timeout = 6.0))
-        # The img src should be a base64 data URI for image/png.
-        src_starts_with = TH.eval_js(ctx, """
+        # bt_show points <img src> at a served Bonito.Asset (range-capable),
+        # NOT a multi-MB data: blob. The src resolves to a /assets/<key> URL.
+        img_src = TH.eval_js(ctx, """
             (() => {
                 const img = document.querySelector('.bt-tool-body[data-tool-id="show-1"] img');
-                return img ? img.src.slice(0, 22) : null;
+                return img ? img.src : null;
             })()
         """)
-        record("img src is data:image/png;base64",
-               @TH.test_eq src_starts_with "data:image/png;base64,")
-        # Caption with relpath should be present too.
-        caption_has_path = TH.eval_js(ctx, """
-            (() => {
-                const slot = document.querySelector('.bt-tool-body[data-tool-id="show-1"]');
-                return slot && (slot.innerText || '').indexOf('show/tiny.png') !== -1;
-            })()
-        """)
-        record("caption shows relpath", @TH.test_true caption_has_path)
+        record("img src is a served /assets/ URL (not a data: blob)",
+               @TH.test_true (img_src isa AbstractString
+                              && !startswith(img_src, "data:")
+                              && occursin("/assets/", img_src)))
     end
 
     TH.section("Text preview — Monaco read-only inside tool body") do

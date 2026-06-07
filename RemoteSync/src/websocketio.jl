@@ -20,9 +20,10 @@ mutable struct WebSocketIO{WS} <: IO
     outbuf    :: IOBuffer             # accumulates writes until `flush`
     closed    :: Bool
     eof_seen  :: Bool                 # true once the peer has closed
+    wlock     :: ReentrantLock        # serializes concurrent multi-write messages (Malt _serialize_msg)
 end
 
-WebSocketIO(ws) = WebSocketIO{typeof(ws)}(ws, UInt8[], 1, IOBuffer(), false, false)
+WebSocketIO(ws) = WebSocketIO{typeof(ws)}(ws, UInt8[], 1, IOBuffer(), false, false, ReentrantLock())
 
 # Transport surface: receive the next frame (returns `nothing` on close),
 # send one frame, and report whether the underlying transport is closed.
@@ -142,3 +143,27 @@ function Base.flush(io::WebSocketIO)
     send_frame!(io.ws, take!(io.outbuf))
     return nothing
 end
+
+# Read exactly `n` bytes into `p`, refilling frames as needed (or throw EOFError).
+# Needed by `Serialization.deserialize` and `read(io, ::Type{T})` for bitstypes
+# (e.g. the UInt64 message id in the Malt wire protocol).
+function Base.unsafe_read(io::WebSocketIO, p::Ptr{UInt8}, n::UInt)
+    nr = 0
+    while nr < n
+        if io.inpos > length(io.inbuf)
+            _refill!(io) || throw(EOFError())
+        end
+        avail = length(io.inbuf) - io.inpos + 1
+        take = min(avail, Int(n) - nr)
+        GC.@preserve io unsafe_copyto!(p + nr, pointer(io.inbuf, io.inpos), take)
+        io.inpos += take
+        nr += take
+    end
+    return nothing
+end
+
+# Lock so concurrent multi-`write` messages (Malt's `_serialize_msg`: type, id,
+# serialized payload, boundary, flush) don't interleave into `outbuf`.
+Base.lock(io::WebSocketIO)    = lock(io.wlock)
+Base.unlock(io::WebSocketIO)  = unlock(io.wlock)
+Base.trylock(io::WebSocketIO) = trylock(io.wlock)

@@ -1,4 +1,5 @@
-import CommonMark as CM
+# `CM` is `import CommonMark as CM` in BonitoTeam.jl — hoisted so chat.jl's
+# const CommonMark parser resolves at include time.
 
 # Session metadata + file path
 struct ChatSession
@@ -55,6 +56,38 @@ end
 
 session_file(chat_dir::AbstractString) = joinpath(String(chat_dir), "chat.md")
 
+# ── ACP wire-frame log ──────────────────────────────────────────────────────
+# Raw ACP JSON-RPC traffic (both directions), one envelope per line:
+#   {"ts": "2026-06-05T12:34:56.789Z", "dir": "in"|"out", "msg": <frame>}
+# Append-only, lives next to chat.md; served read-only via /acp-log/<pid>.
+
+acp_log_file(chat_dir::AbstractString) = joinpath(String(chat_dir), "acp.jsonl")
+
+"""
+    acp_frame_logger(chat_dir) -> Function
+
+Build an `on_frame` tap (see `AgentClientProtocol.Connection`) that appends
+every ACP frame to `chat_dir/acp.jsonl`. Per-call open-append: frames are
+low-rate (claude-agent-acp chunks are paragraph-sized), and holding no handle
+means restarts / external deletion need no lifecycle handling. The lock
+serializes the reader task (`:in`) against sender tasks (`:out`).
+"""
+function acp_frame_logger(chat_dir::AbstractString)
+    path = acp_log_file(chat_dir)
+    lk = ReentrantLock()
+    return function (dir::Symbol, msg::AbstractDict)
+        ts = Dates.format(now(UTC), dateformat"yyyy-mm-dd\THH:MM:SS.sss\Z")
+        lock(lk) do
+            open(path, "a") do io
+                JSON.print(io, Dict{String,Any}(
+                    "ts" => ts, "dir" => String(dir), "msg" => msg))
+                println(io)
+            end
+        end
+        return nothing
+    end
+end
+
 # Per-tool JSON snapshot of the latest ACP params (the wire format itself), so
 # tool bodies survive restarts and don't have to live in process memory.
 function tools_dir(chat_dir::AbstractString)
@@ -66,15 +99,26 @@ end
 tool_file(chat_dir::AbstractString, tool_id::AbstractString) =
     joinpath(tools_dir(chat_dir), String(tool_id) * ".json")
 
-# ACP sends either a full snapshot (initial notif + final update with content)
-# or status-only updates with `content: []`. We only persist when there's real
-# content; status/title transitions live in memory on ToolMsg.
-function update_tool_file!(chat_dir::AbstractString, tool_id::AbstractString, params::AbstractDict)
-    content = get(params, "content", nothing)
-    (content === nothing || isempty(content)) && return nothing
-    path = tool_file(chat_dir, tool_id)
-    open(io -> JSON.print(io, params), path, "w")
-    return params
+# Persist a tool's parsed content blocks so the lazily-loaded body survives
+# restarts. We serialize the typed `Vector{ToolContent}` back to the same
+# `{"content": [...]}` shape `load_tool_content` reads (the inverse of
+# `parse_tool_content_item`) — no raw wire dict round-trips through the chat.
+# Status-only updates carry no content, so there's nothing to persist.
+tool_content_to_dict(c::DiffContent) = Dict{String,Any}(
+    "type" => "diff", "path" => c.path, "oldText" => c.old_text, "newText" => c.new_text)
+tool_content_to_dict(c::TextContent) = Dict{String,Any}(
+    "type" => "content", "content" => Dict{String,Any}("type" => "text", "text" => c.text))
+tool_content_to_dict(c::ImageContent) = Dict{String,Any}(
+    "type" => "content", "content" => Dict{String,Any}(
+        "type" => "image", "data" => c.data, "mimeType" => c.mime_type))
+
+function persist_tool_content!(chat_dir::AbstractString, tc::AgentClientProtocol.ToolCall)
+    isempty(tc.content) && return nothing
+    path = tool_file(chat_dir, tc.id)
+    open(path, "w") do io
+        JSON.print(io, Dict("content" => [tool_content_to_dict(c) for c in tc.content]))
+    end
+    return nothing
 end
 
 function load_tool_file(chat_dir::AbstractString, tool_id::AbstractString)::Union{AbstractDict,Nothing}
@@ -181,7 +225,10 @@ end
 
 function append_tool(session::ChatSession, msg::ToolMsg)
     open(session.path, "a") do io
-        meta = "$(msg.kind) · $(msg.status) · $(msg.id)"
+        # 4th field: the resolved filter key (`tool_key`) — persisting it makes
+        # the typed variants (Bash/Task/MCP…) reload with stable per-tool
+        # filter identities even though reload lands as `GenericToolMsg`.
+        meta = "$(msg.kind) · $(msg.status) · $(msg.id) · $(tool_key(msg))"
         println(io, "!!! tool \"$meta\"")
         println(io, "    `$(msg.title)`")
         # Brief summary on the collapsed header; full ACP body lives in
@@ -194,13 +241,26 @@ function append_tool(session::ChatSession, msg::ToolMsg)
     end
 end
 
-function append_plan(session::ChatSession, msg::PlanMsg)
+function append_plan(session::ChatSession, msg::TodoListMsg)
     open(session.path, "a") do io
         println(io, "!!! plan")
         # Write as plain lines (not markdown list) so admonition_text can round-trip them
         for e in msg.entries
             mark = e.status == "completed" ? "x" : " "
             println(io, "    [$mark] $(e.content)")
+        end
+        println(io)
+    end
+end
+
+# `/compact` summary boundary, persisted under its own block so reload doesn't
+# have to re-classify by matching the verbatim Claude Code prefix every time.
+function append_summary(session::ChatSession, msg::SummaryMsg)
+    isempty(strip(msg.text)) && return
+    open(session.path, "a") do io
+        println(io, "!!! summary \"$(now(UTC))\"")
+        for line in split(msg.text, '\n')
+            println(io, "    ", line)
         end
         println(io)
     end
@@ -259,9 +319,13 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
         elseif category == "assistant"
             push!(msgs, AgentMsg(string(length(msgs)), String(body)))
         elseif category == "tool"
-            # title encodes "kind · status · id"
-            parts = split(title, " · "; limit = 3)
-            kind, status, id = length(parts) == 3 ? parts : ("other", "completed", "")
+            # title encodes "kind · status · id · name" — the 4th field (the
+            # tool's filter key) was added later; legacy 3-field chats parse
+            # with an empty name and fall back to filtering by kind.
+            parts = split(title, " · "; limit = 4)
+            kind, status, id, name =
+                length(parts) == 4 ? parts :
+                length(parts) == 3 ? (parts..., "") : ("other", "completed", "", "")
             # body is `` `<tool title>` `` then an optional summary line.
             title_line = match(r"`([^`]*)`", body)
             tool_title = title_line !== nothing ? String(title_line.captures[1]) : ""
@@ -270,8 +334,14 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
                 tail = strip(body[nextind(body, title_line.offset + ncodeunits(title_line.match) - 1):end])
                 summary = String(tail)
             end
-            push!(msgs, ToolMsg(string(id), string(kind), tool_title,
-                                string(status), summary))
+            # Reload always lands as the generic variant — by the time chat.md
+            # was written, every tool had reached terminal status, so the
+            # subtype-specific fields (background flag, MCP server, …) no
+            # longer drive any live UX. New tool calls in the resumed session
+            # come through the typed dispatcher again.
+            push!(msgs, GenericToolMsg(string(id), string(kind), string(name),
+                                       tool_title, string(status), summary,
+                                       time(), time(), nothing))
         elseif category == "plan"
             entries = PlanEntry[]
             for line in split(body, '\n')
@@ -280,9 +350,17 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
                 status = m.captures[1] == "x" ? "completed" : "pending"
                 push!(entries, PlanEntry(String(m.captures[2]), "", status))
             end
-            isempty(entries) || push!(msgs, PlanMsg(entries))
+            isempty(entries) || push!(msgs, TodoListMsg(string(uuid4()), entries,
+                                                        time(), time(), nothing))
+        elseif category == "thought"
+            # `!!! thought "<id>"` — reload the (non-empty) reasoning so a
+            # reopened chat keeps the trail. `title` is the original thought id
+            # so the lazy `thought.render` round-trip still finds it.
+            isempty(strip(body)) || push!(msgs, ThoughtMsg(String(title), String(body)))
+        elseif category == "summary"
+            # `/compact` boundary — centered separator, NOT a user bubble.
+            isempty(strip(body)) || push!(msgs, SummaryMsg(String(body)))
         end
-        # `thought` admonitions are intentionally not reloaded (ephemeral).
     end
     return msgs
 end

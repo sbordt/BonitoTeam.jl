@@ -167,7 +167,7 @@ TH.section("Stress 2: 100-msg burst from Julia") do
             timeout = 8)
 
         for i in 1:100
-            BonitoTeam.chat_push_msg!(model, BonitoTeam.UserMsg("burst-$i"))
+            BonitoTeam.send!(model, BonitoTeam.UserMsg("burst-$i"))
         end
         ok = wait_for_js(w.win,
             "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 110";
@@ -212,7 +212,7 @@ TH.section("Stress 3: two tabs of the same serve(), same project") do
         push!(RESULTS, "multitab: tab A sees seeded count" => wait_total(w1, 6))
         push!(RESULTS, "multitab: tab B sees seeded count" => wait_total(w2, 6))
 
-        BonitoTeam.chat_push_msg!(model, BonitoTeam.UserMsg("broadcast"))
+        BonitoTeam.send!(model, BonitoTeam.UserMsg("broadcast"))
         push!(RESULTS, "multitab: tab A picked up push" => wait_total(w1, 7))
         push!(RESULTS, "multitab: tab B picked up push" => wait_total(w2, 7))
     finally
@@ -267,7 +267,7 @@ TH.section("Stress 5: drop browser mid-stream; reconnect bootstraps") do
         threw = false
         try
             for i in 1:50
-                BonitoTeam.chat_push_msg!(model, BonitoTeam.UserMsg("offline-$i"))
+                BonitoTeam.send!(model, BonitoTeam.UserMsg("offline-$i"))
             end
         catch e
             threw = true
@@ -303,11 +303,12 @@ TH.section("Stress 6: streaming agent chunks via unified_app") do
             "document.querySelector('.bt-messages')?.__bt_chat?.totalCount === 40"; timeout=10)
         sleep(1.0)   # let initial render settle before streaming on top of it
 
-        for text in ["Lorem ", "ipsum ", "dolor ", "sit ", "amet, ",
+        # Stream into one agent bubble via the message-as-target verbs: `send!`
+        # opens it (seeded with the first chunk), `append!` grows it in place.
+        bubble = BonitoTeam.send!(model, BonitoTeam.AgentMsg(model, "Lorem "))
+        for text in ["ipsum ", "dolor ", "sit ", "amet, ",
                      "consectetur ", "adipiscing ", "elit."]
-            upd = BonitoTeam.AgentClientProtocol.AgentMessageChunk(
-                BonitoTeam.AgentClientProtocol.TextContent(text))
-            BonitoTeam.apply!(model, BonitoTeam.AgentUpdate(upd))
+            BonitoTeam.append!(bubble, text)
             sleep(0.3)
         end
         ok = wait_for_js(w.win, """
@@ -341,7 +342,7 @@ TH.section("Stress 7: switch alpha ↔ beta, background push to inactive project
         push!(RESULTS, "switch: alpha shows 6" => ok_a)
 
         # Push to beta while viewing alpha
-        BonitoTeam.chat_push_msg!(b, BonitoTeam.UserMsg("background-beta"))
+        BonitoTeam.send!(b, BonitoTeam.UserMsg("background-beta"))
 
         navigate_to(w.win, "beta")
         # Slower than the seeded-only case — the chat mounts AND has to

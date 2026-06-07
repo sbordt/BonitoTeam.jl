@@ -115,7 +115,7 @@ try
         # Push 3 fresh agent messages server-side. With the rAF stuck,
         # the pre-fix code would never insert them into the DOM.
         for i in 1:3
-            BonitoTeam.chat_push_msg!(model,
+            BonitoTeam.send!(model,
                 BonitoTeam.AgentMsg("bg-test-$i",
                     "background-tab message $i — should appear despite paused rAF"))
         end

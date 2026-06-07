@@ -70,7 +70,7 @@ function create_project!(state::ServerState, name::String, src_path::String,
     isdir(src_path)   || error("Source path is not a directory: $src_path")
 
     w = state.workers[][worker_name]
-    server_path = joinpath(state.working_dir, name)
+    server_path = compute_server_path(state, worker_name, name)
     worker_path = joinpath(w.projects_root, name)
 
     # Idempotent re-import: if the same folder on the same worker is already
@@ -127,30 +127,11 @@ basename in `~/.claude/projects/<encoded>/`), the chat will use ACP's
 chat UI and the agent regains full context. The ID persists across server
 restarts.
 """
-# Raised by `create_project_from_worker!` when a project with the same
-# `name` is already registered under a DIFFERENT `(worker_id, worker_path)`.
-# The UI catches this, shows the `comparison` summaries, and re-invokes
-# the import with an explicit `on_collision` directive (`:take_candidate`,
-# `:keep_existing`, or a renamed import via `name = "..."`).
-struct ProjectCollisionError <: Exception
-    existing::ProjectInfo
-    candidate_worker_name::String
-    candidate_worker_path::String
-    comparison::NamedTuple    # from compare_for_collision
-end
-
-Base.showerror(io::IO, e::ProjectCollisionError) = print(io,
-    "project name '", e.existing.name, "' already bound to worker '",
-    e.existing.worker_id, "' (path: ", e.existing.worker_path, "); ",
-    "candidate is worker '", e.candidate_worker_name, "' at ",
-    e.candidate_worker_path)
-
 function create_project_from_worker!(state::ServerState, worker_name::String,
                                       worker_path::String;
                                       name::String = basename(rstrip(worker_path, '/')),
                                       sync::Bool = false,
                                       resume_session_id::Union{String,Nothing} = nothing,
-                                      on_collision::Symbol = :detect,
                                       start_session::Bool = true,
                                       progress = nothing)
     # `start_session=false` skips the post-registration ACP session
@@ -164,55 +145,28 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
         error("Project name must be alphanumeric/_/- only — got '$name'")
     isempty(worker_path) && error("Worker path is required (pick a folder).")
 
-    # Idempotent re-import: same (worker_name, worker_path) returns the
-    # already-registered project. If this caller supplied a `resume_session_id`
-    # and the existing entry didn't have one, adopt it so the next chat session
-    # uses session/load instead of session/new.
-    existing = find_project_by_location(state, worker_name, worker_path)
+    # Threads: a folder can hold several conversations, identified by
+    # (worker, path, chat_id) where chat_id is the claude session id. Importing
+    # the SAME session id reuses its thread; importing a DIFFERENT session of
+    # the same folder creates a sibling thread; a no-session import
+    # (resume_session_id === nothing) always starts a fresh thread. This is the
+    # fix for "opening a folder→subchat locks that one in".
+    existing = find_thread(state, worker_name, worker_path, resume_session_id)
     if existing !== nothing
-        @info "create_project_from_worker!: reusing existing project" id=existing.id name=existing.name
-        if resume_session_id !== nothing && existing.resume_session_id === nothing
-            existing.resume_session_id = resume_session_id
-            save_projects!(state)
-        end
-        notify_progress(progress, :phase, (msg = "Reusing existing project…",))
+        @info "create_project_from_worker!: reusing existing thread" id=existing.id name=existing.name session=resume_session_id
+        notify_progress(progress, :phase, (msg = "Reusing existing chat…",))
         maybe_start(existing)
         return existing
     end
 
-    # Name collision: a different (worker, path) pair already owns this name.
-    # `on_collision` controls the behaviour:
-    #   :detect          (default) raise ProjectCollisionError with both
-    #                    sides' summaries — the UI catches this and shows
-    #                    the compare panel so the user picks.
-    #   :take_candidate  reassign the existing project to this worker/path
-    #                    (effectively a move; uses transfer_project!).
-    #   :keep_existing   no-op; returns the existing project unchanged.
-    # A renamed import (pass `name = "different"`) skips the collision
-    # check entirely because the names no longer match.
-    name_collider = find_project_by_name(state, name)
-    if name_collider !== nothing
-        if on_collision === :keep_existing
-            @info "create_project_from_worker!: name collision; keeping existing" name id=name_collider.id
-            maybe_start(name_collider)
-            return name_collider
-        elseif on_collision === :take_candidate
-            @info "create_project_from_worker!: name collision; reassigning to candidate" name from=name_collider.worker_id to=worker_name
-            name_collider.worker_id   = worker_name
-            name_collider.worker_path = worker_path
-            name_collider.backup_status = :stale
-            save_projects!(state)
-            safe_notify!(state.projects)
-            maybe_start(name_collider)
-            return name_collider
-        else  # :detect
-            cmp = compare_for_collision(state, name_collider, worker_name, worker_path)
-            throw(ProjectCollisionError(name_collider, worker_name, worker_path, cmp))
-        end
-    end
-
+    # Same-name-different-(worker,path) is NOT a collision: we want to let
+    # each worker have its own "BonitoTeam" project that opens to its own
+    # chat. server_path is disambiguated via `compute_server_path` (which
+    # prefixes the worker name), so the two mirrors live side-by-side.
+    # Reconciling them is an explicit, sync-time operation — not an
+    # open-time decision.
     id = string(uuid4())[1:8]
-    server_path = joinpath(state.working_dir, name)
+    server_path = compute_server_path(state, worker_name, name)
 
     p = ProjectInfo(id, name, worker_name, server_path, worker_path, now(UTC))
     p.resume_session_id = resume_session_id
@@ -341,8 +295,19 @@ function ensure_project_session!(state::ServerState, p::ProjectInfo;
     # The worker reports its BonitoMCP launch as a `julia` binary (`mcp_path`)
     # plus an argv array (`mcp_args`) — no shell wrapper, so it's identical on
     # Windows. claude-agent-acp spawns `command + args` directly.
+    # `env` carries the eval-worker dial-back coordinates so BonitoMCP's eval
+    # session can connect back to the server for interactive app proxying.
+    #
+    # The server name must NOT collide with any MCP server the user has in their
+    # global/project config: claude-agent-acp runs the agent with
+    # settingSources ["user","project","local"], so it ALSO loads the user's
+    # `~/.claude.json` mcpServers. A same-named (e.g. stale/broken) entry there
+    # shadows the one we inject here, and the tools silently vanish. `btworker`
+    # is deliberately specific to avoid that — see `mcp__btworker__*` tool names.
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
-        [AgentClientProtocol.MCPServer("bonitoteam", w.mcp_path; args = w.mcp_args)]
+        [AgentClientProtocol.MCPServer("btworker", w.mcp_path;
+                                       args = w.mcp_args,
+                                       env  = eval_dialback_env(state, p.id))]
 
     # The transport carries everything start_session needs — including the
     # `resume_session_id` so the worker bring-up path uses session/load
@@ -389,7 +354,12 @@ function stop_session!(state::ServerState, p::ProjectInfo)
     end
     # close is idempotent + total now; a real error here is worth surfacing.
     model === nothing || close(model.transport)
+    model === nothing || notify_chats!(state)   # drop from the active-chats sidebar
     release_project!(state, p)
+    # The reaped claude subprocess takes its MCP server + eval worker with it, so
+    # the eval bridge's worker session is gone — tear the bridge down explicitly
+    # (a WS drop alone no longer does; its lifetime is the worker session).
+    teardown_eval_bridge!(state, p.id)
     return nothing
 end
 
@@ -617,7 +587,6 @@ const DashboardStyles = Bonito.Styles(
     # Wrappers around the toggled blocks; semantic class for the test
     # suite to query.
     CSS(".bt-form-wrapper", "display" => "block"),
-    CSS(".bt-discover-wrapper", "display" => "block"),
     CSS(".bt-install-wrap", "display" => "block"),
     CSS(".bt-empty-wrap", "display" => "block"),
     # Per-project cell — sibling to the card slot, currently a thin pass-
@@ -674,12 +643,18 @@ const DashboardStyles = Bonito.Styles(
         "border-radius" => "var(--bt-radius)",
         "padding" => "14px 16px",
         "margin-bottom" => "8px",
-        "display" => "flex", "align-items" => "center",
-        "justify-content" => "space-between", "gap" => "16px",
+        "display" => "flex", "flex-direction" => "column",
+        "align-items" => "stretch", "gap" => "8px",
         "transition" => "border-color 120ms ease, box-shadow 120ms ease"),
     CSS(".bt-card:hover",
         "border-color" => "var(--bt-border-strong)",
         "box-shadow" => "var(--bt-shadow-sm)"),
+    # The top row of a worker card — what `.bt-card` itself used to be (title +
+    # actions on one line). The card is now a column so the nested project
+    # `<details>` can sit beneath the row INSIDE the same pill chrome.
+    CSS(".bt-card-row",
+        "display" => "flex", "align-items" => "center",
+        "justify-content" => "space-between", "gap" => "16px"),
     CSS(".bt-card-body",
         "min-width" => "0", "flex" => "1 1 auto"),
     CSS(".bt-card-title",
@@ -693,6 +668,22 @@ const DashboardStyles = Bonito.Styles(
         "text-overflow" => "ellipsis",
         "white-space" => "nowrap",
         "word-break" => "keep-all"),
+    # Remove-worker affordance: a faint ✕ pinned to the right of the title
+    # row (margin-left:auto), turning red on hover so it reads as destructive.
+    CSS(".bt-card-remove",
+        "margin-left" => "auto",
+        "flex-shrink" => "0",
+        "cursor" => "pointer",
+        "color" => "var(--bt-text-faint)",
+        "font-size" => "13px",
+        "line-height" => "1",
+        "padding" => "2px 6px",
+        "border-radius" => "var(--bt-radius-sm)",
+        "user-select" => "none",
+        "transition" => "background 80ms, color 80ms"),
+    CSS(".bt-card-remove:hover",
+        "background" => "rgba(239,68,68,0.12)",
+        "color" => "var(--bt-error)"),
     # Inline-editable variant for the worker name. Reads as plain text until
     # the user clicks/focuses it; on focus we surface a soft border so it's
     # discoverable that the field is editable.
@@ -714,6 +705,52 @@ const DashboardStyles = Bonito.Styles(
     CSS("input.bt-card-name-edit:focus",
         "background" => "var(--bt-surface-2)",
         "box-shadow" => "inset 0 0 0 1px var(--bt-border-strong)"),
+    # Worker initials `[XX]` tag — small monospace input next to the name.
+    # Width fits ~4 chars + padding; sits flush, shows a subtle pill outline
+    # so it reads as a tag rather than free text.
+    CSS("input.bt-card-initials",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface-2)",
+        "padding" => "1px 6px",
+        "border-radius" => "999px",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "11px",
+        "font-weight" => "600",
+        "color" => "var(--bt-text-muted)",
+        "letter-spacing" => "0.04em",
+        "text-align" => "center",
+        "width" => "44px",
+        "flex-shrink" => "0",
+        "outline" => "none",
+        "cursor" => "text",
+        "transition" => "background 80ms, box-shadow 80ms"),
+    CSS("input.bt-card-initials:hover",
+        "background" => "var(--bt-surface)"),
+    CSS("input.bt-card-initials:focus",
+        "background" => "var(--bt-surface)",
+        "box-shadow" => "inset 0 0 0 1px var(--bt-border-strong)",
+        "color" => "var(--bt-text)"),
+    # `[XX]` pill in front of a project's title — read-only mirror of the
+    # worker's initials. Same pill shape as the editable input above so the
+    # tag reads consistently across worker / project cards.
+    CSS(".bt-card-worker-tag",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface-2)",
+        "padding" => "1px 6px",
+        "border-radius" => "999px",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "11px",
+        "font-weight" => "600",
+        "color" => "var(--bt-text-muted)",
+        "letter-spacing" => "0.04em",
+        "flex-shrink" => "0",
+        "user-select" => "none"),
+    # Folder name shown under the title as a meta line. Same tone as the
+    # rest of `.bt-card-meta`; explicit class so the test suite can target it.
+    CSS(".bt-card-folder-name",
+        "color" => "var(--bt-text-muted)",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "12px"),
     CSS(".bt-card-meta",
         "color" => "var(--bt-text-muted)", "font-size" => "12px",
         "margin-top" => "2px",
@@ -927,21 +964,52 @@ const DashboardStyles = Bonito.Styles(
         "color" => "var(--bt-text-muted)",
         "padding" => "12px", "font-size" => "12px"),
 
-    # ── Discover panel ───────────────────────────────────────────────────────
-    CSS(".bt-discover-panel",
-        "background" => "var(--bt-surface-2)",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius)",
-        "padding" => "14px 16px",
-        "margin-top" => "-4px", "margin-bottom" => "8px"),
+    # ── Discover panel (collapsable <details>) ───────────────────────────────
+    # `<details>` keeps the worker pill compact by default; clicking the header
+    # toggles the folder→threads tree. Rescan inside the summary
+    # preventDefault's the toggle and force-opens, so scan progress is visible.
+    # Nested inside `.bt-card` now — no separate pill chrome (the card's
+    # background/border IS the chrome). A faint top divider separates the
+    # "▸ projects (N)" toggle from the worker title row above it.
+    CSS(".bt-card > details.bt-discover-panel",
+        "background" => "transparent",
+        "border" => "none",
+        "border-top" => "1px solid var(--bt-border)",
+        "border-radius" => "0",
+        "padding" => "8px 0 0", "margin" => "0"),
+    CSS(".bt-card > details.bt-discover-panel[open]", "padding-bottom" => "4px"),
     CSS(".bt-discover-header",
         "display" => "flex", "align-items" => "center",
         "justify-content" => "space-between",
-        "margin-bottom" => "10px"),
+        "cursor" => "pointer", "user-select" => "none",
+        "list-style" => "none",
+        # Add some breathing room between the chevron and title.
+        "gap" => "10px",
+        # The toggle is meant to be unobtrusive — small text, muted by default,
+        # full-color on hover (the :hover rule below).
+        "font-size" => "12px",
+        "color" => "var(--bt-text-muted)"),
+    CSS("details[open] > .bt-discover-header", "margin-bottom" => "10px"),
+    # Hide the default disclosure triangle (Chrome / Safari).
+    CSS(".bt-discover-header::-webkit-details-marker", "display" => "none"),
+    # Custom chevron — matches `.bt-group-summary::before` so the two collapsable
+    # surfaces feel like one design language.
+    CSS(".bt-discover-header::before",
+        "content" => "\"▸\"",
+        "color" => "var(--bt-text-faint)", "font-size" => "10px",
+        "flex-shrink" => "0"),
+    CSS("details.bt-discover-panel[open] > .bt-discover-header::before",
+        "content" => "\"▾\""),
+    CSS(".bt-discover-header:hover",
+        "background" => "var(--bt-surface)"),
     CSS(".bt-discover-title",
-        "font-weight" => "600", "font-size" => "13px"),
+        "font-weight" => "500", "font-size" => "12px",
+        "flex" => "1 1 auto", "min-width" => "0",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "white-space" => "nowrap"),
     CSS(".bt-discover-actions",
-        "display" => "flex", "gap" => "6px", "align-items" => "center"),
+        "display" => "flex", "gap" => "6px", "align-items" => "center",
+        "flex-shrink" => "0"),
 
     CSS(".bt-section-label",
         "font-size" => "10.5px", "font-weight" => "600",
@@ -1033,6 +1101,17 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-group-meta",
         "font-size" => "11px", "color" => "var(--bt-text-faint)",
         "flex-shrink" => "0"),
+    # "+ New thread" in a folder's summary row — reveal on hover so it doesn't
+    # clutter the collapsed list.
+    CSS(".bt-new-thread",
+        "flex-shrink" => "0",
+        "font-size" => "11px", "font-weight" => "500",
+        "color" => "var(--bt-accent)", "cursor" => "pointer",
+        "padding" => "2px 8px", "border-radius" => "var(--bt-radius-sm)",
+        "white-space" => "nowrap",
+        "opacity" => "0", "transition" => "opacity 80ms, background 80ms"),
+    CSS(".bt-group-summary:hover .bt-new-thread", "opacity" => "1"),
+    CSS(".bt-new-thread:hover", "background" => "var(--bt-surface-2)"),
     CSS(".bt-group-body",
         "padding" => "8px 10px 4px",
         "border-top" => "1px solid var(--bt-border)",
@@ -1057,6 +1136,28 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-spinner-sm",
         "width" => "11px", "height" => "11px", "border-width" => "1.5px"),
     CSS("@keyframes bt-spin", CSS("to", "transform" => "rotate(360deg)")),
+
+    # ── Chat loading screen (project_loading_view) ───────────────────────────
+    # Centered in the main panel while a chat's ACP session is brought up, or
+    # to explain that the project's worker is offline.
+    CSS(".bt-loading",
+        "flex" => "1 1 auto",
+        "display" => "flex", "flex-direction" => "column",
+        "align-items" => "center", "justify-content" => "center",
+        "gap" => "12px", "padding" => "40px", "text-align" => "center"),
+    CSS(".bt-loading-spinner",
+        "width" => "30px", "height" => "30px",
+        "border-radius" => "50%",
+        "border" => "3px solid var(--bt-border)",
+        "border-top-color" => "var(--bt-accent)",
+        "animation" => "bt-spin 0.7s linear infinite"),
+    CSS(".bt-loading-glyph", "font-size" => "28px", "opacity" => "0.7"),
+    CSS(".bt-loading-title",
+        "font-size" => "15px", "font-weight" => "600",
+        "color" => "var(--bt-text)"),
+    CSS(".bt-loading-sub",
+        "font-size" => "13px", "color" => "var(--bt-text-muted)",
+        "max-width" => "360px", "line-height" => "1.5"),
 
     # ── Open chat link ───────────────────────────────────────────────────────
     CSS(".bt-link",
@@ -1220,8 +1321,10 @@ const DashboardStyles = Bonito.Styles(
             "gap" => "8px"),
         CSS(".bt-form label",
             "padding-top" => "0", "font-size" => "12px"),
-        # Cards: body + actions stack instead of sitting on one row
-        CSS(".bt-card", "flex-wrap" => "wrap"),
+        # Cards: body + actions stack instead of sitting on one row. The card
+        # is column-flex now (project list lives inside it), so wrapping is on
+        # the top row (`.bt-card-row`) rather than the card itself.
+        CSS(".bt-card-row", "flex-wrap" => "wrap"),
         # Card title row (name + badges): if the natural widths don't all
         # fit, let the pills wrap onto a second row below the name rather
         # than shrinking the name to "Cl..." just to keep one row.
@@ -1495,17 +1598,17 @@ end
 FolderPicker(start::String = pwd()) = FolderPicker(
     Observable(js_path(abspath(start))), Observable(""), Observable(false), Observable(false))
 
-function folder_picker_render(p::FolderPicker)
+function folder_picker_render(session::Bonito.Session, p::FolderPicker)
     up_btn     = Bonito.Button("↑"; style=nothing, class = "bt-btn bt-btn-secondary",
                                title = "Up one level")
     choose_btn = Bonito.Button("Choose"; style=nothing, class = "bt-btn")
 
-    on(up_btn.value) do clicked
+    on(session, up_btn.value) do clicked
         clicked || return
         parent = js_path(dirname(rstrip(p.cur[], '/')))
         isempty(parent) || parent == p.cur[] || (p.cur[] = parent)
     end
-    on(choose_btn.value) do clicked
+    on(session, choose_btn.value) do clicked
         clicked || return
         p.selected[] = p.cur[]
     end
@@ -1592,29 +1695,29 @@ function fetch_remote_entries!(p::RemoteFolderPicker)
     end
 end
 
-function setup_remote_picker_listeners!(p::RemoteFolderPicker)
+function setup_remote_picker_listeners!(session::Bonito.Session, p::RemoteFolderPicker)
     p.listeners_set_up[] && return
     p.listeners_set_up[] = true
-    on(p.cur)      do _;   p.expanded[] && fetch_remote_entries!(p); end
-    on(p.expanded) do exp; exp && fetch_remote_entries!(p); end
+    on(session, p.cur)      do _;   p.expanded[] && fetch_remote_entries!(p); end
+    on(session, p.expanded) do exp; exp && fetch_remote_entries!(p); end
     return
 end
 
-function remote_folder_picker_render(p::RemoteFolderPicker)
-    setup_remote_picker_listeners!(p)
+function remote_folder_picker_render(session::Bonito.Session, p::RemoteFolderPicker)
+    setup_remote_picker_listeners!(session, p)
 
     up_btn     = Bonito.Button("↑"; style=nothing, class = "bt-btn bt-btn-secondary",
                                title = "Up one level")
     choose_btn = Bonito.Button("Choose"; style=nothing, class = "bt-btn")
 
-    on(up_btn.value) do clicked
+    on(session, up_btn.value) do clicked
         clicked || return
         cur = p.cur[]
         isempty(cur) && return
         parent = js_path(dirname(rstrip(cur, '/')))
         !isempty(parent) && parent != cur && (p.cur[] = parent)
     end
-    on(choose_btn.value) do clicked
+    on(session, choose_btn.value) do clicked
         clicked || return
         p.selected[] = p.cur[]
     end
@@ -1725,21 +1828,16 @@ end
 # project list without remounting every card on every state.projects notify.
 
 """
-    dashboard_dom(state; current_view = nothing) → DOM
+    dashboard_dom(session, state; current_view = nothing) → DOM
 
 Build the dashboard's DOM block. When `current_view` is provided (the
 unified app's view-selector observable), the project-creation flows
 auto-navigate to the new project's chat by setting it; otherwise creation
 just leaves the user on the dashboard.
 """
-function dashboard_dom(state::ServerState;
+function dashboard_dom(session::Bonito.Session, state::ServerState;
                         current_view::Union{Observable{String},Nothing} = nothing)
     error_obs = Observable("")
-
-    # Collision modal state. `nothing` ⇒ no modal; otherwise carries the
-    # comparison + the args needed to re-invoke create_project_from_worker!
-    # with an explicit on_collision directive (when the user picks a side).
-    collision_state = Observable{Union{Nothing,NamedTuple}}(nothing)
 
     # Workers self-register over WS — no manual "Add worker" form.
 
@@ -1756,7 +1854,7 @@ function dashboard_dom(state::ServerState;
     # Form fields
     np_name   = Observable("")
     np_picker = FolderPicker(state.working_dir)
-    on(np_picker.selected) do sel
+    on(session, np_picker.selected) do sel
         isempty(strip(np_name[])) || return
         isempty(sel) && return
         np_name[] = basename(rstrip(sel, '/'))
@@ -1770,7 +1868,7 @@ function dashboard_dom(state::ServerState;
     # actual transfer runs in the background; we update `busy` + notify(state.projects)
     # so the global progress card and the project card both reflect the syncing state.
     sync_request = Observable("")
-    on(sync_request) do pid
+    on(session, sync_request) do pid
         isempty(pid) && return
         sync_request[] = ""           # reset so the same card can re-fire
         haskey(state.projects[], pid) || return
@@ -1802,7 +1900,7 @@ function dashboard_dom(state::ServerState;
     # re-bind, start session). Long-running so it goes through the busy
     # card; the (stage, info) callback surfaces per-file progress.
     open_request = Observable(Dict{String,Any}())
-    on(open_request) do payload
+    on(session, open_request) do payload
         isempty(payload) && return
         pid    = String(get(payload, "project", ""))
         target = String(get(payload, "worker",  ""))
@@ -1840,7 +1938,7 @@ function dashboard_dom(state::ServerState;
     np_submit = Bonito.Button("Create"; style=nothing, class = "bt-btn")
     np_cancel = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
 
-    on(np_submit.value) do clicked
+    on(session, np_submit.value) do clicked
         clicked || return
         is_busy_idle(busy[]) || return   # guard: ignore clicks while busy
         nm = String(strip(np_name[]))
@@ -1862,7 +1960,7 @@ function dashboard_dom(state::ServerState;
             end
         end
     end
-    on(np_cancel.value) do clicked
+    on(session, np_cancel.value) do clicked
         clicked || return
         is_busy_idle(busy[]) || return   # don't cancel mid-create
         which_form[] = :none
@@ -1870,7 +1968,7 @@ function dashboard_dom(state::ServerState;
     end
 
     new_proj_btn = Bonito.Button("+ New project"; style=nothing, class = "bt-btn bt-btn-secondary")
-    on(new_proj_btn.value) do clicked
+    on(session, new_proj_btn.value) do clicked
         clicked || return
         if isempty(state.workers[])
             error_obs[] = "Register a worker before creating a project."
@@ -1884,7 +1982,7 @@ function dashboard_dom(state::ServerState;
     gh_submit = Bonito.Button("Open"; style=nothing, class = "bt-btn")
     gh_cancel = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
 
-    on(gh_submit.value) do clicked
+    on(session, gh_submit.value) do clicked
         clicked || return
         is_busy_idle(busy[]) || return
         url = String(strip(gh_url[]))
@@ -1908,7 +2006,7 @@ function dashboard_dom(state::ServerState;
             end
         end
     end
-    on(gh_cancel.value) do clicked
+    on(session, gh_cancel.value) do clicked
         clicked || return
         is_busy_idle(busy[]) || return
         which_form[] = :none
@@ -1916,7 +2014,7 @@ function dashboard_dom(state::ServerState;
     end
 
     gh_btn = Bonito.Button("+ From GitHub"; style=nothing, class = "bt-btn bt-btn-secondary")
-    on(gh_btn.value) do clicked
+    on(session, gh_btn.value) do clicked
         clicked || return
         if isempty(state.workers[])
             error_obs[] = "Register a worker before opening a GitHub project."
@@ -1936,9 +2034,12 @@ function dashboard_dom(state::ServerState;
     discover_state   = Observable("")                       # worker name whose panel is open
     discover_results = Observable(Dict{String,Any}[])
     discover_busy    = Observable(false)
-    # JS onclick notifies a {path, session_id} dict so the import handler can
-    # tell the worker to claude-agent-acp's session/load instead of /new.
-    import_path      = Observable(Dict{String,Any}())
+    # NOTE: the session-pick sink used to live here as a shared `import_path`
+    # Observable interpolated into the per-card discover panel — but the panel
+    # renders in a different (sub-)session than this `dashboard_dom` scope, so
+    # the client lookup failed ("Key N not found" → null.notify → silent Resume
+    # failure). It now lives as a SESSION-LOCAL `pick` inside
+    # `render_discover_panel`, bridged to `do_import`. See worker_widget.jl.
 
     function trigger_scan!(w_name::String)
         discover_busy[]    = true
@@ -1954,19 +2055,18 @@ function dashboard_dom(state::ServerState;
         end
     end
 
-    on(discover_state) do w_name
+    on(session, discover_state) do w_name
         isempty(w_name) || trigger_scan!(w_name)
     end
 
     # Shared import path used by both the "discovered sessions" panel and
-    # the remote-folder picker. Catches ProjectCollisionError and routes
-    # the comparison into the modal Observable; the user picks a side,
-    # and the modal re-invokes this same helper with the explicit
-    # on_collision directive baked in.
+    # the remote-folder picker. Name collisions across workers are no
+    # longer treated as a decision — each worker gets its own project with
+    # its own server_path mirror. The "merge / move" decision only matters
+    # at sync-time and is handled separately.
     function do_import(w_name::String, path::String;
                         name::Union{Nothing,String} = nothing,
-                        resume_session_id::Union{Nothing,String} = nothing,
-                        on_collision::Symbol = :detect)
+                        resume_session_id::Union{Nothing,String} = nothing)
         proj_name = name !== nothing ? name :
             let n = replace(basename(rstrip(path, '/')), r"[^a-zA-Z0-9_\-]" => "_")
                 isempty(n) ? "project" : n
@@ -1977,47 +2077,37 @@ function dashboard_dom(state::ServerState;
         busy_start!(busy, title)
         @async begin
             try
+                @info "do_import: starting" worker=w_name path resume=resume_session_id
+                # `start_session=false` so the registration finishes fast and we
+                # can flip `current_view` early — the chat bring-up itself
+                # (ensure_project_session!) is then driven by
+                # `project_loading_view`, which shows a full-panel spinner while
+                # it runs. Otherwise the user stares at the dashboard for ~10s
+                # of ACP `session/load` with only a tiny pill at the top.
                 p = create_project_from_worker!(state, w_name, path;
                     name = proj_name,
                     resume_session_id = resume_session_id,
-                    on_collision = on_collision,
+                    start_session = false,
                     progress = (stage, info) -> busy_event!(busy, stage, info))
+                @info "do_import: registered project, flipping view" id=p.id
                 error_obs[]      = ""
                 discover_state[] = ""
                 picker_state[]   = ""
-                collision_state[] = nothing
                 current_view !== nothing && (current_view[] = p.id)
             catch e
-                if e isa ProjectCollisionError
-                    collision_state[] = (
-                        existing         = e.existing,
-                        candidate_worker = w_name,
-                        candidate_path   = path,
-                        candidate_name   = proj_name,
-                        comparison       = e.comparison,
-                    )
-                else
-                    error_obs[] = "Failed to import: $(sprint(showerror, e))"
-                end
+                # Never swallow silently: surface to the UI AND the server log.
+                @warn "do_import failed" worker=w_name path resume=resume_session_id exception=(e, catch_backtrace())
+                error_obs[] = "Failed to import: $(sprint(showerror, e))"
             finally
                 busy_clear!(busy)
             end
         end
     end
 
-    on(import_path) do payload
-        isempty(payload) && return
-        path = String(get(payload, "path", ""))
-        isempty(path) && return
-        sid_raw = get(payload, "session_id", nothing)
-        resume_session_id = (sid_raw === nothing || isempty(String(sid_raw))) ?
-                                nothing : String(sid_raw)
-        import_path[] = Dict{String,Any}()    # reset so the same path can re-fire
-        is_busy_idle(busy[]) || return
-        w_name = discover_state[]
-        isempty(w_name) && return
-        do_import(w_name, path; resume_session_id = resume_session_id)
-    end
+    # The session-pick handler (payload parse + busy-idle guard + do_import) now
+    # lives next to its SESSION-LOCAL `pick` observable in `render_discover_panel`
+    # (worker_widget.jl), bridged to this `do_import` — so the observable is
+    # registered in the same session that renders the panel.
 
     # session_row + discover_panel are now rendered inside WorkerCard
     # (see worker_widget.jl) — each worker's card owns its discover panel
@@ -2032,7 +2122,7 @@ function dashboard_dom(state::ServerState;
     new_proj_form() = DOM.div(
         DOM.label("Name"),   text_input(np_name, "e.g. my-project"),
         DOM.label("Source"), DOM.div(
-            folder_picker_render(np_picker),
+            folder_picker_render(session, np_picker),
             map(np_picker.selected) do sel
                 isempty(sel) ? DOM.div() :
                     DOM.div("✓ selected: $sel",
@@ -2114,7 +2204,6 @@ function dashboard_dom(state::ServerState;
                 busy             = busy,
                 discover_busy    = discover_busy,
                 discover_results = discover_results,
-                import_path      = import_path,
                 do_import        = do_import,
                 trigger_scan     = trigger_scan!)
         end
@@ -2169,31 +2258,13 @@ function dashboard_dom(state::ServerState;
         DOM.div(worker_keyed_list; class = "bt-cards"))
 
     # ── Project list ────────────────────────────────────────────────────────
-    # Per-project ProjectCard widgets, stable in `project_cards`, fed to a
-    # KeyedList keyed on `project_id`. A sync starting on one project only
-    # re-renders THAT card's body — the other cards' DOM (and their
-    # in-flight click handlers, open-chat dropdowns) stay mounted.
-    project_cards = Dict{String,ProjectCard}()
-    function get_project_card(pid::AbstractString)
-        get!(project_cards, String(pid)) do
-            ProjectCard(state, String(pid), error_obs, sync_request,
-                         open_request, current_view)
-        end
-    end
-    empty_projects_block = DOM.div(
-        "No projects yet — pick a worker above and click + Project, or import an existing Claude session via Discover.";
-        class = "bt-empty")
-    empty_projects_class = map(state.projects) do projects
-        isempty(projects) ? "bt-empty-wrap" : "bt-empty-wrap bt-hidden"
-    end
-    project_widgets_obs = map(state.projects) do projects
-        ProjectCard[get_project_card(p.id) for p in values(projects)]
-    end
-    project_keyed_list = KeyedList(project_widgets_obs;
-                                    key = c -> c.project_id)
-    project_list = DOM.div(
-        DOM.div(empty_projects_block; class = empty_projects_class),
-        DOM.div(project_keyed_list; class = "bt-cards"))
+    # The standalone dashboard "Projects" card list was removed: it duplicated
+    # the per-worker `▸ projects` tree (in each WorkerCard) and the left sidebar
+    # ("running on workers"). The only card-only feature was move-to-worker,
+    # which is being redesigned. Project creation stays on the dashboard via the
+    # + New project / + From GitHub buttons; the projects themselves live in the
+    # worker pills and the sidebar. (`ProjectCard`, `sync_request`,
+    # `open_request` remain defined for the future move-to-worker redesign.)
 
     # Two slide-in forms, one source of truth: which one is open right now.
     form_block = map(which_form) do which
@@ -2229,13 +2300,10 @@ function dashboard_dom(state::ServerState;
         DOM.span(msg_obs;   class = "bt-busy-msg");
         class = visibility_class)
 
-    collision_overlay = render_collision_modal(state, collision_state, do_import)
-
     # Layout — DOM only; the App() wrapper + global assets (DashboardStyles,
     # ConnectionIndicator) live in the caller (unified_app or dashboard_app).
     DOM.div(
         busy_card,
-        collision_overlay,
         DOM.div(
             DOM.h1("BonitoTeam"),
             DOM.div("Multi-host orchestrator for agentic coding sessions";
@@ -2248,103 +2316,94 @@ function dashboard_dom(state::ServerState;
         worker_list,
 
         DOM.div(
-            DOM.h2("Projects"),
+            DOM.h2("New project"),
             new_proj_btn,
             gh_btn;
             class = "bt-section"),
-        project_list,
         form_block;
 
         class = "bt-dash")
 end
 
-# ── Collision-resolution modal ──────────────────────────────────────────────
-# When `create_project_from_worker!` raises ProjectCollisionError, the
-# dashboard's import handler stuffs the comparison + retry info into the
-# `collision_state` Observable. This renderer turns that into a fixed
-# overlay with side-by-side summaries and three actions:
-#   - Keep existing  → :keep_existing (no reassignment)
-#   - Use candidate  → :take_candidate (reassign to the candidate worker)
-#   - Cancel         → close modal, do nothing
-function render_collision_modal(state::ServerState,
-                                  collision_state::Observable,
-                                  do_import_fn::Function)
-    map(collision_state) do c
+# ── Cross-worker sync modal ─────────────────────────────────────────────────
+# Surfaced from the chat header when a project has a same-named sibling on
+# another worker (see `same_name_siblings`). `sync_modal_state` is `nothing`
+# (hidden) or `(current, other, comparison)` where comparison comes from
+# `compare_projects`. The user picks a direction; `on_apply(src, dst)` runs the
+# directional overwrite via `sync_across_workers!`. Reuses the `bt-collision-*`
+# CSS that already ships in DashboardStyles.
+function render_sync_modal(session::Bonito.Session,
+                            state::ServerState,
+                            sync_modal_state::Observable,
+                            on_apply::Function)
+    worker_label(id) = haskey(state.workers[], id) ? state.workers[][id].name : id
+    map(session, sync_modal_state) do c
         c === nothing && return DOM.div()
-        existing_worker_name = haskey(state.workers[], c.existing.worker_id) ?
-            state.workers[][c.existing.worker_id].name : c.existing.worker_id
-        candidate_worker_name = haskey(state.workers[], c.candidate_worker) ?
-            state.workers[][c.candidate_worker].name : c.candidate_worker
+        cur_label   = worker_label(c.current.worker_id)
+        other_label = worker_label(c.other.worker_id)
 
-        existing_side  = collision_side_panel(
-            "Existing — $(existing_worker_name)",
-            c.existing.worker_path,
-            c.comparison.existing,
-            c.comparison.existing_source === :worker ? "live" : "server mirror")
-        candidate_side = collision_side_panel(
-            "Candidate — $(candidate_worker_name)",
-            c.candidate_path,
-            c.comparison.candidate,
-            "live")
+        cur_side = sync_side_panel(
+            "$(cur_label) (this chat)", c.current.worker_path,
+            c.comparison.a,
+            c.comparison.a_source === :worker ? "live" : "server mirror")
+        other_side = sync_side_panel(
+            other_label, c.other.worker_path,
+            c.comparison.b,
+            c.comparison.b_source === :worker ? "live" : "server mirror")
 
-        # Highlight the side that's been edited more recently.
-        ex_mt = Float64(c.comparison.existing["latest_mtime"])
-        ca_mt = Float64(c.comparison.candidate["latest_mtime"])
-        newer = ex_mt > ca_mt ? :existing : (ca_mt > ex_mt ? :candidate : :tie)
-        if newer === :existing
-            existing_side = DOM.div(existing_side; class = "bt-collision-newer")
-        elseif newer === :candidate
-            candidate_side = DOM.div(candidate_side; class = "bt-collision-newer")
+        # Highlight whichever side was edited more recently.
+        cur_mt   = Float64(c.comparison.a["latest_mtime"])
+        other_mt = Float64(c.comparison.b["latest_mtime"])
+        newer = cur_mt > other_mt ? :current : (other_mt > cur_mt ? :other : :tie)
+        if newer === :current
+            cur_side = DOM.div(cur_side; class = "bt-collision-newer")
+        elseif newer === :other
+            other_side = DOM.div(other_side; class = "bt-collision-newer")
         end
 
-        keep_btn   = Bonito.Button("Keep existing"; style=nothing,
-                                    class = "bt-btn bt-btn-secondary",
-                                    title = "Leave the project bound to $existing_worker_name; do nothing")
-        take_btn   = Bonito.Button("Use candidate"; style=nothing,
-                                    class = "bt-btn bt-btn-primary",
-                                    title = "Reassign the project to $candidate_worker_name")
-        cancel_btn = Bonito.Button("Cancel"; style=nothing,
-                                    class = "bt-btn bt-btn-ghost")
-        on(keep_btn.value) do clicked
+        push_btn = Bonito.Button("Use $cur_label → overwrite $other_label";
+            style = nothing, class = "bt-btn bt-btn-primary",
+            title = "Copy $(cur_label)'s files onto $other_label, overwriting it")
+        pull_btn = Bonito.Button("Use $other_label → overwrite $cur_label";
+            style = nothing, class = "bt-btn bt-btn-secondary",
+            title = "Copy $(other_label)'s files onto $cur_label, overwriting it")
+        cancel_btn = Bonito.Button("Cancel"; style = nothing,
+            class = "bt-btn bt-btn-ghost")
+        on(session, push_btn.value) do clicked
             clicked || return
-            do_import_fn(c.candidate_worker, c.candidate_path;
-                          name = c.candidate_name,
-                          on_collision = :keep_existing)
+            on_apply(c.current, c.other)
         end
-        on(take_btn.value) do clicked
+        on(session, pull_btn.value) do clicked
             clicked || return
-            do_import_fn(c.candidate_worker, c.candidate_path;
-                          name = c.candidate_name,
-                          on_collision = :take_candidate)
+            on_apply(c.other, c.current)
         end
-        on(cancel_btn.value) do clicked
+        on(session, cancel_btn.value) do clicked
             clicked || return
-            collision_state[] = nothing
+            sync_modal_state[] = nothing
         end
 
         DOM.div(
             DOM.div(
                 DOM.div(
-                    DOM.h3("Project name '$(c.existing.name)' already exists"),
-                    DOM.div("This name is already bound to $existing_worker_name. " *
-                            "Compare the two sides and pick which one to keep.";
+                    DOM.h3("Sync '$(c.current.name)' across workers"),
+                    DOM.div("This project exists on both $cur_label and $other_label. " *
+                            "Pick which side's files to keep — the other side is overwritten.";
                             class = "bt-collision-sub")),
-                DOM.div(existing_side, candidate_side;
-                        class = "bt-collision-sides"),
-                DOM.div(cancel_btn, keep_btn, take_btn;
+                DOM.div(cur_side, other_side; class = "bt-collision-sides"),
+                DOM.div(cancel_btn, pull_btn, push_btn;
                         class = "bt-collision-actions");
                 class = "bt-collision-card");
             class = "bt-collision-overlay")
     end
 end
 
-# One column of the side-by-side compare. Top line is the headline
-# decision signal (last edit time), then file/byte counts, then a
-# short recent-files list and a per-subrepo git breakdown.
-function collision_side_panel(title::AbstractString,
-                                path::AbstractString,
-                                summary::AbstractDict,
-                                source_label::AbstractString)
+# One column of the side-by-side compare. Top line is the headline decision
+# signal (last edit time), then file/byte counts, then a short recent-files
+# list and a per-subrepo git breakdown.
+function sync_side_panel(title::AbstractString,
+                          path::AbstractString,
+                          summary::AbstractDict,
+                          source_label::AbstractString)
     age_str    = format_relative_age(Float64(summary["latest_mtime"]))
     n_files    = Int(summary["total_files"])
     total_kb   = round(Int(summary["total_bytes"]) / 1024; digits = 1)
@@ -2362,10 +2421,9 @@ function collision_side_panel(title::AbstractString,
     end
 
     git_rows = if isempty(subrepos)
-        [DOM.div("no git sub-repos found";
-                  class = "bt-collision-empty")]
+        [DOM.div("no git sub-repos found"; class = "bt-collision-empty")]
     else
-        [collision_git_row(g) for g in subrepos]
+        [sync_git_row(g) for g in subrepos]
     end
 
     DOM.div(
@@ -2377,8 +2435,7 @@ function collision_side_panel(title::AbstractString,
                 DOM.span(age_str; class = "bt-collision-value")),
             DOM.div(
                 DOM.span("Files: "; class = "bt-collision-label"),
-                DOM.span("$n_files ($(total_kb) KB)";
-                         class = "bt-collision-value")),
+                DOM.span("$n_files ($(total_kb) KB)"; class = "bt-collision-value")),
             DOM.div(
                 DOM.span("Source: "; class = "bt-collision-label"),
                 DOM.span(source_label; class = "bt-collision-value-faint"));
@@ -2394,7 +2451,7 @@ function collision_side_panel(title::AbstractString,
         class = "bt-collision-side")
 end
 
-function collision_git_row(g::AbstractDict)
+function sync_git_row(g::AbstractDict)
     head = String(get(g, "head_sha", ""))
     short_sha = isempty(head) ? "(no head)" : (length(head) >= 7 ? head[1:7] : head)
     dirty = Int(get(g, "dirty_count", 0))
@@ -2411,9 +2468,7 @@ function collision_git_row(g::AbstractDict)
         class = "bt-collision-git-row")
 end
 
-# "5m ago" / "3h ago" / "2d ago" — short, glanceable. Skips
-# fractional precision past the second decimal so big mtime
-# gaps don't render as "1.7892… days ago".
+# "5m ago" / "3h ago" / "2d ago" — short, glanceable.
 function format_relative_age(t::Float64)
     t <= 0 && return "—"
     Δ = time() - t
@@ -2438,7 +2493,7 @@ function dashboard_app(state::ServerState)
         DOM.div(
             DashboardStyles,
             Bonito.ConnectionIndicator(),
-            dashboard_dom(view))
+            dashboard_dom(session, view))
     end
 end
 

@@ -104,7 +104,7 @@ record(name, ok) = push!(results, name => ok)
 try
     p1_idx = TH.eval_js(ctx, """(() => {
         const items = document.querySelectorAll('.bt-side-item .bt-side-name');
-        for (let i = 0; i < items.length; i++) if (items[i].innerText === 'Project1') return i;
+        for (let i = 0; i < items.length; i++) if (items[i].innerText.split(' · ')[0] === 'Project1') return i;
         return -1; })()""")
     TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[$p1_idx].click()""")
     @assert TH.wait_for(ctx, "document.querySelector('.bt-text-input') !== null") "no chat"
@@ -340,14 +340,13 @@ try
         record("exactly one bubble for prog-1", @TH.test_eq n_with_id 1)
     end
 
-    TH.section("Plan: a second update lives alongside the first (today)") do
-        # Document the *current* behaviour: each plan event pushes a new
-        # PlanMsg, so two plan updates produce two .bt-plan-msg bubbles.
-        # If we ever decide to dedup, this assertion has to flip — that's a
-        # deliberate choice point.
+    TH.section("Plan: the second update absorbs into the first bubble") do
+        # The live-tracking consolidation: each new plan/TodoWrite event
+        # ABSORBS into the previous TodoListMsg instead of spawning a new
+        # bubble. Two events → still one .bt-plan-msg.
         n_plans = TH.eval_js(ctx, "document.querySelectorAll('.bt-plan-msg').length")
-        record("two plan bubbles (one per plan event)",
-               @TH.test_eq Int(n_plans) 2)
+        record("one plan bubble after consecutive updates",
+               @TH.test_eq Int(n_plans) 1)
         # The latest plan has 3 entries; the earlier had 2.
         latest_entries = TH.eval_js(ctx, """
             (() => {

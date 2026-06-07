@@ -12,6 +12,85 @@
 // `[data-tool-id]` slot directly. Everything else (counts, ranges, message
 // pushes, status pings) is on `comm`.
 
+// One reusable collapsible-section behaviour, shared by tool rows and thought
+// bubbles (and any future lazy section). It owns the expand/collapse plus the
+// lazy-body lifecycle that used to be duplicated across wireToolToggle /
+// setToolExpanded / wireThoughtToggle:
+//   • a header click (or, in `native` mode, a <details> `toggle`) flips expanded
+//   • the first expand of a lazy section shows a "loading…" placeholder and
+//     fires `onExpand` once; the owner fills the body (via dom_in_js or a comm
+//     reply) and `fill()` marks it loaded so a re-expand doesn't refetch
+//   • `fetchEachExpand` (tools) refetches on every expand and `discardOnCollapse`
+//     empties the body on collapse (frees the mounted Monaco editors)
+export class Collapsable {
+    constructor(headerEl, bodyEl, opts = {}) {
+        this.header  = headerEl;
+        this.body    = bodyEl;
+        this.toggle  = opts.toggleEl || null;
+        this.native  = opts.native || false;          // hosted in <details>/<summary>
+        this.fetchEachExpand   = opts.fetchEachExpand || false;
+        this.discardOnCollapse = opts.discardOnCollapse || false;
+        this.onExpand = opts.onExpand || null;
+        this.lazy     = !!this.onExpand;
+        this.loaded   = !this.lazy;                    // eager bodies start loaded
+        this.expanded = false;
+
+        if (this.native) {
+            this.details = headerEl.closest('details') || bodyEl.closest('details');
+            this.details && this.details.addEventListener(
+                'toggle', () => this.applyExpanded(this.details.open));
+        } else {
+            headerEl.style.cursor = 'pointer';
+            headerEl.addEventListener('click', () => this.applyExpanded(!this.expanded));
+        }
+    }
+
+    setExpanded(expanded) {
+        if (this.native) { if (this.details) this.details.open = expanded; return; }
+        this.applyExpanded(expanded);
+    }
+
+    applyExpanded(expanded) {
+        if (expanded === this.expanded) return;        // idempotent
+        this.expanded = expanded;
+        if (!this.native) {
+            this.header.dataset.expanded = expanded ? 'true' : 'false';
+            if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
+            this.body.style.display = expanded ? '' : 'none';
+        }
+        if (expanded) {
+            if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
+                this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+                this.onExpand && this.onExpand();
+            }
+        } else if (this.discardOnCollapse) {
+            this.body.innerHTML = '';
+            this.loaded = false;
+        }
+    }
+
+    // Owner finished loading the lazy body: set its html + mark loaded so a
+    // subsequent expand shows it without another round-trip.
+    fill(html) {
+        if (html != null) this.body.innerHTML = html;
+        this.loaded = true;
+    }
+}
+
+// Message filter: human labels + a fixed display order so toolbar checkboxes
+// don't reshuffle based on which type happens to arrive first. Tool calls are
+// NOT one type — each tool name gets its own key/checkbox in a trailing
+// "Tools:" group (alphabetical), keyed `tool:<name>` from the wire `tool`
+// field (the ACP tool name, threaded through by tool_header_dict).
+const TYPE_LABELS = { user: 'User', agent: 'Agent', thought: 'Thoughts',
+                      plan: 'Todos', summary: 'Summaries' };
+const TYPE_ORDER  = ['user', 'agent', 'thought', 'plan', 'summary'];
+const filterKey = (msg) =>
+    msg.type === 'tool' ? 'tool:' + (msg.tool || 'other') : msg.type;
+// Filter keys that start HIDDEN: their checkbox appears unchecked when the
+// key first occurs. ToolSearch calls are tool-discovery noise — opt-in.
+const DEFAULT_HIDDEN = ['tool:ToolSearch'];
+
 class BonitoChat {
     constructor(container, comm) {
         this.container = container;
@@ -28,6 +107,13 @@ class BonitoChat {
         this.EST_HEIGHT    = 80;
         this.OVERSCAN      = 8;
         this.initialLoad   = false;
+        // The .bt-messages flex column separates children with a row gap.
+        // The virtual height math must count it per item or the virtual
+        // geometry drifts ~gap px per message from the real scrollHeight —
+        // in long chats that drift exceeds the overscan and the bottom
+        // "bounces" away while scrolling down. Read it from the computed
+        // style so a CSS change can't silently re-introduce the drift.
+        this.ITEM_GAP = parseFloat(getComputedStyle(container).rowGap) || 0;
 
         // ── Scroll UX state ────────────────────────────────────────────
         // followMode: when true, new messages auto-scroll the viewport
@@ -53,7 +139,73 @@ class BonitoChat {
 
         this.spacerTop    = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
-        this.busyEl       = container.parentElement.querySelector('.bt-busy');
+        // ── Message filter ─────────────────────────────────────────────
+        // Checkboxes appear in the toolbar (below the composer) the first
+        // time a filter key occurs (a base message type, or `tool:<name>`
+        // per tool). Unchecking hides matching nodes (inline display:none)
+        // AND zeroes their entries in the height math (effHeight), so
+        // spacers/scroll mapping stay exact. Per-tab — rebuilt on remount.
+        this.toolbarEl   = container.parentElement.querySelector('.bt-chat-toolbar');
+        this.hiddenTypes = new Set(DEFAULT_HIDDEN);   // filter keys currently hidden
+        this.seenTypes   = new Set();   // keys that already have a checkbox
+        this.keyByIdx    = new Map();   // idx → filter key (drives effHeight)
+        // Two toolbar rows: the dynamic filter checkboxes on top, static
+        // display options below ("Depict Images Natively in Chat", …).
+        this.filterRow  = null;
+        this.optionsRow = null;
+        this.nativeImages = true;       // bt_show image results: bare by default
+        this.nativeVideos = true;       // bt_show video results: ditto
+        if (this.toolbarEl) {
+            this.filterRow = document.createElement('div');
+            this.filterRow.className = 'bt-toolbar-filters';
+            this.optionsRow = document.createElement('div');
+            this.optionsRow.className = 'bt-toolbar-options';
+            this.toolbarEl.append(this.filterRow, this.optionsRow);
+            const addOption = (text, checked, onChange) => {
+                const label = document.createElement('label');
+                label.className = 'bt-filter-toggle';
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.checked = checked;
+                cb.addEventListener('change', () => onChange(cb.checked));
+                label.append(cb, text);
+                this.optionsRow.appendChild(label);
+            };
+            addOption('Native Images', this.nativeImages,
+                      (on) => this._setNativeMedia('image/', on));
+            addOption('Native Videos', this.nativeVideos,
+                      (on) => this._setNativeMedia('video/', on));
+        }
+        // Busy dots + thinking indicator are scroll CONTENT — they sit
+        // between the bottom spacer and the overscroll tail so they appear
+        // directly under the last message (not below the tail, down by the
+        // composer). Plain content like the tail: the virtual-scroll
+        // geometry never tracks them.
+        this.busyEl       = container.querySelector('.bt-busy');
+        // Idle "waiting for your next instruction" text: pure CSS — visible
+        // exactly when .bt-busy is NOT active (adjacent-sibling rule). The
+        // JS only holds it for the RO chase below.
+        this.waitingEl    = container.querySelector('.bt-waiting');
+        // Transient "reasoning…" indicator: shown for the lifetime of an agent
+        // thought, then removed. Most thoughts are redacted (empty) so this is
+        // usually all the user sees of the model's thinking.
+        this.thinkingEl   = container.querySelector('.bt-thinking');
+        // Overscroll tail: empty space below the last message the user can
+        // scroll into (~30% of the pane; sized in the container RO).
+        this.tailEl       = container.querySelector('.bt-messages-tail');
+        this._sizeTail();
+        // Off-screen measuring host: prefetched nodes get REAL heights here
+        // before they're ever rendered, so the virtual geometry is exact
+        // everywhere and scrollbar drags see a stable scrollHeight (see
+        // `_measureNodes`). Width is synced to the messages content box so
+        // text wrapping (and thus heights) match the live layout.
+        this.measureEl = document.createElement('div');
+        this.measureEl.className = 'bt-measure';
+        container.parentElement.appendChild(this.measureEl);
+        // Start the settle watch immediately: its hard cap must dismiss the
+        // load overlay (sidebar.jl chat_waiting_view) even if the comm
+        // bootstrap stalls.
+        this._startSettle();
 
         // Single subscription. `comm` is a Bonito Observable bridged via
         // WS; every message Julia sets via `model.comm[] = {...}` arrives here.
@@ -72,7 +224,9 @@ class BonitoChat {
             this.applyCount(cur.n);
         } else if (cur && cur.type === 'msgs.range') {
             // Re-mount of a chat that already has messages cached.
+            this._startSettle();
             this.onRange(cur);
+            this._startPrefetch();
         }
         comm.notify({type: 'init'});
 
@@ -90,8 +244,39 @@ class BonitoChat {
         container.addEventListener('keydown',    markUserInput, { passive: true });
         this._markUserInput = markUserInput;
 
+        // Scrollbar drags emit NO wheel/touch/key events — only mousedown on
+        // the container (the scrollbar is part of its hit area) and then
+        // scroll events while the button is held, possibly for much longer
+        // than the 400ms recency window. Track the held state explicitly so
+        // a drag is always classified as user-driven; otherwise the chase
+        // treats it as a layout shift and yanks the thumb back to the
+        // bottom ("scrollbar feels stuck"). mouseup lands on window — the
+        // pointer often leaves the container before release.
+        this._scrollbarDrag = false;
+        this._onContainerMouseDown = () => {
+            this._scrollbarDrag = true;
+            markUserInput();
+        };
+        this._onWindowMouseUp      = () => {
+            if (!this._scrollbarDrag) return;
+            this._scrollbarDrag = false;
+            markUserInput();   // the release tick still counts as user input
+            // Auto-expands deferred during the drag (image bodies inflate
+            // scrollHeight — poison for a held thumb): mount them now.
+            for (const node of this.cache.values()) {
+                if (node.isConnected && node.dataset.btAutoExpand) {
+                    delete node.dataset.btAutoExpand;
+                    node.collapsable?.setExpanded(true);
+                }
+            }
+            this._queueRefresh();   // re-true spacers to the corrected heights
+        };
+        container.addEventListener('mousedown', this._onContainerMouseDown, { passive: true });
+        window.addEventListener('mouseup', this._onWindowMouseUp, { passive: true });
+
         this._onScroll = () => {
-            const userDriven = (performance.now() - this._lastUserInputT) < 400;
+            const userDriven = this._scrollbarDrag ||
+                (performance.now() - this._lastUserInputT) < 400;
             const atBot      = this.atBottom();
             if (userDriven) {
                 // User-driven scroll → followMode reflects whether
@@ -110,17 +295,25 @@ class BonitoChat {
         container.addEventListener('scroll', this._onScroll, { passive: true });
 
         // Re-scroll whenever the messages container changes size
-        // while in follow mode. Covers: bt-busy 0↔28px transition
-        // on each agent turn, mobile soft-keyboard slide-in/out,
-        // browser address bar collapse, window resize, attachment
-        // bar growing. Without this, the last message + input area
-        // slide below the fold and the user has no way back without
-        // manual scroll.
+        // while in follow mode. Covers: mobile soft-keyboard
+        // slide-in/out, browser address bar collapse, window resize,
+        // attachment bar growing. Without this, the last message +
+        // input area slide below the fold and the user has no way
+        // back without manual scroll.
+        // ALSO observes the busy/thinking indicators: they live inside
+        // the scroll content, so their 150ms height transition changes
+        // scrollHeight — not the container's box — and the container
+        // observation alone would miss it. Observing them keeps the
+        // chase pinned to the bottom across every frame of the grow.
         this._containerRO = new ResizeObserver(() => {
             if (this.destroyed) return;
+            this._sizeTail();
             if (this.followMode) this._queueScrollToBottom();
         });
         this._containerRO.observe(this.container);
+        if (this.busyEl)     this._containerRO.observe(this.busyEl);
+        if (this.waitingEl)  this._containerRO.observe(this.waitingEl);
+        if (this.thinkingEl) this._containerRO.observe(this.thinkingEl);
 
         if (window.visualViewport) {
             this._onVPResize = () => this.onViewportResize();
@@ -129,7 +322,10 @@ class BonitoChat {
 
         // Image attachments (paste / drag-drop). Wired AFTER the input area
         // is in the DOM, on a microtask so .bt-app's children are queryable.
-        Promise.resolve().then(() => this._setupInputs());
+        Promise.resolve().then(() => {
+            this._setupInputs();
+            this._setupLiveTicker();
+        });
     }
 
     destroy() {
@@ -142,6 +338,12 @@ class BonitoChat {
             this.container.removeEventListener('touchstart', this._markUserInput);
             this.container.removeEventListener('touchmove',  this._markUserInput);
             this.container.removeEventListener('keydown',  this._markUserInput);
+        }
+        if (this._onContainerMouseDown) {
+            this.container.removeEventListener('mousedown', this._onContainerMouseDown);
+        }
+        if (this._onWindowMouseUp) {
+            window.removeEventListener('mouseup', this._onWindowMouseUp);
         }
         if (this._scrollRafId !== null && this._scrollRafId !== undefined) {
             cancelAnimationFrame(this._scrollRafId);
@@ -160,11 +362,11 @@ class BonitoChat {
         if (this._onTextInputKeyCapture && this.textInput) {
             this.textInput.removeEventListener('keydown', this._onTextInputKeyCapture, true);
         }
-        if (this._onSendClickCapture && this.sendBtn) {
-            this.sendBtn.removeEventListener('click', this._onSendClickCapture, true);
+        if (this._onAppClickCapture && this.app) {
+            this.app.removeEventListener('click', this._onAppClickCapture, true);
         }
-        if (this._onStopClick && this.stopBtn) {
-            this.stopBtn.removeEventListener('click', this._onStopClick);
+        if (this._onEscapeKey) {
+            document.removeEventListener('keydown', this._onEscapeKey, true);
         }
         if (this.app) {
             this._onDragOver  && this.app.removeEventListener('dragover',  this._onDragOver);
@@ -172,6 +374,19 @@ class BonitoChat {
             this._onDrop      && this.app.removeEventListener('drop',      this._onDrop);
         }
         clearTimeout(this._attachErrorTimer);
+        clearTimeout(this._prefetchTimer);
+        // Torn down mid-settle: clear the in-progress flag so a successor
+        // overlay doesn't read a stale "settling" state off the pane (the
+        // overlay's own timeout failsafe covers the never-settled case).
+        if (!this._settleDone && this._paneEl) delete this._paneEl.dataset.btSettling;
+        if (this.measureEl) { this.measureEl.remove(); this.measureEl = null; }
+        if (this._tickerId) {
+            clearInterval(this._tickerId);
+            this._tickerId = null;
+        }
+        if (this.taskbarEl && this._onTaskbarClick) {
+            this.taskbarEl.removeEventListener('click', this._onTaskbarClick);
+        }
     }
 
     // Single dispatch table. Julia sends `{type, ...}`; we route here.
@@ -188,9 +403,10 @@ class BonitoChat {
             case 'msgs.range':   return this.onRange(msg);
             case 'busy_start':
                 this.busyEl?.classList.add('bt-busy-active');
-                // bt-busy grows from 0 to 28px over 150ms; the container
-                // ResizeObserver re-scrolls on each frame, but only if
-                // followMode is on — which it should be when a turn starts.
+                // bt-busy grows from 0 to 28px over 150ms; its own RO
+                // (it's observed alongside the container) re-scrolls on
+                // each frame, but only if followMode is on — which it
+                // should be when a turn starts.
                 if (this.followMode) this._queueScrollToBottom();
                 return;
             case 'busy_end':
@@ -198,12 +414,15 @@ class BonitoChat {
                 if (this.followMode) this._queueScrollToBottom();
                 return;
             case 'agent_final':  return this.onAgentFinal(msg);
+            case 'thinking':     return this.onThinking(msg.active);
             case 'thought_final':return this.onThoughtFinal(msg);
             case 'thought.body': return this.onThoughtBody(msg);
             case 'tool_update':  return this.onToolUpdate(msg);
-            case 'chunk':        return this.appendChunk(msg.id, msg.text);
-            case 'thought_chunk':return this.appendChunk(msg.id, msg.text);
+            case 'plan_update':  return this.onPlanUpdate(msg);
+            case 'chunk':        return this.appendChunk(msg);
             case 'user_chunk':   return this.appendUserChunk(msg.text);
+            case 'user_unqueue': return this.unqueueOldestUser();
+            case 'summary_final':return this.onSummaryFinal(msg);
             case 'attach_error':
                 return this._showAttachError(msg.error || 'Attachment failed');
             // (formerly `send_ack` — JS now clears the input widget
@@ -213,6 +432,7 @@ class BonitoChat {
             case 'thought':
             case 'tool':
             case 'plan':
+            case 'summary':
                 return this.appendNewMessage(msg);
         }
     }
@@ -220,10 +440,133 @@ class BonitoChat {
     // ── Range / virtual scroll ────────────────────────────────────────────
 
     applyCount(n) {
-        if (n <= 0) return;
+        if (n <= 0) {
+            // Empty chat: nothing to settle — dismiss the load overlay
+            // right away.
+            this._startSettle();
+            this._settle();
+            return;
+        }
         this.totalCount  = n;
         this.initialLoad = true;
+        this._startSettle();
         this.refresh();
+        this._startPrefetch();
+    }
+
+    // ── Settle watch (drives the load overlay) ────────────────────────────
+    // The first second after mount is geometry soup: the visible window
+    // renders, estimate heights correct to measurements, bt_show images
+    // mount and resize their nodes — the scrollbar visibly pumps. The
+    // dashboard's load overlay (sidebar.jl chat_waiting_view) covers the
+    // pane through all of it; this module owns settle DETECTION and tells
+    // the overlay when to move on:
+    //   bt-chat-settling  (watch started — overlay flips to "Rendering
+    //                      messages…")
+    //   bt-chat-settled   (geometry quiet — overlay fades out)
+    // Both are window events carrying the pane pid, mirrored as
+    // data-bt-settling / data-bt-settled flags on the .bt-chatpane so an
+    // overlay that mounts AFTER an event fired (kept-alive revisit) reads
+    // the state synchronously. Settle = scrollHeight unchanged for ~10
+    // frames once the initial scroll passes are done; image loads reset
+    // the quiet counter via their height changes, so image-heavy chats
+    // simply hold the overlay a little longer. Hard cap so a broken image
+    // can never strand it.
+    _startSettle() {
+        if (this._settleWatch || this._settleDone) return;
+        this._settleWatch  = true;
+        this._settleT0     = performance.now();
+        this._settleLastH  = -1;
+        this._settleStable = 0;
+        this._paneEl = this.container.closest('.bt-chatpane');
+        if (this._paneEl) {
+            delete this._paneEl.dataset.btSettled;
+            this._paneEl.dataset.btSettling = '1';
+        }
+        this._announceSettle('bt-chat-settling');
+        const watch = () => {
+            if (this.destroyed || this._settleDone) return;
+            const h = this.container.scrollHeight;
+            if (h === this._settleLastH) this._settleStable++;
+            else { this._settleStable = 0; this._settleLastH = h; }
+            const elapsed = performance.now() - this._settleT0;
+            // Quiet geometry alone isn't enough: a tool body still being
+            // fetched (native bt_show images come from the worker) shows a
+            // "loading…" placeholder with STABLE height, and a mounted
+            // <img> may not have decoded yet — both would pop in right
+            // after an early reveal ("saw the box flash"). Hold for them
+            // too; the hard cap still guarantees the overlay lifts.
+            // EXCEPT video bodies: a multi-GB bt_show fetch takes minutes,
+            // not frames — the overlay must not ride out its hard cap on
+            // every reload. Videos pop in when ready; the follow chase
+            // absorbs the height jump.
+            const pendingBody = [...this.container.querySelectorAll('.bt-collapsable-loading')]
+                .some(el => !(el.closest('.bt-tool-msg')?.dataset.showMime || '')
+                    .startsWith('video/'));
+            const pendingImg  = [...this.container.querySelectorAll('img')]
+                .some(img => !img.complete);
+            const settled = this._settleStable >= 10 &&
+                            elapsed > 400 && !this.initialLoad &&
+                            !pendingBody && !pendingImg;
+            if (settled || elapsed > 5000) this._settle();
+            else requestAnimationFrame(watch);
+        };
+        requestAnimationFrame(watch);
+    }
+
+    _settle() {
+        if (this._settleDone) return;
+        this._settleDone  = true;
+        this._settleWatch = false;
+        // Land exactly at the bottom of the SETTLED layout before the
+        // overlay reveals it.
+        this.setFollowMode(true);
+        this.scrollToBottom();
+        if (this._paneEl) {
+            delete this._paneEl.dataset.btSettling;
+            this._paneEl.dataset.btSettled = '1';
+        }
+        this._announceSettle('bt-chat-settled');
+    }
+
+    _announceSettle(name) {
+        const pid = this._paneEl?.dataset.panePid || '';
+        window.dispatchEvent(new CustomEvent(name, { detail: pid }));
+    }
+
+    // ── Background history prefetch ──────────────────────────────────────
+    // Trickle-load the ENTIRE history into the node cache after mount, so
+    // scrolling/seeking never lands on blank spacer. Bottom-up (the
+    // direction users scroll into), 64 messages per request, each chunk
+    // paced on the previous response — user-driven fetches and streaming
+    // always win the wire. Cached-only during scrollbar drags by design
+    // (onRange skips DOM work mid-drag), so blanks fill in on release.
+    _startPrefetch() {
+        if (this._prefetchStarted) return;
+        this._prefetchStarted = true;
+        this._prefetchTimer = setTimeout(() => this._prefetchTick(), 600);
+    }
+
+    _prefetchTick() {
+        if (this.destroyed) return;
+        // Highest missing index at or below the cursor.
+        let e = -1;
+        for (let i = Math.min(this._prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--) {
+            if (!this.cache.has(i)) { e = i; break; }
+        }
+        if (e < 0) return;                       // fully cached — done
+        let s = e;
+        while (s > 0 && !this.cache.has(s - 1) && (e - s) < 63) s--;
+        this._prefetchCursor = s - 1;
+        // Marks the in-flight chunk so onRange can treat its arrival as
+        // SILENT (cache-only): prefetch must not re-window/scroll per chunk
+        // — that's a visible flicker storm right after mount.
+        this._prefetchPending = [s, e];
+        this.comm.notify({type: 'msgs.request', range: [s, e]});
+        // onRange reschedules the next tick when the response lands; this
+        // timer is only the safety net for a lost/empty response.
+        clearTimeout(this._prefetchTimer);
+        this._prefetchTimer = setTimeout(() => this._prefetchTick(), 2000);
     }
 
     visibleRange() {
@@ -235,10 +578,22 @@ class BonitoChat {
         return [s, Math.min(this.totalCount - 1, e)];
     }
 
+    // Effective height: 0 for filtered-out keys (display:none flex items
+    // produce no gap either), else the measured height (or the estimate)
+    // PLUS the flex row gap that follows each rendered item. The ONLY way
+    // spacer/offset math may read heights — keeping it gap-aware makes a
+    // measured node's virtual contribution match its real pixels exactly.
+    // `observe`'s h>0 guard keeps the last measured height through a
+    // hide/show cycle, so re-showing restores exact sizes.
+    effHeight(i) {
+        if (this.hiddenTypes.has(this.keyByIdx.get(i))) return 0;
+        return (this.heights.get(i) ?? this.EST_HEIGHT) + this.ITEM_GAP;
+    }
+
     indexAt(offset) {
         let h = 0;
         for (let i = 0; i < this.totalCount; i++) {
-            h += (this.heights.get(i) ?? this.EST_HEIGHT);
+            h += this.effHeight(i);
             if (h > offset) return i;
         }
         return Math.max(0, this.totalCount - 1);
@@ -246,33 +601,86 @@ class BonitoChat {
 
     cumHeight(from, to) {
         let h = 0;
-        for (let i = from; i < to; i++) h += (this.heights.get(i) ?? this.EST_HEIGHT);
+        for (let i = from; i < to; i++) h += this.effHeight(i);
         return h;
     }
 
     refresh() {
         if (this.totalCount === 0) return;
+        // Bottom anchoring: updateDOM resizes the spacers, which moves
+        // scrollHeight under a scrollTop pinned at the bottom — without
+        // compensation the bottom edge "bounces" away from the user
+        // (scrollHeight changes fire no scroll event, and overflow-anchor
+        // is off on the spacers). If we were at the bottom before the
+        // re-window and the geometry shifted, re-pin. Within-AT_BOTTOM_PX
+        // already means "at the bottom" everywhere else (followMode), so
+        // pinning here matches the existing semantics.
+        const wasAtBottom = this.atBottom();
+        const preHeight   = this.container.scrollHeight;
         const [s, e] = this.visibleRange();
 
-        const missing = [];
-        for (let i = s; i <= e; i++) if (!this.cache.has(i)) missing.push(i);
-        if (missing.length > 0) {
-            this.comm.notify({type: 'msgs.request',
-                              range: [missing[0], missing[missing.length - 1]]});
+        // While the scrollbar is held, do NOT fetch: every arriving range
+        // inserts + measures new nodes mid-drag and the resulting geometry
+        // churn makes the thumb flicker. A drag navigates CACHED content
+        // only (uncached regions show as spacer); the release handler's
+        // refresh fetches whatever the thumb landed on.
+        if (!this._scrollbarDrag) {
+            const missing = [];
+            for (let i = s; i <= e; i++) if (!this.cache.has(i)) missing.push(i);
+            if (missing.length > 0) {
+                this.comm.notify({type: 'msgs.request',
+                                  range: [missing[0], missing[missing.length - 1]]});
+            }
         }
         this.updateDOM(s, e);
+        // Never pin while the user is actively dragging the scrollbar —
+        // the drag IS the authority on where scrollTop should be.
+        if (wasAtBottom && !this._scrollbarDrag &&
+            this.container.scrollHeight !== preHeight) {
+            this.container.scrollTop = this.container.scrollHeight;
+        }
     }
 
     onRange({ start, msgs }) {
         const messages = msgs ?? [];          // tolerate the legacy `messages` field
+        const fresh = [];
         messages.forEach((data, i) => {
             const idx = start + i;
             if (this.cache.has(idx)) return;
             const node = this.createNode(data);
             this.cache.set(idx, node);
+            this.keyByIdx.set(idx, filterKey(data));
             if (data.id) this.nodeById.set(data.id, node);
             this.observe(idx, node);
+            fresh.push([idx, node]);
         });
+        this._measureNodes(fresh);
+        // Any arriving range advances the background prefetch (pacing: one
+        // chunk in flight at a time, ~30ms apart). Runs through drags too —
+        // caching is the drag-safe part.
+        if (this._prefetchStarted) {
+            clearTimeout(this._prefetchTimer);
+            this._prefetchTimer = setTimeout(() => this._prefetchTick(), 30);
+        }
+        // Prefetch chunks are SILENT: cache-only, no scroll, and a DOM
+        // re-window only when the chunk actually overlaps the visible
+        // window. Per-chunk updateDOM + scroll-to-bottom was a visible
+        // flicker storm (scrollbar resizing, content shifting) right after
+        // mount while ~15 chunks streamed in.
+        const pf = this._prefetchPending;
+        if (pf && start === pf[0]) {
+            this._prefetchPending = null;
+            const [vs, ve] = this.visibleRange();
+            const end = start + messages.length - 1;
+            if (end >= vs && start <= ve && !this._scrollbarDrag) {
+                this.updateDOM(vs, ve);
+            }
+            return;
+        }
+        // Ranges still in flight when a scrollbar drag started: cache the
+        // nodes (above) but don't touch the DOM/geometry until release —
+        // mid-drag insertion is the thumb flicker.
+        if (this._scrollbarDrag) return;
         this.updateDOM(...this.visibleRange());
         if (this.initialLoad) {
             // Initial mount: scroll to bottom and lock follow mode on.
@@ -297,13 +705,59 @@ class BonitoChat {
         }
     }
 
+    // Measure freshly-created (detached) nodes in the hidden off-screen
+    // host: one batch insert, one layout pass, real heights for everything
+    // the prefetcher caches. Estimates then only ever exist for the few
+    // frames before a chunk arrives — scrollbar geometry stays truthful,
+    // which is what keeps direct thumb drags smooth (no drift to correct,
+    // no freeze needed). Nodes already in the live DOM are skipped.
+    _measureNodes(pairs) {
+        if (!this.measureEl || pairs.length === 0) return;
+        const cs = getComputedStyle(this.container);
+        const w = this.container.clientWidth -
+            (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+        if (w <= 0) return;   // hidden pane — measuring would record garbage
+        this.measureEl.style.width = w + 'px';
+        const toMeasure = pairs.filter(([idx, node]) =>
+            !node.isConnected && !this.heights.has(idx));
+        for (const [, node] of toMeasure) this.measureEl.appendChild(node);
+        for (const [idx, node] of toMeasure) {
+            const h = node.offsetHeight;
+            if (h > 0) this.heights.set(idx, h);
+        }
+        for (const [, node] of toMeasure) {
+            if (node.parentNode === this.measureEl) this.measureEl.removeChild(node);
+        }
+    }
+
     observe(idx, node) {
         const ro = new ResizeObserver(([e]) => {
             const h = e.contentRect.height;
-            if (h > 0) { this.heights.set(idx, h); }
+            if (h > 0 && this.heights.get(idx) !== h) {
+                this.heights.set(idx, h);
+                // Apply the correction NOW (rAF-batched) instead of letting
+                // it ambush the next scroll tick: the spacers re-true while
+                // refresh()'s bottom anchoring keeps the viewport pinned,
+                // so estimate→measured corrections are invisible. EXCEPT
+                // mid-scrollbar-drag: corrections then wait for release —
+                // re-spacing under a held thumb is exactly the flicker.
+                if (!this._scrollbarDrag) this._queueRefresh();
+            }
         });
         ro.observe(node);
         this.ros.set(idx, ro);
+    }
+
+    // rAF-batched refresh: many ResizeObserver measurements land in the
+    // same frame (initial range render, streaming reflows) — coalesce them
+    // into one re-window + respace.
+    _queueRefresh() {
+        if (this._refreshQueued || this.destroyed) return;
+        this._refreshQueued = true;
+        requestAnimationFrame(() => {
+            this._refreshQueued = false;
+            if (!this.destroyed) this.refresh();
+        });
     }
 
     updateDOM(s, e) {
@@ -322,12 +776,29 @@ class BonitoChat {
         }
         this.spacerTop.style.height    = this.cumHeight(0, s) + 'px';
         this.spacerBottom.style.height = this.cumHeight(e + 1, this.totalCount) + 'px';
+        // NOTE: no drag-time scrollHeight freeze here. An earlier freeze
+        // (pin total at drag-start, absorb deltas in the spacers) turned
+        // estimate-vs-real drift into PHANTOM BLANK at the end of the
+        // scroll range — "the view hits bottom while the bar still has
+        // track left". The real fix is upstream: prefetched nodes are
+        // measured off-screen (`_measureNodes`), so heights are real
+        // everywhere and drags see a stable scrollHeight to begin with.
     }
 
     insertSorted(idx, node) {
         const sorted = [...this.rendered].filter(i => i > idx).sort((a,b) => a-b);
         const before = sorted.length ? this.cache.get(sorted[0]) : this.spacerBottom;
         this.container.insertBefore(node, before);
+        // Deferred auto-expand (bt_show / native images): the node is now in
+        // the document, so the tool.render reply has a live slot to mount
+        // into. One-shot — clear the flag before expanding. NOT during a
+        // scrollbar drag: bodies mounting mid-drag inflate scrollHeight and
+        // the thumb's mapping stretches out from under the pointer ("bar
+        // gets stuck before the bottom") — the release sweep handles them.
+        if (node.dataset && node.dataset.btAutoExpand && !this._scrollbarDrag) {
+            delete node.dataset.btAutoExpand;
+            node.collapsable?.setExpanded(true);
+        }
     }
 
     // ── New messages + streaming ──────────────────────────────────────────
@@ -338,6 +809,7 @@ class BonitoChat {
         if (!this.cache.has(idx)) {
             const node = this.createNode(msg);
             this.cache.set(idx, node);
+            this.keyByIdx.set(idx, filterKey(msg));
             if (msg.id) this.nodeById.set(msg.id, node);
             this.observe(idx, node);
         }
@@ -371,11 +843,21 @@ class BonitoChat {
         }
     }
 
-    appendChunk(id, text) {
-        const node = this.nodeById.get(id);
+    appendChunk(msg) {
+        const node = this.nodeById.get(msg.id);
         if (!node) return;
-        const t = node.querySelector('.bt-stream-text');
-        if (t) t.textContent += text;
+        // Server ships the FULL rendered html of the message-so-far each
+        // chunk (CommonMark-rendered, so intraword `_`s don't italicize and
+        // newlines/lists/headings format correctly while streaming). Just
+        // replace the bubble's content.
+        if (msg.html !== undefined) {
+            node.innerHTML = msg.html;
+        } else if (msg.text !== undefined) {
+            // Legacy text-delta path (kept for the streaming-stress mocks
+            // that still feed plain text). Append to the streaming span.
+            const t = node.querySelector('.bt-stream-text');
+            if (t) t.textContent += msg.text;
+        }
         // _queueScrollToBottom rAF-batches multiple chunks per frame so
         // we only scroll AFTER the layout pass that includes the new
         // text (avoids the stale-scrollHeight race).
@@ -409,26 +891,24 @@ class BonitoChat {
         if (node && msg.html) node.innerHTML = msg.html;
     }
 
+    // A committed thought ships its html on close — pre-fill so the body is
+    // there (and marked loaded) before the user even expands.
     onThoughtFinal(msg) {
         const node = this.nodeById.get(msg.id);
-        if (!node) return;
-        if (msg.html) {
-            const body = node.querySelector('.bt-thought-body');
-            if (body) body.innerHTML = msg.html;
-        }
-        const details = node.querySelector('.bt-thought-details');
-        if (details) details.dataset.streamed = 'true';
+        node && node.collapsable && node.collapsable.fill(msg.html || '');
     }
 
+    // Reply to a `thought.render` request (reloaded thought, lazy body).
     onThoughtBody(msg) {
-        // Reply to a `thought.render` request — populate the lazy body.
         const node = this.nodeById.get(msg.id);
-        if (!node) return;
-        const body = node.querySelector('.bt-thought-body');
-        if (body) {
-            body.innerHTML = msg.html;
-            body.dataset.loaded = 'true';
-        }
+        node && node.collapsable && node.collapsable.fill(msg.html);
+    }
+
+    // Transient "reasoning…" indicator toggled by Julia for the lifetime of an
+    // agent thought (redacted thoughts have no body, so this is the only trace).
+    onThinking(active) {
+        if (this.thinkingEl) this.thinkingEl.classList.toggle('bt-thinking-active', !!active);
+        if (active && this.followMode) this._queueScrollToBottom();
     }
 
     onToolUpdate(msg) {
@@ -437,6 +917,14 @@ class BonitoChat {
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) { s.textContent = msg.status; s.className = `bt-tool-status bt-status-${msg.status}`; }
+            // Pulsing glow + taskbar slot are gated on the `bt-tool-live`
+            // class. Terminal status sheds it; mid-flight gets it.
+            const live = !(msg.status === 'completed' || msg.status === 'failed');
+            node.classList.toggle('bt-tool-live', live);
+        }
+        if (msg.finished_at != null) {
+            node.dataset.toolFinished = String(msg.finished_at);
+            node.classList.remove('bt-tool-live');
         }
         if (msg.title) {
             const t = node.querySelector('.bt-tool-title');
@@ -446,15 +934,178 @@ class BonitoChat {
             const s = node.querySelector('.bt-tool-summary');
             if (s) s.textContent = msg.summary;
         }
+        // Edit tools ship their inline diff preview as a follow-up update (the
+        // header was emitted before the diff was on disk). Insert it right after
+        // the header, matching the initial toolHTML layout.
+        if (msg.preview != null) {
+            let prev = node.querySelector('.bt-edit-preview');
+            if (!prev) {
+                prev = document.createElement('div');
+                prev.className = 'bt-edit-preview';
+                const header = node.querySelector('.bt-tool-header');
+                if (header) header.insertAdjacentElement('afterend', prev);
+            }
+            prev.innerHTML = msg.preview;
+        }
+        // bt_show: the completion update is when we learn it's a "show me
+        // this" tool (and its mime). Native-media mode takes precedence:
+        // chrome off + body mounted; otherwise auto-expand the pill
+        // (idempotent; user can still collapse). Detached nodes defer the
+        // expand to insertion (see insertSorted).
+        if (msg.show_mime) node.dataset.showMime = msg.show_mime;
+        if (this._wantsNative(node)) {
+            this._applyNative(node);
+        } else if (msg.expand && node.collapsable) {
+            if (node.isConnected) node.collapsable.setExpanded(true);
+            else node.dataset.btAutoExpand = '1';
+        }
+        // A background bash/Task only learns it's a taskbar item when its launch
+        // result arrives (rawInput doesn't carry run_in_background), so the server
+        // flips `taskbar` on a later update. The taskbar filter keys off this
+        // attr — set it so `_refreshTaskbar` below adds the slot. (Set-only,
+        // matching createNode; nothing clears it.)
+        if (msg.taskbar) node.dataset.toolTaskbar = '1';
+        // Live-set / timer / taskbar all sit on the same DOM data attrs the
+        // ticker reads — rebuild now so the taskbar reflects this change
+        // instantly instead of waiting for the next 1s tick.
+        this._refreshTaskbar();
+    }
+
+    // ── Message filter (toolbar below the composer) ──────────────────────
+
+    // First occurrence of a filter key → add its show/hide checkbox to the
+    // toolbar, checked. Base types sit first in TYPE_ORDER; tool keys go in
+    // a trailing "Tools:" group, alphabetical — stable positions either way,
+    // independent of arrival order. No-op when the toolbar isn't mounted.
+    noteKey(msg) {
+        const key = filterKey(msg);
+        if (!key || this.seenTypes.has(key) || !this.filterRow) return;
+        this.seenTypes.add(key);
+        // First agent reply in the chat → the idle "waiting" line below the
+        // last message earns its right to show (see _updateWaiting).
+        if (key === 'agent') this._updateWaiting();
+        const isTool = key.startsWith('tool:');
+        const text   = isTool ? key.slice(5) : (TYPE_LABELS[key] ?? key);
+        const label = document.createElement('label');
+        label.className = 'bt-filter-toggle';
+        label.dataset.key = key;
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !this.hiddenTypes.has(key);
+        cb.addEventListener('change', () => this.setKeyHidden(key, !cb.checked));
+        label.append(cb, text);
+        const toggles = () => [...this.filterRow.querySelectorAll('.bt-filter-toggle')];
+        if (isTool) {
+            this.ensureToolGroupLabel();
+            const next = toggles().find(el =>
+                el.dataset.key.startsWith('tool:') &&
+                el.dataset.key.slice(5).localeCompare(text) > 0);
+            this.filterRow.insertBefore(label, next ?? null);
+        } else {
+            const order = t => { const i = TYPE_ORDER.indexOf(t); return i < 0 ? TYPE_ORDER.length : i; };
+            // Before the first base toggle that sorts after us; else before
+            // the Tools: group; else at the end.
+            const next = toggles().find(el =>
+                !el.dataset.key.startsWith('tool:') && order(el.dataset.key) > order(key))
+                ?? this.filterRow.querySelector('.bt-filter-group-label');
+            this.filterRow.insertBefore(label, next ?? null);
+        }
+    }
+
+    ensureToolGroupLabel() {
+        if (this.filterRow.querySelector('.bt-filter-group-label')) return;
+        const span = document.createElement('span');
+        span.className = 'bt-filter-group-label';
+        span.textContent = 'Tools:';
+        this.filterRow.appendChild(span);
+    }
+
+    // ── Native media display (bt_show results) ───────────────────────────
+    // When "Native Images" / "Native Videos" is on, a bt_show whose mime is
+    // image/* / video/* renders bare in the chat flow: the pill's chrome is
+    // hidden via the bt-tool-native class and the body is auto-expanded
+    // through the normal Collapsable → tool.render path (the server fills
+    // the slot with the <img>/<video>). Display-only, per-tab — like the
+    // filters.
+
+    // Does the current display-option state want this node native? Keys on
+    // the wire show_mime; mimes outside image/video are never native.
+    _wantsNative(node) {
+        const mime = node.dataset.showMime || '';
+        if (mime.startsWith('image/')) return this.nativeImages;
+        if (mime.startsWith('video/')) return this.nativeVideos;
+        return false;
+    }
+
+    _applyNative(node) {
+        node.classList.add('bt-tool-native');
+        if (node.isConnected) {
+            node.collapsable?.setExpanded(true);
+        } else {
+            // Cached but not in the document (virtual-scroll window /
+            // prefetch): defer the expand to insertion so the tool.render
+            // reply has a slot to mount into.
+            node.dataset.btAutoExpand = '1';
+        }
+    }
+
+    _removeNative(node) {
+        node.classList.remove('bt-tool-native');
+        delete node.dataset.btAutoExpand;
+        node.collapsable?.setExpanded(false);   // discardOnCollapse frees the body
+    }
+
+    // Flip one media class ('image/' or 'video/') and re-depict every cached
+    // node of that class; the other class is untouched.
+    _setNativeMedia(prefix, on) {
+        if (prefix === 'image/') this.nativeImages = on;
+        else                     this.nativeVideos = on;
+        for (const node of this.cache.values()) {
+            if (!(node.dataset.showMime || '').startsWith(prefix)) continue;
+            on ? this._applyNative(node) : this._removeNative(node);
+        }
+        this.refresh();
+    }
+
+    // Toggle a key's visibility: inline display on every matching node (an
+    // open key-set — per-tool keys — rules out static CSS classes), while
+    // effHeight zeroes the hidden indices so the spacer/scroll math matches
+    // the real (collapsed) layout exactly. Nodes created later pick up the
+    // current state in createNode.
+    setKeyHidden(key, hidden) {
+        this.hiddenTypes[hidden ? 'add' : 'delete'](key);
+        for (const node of this.cache.values()) {
+            if (node.dataset.filterKey === key) node.style.display = hidden ? 'none' : '';
+        }
+        // Hiding the agent stream also hides the idle "waiting" line that
+        // would otherwise dangle under messages that aren't there.
+        if (key === 'agent') this._updateWaiting();
+        this.refresh();
+        if (this.followMode) this._queueScrollToBottom();
+    }
+
+    // The idle "waiting for your next instruction" line only makes sense
+    // under an agent reply: keep it off for empty chats (nothing was asked
+    // yet) and while the Agent filter hides the messages it would sit
+    // under. The CSS show-rule requires `bt-waiting-on` on top of the
+    // not-busy sibling condition, so busy/idle switching stays pure CSS.
+    _updateWaiting() {
+        if (!this.waitingEl) return;
+        const on = this.seenTypes.has('agent') && !this.hiddenTypes.has('agent');
+        this.waitingEl.classList.toggle('bt-waiting-on', on);
     }
 
     // ── DOM node creation ────────────────────────────────────────────────
 
     createNode(msg) {
         const div = document.createElement('div');
+        const fkey = filterKey(msg);
+        div.dataset.filterKey = fkey;       // filter identity: type, or tool:<name>
+        this.noteKey(msg);                  // first occurrence → toolbar checkbox
         switch (msg.type) {
             case 'user':
                 div.className = 'bt-user-msg';
+                if (msg.queued) div.classList.add('bt-queued');
                 div.textContent = msg.text;
                 break;
             case 'agent':
@@ -471,46 +1122,151 @@ class BonitoChat {
                     div.innerHTML = msg.html || '';
                 }
                 break;
-            case 'thought':
+            case 'thought': {
                 div.className = 'bt-thought-msg';
                 div.innerHTML = this.thoughtHTML(msg);
-                this.wireThoughtToggle(div, msg.id);
+                const id = msg.id;
+                // Native <details> host, lazy body loaded once via thought.render.
+                div.collapsable = new Collapsable(
+                    div.querySelector('.bt-thought-summary'),
+                    div.querySelector('.bt-thought-body'),
+                    { native: true,
+                      onExpand: () => this.comm.notify({type: 'thought.render', id}) });
+                if (msg.html) div.collapsable.fill(msg.html);
                 break;
-            case 'tool':
+            }
+            case 'tool': {
                 div.className = 'bt-tool-msg';
                 div.innerHTML = this.toolHTML(msg);
-                this.wireToolToggle(div, msg.id);
+                // Live state + start time live on the message node itself so
+                // the 1s ticker can find them by selector. Status `pending` /
+                // `in_progress` count as live until a terminal update flips
+                // the class via `onToolUpdate`.
+                if (msg.id) div.dataset.msgId = msg.id;
+                if (msg.started_at != null)
+                    div.dataset.toolStarted = String(msg.started_at);
+                if (msg.finished_at != null)
+                    div.dataset.toolFinished = String(msg.finished_at);
+                // Server-decided opt-in for the taskbar slot. Background bash
+                // / Task land here; regular tools don't.
+                if (msg.taskbar) div.dataset.toolTaskbar = '1';
+                const liveTool = !(msg.status === 'completed' || msg.status === 'failed') &&
+                                  msg.finished_at == null;
+                if (liveTool) div.classList.add('bt-tool-live');
+                const id = msg.id;
+                // Click-header host; the body is re-rendered (Monaco etc.) on
+                // every expand via tool.render → dom_in_js, and discarded on
+                // collapse so the editors are freed.
+                div.collapsable = new Collapsable(
+                    div.querySelector('.bt-tool-header'),
+                    div.querySelector('.bt-tool-body'),
+                    { toggleEl: div.querySelector('.bt-tool-toggle'),
+                      fetchEachExpand: true, discardOnCollapse: true,
+                      onExpand: () => this.comm.notify({type: 'tool.render', id}) });
+                // Detach (bonito_app only): pop the embed into the floating
+                // window. Lives on the ⤢ header button — the conventional "open
+                // in a window" glyph, and where users expect detach.
+                const detachBtn = div.querySelector('.bt-tool-detach');
+                if (detachBtn) detachBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    window._btPopup && window._btPopup.detach(id);
+                });
+                // Full-chat-width toggle, vertically centered on the bubble's
+                // right edge (CSS reveals it only while the body is expanded —
+                // there's no point widening an empty header). Extends the pill to
+                // span the whole message column so wide content (diffs / tables /
+                // remote-app embeds) gets room. Must NOT toggle expand/collapse,
+                // so stopPropagation.
+                const wideBtn = div.querySelector('.bt-tool-fullwidth');
+                if (wideBtn) wideBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const active = div.classList.toggle('bt-tool-wide-active');
+                    wideBtn.textContent = active ? '«' : '»';
+                    wideBtn.title = active ?
+                        'Collapse to default width' : 'Expand to full chat width';
+                });
+                // The show's mime (bt_show results) — the native-media
+                // toggles key on it.
+                if (msg.show_mime) div.dataset.showMime = msg.show_mime;
+                if (this._wantsNative(div)) {
+                    // Native display: chrome off + body auto-mounted on
+                    // first insertion.
+                    div.classList.add('bt-tool-native');
+                    div.dataset.btAutoExpand = '1';
+                } else if (msg.expand) {
+                    // Auto-expand (e.g. bt_show) — DEFERRED until the node
+                    // first enters the document (insertSorted). The history
+                    // prefetcher creates nodes detached; expanding those
+                    // immediately fired tool.render whose dom_in_js reply
+                    // found no slot in the document — the body stayed on
+                    // "loading…" forever (and every off-screen bt_show in
+                    // history cost a render round-trip up front).
+                    div.dataset.btAutoExpand = '1';
+                }
                 break;
-            case 'plan':
+            }
+            case 'plan': {
                 div.className = 'bt-plan-msg';
                 div.innerHTML = msg.html || '';
+                // TodoListMsg absorbs subsequent updates by id — every later
+                // emit overwrites the same node's html. The live flag (and
+                // started_at) drive the pulse + taskbar slot.
+                if (msg.id) div.dataset.msgId = msg.id;
+                if (msg.started_at != null)
+                    div.dataset.planStarted = String(msg.started_at);
+                if (msg.finished_at != null)
+                    div.dataset.planFinished = String(msg.finished_at);
+                if (msg.summary)
+                    div.dataset.planSummary = msg.summary;
+                if (msg.live) div.classList.add('bt-plan-live');
                 break;
+            }
+            case 'summary': {
+                // Centered separator block for a `/compact` summary — NOT a
+                // user/agent bubble. Streaming case shows a tiny placeholder
+                // until `summary_final` lands; the persisted-replay case ships
+                // the html directly in `msg.html`.
+                div.className = 'bt-summary-msg';
+                const inner = document.createElement('div');
+                inner.className = 'bt-summary-body';
+                if (msg.streaming && !msg.html) {
+                    inner.textContent = 'Session continued — summary loading…';
+                } else {
+                    inner.innerHTML = msg.html || '';
+                }
+                div.appendChild(inner);
+                break;
+            }
         }
+        // A node created while its filter key is unchecked starts hidden —
+        // scrollback fetches and live appends respect the active filter.
+        if (this.hiddenTypes.has(fkey)) div.style.display = 'none';
         return div;
     }
 
-    thoughtHTML(msg) {
-        const body = msg.streaming ?
-                       `<span class="bt-stream-text">${escapeHTML(msg.text || '')}</span>` :
-                     msg.html      ? msg.html : '';
-        const summary = msg.streaming ? 'Thinking…' :
-                        (msg.summary || 'Show thinking');
-        return `<details class="bt-thought-details" data-thought-id="${escapeAttr(msg.id || '')}">
-            <summary class="bt-thought-summary">💭 ${escapeHTML(summary)}</summary>
-            <div class="bt-thought-body" data-loaded="${msg.streaming || msg.html ? 'true' : 'false'}">${body}</div>
-        </details>`;
+    // Clear the "queued" state from the FIRST (oldest) still-queued user
+    // bubble. Server-side FIFO under `promote_queued_user_bubble!` matches the
+    // DOM order the bubbles were created in, so first-match is correct.
+    unqueueOldestUser() {
+        const q = this.container.querySelector('.bt-user-msg.bt-queued');
+        if (q) q.classList.remove('bt-queued');
     }
 
-    wireThoughtToggle(node, thoughtId) {
-        const details = node.querySelector('.bt-thought-details');
-        const body    = node.querySelector('.bt-thought-body');
-        if (!details || !body) return;
-        details.addEventListener('toggle', () => {
-            if (!details.open) return;
-            if (body.dataset.loaded === 'true') return;
-            body.innerHTML = '<span class="bt-thought-loading">loading…</span>';
-            this.comm.notify({type: 'thought.render', id: thoughtId});
-        });
+    onSummaryFinal(msg) {
+        // Find the LAST summary node still in streaming/placeholder state and
+        // fill it. We don't carry an id (summaries are rare — one per session
+        // continuation — and there's no ambiguity in practice).
+        const nodes = this.container.querySelectorAll('.bt-summary-msg .bt-summary-body');
+        const tgt = nodes[nodes.length - 1];
+        if (tgt) tgt.innerHTML = msg.html || '';
+    }
+
+    thoughtHTML(msg) {
+        const summary = msg.summary || 'Show thinking';
+        return `<details class="bt-thought-details" data-thought-id="${escapeAttr(msg.id || '')}">
+            <summary class="bt-thought-summary">💭 ${escapeHTML(summary)}</summary>
+            <div class="bt-thought-body">${msg.html || ''}</div>
+        </details>`;
     }
 
     toolHTML(msg) {
@@ -521,6 +1277,9 @@ class BonitoChat {
         // badge before the (already prefix-stripped) tool name.
         const server = msg.server ?
             `<span class="bt-tool-server">${escapeHTML(msg.server)}</span>` : '';
+        // Elapsed timer — only renders text once > 1s have passed (see
+        // _tickLiveTimers). Always emitted so the same span can be updated
+        // in place by every tick + by `onToolUpdate`.
         return `
             <div class="bt-tool-header" data-expanded="false">
                 <span class="bt-tool-toggle">▶</span>
@@ -528,39 +1287,163 @@ class BonitoChat {
                 ${server}
                 <span class="bt-tool-title">${escapeHTML(msg.title || '')}</span>
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
+                <span class="bt-tool-timer"></span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
+                ${msg.kind === 'bonito_app'
+                    ? `<button class="bt-tool-detach" type="button"
+                              title="Detach to floating window">⤢</button>`
+                    : ''}
             </div>
             ${preview}
-            <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
+            <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>
+            <button class="bt-tool-fullwidth" type="button"
+                    title="Expand to full chat width">»</button>`;
     }
 
-    wireToolToggle(node, toolId) {
-        const header = node.querySelector('.bt-tool-header');
-        const toggle = header.querySelector('.bt-tool-toggle');
-        const body   = node.querySelector('.bt-tool-body');
-        if (!header || !body) return;
-        header.style.cursor = 'pointer';
-        header.addEventListener('click', () => {
-            // The glyph is swapped directly (`▶` ↔ `▼`) — a plain
-            // textContent change that works in every renderer. There is
-            // NO CSS `transform: rotate()` on `.bt-tool-toggle`: the old
-            // code rotated the glyph 90° *as well as* swapping it, so the
-            // expanded `▼` came out sideways (looked like a small `◀`).
-            const expanded = header.dataset.expanded === 'true';
-            if (expanded) {
-                body.innerHTML = '';
-                header.dataset.expanded = 'false';
-                toggle.textContent = '▶';
-            } else {
-                body.innerHTML = '<div class="bt-tool-loading">loading…</div>';
-                this.comm.notify({type: 'tool.render', id: toolId});
-                header.dataset.expanded = 'true';
-                toggle.textContent = '▼';
+    // ── Live tools / todos: pulse + timer + taskbar ──────────────────────
+    // A single 1s interval drives all live-state UX:
+    //   1) Update the inline `.bt-tool-timer` on each live pill (> 1s only).
+    //   2) Rebuild the floating taskbar from current live DOM (one slot per
+    //      live pill; click → scrollIntoView on the source).
+    // No per-pill timers, no server-pushed taskbar state — DOM is the source
+    // of truth. Cheap: scans at most a few dozen nodes once a second.
+    onPlanUpdate(msg) {
+        const node = this.nodeById.get(msg.id);
+        if (!node) return;
+        if (msg.html != null) node.innerHTML = msg.html;
+        if (msg.started_at != null)
+            node.dataset.planStarted = String(msg.started_at);
+        if (msg.finished_at != null) {
+            node.dataset.planFinished = String(msg.finished_at);
+            node.classList.remove('bt-plan-live');
+        } else if (msg.live === false) {
+            node.classList.remove('bt-plan-live');
+        } else if (msg.live === true) {
+            node.classList.add('bt-plan-live');
+        }
+        if (msg.summary) node.dataset.planSummary = msg.summary;
+        this._refreshTaskbar();
+    }
+
+    _setupLiveTicker() {
+        // The taskbar element is mounted by the Julia side as a sibling of
+        // `.bt-messages`. Bail gracefully if it's absent (older mount points
+        // / tests skipping the chat shell).
+        this.taskbarEl = this.app ?
+            this.app.querySelector('.bt-taskbar') :
+            this.container.parentElement.querySelector('.bt-taskbar');
+        if (!this.taskbarEl) return;
+        // Delegated click on the taskbar:
+        //   - hitting the ⊗ stop affordance → notify the server, which
+        //     dispatches per-tool via `StopToolCommand` (synthetic user
+        //     message asking Claude to stop the background tool — we don't
+        //     fake an immediate-stop UI because the SDK has no kill primitive
+        //     for background bash, so the slot keeps living until the tool
+        //     itself transitions to terminal status).
+        //   - anywhere else on the slot → scroll back to the source pill.
+        this._onTaskbarClick = (ev) => {
+            const stopBtn = ev.target.closest('.bt-taskbar-slot-stop');
+            if (stopBtn) {
+                ev.stopPropagation();
+                const slot = stopBtn.closest('.bt-taskbar-slot');
+                const id = slot?.dataset.targetId;
+                if (id) this.comm.notify({ type: 'stop_tool', id });
+                return;
             }
-        });
+            const slot = ev.target.closest('.bt-taskbar-slot');
+            if (!slot) return;
+            const id = slot.dataset.targetId;
+            if (!id) return;
+            const target = this.nodeById.get(id);
+            if (target) target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        };
+        this.taskbarEl.addEventListener('click', this._onTaskbarClick);
+        this._tickerId = setInterval(() => this._tickLiveTimers(), 1000);
+        // Initial paint so the bar is populated immediately on first mount
+        // (not after a 1s delay).
+        this._refreshTaskbar();
+    }
+
+    _tickLiveTimers() {
+        if (this.destroyed) return;
+        const now = Date.now() / 1000;
+        // Update inline timers on every live pill — both tools and todos.
+        for (const el of this.container.querySelectorAll(
+                'div.bt-tool-msg.bt-tool-live, div.bt-plan-msg.bt-plan-live')) {
+            const started = parseFloat(el.dataset.toolStarted ?? el.dataset.planStarted ?? '0');
+            if (!started) continue;
+            const elapsed = now - started;
+            const timer = el.querySelector('.bt-tool-timer');
+            if (timer) timer.textContent = elapsed > 1 ? _formatElapsed(elapsed) : '';
+        }
+        // Also tick the taskbar slot timers (cheaper than full rebuild).
+        for (const slot of this.taskbarEl.querySelectorAll('.bt-taskbar-slot')) {
+            const started = parseFloat(slot.dataset.started ?? '0');
+            if (!started) continue;
+            const elapsed = now - started;
+            const t = slot.querySelector('.bt-taskbar-slot-timer');
+            if (t) t.textContent = elapsed > 1 ? _formatElapsed(elapsed) : '';
+        }
+    }
+
+    _refreshTaskbar() {
+        if (this.destroyed || !this.taskbarEl) return;
+        // Collect live source nodes in document order: tool pills that
+        // opted into the taskbar (background bash / Task) plus every live
+        // todo list. The `[data-tool-taskbar]` filter mirrors the server-
+        // side `is_taskbar_item` decision — a regular live Read pulses
+        // briefly but doesn't crowd the bar.
+        const live = this.container.querySelectorAll(
+            'div.bt-tool-msg.bt-tool-live[data-tool-taskbar], div.bt-plan-msg.bt-plan-live');
+        if (live.length === 0) {
+            this.taskbarEl.replaceChildren();
+            return;
+        }
+        const frag = document.createDocumentFragment();
+        for (const el of live) {
+            const id = el.dataset.msgId;
+            if (!id) continue;
+            const isPlan = el.classList.contains('bt-plan-msg');
+            const icon = isPlan ? '📋' :
+                (el.querySelector('.bt-tool-kind')?.textContent || '⚙');
+            const label = isPlan ?
+                (el.dataset.planSummary || 'Todo list') :
+                (el.querySelector('.bt-tool-title')?.textContent || 'Tool');
+            const started = isPlan ? el.dataset.planStarted : el.dataset.toolStarted;
+            const slot = document.createElement('div');
+            slot.className = 'bt-taskbar-slot';
+            slot.dataset.targetId = id;
+            if (started) slot.dataset.started = started;
+            // Todo lists are passive trackers — no SDK primitive to "stop"
+            // them. Only tool slots get the ⊗ affordance.
+            const stop = isPlan ? '' :
+                `<span class="bt-taskbar-slot-stop" title="Ask Claude to stop this">⊗</span>`;
+            slot.innerHTML =
+                `<span class="bt-taskbar-slot-icon">${icon}</span>` +
+                `<span class="bt-taskbar-slot-label"></span>` +
+                `<span class="bt-taskbar-slot-timer"></span>` +
+                stop;
+            slot.querySelector('.bt-taskbar-slot-label').textContent = label;
+            frag.appendChild(slot);
+        }
+        this.taskbarEl.replaceChildren(frag);
+        // Prime the timers now so a freshly added slot doesn't wait a full
+        // tick to show its elapsed time.
+        this._tickLiveTimers();
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
+
+    // The overscroll tail (empty space below the last message) is PLAIN
+    // CONTENT: "bottom" everywhere is the real scroll bottom, tail fully
+    // visible. No bottom-math special-cases — an earlier content-bottom-
+    // excluding-tail model needed tail-awareness in four places and the
+    // missed interactions made the scrollbar fight the user.
+    _sizeTail() {
+        if (!this.tailEl) return;
+        this.tailEl.style.height =
+            Math.round(this.container.clientHeight * 0.3) + 'px';
+    }
 
     atBottom() {
         const { scrollTop, scrollHeight, clientHeight } = this.container;
@@ -579,6 +1462,12 @@ class BonitoChat {
     // returns a stale value mid-layout; deferring to rAF guarantees
     // we measure post-layout.
     _queueScrollToBottom() {
+        // A held scrollbar is ABSOLUTE authority over scrollTop: no chase,
+        // no re-anchor, no reveal-scroll may fire mid-drag (container
+        // resizes from toolbar growth, streaming chunks, and range
+        // arrivals all funnel through here — any of them would snap the
+        // thumb out of the user's hand).
+        if (this._scrollbarDrag) return;
         if (this._scrollQueued || this.destroyed) return;
         this._scrollQueued = true;
         this._scrollRafId = requestAnimationFrame(() => {
@@ -589,14 +1478,17 @@ class BonitoChat {
     }
 
     scrollToBottom() {
-        // Belt + suspenders: set scrollTop AND scrollIntoView on the
-        // bottom spacer. scrollTop alone uses the container's reported
-        // scrollHeight which can be stale during streaming; scrollIntoView
-        // tells the browser "make this element's bottom edge visible"
-        // and lets it compute the right position from current layout.
+        if (this._scrollbarDrag) return;   // the drag owns scrollTop
+        // Belt + suspenders: set scrollTop AND scrollIntoView on the LAST
+        // child (the overscroll tail — plain content, see _sizeTail).
+        // scrollTop alone uses the container's reported scrollHeight which
+        // can be stale during streaming; scrollIntoView tells the browser
+        // "make this element's bottom edge visible" and lets it compute
+        // the right position from current layout.
         this.container.scrollTop = this.container.scrollHeight;
-        if (this.spacerBottom) {
-            this.spacerBottom.scrollIntoView({ block: 'end', behavior: 'auto' });
+        const anchor = this.tailEl || this.spacerBottom;
+        if (anchor) {
+            anchor.scrollIntoView({ block: 'end', behavior: 'auto' });
         }
         // Don't rely on the `scroll` event to drive the post-scroll range
         // fetch — Electron's offscreen renderer (and a few other headless
@@ -626,8 +1518,18 @@ class BonitoChat {
         this.app       = app;
         this.inputArea = app.querySelector('.bt-input-area');
         this.textInput = app.querySelector('.bt-text-input');
-        this.sendBtn   = app.querySelector('.bt-send-btn');
-        if (!this.inputArea || !this.textInput || !this.sendBtn) return;
+        // NOTE: we deliberately do NOT cache `.bt-send-btn` / `.bt-stop-btn`
+        // references at setup time. Bonito renders the chat's children
+        // non-atomically — the send button can land in the DOM a frame
+        // before the stop button, so a `querySelector('.bt-stop-btn')`
+        // here can return `null` even though the button shows up moments
+        // later. A null-ref + late button = silently dead click handler
+        // (esp. the stop button, which is the user's only interrupt
+        // affordance). Event delegation on the chat root (`.bt-app`)
+        // sidesteps the race entirely: the listener is alive before
+        // either button exists, and dispatches by `e.target.closest`
+        // at click time.
+        if (!this.inputArea || !this.textInput) return;
 
         // Thumbnail strip lives ABOVE the input row inside .bt-input-area.
         this.attachBar = document.createElement('div');
@@ -680,17 +1582,25 @@ class BonitoChat {
         this.app.addEventListener('dragleave', this._onDragLeave);
         this.app.addEventListener('drop',      this._onDrop);
 
-        // Send click — capture phase so we run before any other listener
-        // (none exist now that Julia uses a plain DOM button, but
-        // capture is robust against future additions). Same shape for
-        // textarea Enter.
-        this._onSendClickCapture = (e) => {
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            this._submit();
+        // Single delegated click handler on the chat root. Capture phase
+        // so we run before any inner element that might (in the future)
+        // also wire a click handler. `target.closest` survives DOM swaps
+        // and works regardless of when the buttons are added.
+        this._onAppClickCapture = (e) => {
+            if (this.destroyed) return;
+            if (e.target.closest('.bt-send-btn')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this._submit();
+            } else if (e.target.closest('.bt-stop-btn')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this._cancel();
+            }
         };
-        this.sendBtn.addEventListener('click', this._onSendClickCapture, true);
+        this.app.addEventListener('click', this._onAppClickCapture, true);
 
+        // Enter-to-send on the textarea (Shift+Enter newline as usual).
         this._onTextInputKeyCapture = (e) => {
             if (e.key !== 'Enter' || e.shiftKey) return;
             e.preventDefault();
@@ -699,13 +1609,25 @@ class BonitoChat {
         };
         this.textInput.addEventListener('keydown', this._onTextInputKeyCapture, true);
 
-        if (this.stopBtn) {
-            this._onStopClick = (e) => {
-                e.preventDefault();
-                this.comm.notify({type: 'cancel'});
-            };
-            this.stopBtn.addEventListener('click', this._onStopClick);
-        }
+        // ESC anywhere → cancel. Listener on `document` so the user's
+        // current focus (textarea, scroll position, anywhere) can't
+        // suppress it. The Monaco tool-body editor owns ESC for its own
+        // semantics — skip when the user is editing inside one.
+        this._onEscapeKey = (e) => {
+            if (e.key !== 'Escape' || e.repeat) return;
+            const t = e.target;
+            if (t && t.closest && t.closest('.monaco-editor')) return;
+            e.preventDefault();
+            this._cancel();
+        };
+        document.addEventListener('keydown', this._onEscapeKey, true);
+    }
+
+    // Fire a cancel notification. Used by both the stop button click
+    // and the ESC keystroke. Stays a one-line helper so the two
+    // entry points can't drift in what they send.
+    _cancel() {
+        this.comm.notify({type: 'cancel'});
     }
 
     _dragHasImage(e) {
@@ -910,6 +1832,16 @@ function escapeAttr(str) {
     return escapeHTML(str).replace(/"/g, '&quot;');
 }
 
+// Compact elapsed-time formatting for the inline tool timer + taskbar slot.
+// `< 60s` shows seconds; minutes-and-up shows `<m>m<s>s`. Only callers that
+// have already crossed the 1s threshold reach here, so we never render "0s".
+function _formatElapsed(sec) {
+    if (sec < 60) return `${Math.round(sec)}s`;
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec - m * 60);
+    return s === 0 ? `${m}m` : `${m}m${s}s`;
+}
+
 // Chunked base64 encoder. `btoa(String.fromCharCode(...new Uint8Array(buf)))`
 // breaks on large buffers (browser arg-count limit, ~64k); we chunk through
 // 32k bytes at a time.
@@ -928,15 +1860,36 @@ function arrayBufferToBase64(buf) {
 // via `js"$(ChatLib).then(lib => lib.connect($(node), $(comm)))"`. The
 // MutationObserver auto-cleans the BonitoChat instance when its container
 // leaves the document, so no Julia-side lifecycle plumbing is needed.
+// Live chat instances, so `window._btToolSlot` can find tool-body slots on
+// nodes the virtual scroll currently holds DETACHED (cached but not in the
+// document). The server's tool.render reply mounts via this helper — filling
+// a detached node is fine, the content shows when the node is re-inserted.
+// Without it, a reply racing an eviction was silently dropped and the body
+// stayed on "loading…".
+const CHAT_INSTANCES = new Set();
+window._btToolSlot = (id) => {
+    const direct = document.querySelector(
+        `.bt-tool-body[data-tool-id="${CSS.escape(id)}"]`);
+    if (direct) return direct;
+    for (const chat of CHAT_INSTANCES) {
+        const node = chat.nodeById.get(id);
+        const slot = node && node.querySelector('.bt-tool-body');
+        if (slot) return slot;
+    }
+    return null;
+};
+
 export function connect(node, comm) {
     const chat = new BonitoChat(node, comm);
     node.__bt_chat = chat;     // devtools/test inspection hook
+    CHAT_INSTANCES.add(chat);
 
     const parent = node.parentNode;
     if (parent) {
         const mo = new MutationObserver(() => {
             if (!node.isConnected) {
                 try { chat.destroy(); } catch (_) {}
+                CHAT_INSTANCES.delete(chat);
                 mo.disconnect();
             }
         });

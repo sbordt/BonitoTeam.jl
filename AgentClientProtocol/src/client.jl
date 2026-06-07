@@ -20,7 +20,21 @@ mutable struct Client
     conn::Connection
     session_id::String
     cwd::String
+    # The raw, untouched session-setup result (`session/new` / `session/load`)
+    # — mirrors `ToolCallNotif.raw`. The protocol layer stays lossless and
+    # unopinionated here; typed views are FUNCTIONS over this dict (e.g.
+    # `parse_config_options`), so agents with different metadata need no
+    # Client/transport changes.
+    session_result::Dict{String,Any}
 end
+
+# Back-compat: existing call sites (and tests) construct without a result.
+Client(conn::Connection, session_id::AbstractString, cwd::AbstractString) =
+    Client(conn, String(session_id), String(cwd), Dict{String,Any}())
+
+# Normalize whatever JSON gave us (Dict{String,Any} in practice).
+_result_dict(r) = r isa AbstractDict ?
+    Dict{String,Any}(String(k) => v for (k, v) in r) : Dict{String,Any}()
 
 # Default request handler for the local-subprocess Client. Handles the
 # fs/terminal/permission RPCs claude-agent-acp can fire. Holds the cwd so
@@ -67,7 +81,10 @@ function on_request(h::FSRequestHandler, method::AbstractString, params)
     return nothing
 end
 
-# Discover the agent binary: env var → PATH → node_modules search.
+# Discover the agent binary. We rely solely on the user-installed binary:
+# the CLAUDE_AGENT_ACP env var, then PATH. Node installs are user-managed, so
+# we deliberately do NOT walk the repo for a vendored node_modules/.bin copy —
+# that would re-create a node_modules under e.g. dev/Bonito, which we never want.
 function find_agent_bin()
     explicit = get(ENV, "CLAUDE_AGENT_ACP", "")
     !isempty(explicit) && return explicit
@@ -75,21 +92,7 @@ function find_agent_bin()
     global_bin = Sys.which("claude-agent-acp")
     global_bin !== nothing && return global_bin
 
-    # Walk up from this source file; check both direct node_modules and
-    # sibling subdirectory node_modules (e.g. dev/Bonito/node_modules).
-    dir = @__DIR__
-    for _ in 1:8
-        bin = joinpath(dir, "node_modules", ".bin", "claude-agent-acp")
-        isfile(bin) && return bin
-        # Check one level of subdirectories (covers dev/*/node_modules pattern)
-        for sub in readdir(dir; join=true)
-            isdir(sub) || continue
-            bin = joinpath(sub, "node_modules", ".bin", "claude-agent-acp")
-            isfile(bin) && return bin
-        end
-        dir = dirname(dir)
-    end
-    return "claude-agent-acp"  # let OS raise a clear error at spawn time
+    return "claude-agent-acp"  # not on PATH; Client() raises a clear error below
 end
 
 function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
@@ -97,8 +100,11 @@ function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
                 agent_env::Dict{String,String} = Dict{String,String}(),
                 agent_bin::String = find_agent_bin())
 
-    isfile(agent_bin) || error("claude-agent-acp not found at: $agent_bin\n" *
-                               "Set CLAUDE_AGENT_ACP env var or pass agent_bin=.")
+    isfile(agent_bin) || error(
+        "claude-agent-acp not found (resolved to: $agent_bin).\n" *
+        "Install it yourself and put it on PATH, e.g.\n" *
+        "    npm install -g @agentclientprotocol/claude-agent-acp\n" *
+        "or point CLAUDE_AGENT_ACP at the binary / pass agent_bin=.")
 
     env = merge(Dict(k => v for (k,v) in ENV),
                 Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
@@ -126,7 +132,7 @@ function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
                           Dict("cwd" => cwd, "mcpServers" => mcp_list))
     session_id = result["sessionId"]
 
-    return Client(conn, session_id, cwd)
+    return Client(conn, session_id, cwd, _result_dict(result))
 end
 
 # One attached image for a multimodal prompt.
@@ -137,19 +143,16 @@ struct ImageAttachment
     mime::String
 end
 
-# Send a user message; blocks until the agent signals end_turn / cancelled
-# AND every session/update notification queued before that response has
-# been delivered to the handler. Returning this way means the caller can
-# treat "prompt! returned" as "the turn is fully observed" without having
-# to think about the inbox dispatcher running ahead/behind.
+# Send a user message; returns a `Channel{Message}` of the whole, ordered
+# messages that make up this turn (agent text, thoughts, tool calls, plans).
+# Each streaming message carries its own `updates` channel; iterate the
+# returned channel and drain each message's `updates` to render it. The
+# channel closes when the turn ends (end_turn / cancelled); if the connection
+# dies mid-turn, draining the channel rethrows `ConnectionClosed`.
 #
-# Without the trailing `drain_updates`, this race exists: chunks are
-# queued in the update inbox (FIFO) while end_turn arrives on a different
-# JSON-RPC pending channel; the response can unblock send_request before
-# the dispatcher has finished applying the last chunks, and the caller's
-# "turn over" finalize can race the tail of the chunk stream into a
-# corrupted state. The barrier is invisible to callers — they just see
-# `prompt!` block until everything's settled.
+# The whole turn is ONE bounded loop: a local `TurnState` coalesces the raw
+# update stream into messages and is `close`d when the stream ends. Nothing
+# outlives the turn.
 #
 # `images` are appended after the text as ACP image content blocks.
 function prompt!(client::Client, text::String;
@@ -162,16 +165,75 @@ function prompt!(client::Client, text::String;
             "mimeType" => img.mime,
         ))
     end
-    send_request(client.conn, "session/prompt", Dict(
-        "sessionId" => client.session_id,
-        "prompt"    => blocks,
-    ))
-    drain_updates(client.conn)
-    return nothing
+    params = Dict("sessionId" => client.session_id, "prompt" => blocks)
+    updates, response = prompt_updates(client.conn, params)
+    conn = client.conn
+    return Channel{Message}(BUF) do messages
+        st = TurnState()
+        try
+            for u in updates
+                # Once cancel is issued, stop coalescing/rendering and just
+                # drain the backlog so the dispatcher can reach the `cancelled`
+                # response and end the turn promptly. `close(st)` below still
+                # seals whatever was rendered up to the cancel point.
+                (@atomic conn.cancelling) && continue
+                parse_update!(messages, st, u)
+            end
+        finally
+            close(st)                 # finish the trailing message + any open tools
+        end
+        result = take!(response)      # end_turn / cancelled — or ConnectionClosed on teardown
+        result isa Exception && throw(result)
+    end
+end
+
+# Drive `session/load` and collect the resumed session's replayed history as a
+# flat, ordered, fully-materialized `Vector{Message}` (same coalescing the live
+# `prompt!` loop uses — `parse_update!`/`TurnState`). The agent re-streams the
+# session's jsonl as `session/update` notifications during the load; we feed them
+# through the coalescer in a task and drain each message's own stream as it
+# closes (so a long message can't deadlock on the bounded per-message channel).
+#
+# `params` is the `session/load` params dict (`sessionId`, `cwd`, `mcpServers`).
+# Returns `(msgs, result)` after the load response arrives (the whole replay is
+# drained) — `result` is the raw `session/load` response, which carries the same
+# session-config blocks as `session/new` (models/modes/configOptions). Throws
+# the rpc error / ConnectionClosed if the load fails.
+function replay_history(conn::Connection, params)
+    updates, response = request_updates(conn, "session/load", params)
+    out = Channel{Message}(BUF)
+    feeder = Base.errormonitor(@async begin
+        st = TurnState()
+        try
+            for u in updates
+                parse_update!(out, st, u)
+            end
+        finally
+            close(st)
+            close(out)
+        end
+    end)
+    msgs = Message[]
+    for m in out
+        drain_message!(m)
+        push!(msgs, m)
+    end
+    wait(feeder)
+    result = take!(response)
+    result isa Exception && throw(result)
+    return msgs, result
 end
 
 # Cancel the active turn (notification, non-blocking).
+#
+# Two things happen: (1) we flip the connection's `cancelling` flag so the
+# `prompt!` consumer stops coalescing/rendering and just drains the buffered
+# update backlog — otherwise the agent's `cancelled` response is stuck behind
+# that backlog in strict-FIFO order and the turn looks wedged; (2) we send the
+# `session/cancel` notification so the agent actually winds the turn down and
+# resolves the prompt with `stopReason: cancelled`.
 function cancel!(client::Client)
+    @atomic client.conn.cancelling = true
     send_notification(client.conn, "session/cancel",
                       Dict("sessionId" => client.session_id))
 end

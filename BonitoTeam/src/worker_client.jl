@@ -155,10 +155,16 @@ function handle_worker_control(state::ServerState, ws)
                                             "registered_as" => display_name,
                                             "worker_id"     => worker_id)))
 
-        # Build / refresh the WorkerInfo from the hello frame.
+        # Build / refresh the WorkerInfo from the hello frame. Preserve a
+        # user-set `initials` override across reconnects (the worker doesn't
+        # know about it; it lives entirely on the server side).
+        prev_initials = let existing = get(state.workers[], worker_id, nothing)
+            existing === nothing ? nothing : existing.initials
+        end
         w = WorkerInfo(
             worker_id,
             display_name,
+            prev_initials,
             "<inbound-ws>",          # we no longer dial the worker; URL is moot
             state.worker_secret,
             nothing,                 # ssh_target reserved for future rsync-over-ssh
@@ -174,16 +180,11 @@ function handle_worker_control(state::ServerState, ws)
         # critical section so the workers/worker_control_ws/projects tables
         # are mutually consistent across concurrent observers (other RPC
         # handlers, App-body re-renders).
-        projects_to_attach = lock(state.lock) do
+        lock(state.lock) do
             state.workers[][worker_id] = w
             state.worker_control_ws[worker_id] = ws
             migrate_legacy_worker_refs!(state, w)
             save_workers!(state)
-            # Snapshot the projects we want to attach BEFORE leaving the
-            # lock — `ensure_project_session!` itself takes the lock and
-            # also does network I/O, so we don't want to hold the mutex
-            # across that work.
-            [p for p in values(state.projects[]) if p.worker_id == worker_id]
         end
         # Worker added → fan out to worker-cards consumers. If any
         # legacy projects had their worker_id rewritten by
@@ -194,11 +195,31 @@ function handle_worker_control(state::ServerState, ws)
         safe_notify!(state.projects)
         @info "Worker connected" worker_id=worker_id name=display_name hostname=w.hostname
 
-        for p in projects_to_attach
-            try
-                ensure_project_session!(state, p)
+        # Reconcile this worker's projects against its filesystem: drop any whose
+        # `worker_path` is gone (scratch dirs cleared on reboot). Async so the
+        # inspect round-trips never block registration.
+        Base.errormonitor(@async try
+            prune_missing_projects!(state, worker_id)
+        catch e
+            @warn "prune_missing_projects! failed" worker = worker_id exception = e
+        end)
+
+        # Bring-up is LAZY: we no longer spawn a chat (claude process) for every
+        # project the moment a worker connects. A chat starts only when the user
+        # opens one of its threads (ensure_project_session! via the loading view
+        # / dashboard), at which point it appears in the active-chats sidebar.
+        # Eager bring-up meant N claude processes per worker on every reconnect
+        # and made "active" meaningless.
+
+        # Populate the persistent folder→threads browser on FIRST connect only
+        # (if we have no cached scan for this worker yet). Subsequent refreshes
+        # are explicit via the Rescan button — so "no need to click Discover
+        # again" after the first time, and reconnects don't re-scan every time.
+        if !haskey(state.discovered[], worker_id)
+            @async try
+                scan_and_store!(state, worker_id)
             catch e
-                @warn "Failed to (re)attach project on connect" project=p.name exception=e
+                @warn "auto-scan on connect failed" worker_id=worker_id exception=e
             end
         end
 
@@ -220,30 +241,65 @@ function handle_worker_control(state::ServerState, ws)
                     deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                 elseif t == "inspect_path_response"
                     deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                elseif t == "tail_file_response"
+                    deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                 end
             catch e
                 @warn "Worker control frame error" exception=e
             end
         end
     finally
-        # Atomic teardown: mark offline, drop the WS handle, evict the
-        # ChatModels for this worker's projects. release_projects_for_worker!
-        # also takes the lock per release; safe because ReentrantLock is.
-        lock(state.lock) do
-            delete!(state.worker_control_ws, worker_id)
-            if haskey(state.workers[], worker_id)
-                state.workers[][worker_id].status = :offline
-            end
-            for p in values(state.projects[])
-                if p.worker_id == worker_id
-                    delete!(state.chat_models, p.id)
-                end
+        teardown_worker_control!(state, worker_id, ws)
+    end
+end
+
+"""
+    teardown_worker_control!(state, worker_id, ws) -> Bool
+
+Tear down a worker's registration when its control socket closes — but ONLY if
+`ws` is still the registered socket for `worker_id`. Returns `true` if it ran
+the teardown, `false` if the connection was superseded.
+
+Two connections can share a `worker_id`: a duplicate worker process, or a
+reconnect that re-registered before this old socket's `finally` ran. The
+registration map is last-writer-wins (`worker_control_ws[id] = ws` at connect),
+so a stale connection dying must NOT delete the entry, flip the worker offline,
+or evict its chat models — that would destroy the LIVE connection that replaced
+it (the bug that made duplicate workers mutually destructive). The `=== ws`
+identity check is the guard.
+"""
+function teardown_worker_control!(state::ServerState, worker_id::AbstractString, ws)
+    affected = String[]
+    is_current = lock(state.lock) do
+        current = get(state.worker_control_ws, worker_id, nothing)
+        current === ws || return false           # superseded — leave the live one alone
+        delete!(state.worker_control_ws, worker_id)
+        if haskey(state.workers[], worker_id)
+            state.workers[][worker_id].status = :offline
+        end
+        for p in values(state.projects[])
+            if p.worker_id == worker_id
+                delete!(state.chat_models, p.id)
+                push!(affected, p.id)
             end
         end
+        return true
+    end
+    if is_current
+        # The worker host is gone → its eval workers (and their bridges) are gone.
+        # Tear them down explicitly outside the lock (close asset host is I/O); a
+        # WS drop alone no longer does this — the bridge follows the worker session.
+        for pid in affected
+            teardown_eval_bridge!(state, pid)
+        end
         safe_notify!(state.workers)
+        notify_chats!(state)    # evicted chats drop out of the active-chats sidebar
         release_projects_for_worker!(state, worker_id)
         @info "Worker disconnected" worker_id=worker_id
+    else
+        @info "Worker control socket closed but superseded; keeping live registration" worker_id=worker_id
     end
+    return is_current
 end
 
 """
@@ -284,6 +340,84 @@ function rename_worker!(state::ServerState, worker_id::AbstractString,
     save_workers!(state)
     safe_notify!(state.workers)
     return state.workers[][worker_id]
+end
+
+# Per-worker `[XX]` tag shown next to chat / project labels in the sidebar.
+# Empty string clears the override (the UI then falls back to
+# `derive_initials(name)`). Capped at 4 chars to leave room for short
+# emoji sequences but not freeform text — that's what `name` is for.
+function set_worker_initials!(state::ServerState, worker_id::AbstractString,
+                              new_initials::AbstractString)
+    haskey(state.workers[], worker_id) || error("Unknown worker_id: $worker_id")
+    s = strip(String(new_initials))
+    state.workers[][worker_id].initials = isempty(s) ? nothing :
+        (length(s) > 4 ? String(first(s, 4)) : String(s))
+    save_workers!(state)
+    safe_notify!(state.workers)
+    return state.workers[][worker_id]
+end
+
+# Project chat title — what `[WW] <title>` renders in the sidebar/card.
+# Empty string clears the override (the UI falls back to `p.name`, the
+# folder basename).
+function set_project_title!(state::ServerState, project_id::AbstractString,
+                            new_title::AbstractString)
+    haskey(state.projects[], project_id) || error("Unknown project_id: $project_id")
+    s = strip(String(new_title))
+    state.projects[][project_id].title = isempty(s) ? nothing : String(s)
+    save_projects!(state)
+    safe_notify!(state.projects)
+    return state.projects[][project_id]
+end
+
+"""
+    remove_worker!(state, worker_id; remove_projects=true)
+
+Forget a worker: drop it from `state.workers`, close and discard its
+control WebSocket, and evict any cached `ChatModel`s for its projects. By
+default its projects are also removed from the list (their server-side
+chat history under `state_dir/chats/<id>/` is left on disk, so a later
+re-import can still find it).
+
+A worker whose process is still running will dial `/worker-ws` again and
+re-register itself, so removal primarily targets decommissioned (offline)
+workers; closing the control WS here just hangs up the current link.
+"""
+function remove_worker!(state::ServerState, worker_id::AbstractString;
+                         remove_projects::Bool = true)
+    wid = String(worker_id)
+    ws, dropped = lock(state.lock) do
+        sock = get(state.worker_control_ws, wid, nothing)
+        delete!(state.worker_control_ws, wid)
+        delete!(state.workers[], wid)
+        dropped = String[]
+        for p in collect(values(state.projects[]))
+            p.worker_id == wid || continue
+            delete!(state.chat_models, p.id)
+            if remove_projects
+                delete!(state.projects[], p.id)
+                push!(dropped, p.id)
+            end
+        end
+        save_workers!(state)
+        remove_projects && save_projects!(state)
+        (sock, dropped)
+    end
+    # Close the control WS outside the lock — it's network I/O, and closing it
+    # ends the worker's `handle_worker_control` receive loop (its `finally`
+    # teardown is idempotent against the eviction we just did).
+    if ws !== nothing
+        try
+            close(ws)
+        catch e
+            @debug "remove_worker!: closing control WS failed" exception=e
+        end
+    end
+    safe_notify!(state.workers)
+    remove_projects && safe_notify!(state.projects)
+    notify_chats!(state)        # evicted chats drop out of the active-chats sidebar
+    @info "Worker removed" worker_id=wid removed_projects=length(dropped)
+    return nothing
 end
 
 # Handler for /transfer-ws — one invocation per directional RemoteSync transfer.
@@ -492,6 +626,69 @@ function inspect_worker_path(state::ServerState, worker_name::String,
     return Dict{String,Any}(summary)
 end
 
+# Stream a worker file from byte `offset`. Returns the new chunk + offset and
+# whether the file is still held open (the background-task "still running"
+# signal — see the worker's `file_held_open`). `open_known=false` means the
+# worker couldn't tell (non-Linux) and the caller should fall back to mtime.
+function tail_worker_file(state::ServerState, worker_id::AbstractString,
+                           path::AbstractString; offset::Int = 0,
+                           max_bytes::Int = 65536, timeout::Real = 15.0)
+    haskey(state.worker_control_ws, worker_id) ||
+        error("Worker '$worker_id' is not connected")
+    rid, ch = register_rpc!(state)
+    send_command(state, worker_id, Dict(
+        "type" => "tail_file", "request_id" => rid,
+        "path" => String(path), "offset" => offset, "max_bytes" => max_bytes))
+    resp = take_pending!(state, ch, rid, timeout, "tail_file on '$worker_id'")
+    resp isa AbstractDict || error("tail_file: unexpected response shape")
+    haskey(resp, "error") && error("tail_file on '$worker_id': $(resp["error"])")
+    return (exists     = Bool(get(resp, "exists", false)),
+            offset     = Int(get(resp, "offset", offset)),
+            chunk      = String(get(resp, "chunk", "")),
+            open       = Bool(get(resp, "open", true)),
+            open_known = Bool(get(resp, "open_known", false)),
+            mtime      = Float64(get(resp, "mtime", 0.0)))
+end
+
+# Is a project's `worker_path` DEFINITIVELY gone on a connected worker? True only
+# when the worker explicitly reports the path isn't a directory; a timeout /
+# disconnect / any other error is UNCERTAIN → false. We never prune on doubt —
+# that would delete a perfectly valid project.
+function worker_path_missing(state::ServerState, worker_id::AbstractString,
+                              path::AbstractString)::Bool
+    haskey(state.worker_control_ws, worker_id) || return false
+    try
+        inspect_worker_path(state, worker_id, path; timeout = 10.0)
+        return false                       # path exists
+    catch e
+        msg = sprint(showerror, e)
+        return occursin("not a directory", msg) || occursin("path is empty", msg)
+    end
+end
+
+# Drop this worker's registered projects whose `worker_path` no longer exists
+# (e.g. `/tmp/jl_*` scratch dirs cleared on reboot). Conservative: only
+# definitively-missing paths, and never an in-use (locked) project. Returns the
+# number pruned. Runs the inspect round-trips serially — fine off the hot path.
+function prune_missing_projects!(state::ServerState, worker_id::AbstractString)
+    candidates = [(id, p.worker_path) for (id, p) in collect(state.projects[])
+                  if p.worker_id == worker_id && p.locked_by === nothing]
+    dead = String[]
+    for (id, wp) in candidates
+        worker_path_missing(state, worker_id, wp) && push!(dead, id)
+    end
+    isempty(dead) && return 0
+    lock(state.lock) do
+        for id in dead
+            haskey(state.projects[], id) && delete!(state.projects[], id)
+        end
+        save_projects!(state)
+    end
+    safe_notify!(state.projects)
+    @info "pruned project(s) with missing worker paths" worker = worker_id count = length(dead) ids = dead
+    return length(dead)
+end
+
 """
     inspect_path_local(path) -> Dict
 
@@ -506,33 +703,68 @@ function inspect_path_local(path::AbstractString)
 end
 
 """
-    compare_for_collision(state, existing_project, candidate_worker_name,
-                           candidate_worker_path; timeout=30.0) -> NamedTuple
+    inspect_project(state, p; timeout=30.0) -> (summary::Dict, source::Symbol)
 
-Build the side-by-side summary used by the import-collision UI. Returns
-`(existing = summary_dict, existing_source = :worker|:mirror,
-   candidate = summary_dict)`. The existing-side summary is preferred
-from the project's bound worker (live state); falls back to the server
-mirror if the worker is offline.
+Content summary for a project, preferring its live worker (`:worker`) and
+falling back to the server mirror (`:mirror`) when the worker is offline or
+the live inspect fails. Shape matches `inspect_worker_path`.
 """
-function compare_for_collision(state::ServerState, p::ProjectInfo,
-                                candidate_worker_name::String,
-                                candidate_worker_path::String;
-                                timeout::Real = 30.0)
-    candidate = inspect_worker_path(state, candidate_worker_name,
-                                     candidate_worker_path; timeout = timeout)
-    existing, source = if haskey(state.worker_control_ws, p.worker_id)
+function inspect_project(state::ServerState, p::ProjectInfo; timeout::Real = 30.0)
+    if haskey(state.worker_control_ws, p.worker_id)
         try
-            inspect_worker_path(state, p.worker_id, p.worker_path; timeout = timeout),
-                :worker
+            return inspect_worker_path(state, p.worker_id, p.worker_path; timeout = timeout), :worker
         catch e
-            @warn "compare_for_collision: live inspect failed, falling back to mirror" exception=e
-            inspect_path_local(p.server_path), :mirror
+            @warn "inspect_project: live inspect failed, falling back to mirror" project=p.name exception=e
         end
-    else
-        inspect_path_local(p.server_path), :mirror
     end
-    return (existing = existing, existing_source = source, candidate = candidate)
+    return inspect_path_local(p.server_path), :mirror
+end
+
+"""
+    compare_projects(state, a, b; timeout=30.0) -> NamedTuple
+
+Symmetric side-by-side summary of two projects for the cross-worker sync
+modal. Returns `(a, a_source, b, b_source)` where each summary is a Dict
+from `inspect_project`.
+"""
+function compare_projects(state::ServerState, a::ProjectInfo, b::ProjectInfo;
+                          timeout::Real = 30.0)
+    a_sum, a_src = inspect_project(state, a; timeout = timeout)
+    b_sum, b_src = inspect_project(state, b; timeout = timeout)
+    return (a = a_sum, a_source = a_src, b = b_sum, b_source = b_src)
+end
+
+"""
+    sync_across_workers!(state, src::ProjectInfo, dst::ProjectInfo; on_progress=nothing)
+
+Directional overwrite: make `dst`'s worker tree match `src`'s content. There
+is no worker↔worker transport, so this is server-mediated — refresh `src`'s
+server mirror from its live worker, then push that mirror onto `dst`'s worker
+path. `dst`'s divergent edits are overwritten (the caller has confirmed the
+direction via the sync modal). Both workers must be online.
+"""
+function sync_across_workers!(state::ServerState, src::ProjectInfo, dst::ProjectInfo;
+                              on_progress = nothing)
+    src.id == dst.id && error("Source and target are the same project")
+    haskey(state.workers[], src.worker_id) ||
+        error("Source worker '$(src.worker_id)' is not connected")
+    haskey(state.workers[], dst.worker_id) ||
+        error("Target worker '$(dst.worker_id)' is not connected")
+
+    notify_progress(on_progress, :phase, (msg = "Pulling '$(src.name)' from source worker…",))
+    sync_dir_from_worker!(state, src.worker_id, src.worker_path, src.server_path;
+                          on_progress = on_progress)
+    src.backup_status = :synced
+    src.last_sync_at  = now(UTC)
+
+    notify_progress(on_progress, :phase, (msg = "Pushing onto target worker…",))
+    sync_dir_to_worker!(state, dst.worker_id, src.server_path, dst.worker_path;
+                        on_progress = on_progress)
+    # dst's worker tree now matches src; dst's own server mirror is out of date.
+    dst.backup_status = :stale
+    save_projects!(state)
+    safe_notify!(state.projects)
+    return nothing
 end
 
 """
@@ -550,6 +782,32 @@ function scan_worker_sessions(state::ServerState, worker_name::String;
     send_command(state, worker_name, Dict("type" => "scan_sessions", "request_id" => rid))
     resp = take_pending!(state, ch, rid, timeout, "scan_sessions on '$worker_name'")
     return resp isa AbstractVector ? resp : Dict{String,Any}[]
+end
+
+"""
+    scan_and_store!(state, worker_id) -> Vector{Dict}
+
+Scan a worker for Claude Code sessions and persist the result into
+`state.discovered[worker_id]` (→ `discovered.json`), then notify so the
+dashboard's folder→threads browser updates. A scan error is stored as a
+single `{"error" => …}` entry (the panel surfaces it) rather than thrown, so
+this is safe to call from a connect handler or a Rescan click. Returns the
+stored vector.
+"""
+function scan_and_store!(state::ServerState, worker_id::AbstractString)
+    wid = String(worker_id)
+    raw = try
+        scan_worker_sessions(state, wid)
+    catch e
+        Any[Dict{String,Any}("error" => sprint(showerror, e))]
+    end
+    norm = Dict{String,Any}[Dict{String,Any}(r) for r in raw]
+    lock(state.lock) do
+        state.discovered[][wid] = norm
+        save_discovered!(state)
+    end
+    safe_notify!(state.discovered)
+    return norm
 end
 
 """

@@ -4,34 +4,390 @@
 # Loading it as a classic script would syntax-error on the `export`
 # statements.
 
-# Message types
+# Message types. `ChatModel` is defined FIRST so each message can hold a `chat`
+# back-ref — its emit/persist sink, used by `send!`/`append!`/`close` (the
+# message IS the streaming target). History-loaded messages carry `chat ===
+# nothing` and are never appended to. Mirrors the existing `ChatModel.parent`
+# back-ref pattern, so it's idiomatic here.
 abstract type ChatMsg end
 
+# A user's submission, pushed onto `ChatModel.user_messages` by the browser send
+# handler and consumed by the `run_chat!` loop. Distinct from `ACP.UserMessage`
+# (the replay-echo message kind) — this is purely the chat-side request item.
+struct UserMessage
+    text::String
+    images::Vector{AgentClientProtocol.ImageAttachment}
+end
+UserMessage(text::AbstractString) = UserMessage(String(text), AgentClientProtocol.ImageAttachment[])
+
+# ── ChatModel ──────────────────────────────────────────────────────────────
+# Shared per project, lifetime = project's lifetime. One instance lives in
+# `state.chat_models[project_id]`; every browser tab viewing the project gets
+# a per-session view via `Base.copy(::ChatModel)`. The shared bits — message
+# store, ACP client, persistent chat session, the user-message queue — are
+# shared across sessions; the Observable fields are per-session connected
+# children so their JS bridges GC cleanly when the tab closes.
+mutable struct ChatModel
+    # Convention: lock first. Now only a guard around `msgs_store` for the
+    # read-only comm handlers (msgs.request / tool.render) that read it
+    # concurrently with the single `run_chat!` consumer — NOT a mutation
+    # funnel. All chat-state mutation happens on the one `run_chat!` task.
+    lock::ReentrantLock
+    state::ServerState
+    cwd::String
+    project_id::String
+
+    # Where chat.md + tools/<id>.json live (resolved via `chat_storage_dir`).
+    chat_dir::String
+
+    # Persistent state (loaded from disk on construction)
+    chat_session::Any                    # ChatSession from persistence.jl
+    msgs_store::Vector{ChatMsg}
+
+    # ACP client + the typed Transport that knows how to (re)build it.
+    client::Ref{Union{AgentClientProtocol.Client,Nothing}}
+    mcp_servers::Vector{AgentClientProtocol.MCPServer}
+    transport::ChatTransport
+
+    # The user's turns. The browser send handler `put!`s a `UserMessage`; the
+    # `run_chat!` task is the SOLE consumer (one turn at a time). Shared across
+    # per-session views so every tab feeds the same queue.
+    user_messages::Channel{UserMessage}
+
+    # One-shot history prelude prepended to the next prompt after a session
+    # change that lost claude's jsonl (see `arm_history_replay!`). Empty = none.
+    pending_history_replay::Ref{String}
+
+    # Single bidirectional channel between Julia and the browser BonitoChat.
+    # Tagged-dict wire format; see chat_emit / chat_dispatch! below.
+    comm::Observable{Dict{String,Any}}
+
+    # Status surface for the chat header (banner + reconnect state).
+    session_alive::Observable{Bool}
+    last_error::Observable{String}
+
+    # True while a turn is in flight (set/cleared around the `run_chat!` turn).
+    # The single source of truth for the busy spinner — the header binds its
+    # class to this, so no separate busy_start/busy_end comm events are needed.
+    busy_active::Observable{Bool}
+
+    # Session metadata for the chat header: a heterogeneous list of TYPED
+    # items rendered by `header_pill` dispatch. Today: the agent's
+    # `ACP.ConfigOption`s (model / permission mode / effort) parsed from the
+    # session-setup result; future agents add their own item types + a
+    # `header_pill` method — the header skeleton never changes. Reset on every
+    # bring-up (`start_chat_client!`); ephemeral, never persisted.
+    session_meta::Observable{Vector{Any}}
+
+    # The single `run_chat!` consumer task. Started once (guarded) by
+    # `start_chat_client!`; survives `restart_chat_session!` (which only swaps
+    # the ACP client, not the consumer). Shared across per-session views.
+    consumer_task::Ref{Union{Task,Nothing}}
+
+    # Backreference for per-session copies. `nothing` for the shared parent;
+    # points back to it for any `copy(model, session)` view so writes to the
+    # broadcast observables reach every tab via the parent→child bridges.
+    parent::Union{ChatModel,Nothing}
+end
+
+function ChatModel(state::ServerState, cwd::AbstractString;
+    project_id::AbstractString="",
+    mcp_servers=AgentClientProtocol.MCPServer[],
+    transport::Union{ChatTransport,Nothing}=nothing)
+    chat_dir = chat_storage_dir(state, project_id, cwd)
+    chat_session = load_session(chat_dir, cwd)
+    msgs_store = load_history(chat_session)
+    actual_transport = transport === nothing ?
+                       LocalTransport(cwd; mcp_servers=collect(AgentClientProtocol.MCPServer, mcp_servers)) :
+                       transport
+    return ChatModel(
+        ReentrantLock(),
+        state, String(cwd), String(project_id),
+        chat_dir,
+        chat_session, msgs_store,
+        Ref{Union{AgentClientProtocol.Client,Nothing}}(nothing),
+        collect(AgentClientProtocol.MCPServer, mcp_servers),
+        actual_transport,
+        Channel{UserMessage}(64),
+        Ref(""),                    # pending_history_replay
+        Observable(Dict{String,Any}()),
+        Observable(true),
+        Observable(""),
+        Observable(false),          # busy_active
+        Observable(Any[]),          # session_meta
+        Ref{Union{Task,Nothing}}(nothing),   # consumer_task
+        nothing,                    # parent: this is the shared instance itself
+    )
+end
+
+# Per-session view. SHARES the lock, client, msgs_store, chat_session, the
+# user-message queue, etc. with the parent. Observable fields are bridged via
+# `map(identity, session, obs)` so each tab gets its own connected child
+# (auto-GC'd on session close).
+function Base.copy(m::ChatModel, session::Bonito.Session)
+    lock(m.lock) do
+        ChatModel(
+            m.lock,
+            m.state, m.cwd, m.project_id,
+            m.chat_dir,
+            m.chat_session, m.msgs_store,
+            m.client, m.mcp_servers, m.transport,
+            m.user_messages,           # shared queue → all sessions feed one consumer
+            m.pending_history_replay,
+            map(identity, session, m.comm),
+            map(identity, session, m.session_alive),
+            map(identity, session, m.last_error),
+            map(identity, session, m.busy_active),
+            map(identity, session, m.session_meta),
+            m.consumer_task,           # shared → only the parent runs the loop
+            m,    # parent → the shared instance we copied from
+        )
+    end
+end
+
+# Resolve to the shared parent so writes to broadcast observables reach every
+# connected tab via the parent→child bridges.
+shared(m::ChatModel) = m.parent === nothing ? m : m.parent
+
+# `chat_emit` writes the SHARED comm so every connected tab sees the event via
+# its own per-session bridge. Callers may pass either the shared parent or a
+# per-session view — `shared(model)` resolves the right target.
+chat_emit(model::ChatModel, event::AbstractDict) =
+    (shared(model).comm[] = Dict{String,Any}(event); nothing)
+
+# ── Concrete message types (carry the `chat` back-ref) ──────────────────────
 mutable struct UserMsg <: ChatMsg
     text::String
+    # `true` when this bubble was submitted while an earlier turn was still in
+    # flight — the consumer hasn't picked it up yet, so we show it dimmed with
+    # a "queued" badge. Cleared via the `user_unqueue` wire event when
+    # `run_turn!` finally pops it off `user_messages`.
+    queued::Bool
+    chat::Union{ChatModel,Nothing}
 end
+UserMsg(text::AbstractString) = UserMsg(String(text), false, nothing)
+UserMsg(chat::ChatModel, text::AbstractString) = UserMsg(String(text), false, chat)
+
+# A `/compact` session summary, rendered as a centered separator block — NOT a
+# user message. Claude Code persists it in its jsonl as a synthetic user record
+# with `isCompactSummary: true`, but claude-agent-acp doesn't surface that flag
+# over ACP — only the body text. We route on the stable prefix instead (see
+# `SUMMARY_PREFIX` / `is_summary_text`). `html` caches the rendered markdown the
+# same way `AgentMsg` does.
+mutable struct SummaryMsg <: ChatMsg
+    text::String
+    html::String
+    chat::Union{ChatModel,Nothing}
+end
+SummaryMsg(text::AbstractString) = SummaryMsg(String(text), "", nothing)
+SummaryMsg(chat::ChatModel, text::AbstractString) = SummaryMsg(String(text), "", chat)
+ensure_html!(m::SummaryMsg) =
+    isempty(m.html) ? (m.html = markdown_html(m.text)) : m.html
+
+# The exact opening Claude Code writes on `/compact` resume. Verbatim Claude
+# Code text — extremely unlikely as a real user message, and the only signal we
+# get from ACP (claude-agent-acp drops `isCompactSummary` on the wire).
+const SUMMARY_PREFIX = "This session is being continued from a previous conversation that ran out of context."
+is_summary_text(text::AbstractString) = startswith(lstrip(text), SUMMARY_PREFIX)
 
 mutable struct AgentMsg <: ChatMsg
     id::String
     text::String
+    # Cached rendered HTML so scrolling never has to re-run `Markdown.parse`.
+    # Empty = not yet built; `ensure_html!` populates it lazily. Set eagerly
+    # by the 2-arg constructor (history-load / replay-adopt: text is final),
+    # and at `close(::AgentMsg)` for streaming (text becomes final there).
+    # `append!` clears it (defensive; streaming bubbles aren't asked for via
+    # `msgs.request`, but a stale cache would silently lose the trailing chunks).
+    html::String
+    chat::Union{ChatModel,Nothing}
+end
+# Cache starts empty in BOTH paths (history-load/replay-adopt AND streaming):
+# `ensure_html!` populates on first request, then every subsequent fetch is free.
+# Eagerly pre-building here would push the per-message parse onto chat-open;
+# lazy distributes it across the scroll events that actually need it (~3 ms
+# per 30-msg visible window) while keeping repeat fetches allocation-free.
+AgentMsg(id::AbstractString, text::AbstractString) =
+    AgentMsg(String(id), String(text), "", nothing)
+AgentMsg(chat::ChatModel, text::AbstractString) =
+    AgentMsg(string(uuid4()), String(text), "", chat)
+
+# Lazy cache populate. Used by `msg_to_dict` / `wire_final`.
+ensure_html!(m::AgentMsg) =
+    isempty(m.html) ? (m.html = markdown_html(m.text)) : m.html
+
+# ── Tool messages — abstract + typed variants ──────────────────────────────
+# Replaces the previous "one ToolMsg struct with a `kind::String` discriminator"
+# pattern: every Claude tool family with distinct UX (Bash background, MCP,
+# subagent Task, generic) gets its own concrete subtype so renderers,
+# persistence and the taskbar dispatch on the type instead of probing strings.
+# The five header fields (id/kind/title/status/summary) plus the
+# elapsed-time tracking (started_at/finished_at) are duplicated across the
+# variants — small cost, big dispatch clarity. `kind` here is still the ACP
+# abstraction ("read"/"execute"/…); the *actual* tool name lives in
+# subtype-specific fields (e.g. `MCPToolMsg.tool_name`).
+"""
+    ToolMsg <: ChatMsg
+
+Abstract supertype for one tool-call bubble in the chat. Concrete subtypes:
+
+  • `GenericToolMsg` — fallback (Read, Edit, Grep, … plus any future tool)
+  • `BashToolMsg`    — Claude's Bash tool; carries `is_background`
+  • `TaskToolMsg`    — subagent `Task` / `Agent` tool; carries `task_name`
+  • `MCPToolMsg`     — `mcp__<server>__<tool>` calls (our `bt_*` tools, others)
+  • `BonitoAppMsg`   — a live worker Bonito app (`bt_show_app` / `show_remote_app!`)
+
+All variants share `id` / `kind` / `title` / `status` / `summary`, plus
+`started_at` / `finished_at` epoch seconds used by the tool-pill timer.
+"""
+abstract type ToolMsg <: ChatMsg end
+
+mutable struct GenericToolMsg <: ToolMsg
+    id::String
+    kind::String
+    name::String                          # ACP tool name ("Read", "ToolSearch", …); "" if the agent sent no meta
+    title::String
+    status::String
+    summary::String                       # cached header summary; full content on disk
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
+    chat::Union{ChatModel,Nothing}
 end
 
-mutable struct ToolMsg <: ChatMsg
+# Back-compat 8-arg form (pre-`name`): used by test fixtures and any caller
+# without a tool name to hand over.
+GenericToolMsg(id, kind, title, status, summary, started_at, finished_at, chat) =
+    GenericToolMsg(id, kind, "", title, status, summary, started_at, finished_at, chat)
+
+mutable struct BashToolMsg <: ToolMsg
     id::String
     kind::String
     title::String
     status::String
-    summary::String           # cached header summary; full content lives on disk
+    summary::String
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
+    command::String
+    is_background::Bool
+    # Background-task streaming (`run_in_background`): the agent's tool_call
+    # "completes" the moment the command is LAUNCHED, but the shell keeps running.
+    # The poller tails the agent's output file (`bg_output_path`, from byte
+    # `bg_offset`), accumulates into `bg_text`, and flips `bg_running` off when
+    # the file's fd closes (shell exited). `is_live` keys off `bg_running` so a
+    # launched-but-running task stays live instead of "finishing immediately".
+    bg_output_path::String
+    bg_offset::Int
+    bg_running::Bool
+    bg_text::String
+    chat::Union{ChatModel,Nothing}
+end
+
+mutable struct TaskToolMsg <: ToolMsg
+    id::String
+    kind::String
+    title::String
+    status::String
+    summary::String
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
+    description::String
+    is_background::Bool
+    task_name::Union{String,Nothing}      # SDK `name` — for SendMessage addressing
+    chat::Union{ChatModel,Nothing}
+end
+
+mutable struct MCPToolMsg <: ToolMsg
+    id::String
+    kind::String
+    title::String
+    status::String
+    summary::String
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
+    server::String                        # "bonitoteam" / "playwright" / …
+    tool_name::String                     # bare name (without `mcp__<server>__`)
+    chat::Union{ChatModel,Nothing}
+end
+
+# A live worker Bonito app (its own type, NOT a generic/MCP tool — it renders an
+# interactive embed and offers Detach, see render_tool_body / augment_header!
+# below). Recognised at BUILD time from the tool NAME (`bt_show_app`) or KIND
+# (`bonito_app`, the programmatic `show_remote_app!` path) — never by sniffing
+# the persisted result content, which isn't on disk yet for a just-completed
+# live tool (that race is why the detach button vanished on fresh apps). The
+# registered app id is resolved lazily at render time (it lives in the result
+# content for `bt_show_app`, or is the tool id itself for `show_remote_app!`).
+mutable struct BonitoAppMsg <: ToolMsg
+    id::String
+    kind::String                          # always "bonito_app"
+    title::String
+    status::String
+    summary::String
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
+    server::String                        # MCP server badge ("" for programmatic)
+    # The id the worker registered the app under. `show_remote_app!` registers
+    # under the message id (so it's known immediately); `bt_show_app` returns it
+    # in its result, captured ONCE on completion. Empty ⇒ fall back to `id` at
+    # render. Render/header read this field — NEVER the content.
+    app_id::String
+    chat::Union{ChatModel,Nothing}
 end
 
 mutable struct ThoughtMsg <: ChatMsg
     id::String
     text::String
+    chat::Union{ChatModel,Nothing}
 end
+ThoughtMsg(id::AbstractString, text::AbstractString) = ThoughtMsg(String(id), String(text), nothing)
+ThoughtMsg(chat::ChatModel, text::AbstractString) = ThoughtMsg(string(uuid4()), String(text), chat)
 
-struct PlanMsg <: ChatMsg
+# TodoWrite stays a top-level ChatMsg (NOT under ToolMsg) because it arrives
+# as its own `Plan` wire variant — distinct from the `tool_call` channel —
+# and is the canonical LiveTracking message (each new PlanUpdate ABSORBS into
+# the previous bubble; see `absorb!` further down).
+mutable struct TodoListMsg <: ChatMsg
+    id::String                            # synthetic UUID, used by JS for DOM keying
     entries::Vector{PlanEntry}
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
+    chat::Union{ChatModel,Nothing}
 end
+TodoListMsg(entries::Vector{PlanEntry}) =
+    TodoListMsg(string(uuid4()), entries, time(), nothing, nothing)
+TodoListMsg(chat::ChatModel, entries) =
+    TodoListMsg(string(uuid4()), collect(PlanEntry, entries), time(), nothing, chat)
+
+# ── Trait helpers ──────────────────────────────────────────────────────────
+# A live tool message is one whose `status` hasn't yet hit a terminal state.
+# The tool pill's pulsing glow + the taskbar slot both subscribe to this.
+is_live(m::ToolMsg) =
+    m.finished_at === nothing && !(m.status in ("completed", "failed"))
+# A background bash's tool_call "completes" at LAUNCH but the shell runs on. Once
+# we know its output file, liveness is the poller's `bg_running` (the output
+# file's fd still open), NOT the tool_call status — so the bubble keeps pulsing
+# (and its taskbar slot + timer stay) until the shell actually exits.
+function is_live(m::BashToolMsg)
+    (m.is_background && !isempty(m.bg_output_path)) && return m.bg_running
+    return m.finished_at === nothing && !(m.status in ("completed", "failed"))
+end
+# `finished_at` flips to non-nothing inside `try_absorb_todo!` once the
+# absorbed entries become all-done — `is_live` checking that field is what
+# lets the next TodoWrite start a fresh bubble instead of absorbing into
+# the just-finished list. While entries are still in flight we trust
+# claude's per-item status to drive the live decision.
+is_live(t::TodoListMsg) =
+    t.finished_at === nothing &&
+    any(e -> e.status in ("pending", "in_progress"), t.entries)
+is_live(::ChatMsg) = false
+
+# A background-or-streamy task that deserves a taskbar slot. Default false;
+# Bash with `run_in_background`, Task/Agent with `run_in_background`, and
+# TodoListMsg opt in.
+is_taskbar_item(t::BashToolMsg) = t.is_background
+is_taskbar_item(t::TaskToolMsg) = t.is_background
+is_taskbar_item(::TodoListMsg)  = true
+is_taskbar_item(::ChatMsg)      = false
 
 # Tool kind → icon
 const TOOL_ICONS = Dict(
@@ -148,12 +504,30 @@ end
 # itself so the user can skim what changed without expanding the body.
 # `chat_dir` is needed so we can read the persisted DiffContent from disk;
 # pass "" when no on-disk content is available (preview is then omitted).
+#
+# Dispatches on the abstract `ToolMsg` — the four header fields plus
+# `started_at` / `finished_at` are shared across every concrete variant.
+# Subtype-specific augmentations (e.g. the `server` badge for `MCPToolMsg`)
+# patch the dict in their own dispatch arm below.
+# Stable per-tool filter key, the identity the message-type filter toolbar
+# groups by. The ACP tool NAME, not the title (a Bash title is the literal
+# command line). Reloads land as `GenericToolMsg` with the persisted key in
+# `name` (see `append_tool`); pre-name chats fall back to the ACP kind.
+tool_key(m::GenericToolMsg) = isempty(m.name) ? m.kind : m.name
+tool_key(::BashToolMsg)     = "Bash"
+tool_key(::TaskToolMsg)     = "Task"
+tool_key(m::MCPToolMsg)     = m.tool_name          # bare name: "bt_show", "bt_julia_eval"
+tool_key(::BonitoAppMsg)    = "bt_show_app"
+
 function tool_header_dict(m::ToolMsg, chat_dir::AbstractString="")
     pretty_title, server = pretty_tool_title(m.title)
     d = Dict{String,Any}(
         "type" => "tool",
         "id" => m.id,
         "kind" => m.kind,
+        # Filter identity for the per-tool show/hide toolbar (see filterKey
+        # in bonitoteam.js).
+        "tool" => tool_key(m),
         "icon" => tool_icon(m.kind),
         "title" => pretty_title,
         # "" for non-MCP tools; the MCP server name otherwise so the JS
@@ -161,10 +535,60 @@ function tool_header_dict(m::ToolMsg, chat_dir::AbstractString="")
         "server" => server,
         "status" => m.status,
         "summary" => m.summary,
+        "started_at" => m.started_at,
+        # Only background-y tools deserve a taskbar slot. A regular Read in
+        # `in_progress` pulses briefly but doesn't crowd the taskbar.
+        "taskbar" => is_taskbar_item(m),
     )
-    if m.kind == "edit" && !isempty(chat_dir)
-        prev = render_edit_preview(chat_dir, m.id)
+    m.finished_at === nothing || (d["finished_at"] = m.finished_at)
+    augment_header!(d, m, chat_dir)
+    return d
+end
+
+# Per-variant tweaks. The base header is enough for `GenericToolMsg`; the
+# typed variants opt in to their extras here.
+augment_header!(d::Dict, ::GenericToolMsg, chat_dir::AbstractString) =
+    augment_generic_header!(d, chat_dir)
+function augment_header!(d::Dict, m::BashToolMsg, chat_dir::AbstractString)
+    m.is_background && (d["background"] = true)
+    augment_generic_header!(d, chat_dir)
+end
+function augment_header!(d::Dict, m::TaskToolMsg, chat_dir::AbstractString)
+    m.is_background && (d["background"] = true)
+    m.task_name === nothing || (d["task_name"] = m.task_name)
+    augment_generic_header!(d, chat_dir)
+end
+function augment_header!(d::Dict, m::MCPToolMsg, chat_dir::AbstractString)
+    # Server already lives in `d` from `pretty_tool_title`, but the raw bare
+    # tool name (without `mcp__server__`) is more authoritative — prefer it.
+    isempty(m.server)    || (d["server"] = m.server)
+    isempty(m.tool_name) || (d["title"]  = m.tool_name)
+    augment_generic_header!(d, chat_dir)
+end
+# A live worker app. Its `kind` is already "bonito_app" (the JS gates the ⤢
+# detach button on that), and its body always auto-opens. Both come from the
+# TYPE — no content is read to decide either.
+function augment_header!(d::Dict, m::BonitoAppMsg, chat_dir::AbstractString)
+    isempty(m.server) || (d["server"] = m.server)
+    d["expand"] = true
+    return d
+end
+
+# `kind == "edit"` preview + `bt_show` auto-expand are shared across the generic
+# tool variants and depend on persisted on-disk content, so they live here once.
+function augment_generic_header!(d::Dict, chat_dir::AbstractString)
+    if d["kind"] == "edit" && !isempty(chat_dir)
+        prev = render_edit_preview(chat_dir, d["id"])
         prev === nothing || (d["preview"] = prev)
+    end
+    if !isempty(chat_dir)
+        content = load_tool_content(chat_dir, d["id"])
+        # bt_show references auto-expand the pill; inline image content
+        # (Read on a PNG, …) only ships its mime — the client's Native
+        # Images mode decides the depiction.
+        has_show_reference(content) && (d["expand"] = true)
+        mime = tool_media_mime(content)
+        mime === nothing || (d["show_mime"] = mime)
     end
     return d
 end
@@ -173,11 +597,14 @@ end
 # all messages uniformly. The `cwd` argument is only consulted for ToolMsg
 # (to render the edit preview); other variants ignore it.
 msg_to_dict(m::UserMsg, _chat_dir::AbstractString="") =
-    Dict{String,Any}("type" => "user", "text" => m.text)
+    Dict{String,Any}("type" => "user", "text" => m.text, "queued" => m.queued)
 
 function msg_to_dict(m::AgentMsg, _chat_dir::AbstractString="")
-    html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
-    Dict{String,Any}("type" => "agent", "id" => m.id, "html" => html)
+    Dict{String,Any}("type" => "agent", "id" => m.id, "html" => ensure_html!(m))
+end
+
+function msg_to_dict(m::SummaryMsg, _chat_dir::AbstractString="")
+    Dict{String,Any}("type" => "summary", "html" => ensure_html!(m))
 end
 
 msg_to_dict(m::ToolMsg, chat_dir::AbstractString="") = tool_header_dict(m, chat_dir)
@@ -191,11 +618,22 @@ function msg_to_dict(m::ThoughtMsg, _chat_dir::AbstractString="")
         "summary" => "$n $(n == 1 ? "line" : "lines")")
 end
 
-function msg_to_dict(m::PlanMsg, _chat_dir::AbstractString="")
+function msg_to_dict(m::TodoListMsg, _chat_dir::AbstractString="")
     rows = join(["""<div class="bt-plan-entry">
         <span class="bt-plan-status">$(e.status == "completed" ? "✓" : e.status == "in_progress" ? "▶" : "○")</span>
         <span>$(e.content)</span></div>""" for e in m.entries])
-    Dict{String,Any}("type" => "plan", "html" => rows)
+    d = Dict{String,Any}("type" => "plan", "id" => m.id, "html" => rows,
+        "started_at" => m.started_at, "live" => is_live(m),
+        # Cheap label for the taskbar slot — "3/5 done" reads at a glance.
+        "summary" => todolist_summary(m.entries))
+    m.finished_at === nothing || (d["finished_at"] = m.finished_at)
+    return d
+end
+
+function todolist_summary(entries)
+    isempty(entries) && return "todos"
+    done = count(e -> e.status == "completed", entries)
+    return "$done/$(length(entries)) done"
 end
 
 # ── Edit preview ──────────────────────────────────────────────────────────────
@@ -345,23 +783,36 @@ function render_text_block(text::AbstractString)
     return DOM.div(Markdown.parse(text), class="bt-tool-md")
 end
 
-# A native <details> collapsible for tool-body sub-sections. `label` is the
-# always-visible heading; `preview` (optional) is dim text shown next to it
-# while collapsed-or-open; `body` is the content. Open by default — an
-# already-expanded tool card should show everything without extra clicks;
-# the collapsible just lets the user fold away a long code block or a noisy
-# output to focus on the other.
-function tool_subsection(label::AbstractString, body;
-    preview::AbstractString="", open::Bool=true)
-    summary_kids = Any[DOM.span(label; class="bt-subsection-label")]
-    isempty(preview) || push!(summary_kids,
-        DOM.span(preview; class="bt-subsection-preview"))
-    return DOM.details(
-        DOM.summary(summary_kids...; class="bt-subsection-summary"),
-        DOM.div(body; class="bt-subsection-body");
-        class="bt-subsection",
-        open=open ? true : nothing)
+# A reusable collapsible section — the server-side (eager) counterpart of the
+# JS `Collapsable` in bonitoteam.js. Renders a native <details>: the `body` is
+# present from the start (no lazy fetch), used for eval Code/Output sub-sections
+# inside an already-expanded tool card. `label` is the always-visible heading;
+# `preview` (optional) is dim text next to it; `open` shows it expanded.
+struct Collapsable
+    label::String
+    body::Any
+    preview::String
+    open::Bool
 end
+Collapsable(label::AbstractString, body; preview::AbstractString="", open::Bool=true) =
+    Collapsable(String(label), body, String(preview), open)
+
+function Bonito.jsrender(session::Session, c::Collapsable)
+    summary_kids = Any[DOM.span(c.label; class="bt-subsection-label")]
+    isempty(c.preview) || push!(summary_kids,
+        DOM.span(c.preview; class="bt-subsection-preview"))
+    Bonito.jsrender(session, DOM.details(
+        DOM.summary(summary_kids...; class="bt-subsection-summary"),
+        DOM.div(c.body; class="bt-subsection-body");
+        class="bt-subsection",
+        open=c.open ? true : nothing))
+end
+
+# Open by default — an already-expanded tool card should show everything without
+# extra clicks; the collapsible just lets the user fold away a long code block
+# or a noisy output to focus on the other.
+tool_subsection(label::AbstractString, body; preview::AbstractString="", open::Bool=true) =
+    Collapsable(label, body; preview, open)
 
 # bt_julia_eval tool bodies: a ```julia code echo followed by stdout / result
 # / error sections. Render as two collapsibles — "Code" (Monaco julia, same
@@ -458,120 +909,151 @@ function find_show_reference(content)
     return nothing
 end
 
-# Parse a `shown: <relpath> (<mime>, <size>)` reference and render a preview
-# of the file. The file lives at <worker_path>/<relpath> on the worker. We
-# try the server-side mirror first (RemoteSync may have already pulled it)
-# and fall back to a single-file fetch over the worker control WS. Returns
-# `nothing` if the reference can't be parsed (caller falls back to the
-# default rendering).
-function render_show_reference(state::ServerState, text::AbstractString,
-    cwd::AbstractString, project_id::AbstractString)
-    # Header line is the first line; "type: ..." may follow.
+has_show_reference(content) = find_show_reference(content) !== nothing
+
+# ── bt_show: render a worker file inline (ShowTool) ─────────────────────────
+# A `shown: <path> …` text block (emitted by the `bt_show` MCP tool) becomes a
+# `ShowTool`. Its `jsrender` fetches the file to the server (blocking the
+# per-render task — the Collapsable's "loading…" placeholder shows meanwhile)
+# and renders the right element. Video plays because Bonito's asset server
+# honours HTTP Range requests, and we point `<video src>` at a served
+# `Bonito.Asset` URL (not a multi-MB `data:` blob). No bytes pass through
+# claude; the path is the only thing on the wire.
+
+# Pull the path out of a `shown: <path>` header (tolerates a trailing
+# ` (<mime>, <size>)` from older tool output). `nothing` if not a show ref.
+function parse_show_path(text::AbstractString)
     nl = findfirst('\n', text)
     header = nl === nothing ? text : text[1:prevind(text, nl)]
-    m = match(r"^shown: (\S+)\s+\(([^,]+),\s*([^)]+)\)\s*$", header)
-    m === nothing && return nothing
-    relpath_str, mime, size_str = String(m.captures[1]),
-    String(strip(m.captures[2])),
-    String(strip(m.captures[3]))
-
-    server_local_path = joinpath(cwd, relpath_str)
-
-    # Already on the server (RemoteSync mirror or a previous fetch). Render
-    # synchronously — no spinner needed.
-    if isfile(server_local_path)
-        return render_show_preview(read(server_local_path), mime, size_str, relpath_str)
-    end
-
-    # No project context → no worker to ask.
-    if isempty(project_id) || !haskey(state.projects[], project_id)
-        return DOM.div("(file not on server: $relpath_str)";
-            class="bt-tool-empty")
-    end
-
-    # Stream from the worker via /transfer-ws + RemoteSync.send_file. Show a
-    # spinner immediately and swap in the preview when the file lands on disk.
-    p = state.projects[][project_id]
-    worker_path = joinpath(p.worker_path, relpath_str)
-
-    # NOTE: keep this Observable's binding distinct from the `state` parameter
-    # — earlier this was named `state`, which shadowed the ServerState and
-    # caused the @async branch to call fetch_file_from_worker with an
-    # Observable instead of the ServerState.
-    fetch_state = Observable{Any}(:loading)
-    body = map(fetch_state) do s
-        if s === :loading
-            DOM.div(
-                DOM.span(""; class="bt-spinner"),
-                DOM.span("Fetching $relpath_str from worker… ($size_str)";
-                    style=Styles("margin-left" => "8px")),
-                style=Styles("display" => "flex", "align-items" => "center",
-                    "padding" => "8px", "color" => "var(--bt-text-muted)"))
-        elseif s isa Tuple && s[1] === :ready
-            render_show_preview(s[2], mime, size_str, relpath_str)
-        elseif s isa Tuple && s[1] === :error
-            DOM.div("(failed to fetch $relpath_str from worker: $(s[2]))";
-                class="bt-tool-empty")
-        else
-            DOM.div("(unexpected state)"; class="bt-tool-empty")
-        end
-    end
-
-    Base.errormonitor(@async begin
-        try
-            mkpath(dirname(server_local_path))
-            fetch_file_from_worker(state, p.worker_id, worker_path, server_local_path;
-                handoff_timeout=30.0)
-            fetch_state[] = (:ready, read(server_local_path))
-        catch e
-            fetch_state[] = (:error, sprint(showerror, e))
-        end
-    end)
-
-    return DOM.div(body)
+    m = match(r"^shown:\s+(.+?)(?:\s+\([^)]*\))?\s*$", header)
+    m === nothing ? nothing : String(m.captures[1])
 end
 
-# Render the actual preview based on MIME. Images / SVG → <img>, video/*
-# → <video>, text/html → <iframe sandbox>, text/* → Monaco; everything else
-# → a generic "binary" message + size.
-function render_show_preview(bytes::AbstractVector{UInt8}, mime::AbstractString,
-    size_str::AbstractString, relpath_str::AbstractString)
-    if startswith(mime, "image/")
-        b64 = Base64.base64encode(bytes)
-        return DOM.div(
-            DOM.img(src="data:$mime;base64,$b64",
-                style=Styles("max-width" => "100%", "display" => "block")),
-            DOM.div("$relpath_str · $size_str";
-                style=Styles("font-size" => "11px",
-                    "color" => "var(--bt-text-faint)",
-                    "margin-top" => "4px")))
-    elseif startswith(mime, "video/")
-        b64 = Base64.base64encode(bytes)
-        return DOM.div(
-            # Bonito enforces strict booleans for HTML boolean attrs —
-            # `controls = ""` (or any string) raises at render time.
-            DOM.video(controls=true,
-                style=Styles("max-width" => "100%", "display" => "block"),
-                DOM.source(src="data:$mime;base64,$b64", type=mime)),
-            DOM.div("$relpath_str · $size_str";
-                style=Styles("font-size" => "11px",
-                    "color" => "var(--bt-text-faint)",
-                    "margin-top" => "4px")))
-        # NOTE: text/html is intentionally NOT special-cased. Rendering arbitrary
-        # HTML inline would clobber chat styles + JS; iframes have their own
-        # downsides (Chromium opaque-origin churn for sandboxed data: URLs;
-        # duplicated runtime cost for every WGLMakie/Bonito blob). The proper
-        # fix is a serialize_bonito / deserialize_bonito pair that hooks into
-        # the chat's existing Bonito session — tracked separately. Until then,
-        # text/html falls through to the generic "binary" branch below.
-    elseif startswith(mime, "text/")
-        text = String(bytes)
-        return monaco_readonly(text, mime == "text/julia" ? "julia" : "plaintext")
+# Pull the mime out of the `shown: <path> (<mime>, <size>)` reference. The
+# wire ships it as `show_mime` so the client can decide how to depict the
+# show (e.g. the "Native Images" toggle keys on image/*). `nothing` for
+# refs without the parenthesized tail or a mime-shaped token.
+function parse_show_mime(text::AbstractString)
+    nl = findfirst('\n', text)
+    header = nl === nothing ? text : text[1:prevind(text, nl)]
+    m = match(r"\(([a-z0-9.+-]+/[a-z0-9.+-]+)\s*,", header)
+    m === nothing ? nothing : String(m.captures[1])
+end
+
+# The displayable-media mime of a tool's content, if any: a bt_show
+# reference's mime, or the mime of inline image content (e.g. the Read tool
+# on a PNG ships an ACP ImageContent block). This is what the wire's
+# `show_mime` field carries — the client's "Native Images" mode keys on it.
+function tool_media_mime(content)
+    ref = find_show_reference(content)
+    ref === nothing || return parse_show_mime(ref)
+    for c in content
+        c isa ImageContent && return c.mime_type
+    end
+    return nothing
+end
+
+# A bt_show reference, rendered inline. Pure data — the fetch starts at render
+# time (when the tool body is expanded), not at construction.
+struct ShowTool
+    state::ServerState
+    project_id::String
+    cwd::String
+    path::String        # path as the WORKER sees it (absolute, or relative to its cwd)
+end
+
+# Always render synchronously: the fetch (minutes for a multi-GB video)
+# blocks only the per-render @async task in `handle_command!(::ToolRender-
+# Command)`, and the finished element ships through that handler's
+# `dom_in_js` → `_btToolSlot` mount, which finds nodes the virtual scroll
+# holds DETACHED. The earlier `@async` + `jsrender(::Task)` spinner path
+# swapped the result in via Bonito's Observable machinery, whose
+# document-scoped uuid lookup polls for 30s and then gives up — a video
+# whose fetch outlived that window (or whose node was off-window at swap
+# time) kept its spinner forever; only a manual re-render, by then on the
+# isfile fast path, showed it.
+Bonito.jsrender(session::Bonito.Session, st::ShowTool) =
+    Bonito.jsrender(session, render_show_file(st))
+
+# The server-side path a ShowTool's file resolves to — no IO. Files under the
+# project tree map straight onto the server mirror (cwd ⟷ worker_path); an
+# absolute path outside the project lands in a server-side cache.
+function show_server_path(st::ShowTool)
+    proj = get(st.state.projects[], st.project_id, nothing)
+    if !isabspath(st.path)
+        return joinpath(st.cwd, st.path)
+    elseif proj !== nothing && startswith(st.path, proj.worker_path)
+        return joinpath(st.cwd, relpath(st.path, proj.worker_path))
     else
-        return DOM.div("$relpath_str · $size_str ($mime)";
-            class="bt-tool-empty")
+        return joinpath(st.cwd, ".bt-show-cache", basename(st.path))
     end
 end
+
+# Single-flight per destination: concurrent `tool.render` calls for the same
+# file (native-toggle spam, several tabs) would otherwise both stream into the
+# same `<dst>.partial` and corrupt it. The loser blocks until the winner's
+# fetch lands, re-checks isfile, and returns without a second transfer.
+# Entries are kept (one small lock per distinct shown file) — dropping them
+# would re-open the two-writers window for a fetch that errors and retries.
+const SHOW_FETCH_LOCKS = ReentrantLock()
+const SHOW_FETCH_INFLIGHT = Dict{String,ReentrantLock}()
+
+# Resolve `st.path` to a file on the SERVER's disk, fetching it from the worker
+# if we don't already have it. Blocks for the transfer (multi-GB videos take
+# a while — receive_file streams into `<dst>.partial` and renames, so isfile
+# never sees a torso). Throws if it can't be obtained.
+function fetch_show_file(st::ShowTool)
+    server_dst = show_server_path(st)
+    isfile(server_dst) && return server_dst        # already mirrored or cached
+    dst_lock = lock(SHOW_FETCH_LOCKS) do
+        get!(ReentrantLock, SHOW_FETCH_INFLIGHT, server_dst)
+    end
+    lock(dst_lock) do
+        isfile(server_dst) && return server_dst    # the racer fetched it
+        proj = get(st.state.projects[], st.project_id, nothing)
+        proj === nothing && error("bt_show: file not on server and no worker to fetch from: $(st.path)")
+        worker_src = isabspath(st.path) ? st.path : joinpath(proj.worker_path, st.path)
+        mkpath(dirname(server_dst))
+        fetch_file_from_worker(st.state, proj.worker_id, worker_src, server_dst; handoff_timeout=60.0)
+        return server_dst
+    end
+end
+
+# MIME inferred from extension → the right element. Media point `src` at a
+# served `Bonito.Asset` (range-capable); text goes through Monaco; anything
+# else gets a caption. `<video>`/`<img>` get explicit `type`/element so we
+# cover webp/bmp/mov and emit correct MIME types.
+const SHOW_VIDEO_MIME = Dict(".mp4" => "video/mp4", ".webm" => "video/webm",
+    ".ogg" => "video/ogg", ".mov" => "video/quicktime")
+const SHOW_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
+const SHOW_TEXT_EXTS = (".txt", ".log", ".md", ".json", ".csv", ".jl", ".py",
+    ".js", ".ts", ".html", ".htm", ".toml", ".yaml", ".yml", ".css")
+
+function render_show_file(st::ShowTool)
+    path = fetch_show_file(st)
+    ext = lowercase(splitext(path)[2])
+    if ext in SHOW_IMAGE_EXTS
+        return DOM.img(src=Bonito.Asset(path),
+            style=Styles("max-width" => "100%", "display" => "block"))
+    elseif haskey(SHOW_VIDEO_MIME, ext)
+        return DOM.video(DOM.source(src=Bonito.Asset(path), type=SHOW_VIDEO_MIME[ext]);
+            controls=true,
+            style=Styles("max-width" => "100%", "display" => "block"))
+    elseif ext in SHOW_TEXT_EXTS
+        return monaco_readonly(read(path, String), detect_language(path))
+    else
+        return DOM.div("$(basename(path)) · $(filesize(path)) bytes"; class="bt-tool-empty")
+    end
+end
+
+# A live worker app embeds against the per-tab Session via the placeholder's
+# jsrender (not loaded from disk). The registered app id lives on the message
+# (`app_id`, captured once on completion); empty ⇒ the app was registered under
+# the message id (`show_remote_app!`). No content is read here.
+render_tool_body(state::ServerState, m::BonitoAppMsg, cwd::AbstractString,
+    chat_dir::AbstractString=cwd; project_id::AbstractString="") =
+    wrap_for_detach(m.id, remote_app_placeholder(m.id, project_id,
+                                                 isempty(m.app_id) ? m.id : m.app_id))
 
 function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     chat_dir::AbstractString=cwd;
@@ -588,8 +1070,8 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     # renders a collapsible preview without putting the bytes through claude.
     show_text = find_show_reference(content)
     if show_text !== nothing
-        body = render_show_reference(state, show_text, cwd, project_id)
-        body === nothing || return body
+        path = parse_show_path(show_text)
+        path === nothing || return ShowTool(state, project_id, String(cwd), path)
     end
 
     # bt_julia_eval: `\`\`\`julia` code echo + stdout/result/error sections →
@@ -642,706 +1124,788 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     return DOM.div(parts...)
 end
 
-# ── Streaming state machine ────────────────────────────────────────────────
-# ACP feeds us chunks for three concurrent kinds of message — user echo,
-# agent reply, agent thought — plus discrete tool / plan events. At any
-# moment at most ONE chunk stream can be open. Modeling that as a sum
-# type (instead of three independent `Ref{String}`/`Ref{Bool}` flags) makes
-# the four possible states exclusive by construction, and routes every
-# (state, event) transition through dispatched `ingest!` methods — so
-# "forgot to finalize the prior stream before starting a new one" can't
-# happen.
-abstract type StreamingState end
+# ── The message is the streaming target ─────────────────────────────────────
+# Each `ChatMsg` carries a `chat` back-ref (set when it goes live). The three
+# sinks — in-memory store, browser (comm), disk (chat.md) — are each expressed
+# ONCE here, as common verbs:
+#
+#   send!(chat, m)     store + emit the "new" wire event       (render a bubble)
+#   append!(m, chunk)  grow the bubble's text + emit "chunk"   (stream into it)
+#   close(m)           persist to chat.md + emit the "*_final"  (finalize)
+#
+# These are the ONLY things that touch `msgs_store` / `comm` / chat.md, and
+# they all run on the single `run_chat!` consumer task — so the lock degenerates
+# to a brief Vector guard around the `msgs_store` push (the read-only comm
+# handlers read it concurrently), not a mutation funnel.
 
-# Nothing in flight. Tool / plan events leave us here; chunk events
-# transition into the matching streaming state.
-struct NoStream <: StreamingState end
-
-# Mid user-message stream. The current `UserMsg` is the *last* UserMsg in
-# `msgs_store` — UserMsg has no id field, so there's nothing else to track.
-struct UserStream <: StreamingState end
-
-# Mid agent / thought stream. `msg_id` identifies the bubble each
-# subsequent chunk extends. We don't keep a Vector index because
-# `session/load` replay can interleave events that rearrange the store.
-struct AgentStream   <: StreamingState; msg_id::String; end
-struct ThoughtStream <: StreamingState; msg_id::String; end
-
-# Chat app
-# ── ChatModel ──────────────────────────────────────────────────────────────
-# Shared per project, lifetime = project's lifetime. One instance lives in
-# `state.chat_models[project_id]`; every browser tab viewing the project gets
-# a per-session view via `Base.copy(::ChatModel)` (below). The shared bits —
-# message store, ACP client, persistent chat session — are mutated under
-# `lock` and broadcast via `comm`; the per-session copies share those refs
-# but each get their own connected child of `comm` (and the small status
-# Observables) so their JS bridges are GC'd cleanly when the tab closes.
-mutable struct ChatModel
-    # Convention: lock as the first field. Held by every mutator that touches
-    # `msgs_store` together with `comm` or other multi-step state. See
-    # .claude/skills/bonito/SKILL.md § "Thread-safe shared state".
-    lock::ReentrantLock
-    state::ServerState
-    cwd::String
-    project_id::String
-
-    # Where chat.md + tools/<id>.json live. Resolved via `chat_storage_dir`
-    # — for projects with an id, that's `state.state_dir/chats/<id>` (outside
-    # the project tree, server-owned). Legacy fallback `<cwd>/.bonitoTeam`
-    # only for orphan chats (project_id == "").
-    chat_dir::String
-
-    # Persistent state (loaded from disk on construction)
-    chat_session::Any                    # ChatSession from persistence.jl
-    msgs_store::Vector{ChatMsg}
-
-    # ACP client + the typed Transport that knows how to (re)build it. Each
-    # concrete transport (LocalTransport, WorkerTransport, MockTransport)
-    # encapsulates everything needed to bring up a new session — no opaque
-    # closure stored on the model.
-    client::Ref{Union{AgentClientProtocol.Client,Nothing}}
-    mcp_servers::Vector{AgentClientProtocol.MCPServer}
-    transport::ChatTransport
-
-    # Streaming bookkeeping. Held as a sum type so the four possible states
-    # — no stream / user / agent / thought — are exhaustive and exclusive,
-    # not three independent Refs that callers must keep in sync. Mutated
-    # only inside `apply!(model, event)` (which holds `model.lock` across
-    # the full `do_apply!` transition); combined with ACP's single
-    # dispatcher task, this rules out both (a) interleaved transitions
-    # mid-step and (b) out-of-order chunk delivery.
-    streaming::Ref{StreamingState}
-
-    # One-shot prelude: when chat starts on a worker that doesn't have
-    # claude's session jsonl (project moved, fresh sync, etc.), claude
-    # has no memory of the prior conversation but `msgs_store` does. The
-    # next user prompt gets this string prepended so claude picks up
-    # where we left off. Empty = nothing armed.
-    #
-    # The whole transcript is materialised at *arm* time (see
-    # `arm_history_replay!`) rather than at send time so any messages the
-    # user types between arm and send don't get folded into their own
-    # prelude. Set/consume both happen via the two named helpers — never
-    # mutated inline.
-    pending_history_replay::Ref{String}
-
-    # Single bidirectional channel between Julia and the browser-side BonitoChat.
-    # Wire format is a tagged dict; see chat_emit / chat_dispatch! below for
-    # the message types. Bonito's `update_nocycle!` prevents JS-originated
-    # notifications from echoing back to JS, so one Observable serves both
-    # directions cleanly.
-    comm::Observable{Dict{String,Any}}
-
-    # Status surface for the chat header (banner + reconnect state).
-    session_alive::Observable{Bool}
-    last_error::Observable{String}
-
-    # True while a user prompt is in flight. Set in `do_apply!(::UserSubmitted)`,
-    # cleared in `do_apply!(::PromptCompleted)`. Stateful — survives chat
-    # remount, unlike the comm `busy_start`/`busy_end` events.
-    busy_active::Observable{Bool}
-
-    # Backreference for per-session copies. `nothing` for the shared
-    # parent (the one in `state.chat_models[pid]`); points back to that
-    # parent for any `copy(model, session)` view. Handlers use
-    # `shared(model)` to reach the parent so writes to `session_alive` /
-    # `last_error` / `comm` broadcast to every connected tab instead of
-    # silently flipping only the per-session view.
-    parent::Union{ChatModel,Nothing}
-end
-
-function ChatModel(state::ServerState, cwd::AbstractString;
-    project_id::AbstractString="",
-    mcp_servers=AgentClientProtocol.MCPServer[],
-    transport::Union{ChatTransport,Nothing}=nothing)
-    chat_dir = chat_storage_dir(state, project_id, cwd)
-    chat_session = load_session(chat_dir, cwd)
-    msgs_store = load_history(chat_session)
-    # Default transport: spawn claude-agent-acp locally for `cwd`.
-    actual_transport = transport === nothing ?
-                       LocalTransport(cwd; mcp_servers=collect(AgentClientProtocol.MCPServer, mcp_servers)) :
-                       transport
-    return ChatModel(
-        ReentrantLock(),
-        state, String(cwd), String(project_id),
-        chat_dir,
-        chat_session, msgs_store,
-        Ref{Union{AgentClientProtocol.Client,Nothing}}(nothing),
-        collect(AgentClientProtocol.MCPServer, mcp_servers),
-        actual_transport,
-        Ref{StreamingState}(NoStream()),
-        Ref(""),                    # pending_history_replay
-        Observable(Dict{String,Any}()),
-        Observable(true),
-        Observable(""),
-        Observable(false),          # busy_active
-        nothing,                    # parent: this is the shared instance itself
-    )
-end
-
-# Per-session view. SHARES the lock, ACP client, msgs_store, chat_session,
-# Refs etc. with the parent — sessions cooperate on the same chat history
-# and the same lock. The Observable fields are bridged via
-# `map(identity, session, obs)` so each session ends up with its own
-# connected child Observable AND the parent→child callback is registered
-# on `session.deregister_callbacks` (auto-GC'd on session close).
-# `copy(obs)` would also produce a child but leak the callback forever.
-function Base.copy(m::ChatModel, session::Bonito.Session)
-    lock(m.lock) do
-        ChatModel(
-            m.lock,
-            m.state, m.cwd, m.project_id,
-            m.chat_dir,
-            m.chat_session, m.msgs_store,
-            m.client, m.mcp_servers, m.transport,
-            m.streaming,                # shared Ref → all sessions see the same state
-            m.pending_history_replay,
-            map(identity, session, m.comm),
-            map(identity, session, m.session_alive),
-            map(identity, session, m.last_error),
-            map(identity, session, m.busy_active),
-            m,    # parent → the shared instance we copied from
-        )
-    end
-end
-
-# Resolve to the shared parent. Handlers invoked from per-session
-# listeners use this so writes to broadcast observables (`comm`,
-# `session_alive`, `last_error`) reach every connected tab via the
-# parent→child `map(identity, session, ...)` bridges instead of
-# silently flipping just this session's view.
-shared(m::ChatModel) = m.parent === nothing ? m : m.parent
-
-# ── Small helpers shared by every handler ─────────────────────────────────
-# `chat_emit` writes to `comm`. Since Bonito propagates Julia-side writes to
-# every JS subscriber on every per-session child of `m.comm`, all open tabs
-# of this chat see the event. JS sends back via the same channel
-# (`comm.notify({type, ...})`) — Julia's listener dispatches by `type`.
-# Always writes to the SHARED comm so every connected tab sees the
-# event via its own per-session bridge. Callers freely pass either the
-# shared parent or a per-session view — `shared(model)` resolves the
-# right target.
-chat_emit(model::ChatModel, event::AbstractDict) =
-    (shared(model).comm[] = Dict{String,Any}(event); nothing)
-
-function chat_push_msg!(model::ChatModel, msg::ChatMsg)
+# Add a fresh message to the chat: push to the store, emit its "new" event.
+function send!(model::ChatModel, m::ChatMsg)
     n = lock(model.lock) do
-        push!(model.msgs_store, msg)
+        push!(model.msgs_store, m)
         length(model.msgs_store)
     end
-    # Emit the typed dict directly (e.g. {type: "user", text, ...}) with the
-    # new total count piggybacked. The JS `dispatch` routes by `type` and
-    # bumps `totalCount` from the `n` field — no separate "msg.new" wrapper.
-    payload = msg_to_dict(msg, model.chat_dir)
-    payload["n"] = n
-    chat_emit(model, payload)
+    d = wire_new(model, m)
+    d["n"] = n            # JS bumps totalCount from `n`; no separate broadcast
+    chat_emit(model, d)
+    return m
 end
 
-# ── Stream finalization, dispatched per state ──────────────────────────────
-# `finalize_stream!` is called every time we leave a streaming state — it
-# persists the accumulated text + emits a `*_final` event so the JS side
-# swaps the streaming bubble for rendered Markdown HTML. User streams
-# need no finalization (UserMsg has no Markdown render — text was
-# persisted per-chunk in `ingest!`).
-finalize_stream!(::ChatModel, ::NoStream)   = nothing
-finalize_stream!(::ChatModel, ::UserStream) = nothing
+# Grow a streaming text bubble in place and emit the delta. `m.chat` is the
+# sink captured when the bubble was created. AgentMsg clears its cached html
+# so a finalize-then-rerequest never serves the pre-streaming snapshot.
+# Stream a text delta into the bubble. We still ACCUMULATE `m.text` (cheap), but
+# once cancel is requested we stop shipping each chunk over the wire — under a
+# heavy token stream that per-chunk `chat_emit` to a (possibly slow) browser is
+# the one thing that keeps the turn "busy" after the user hit stop. The seal
+# (`close` → `wire_final`) still ships the final partial, so the bubble is
+# correct; we just don't stream the now-discarded tail.
+function Base.append!(m::AgentMsg, t::AbstractString)
+    m.text *= t
+    m.html = ""
+    c = m.chat === nothing ? nothing : m.chat.client[]
+    (c !== nothing && (@atomic c.conn.cancelling)) || chat_emit(m.chat, wire_chunk(m, t))
+    return m
+end
+Base.append!(m::UserMsg, t::AbstractString) = (m.text *= t; chat_emit(m.chat, wire_chunk(m, t)); m)
+# Summaries arrive whole on replay; live they can stream through `process_update!`
+# like a UserMessage. Append clears the HTML cache so the eventual close-time
+# render reflects the full text.
+Base.append!(m::SummaryMsg, t::AbstractString) = (m.text *= t; m.html = ""; m)
 
-function finalize_stream!(model::ChatModel, s::AgentStream)
-    idx = findfirst(m -> m isa AgentMsg && m.id == s.msg_id, model.msgs_store)
-    idx === nothing && return nothing
-    m = model.msgs_store[idx]
-    finalize_agent(model.chat_session, m)
-    html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
-    chat_emit(model, Dict{String,Any}("type" => "agent_final", "id" => m.id, "html" => html))
+# Finalize a message: persist to chat.md (per-type writer) + emit its closing
+# event. UserMsg / TodoListMsg have no `*_final` event; a ToolMsg only persists once
+# it reaches a terminal status. AgentMsg builds its rendered html ONCE here so
+# later `msgs.request` round-trips (scroll-back, re-mount) reuse the cache.
+Base.close(m::AgentMsg) = (ensure_html!(m); finalize_agent(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
+Base.close(m::ThoughtMsg) = (append_thought(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
+Base.close(m::UserMsg) = (append_user(m.chat.chat_session, m); nothing)
+# Persist only. The previous version also stamped `finished_at = time()`,
+# which made every just-created TodoListMsg immediately stop being "live"
+# and broke cross-turn absorption (the next TodoWrite found the prior
+# bubble as not-live and spawned a fresh one — visible in the chat
+# history as a parallel stack of duplicate todo bubbles, each with its
+# own timer ticking). `finished_at` is now set exclusively by
+# `try_absorb_todo!` when the absorbed entries become all-done.
+Base.close(m::TodoListMsg) =
+    (append_plan(m.chat.chat_session, m); nothing)
+function Base.close(m::ToolMsg)
+    if m.status in ("completed", "failed")
+        m.finished_at === nothing && (m.finished_at = time())
+        append_tool(m.chat.chat_session, m)
+    end
+    nothing
+end
+Base.close(m::SummaryMsg) = (ensure_html!(m); append_summary(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
+
+# ── Wire-dict builders (the browser protocol; byte-identical to before) ─────
+# CommonMark for rendering — `Bonito.bonito_parser()` already turns on the
+# extensions we want (TableRule, FootnoteRule, DollarMath, Admonition,
+# Strikethrough, RawContent, AttributeRule), so we share its config instead
+# of maintaining a parallel `enable!` list here. The bare stdlib `Markdown`
+# / `CM.Parser()` paths were both wrong: stdlib `Markdown` italicizes
+# intraword `_` (`foo_bar_baz` → `foo<em>bar</em>baz`); a bare `CM.Parser()`
+# fixes that but drops tables on the floor (they came out as literal `|`).
+# The parser is reused across calls; CommonMark.Parser is mutating but the
+# parse + write_html cycle leaves it in the same state each time.
+const MARKDOWN_PARSER = Bonito.bonito_parser()
+# Wrap the rendered html in `.markdown-body` so `Bonito.MarkdownCSS` (which
+# is GitHub-style and already loaded into the shell) handles tables, code
+# blocks, lists, etc. — we don't have to duplicate the styling.
+markdown_html(text::AbstractString) =
+    "<div class=\"markdown-body\">" *
+    sprint(io -> CM.html(io, MARKDOWN_PARSER(String(text)))) *
+    "</div>"
+
+# "new message" event. Streaming-open shape for agent/thought (seeded with the
+# first chunk); plain shape for user/tool/plan. `send!` adds the `n` count.
+wire_new(::ChatModel, m::AgentMsg) =
+    Dict{String,Any}("type" => "agent", "id" => m.id, "html" => "", "streaming" => true, "text" => m.text)
+# A thought is committed whole (see `process!(::Thought)`): render it collapsed
+# like a reloaded one (summary only, lazy body); `close` then ships the html.
+wire_new(::ChatModel, m::ThoughtMsg) = msg_to_dict(m)
+wire_new(::ChatModel, m::UserMsg) =
+    Dict{String,Any}("type" => "user", "text" => m.text, "queued" => m.queued)
+wire_new(model::ChatModel, m::ToolMsg) = tool_header_dict(m, model.chat_dir)
+wire_new(model::ChatModel, m::TodoListMsg) = msg_to_dict(m, model.chat_dir)
+# Summary opens as a centered placeholder; `close` ships the rendered html.
+wire_new(::ChatModel, ::SummaryMsg) =
+    Dict{String,Any}("type" => "summary", "html" => "", "streaming" => true)
+
+# Stream the FULL rendered html of the message-so-far rather than the text
+# delta — so a live agent message reads as proper markdown (lists, headings,
+# code blocks, bold, links) instead of running together as one wall of text
+# whose newlines also get lost. CommonMark is cheap per parse (~µs) and
+# claude-agent-acp chunks are paragraph-sized, not per-character, so the
+# O(N²) cumulative cost over a single message stays well under a millisecond
+# for typical lengths. `append!` already invalidated the cache; `ensure_html!`
+# rebuilds it from the new accumulated text.
+wire_chunk(m::AgentMsg, _t) = Dict{String,Any}(
+    "type" => "chunk", "id" => m.id, "html" => ensure_html!(m))
+wire_chunk(m::UserMsg, t) = Dict{String,Any}("type" => "user_chunk", "text" => t)
+
+wire_final(m::AgentMsg) = Dict{String,Any}("type" => "agent_final", "id" => m.id, "html" => ensure_html!(m))
+wire_final(m::ThoughtMsg) = Dict{String,Any}("type" => "thought_final", "id" => m.id, "html" => markdown_html(m.text))
+wire_final(m::SummaryMsg) = Dict{String,Any}("type" => "summary_final", "html" => ensure_html!(m))
+
+# ── Rendering one ACP message into a bubble ─────────────────────────────────
+# `process!` is the per-message renderer used by the `run_chat!` loop: turn the
+# clean ACP message into a chat bubble, `send!` it, then stream its `updates`
+# into that bubble via `process_update!`. Only tools/plan override
+# `process_update!`; text messages use the default (drain the text deltas).
+process!(chat::ChatModel, m::AgentClientProtocol.Message) =
+    process_update!(send!(chat, to_message(chat, m)), m)
+
+# Thoughts get special handling. This agent redacts the plaintext reasoning
+# (the model returns thinking blocks with an empty `thinking` field and only an
+# encrypted `signature`), so a thought is almost always EMPTY. We show a
+# transient "reasoning…" indicator for the lifetime of the thought and only
+# commit a real (collapsed, persisted) thought bubble if non-empty text
+# actually arrives — empty redacted thoughts leave no trace in the store, while
+# an agent that DOES expose plaintext still renders one.
+function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
+    chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => true))
+    text = m.text
+    for delta in m.updates
+        text *= delta
+    end
+    chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => false))
+    isempty(strip(text)) || close(send!(chat, ThoughtMsg(chat, text)))
     return nothing
 end
 
-function finalize_stream!(model::ChatModel, s::ThoughtStream)
-    idx = findfirst(m -> m isa ThoughtMsg && m.id == s.msg_id, model.msgs_store)
-    idx === nothing && return nothing
-    m = model.msgs_store[idx]
-    append_thought(model.chat_session, m)
-    html = sprint(show, MIME("text/html"), Markdown.parse(m.text))
-    chat_emit(model, Dict{String,Any}("type" => "thought_final", "id" => m.id, "html" => html))
+# Session-config changes mid-turn: pure header metadata — update the shared
+# observable, no chat bubble, no persistence (config is ephemeral per
+# connection; the next bring-up resets it from the session-setup result).
+function process!(chat::ChatModel, m::AgentClientProtocol.ConfigUpdate)
+    s = shared(chat)
+    # The spec payload is the COMPLETE config state: replace the ConfigOption
+    # items, preserve any other meta kinds a future parser may have added.
+    rest = [x for x in s.session_meta[] if !(x isa AgentClientProtocol.ConfigOption)]
+    s.session_meta[] = Any[m.options..., rest...]
     return nothing
 end
 
-# ── ACP update ingestion: one method per (state, update) pair ──────────────
-# `ingest!` returns the next StreamingState. `do_apply!(::AgentUpdate)`
-# is the *only* place that writes `model.streaming[]`, and does so under
-# the model lock — every transition is atomic w.r.t. concurrent chunks.
-#
-# Shape:
-#   - Default chunk method (StreamingState, ChunkUpdate) = finalize current,
-#     open a fresh stream of the chunk's kind, return the matching state.
-#   - Specialized chunk method (MatchingStream, ChunkUpdate) = append to
-#     the existing bubble, return the same state.
-#   - Tool / plan = finalize current, push a discrete message, return NoStream.
-#   - ToolCallUpdate = patch the matching tool header in place, don't touch
-#     the streaming state (no finalize either: the tool update fires while
-#     the agent text bubble is still streaming and shouldn't kill it).
-
-function ingest!(model::ChatModel, state::StreamingState, upd::UserMessageChunk)
-    upd.content isa TextContent || return state
-    finalize_stream!(model, state)
-    text = upd.content.text
-    msg = UserMsg(text)
-    push!(model.msgs_store, msg)
-    append_user(model.chat_session, msg)
-    n = length(model.msgs_store)
-    chat_emit(model, Dict{String,Any}("type" => "user", "text" => text, "n" => n))
-    return UserStream()
+function process!(chat::ChatModel, m::AgentClientProtocol.ModeUpdate)
+    s = shared(chat)
+    s.session_meta[] = Any[map(s.session_meta[]) do x
+        x isa AgentClientProtocol.ConfigOption && x.id == "mode" ?
+            AgentClientProtocol.ConfigOption(x.id, x.name, x.description,
+                x.category, m.mode_id, x.choices) : x
+    end...]
+    return nothing
 end
 
-function ingest!(model::ChatModel, state::UserStream, upd::UserMessageChunk)
-    upd.content isa TextContent || return state
-    idx = findlast(m -> m isa UserMsg, model.msgs_store)
-    idx === nothing && return state
-    text = upd.content.text
-    model.msgs_store[idx].text *= text
-    chat_emit(model, Dict{String,Any}("type" => "user_chunk", "text" => text))
-    return state
+to_message(chat::ChatModel, m::AgentClientProtocol.AgentMessage) = AgentMsg(chat, m.text)
+# Compact-summary "user" messages get their own centered kind. ACP doesn't carry
+# Claude Code's `isCompactSummary` flag, so we route on the verbatim opening.
+to_message(chat::ChatModel, m::AgentClientProtocol.UserMessage) =
+    is_summary_text(m.text) ? SummaryMsg(chat, m.text) : UserMsg(chat, m.text)
+# Typed dispatch on the ACP variant — one method per concrete `ToolCall`.
+to_message(chat::ChatModel, tc::AgentClientProtocol.GenericTool)   = build_tool_msg(chat, tc)
+to_message(chat::ChatModel, tc::AgentClientProtocol.BashCall)      = build_tool_msg(chat, tc)
+to_message(chat::ChatModel, tc::AgentClientProtocol.TaskCall)      = build_tool_msg(chat, tc)
+to_message(chat::ChatModel, tc::AgentClientProtocol.MCPCall)       = build_tool_msg(chat, tc)
+to_message(chat::ChatModel, tc::AgentClientProtocol.TodoWriteCall) = TodoListMsg(chat, tc.entries)
+to_message(chat::ChatModel, m::AgentClientProtocol.Plan)           = TodoListMsg(chat, m.entries)
+
+# Concrete-typed builders for the four ToolMsg variants. Each one knows which
+# tool-specific fields to lift out of its ACP source.
+# `bt_show_app` (an MCP call) and any tool already tagged `bonito_app`
+# (`show_remote_app!`) are live worker apps — route them to `BonitoAppMsg`,
+# decided purely from the tool name / kind (no content sniffing).
+is_bonito_app(tc::AgentClientProtocol.MCPCall)     = tc.tool_name == "bt_show_app"
+is_bonito_app(tc::AgentClientProtocol.GenericTool) = tc.kind == "bonito_app"
+is_bonito_app(::AgentClientProtocol.ToolCall)      = false
+
+bonito_app_msg(tc, server, chat) =
+    BonitoAppMsg(tc.id, "bonito_app", tc.title, tc.status,
+                 content_summary("bonito_app", tc.content),
+                 time(), nothing, server,
+                 something(find_app_reference(tc.content), ""), chat)
+
+build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.GenericTool) =
+    is_bonito_app(tc) ? bonito_app_msg(tc, "", chat) :
+    GenericToolMsg(tc.id, tc.kind, tc.name, tc.title, tc.status,
+                   content_summary(tc.kind, tc.content),
+                   time(), nothing, chat)
+
+build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.BashCall) =
+    BashToolMsg(tc.id, tc.kind, tc.title, tc.status,
+                content_summary(tc.kind, tc.content),
+                time(), nothing,
+                tc.command, tc.run_in_background,
+                "", 0, false, "", chat)
+
+build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.TaskCall) =
+    TaskToolMsg(tc.id, tc.kind, tc.title, tc.status,
+                content_summary(tc.kind, tc.content),
+                time(), nothing,
+                tc.description, tc.run_in_background, tc.task_name, chat)
+
+build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.MCPCall) =
+    is_bonito_app(tc) ? bonito_app_msg(tc, tc.server, chat) :
+    MCPToolMsg(tc.id, tc.kind, tc.title, tc.status,
+               content_summary(tc.kind, tc.content),
+               time(), nothing,
+               tc.server, tc.tool_name, chat)
+
+# Default: stream the message's text deltas into the bubble, then finalize.
+function process_update!(b::ChatMsg, m::AgentClientProtocol.Message)
+    for delta in m.updates
+        append!(b, delta)
+    end
+    close(b)
+    return nothing
 end
 
-function ingest!(model::ChatModel, state::StreamingState, upd::AgentMessageChunk)
-    upd.content isa TextContent || return state
-    finalize_stream!(model, state)
-    text = upd.content.text
-    id = string(uuid4())
-    msg = AgentMsg(id, text)
-    push!(model.msgs_store, msg)
-    n = length(model.msgs_store)
-    # Seed the bubble's streaming accumulator with this first chunk's text
-    # so a viewer that reconnected mid-stream sees content right away.
-    chat_emit(model, Dict{String,Any}("type" => "agent", "id" => id, "n" => n,
-        "html" => "", "streaming" => true, "text" => text))
-    return AgentStream(id)
+# Tools: persist the content snapshot to disk (so the lazily-loaded body stays
+# current), re-render the header on each change, finalize on terminal status.
+# A tool's `updates` channel yields the (mutated) ToolCall after each change.
+# `b::ToolMsg` covers every concrete variant — they all carry the same five
+# header fields the update path touches.
+function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
+    persist_tool_content!(b.chat.chat_dir, m)
+    ship_edit_preview!(b)
+    for snap in m.updates
+        prev_status = b.status
+        b.status = snap.status
+        b.title = snap.title
+        b.summary = content_summary(snap.kind, snap.content)
+        # Stamp `finished_at` on terminal-transition so the live timer freezes.
+        prev_status in ("completed", "failed") || !(b.status in ("completed", "failed")) ||
+            (b.finished_at = time())
+        persist_tool_content!(b.chat.chat_dir, snap)
+        pretty_title, _ = pretty_tool_title(b.title)
+        d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
+            "status" => b.status, "title" => pretty_title, "summary" => b.summary)
+        b.finished_at === nothing || (d["finished_at"] = b.finished_at)
+        # Auto-expand the body: a live Bonito app always (it IS the point), or a
+        # `bt_show` tool once its content carries a `shown:` ref. `auto_expand_body`
+        # dispatches on the type — no content sniffing to decide.
+        (auto_expand_body(b) || has_show_reference(snap.content)) &&
+            (d["expand"] = true)
+        # Displayable media (bt_show mime, or inline image content from
+        # e.g. Read on a PNG) — the client's Native Images mode keys on
+        # this; ship it with the update that carries the result.
+        mime = tool_media_mime(snap.content)
+        mime === nothing || (d["show_mime"] = mime)
+        chat_emit(b.chat, d)
+        ship_edit_preview!(b)
+    end
+    close(b)
+    return nothing
 end
 
-function ingest!(model::ChatModel, state::AgentStream, upd::AgentMessageChunk)
-    upd.content isa TextContent || return state
-    idx = findfirst(m -> m isa AgentMsg && m.id == state.msg_id, model.msgs_store)
-    idx === nothing && return state
-    text = upd.content.text
-    model.msgs_store[idx].text *= text
-    chat_emit(model, Dict{String,Any}("type" => "chunk",
-        "id" => state.msg_id, "text" => text))
-    return state
+# Does this tool's body auto-open on render? Only a live Bonito app.
+auto_expand_body(::ToolMsg) = false
+auto_expand_body(::BonitoAppMsg) = true
+
+# A live worker app: run the generic tool update, but first capture the worker's
+# registered app id from the result content ONCE (bt_show_app returns it there),
+# so render/header read `b.app_id` and never touch content again.
+function process_update!(b::BonitoAppMsg, m::AgentClientProtocol.ToolCall)
+    if isempty(b.app_id)
+        for snap in m.updates
+            ref = find_app_reference(snap.content)
+            if ref !== nothing
+                b.app_id = ref
+                break
+            end
+        end
+    end
+    invoke(process_update!, Tuple{ToolMsg, AgentClientProtocol.ToolCall}, b, m)
 end
 
-function ingest!(model::ChatModel, state::StreamingState, upd::AgentThoughtChunk)
-    upd.content isa TextContent || return state
-    text = upd.content.text
-    # claude-agent-acp's session/load replay emits placeholder thought chunks
-    # with empty content — underlying jsonl doesn't persist thought text.
-    # Skip those so a resume doesn't spawn empty bubbles.
-    isempty(text) && return state
-    finalize_stream!(model, state)
-    id = string(uuid4())
-    msg = ThoughtMsg(id, text)
-    push!(model.msgs_store, msg)
-    n = length(model.msgs_store)
-    chat_emit(model, Dict{String,Any}("type" => "thought", "id" => id, "n" => n,
-        "html" => "", "streaming" => true, "text" => text))
-    return ThoughtStream(id)
+# Background bash (`run_in_background`): the agent "completes" the tool_call the
+# instant the command is LAUNCHED and hands back an output-file path; the shell
+# keeps running. We do the normal persist + header updates but, instead of
+# finalizing on "completed", capture the output path and go live (`bg_running`) —
+# the background-task poller then streams the file and finalizes when the shell
+# exits. Non-background bashes fall through to the generic ToolMsg handling.
+function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
+    persist_tool_content!(b.chat.chat_dir, m)
+    for snap in m.updates
+        b.status  = snap.status
+        b.title   = snap.title
+        b.summary = content_summary(snap.kind, snap.content)
+        persist_tool_content!(b.chat.chat_dir, snap)
+        # Detect a background launch from the RESULT ("…running in background…
+        # Output is being written to: <path>"), NOT from rawInput's
+        # `run_in_background` — some agent builds don't forward it, so
+        # `is_background` reads false even for a real background bash. The result
+        # text is the reliable signal; flip `is_background` on so the taskbar +
+        # `is_live` treat it as the live task it is.
+        if isempty(b.bg_output_path)
+            path = parse_bg_output_path(snap.content)
+            if path !== nothing
+                @debug "background task detected from result" id = b.id path = basename(path)
+                b.is_background  = true
+                b.bg_output_path = path
+                b.bg_offset      = 0
+                b.bg_running     = true       # the poller now owns its lifecycle
+            end
+        end
+        # Foreground bash (or a failed launch): stamp finished_at on terminal.
+        # A live background task is left unstamped — the poller finalizes it.
+        if !b.bg_running && b.status in ("completed", "failed")
+            b.finished_at === nothing && (b.finished_at = time())
+        end
+        pretty_title, _ = pretty_tool_title(b.title)
+        d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
+            "status" => b.bg_running ? "in_progress" : b.status,
+            "title" => pretty_title, "summary" => b.summary)
+        if b.bg_running
+            d["background"] = true
+            # `wire_new` shipped `taskbar=false` (is_background was still false —
+            # rawInput omits run_in_background); now that we know it IS a
+            # background task, flip the taskbar slot on so it joins the bar.
+            d["taskbar"] = true
+        elseif b.finished_at !== nothing
+            d["finished_at"] = b.finished_at
+        end
+        chat_emit(b.chat, d)
+    end
+    # A live background task is finalized later (by `finalize_bg_task!` when the
+    # shell exits); only persist-to-chat.md here if it already terminated.
+    b.bg_running || close(b)
+    return nothing
 end
 
-function ingest!(model::ChatModel, state::ThoughtStream, upd::AgentThoughtChunk)
-    upd.content isa TextContent || return state
-    text = upd.content.text
-    isempty(text) && return state
-    idx = findfirst(m -> m isa ThoughtMsg && m.id == state.msg_id, model.msgs_store)
-    idx === nothing && return state
-    model.msgs_store[idx].text *= text
-    chat_emit(model, Dict{String,Any}("type" => "thought_chunk",
-        "id" => state.msg_id, "text" => text))
-    return state
-end
-
-function ingest!(model::ChatModel, state::StreamingState, upd::ToolCallNotif)
-    finalize_stream!(model, state)
-    update_tool_file!(model.chat_dir, upd.tool_call_id, upd.raw)
-    summary = content_summary(upd.kind, upd.content)
-    msg = ToolMsg(upd.tool_call_id, upd.kind, upd.title, upd.status, summary)
-    push!(model.msgs_store, msg)
-    n = length(model.msgs_store)
-    payload = msg_to_dict(msg, model.chat_dir)
-    payload["n"] = n
-    chat_emit(model, payload)
-    upd.status in ("completed", "failed") && append_tool(model.chat_session, msg)
-    return NoStream()
-end
-
-function ingest!(model::ChatModel, state::StreamingState, upd::ToolCallUpdateNotif)
-    # Tool updates patch an existing tool-header in place; they don't
-    # interrupt agent text streaming, so leave the stream state alone.
-    idx = findfirst(m -> m isa ToolMsg && m.id == upd.tool_call_id, model.msgs_store)
-    idx === nothing && return state
-    m = model.msgs_store[idx]
-    update_tool_file!(model.chat_dir, upd.tool_call_id, upd.raw)
-    upd.status !== nothing && (m.status = upd.status)
-    upd.title !== nothing && (m.title = upd.title)
-    isempty(upd.content) || (m.summary = content_summary(m.kind, upd.content))
-    pretty_title, _ = pretty_tool_title(m.title)
-    chat_emit(model, Dict{String,Any}("type" => "tool_update",
-        "id" => m.id, "status" => m.status, "title" => pretty_title,
-        "summary" => m.summary))
-    m.status in ("completed", "failed") && append_tool(model.chat_session, m)
-    return state
-end
-
-function ingest!(model::ChatModel, state::StreamingState, upd::PlanUpdate)
-    finalize_stream!(model, state)
-    msg = PlanMsg(upd.entries)
-    push!(model.msgs_store, msg)
-    n = length(model.msgs_store)
-    payload = msg_to_dict(msg, model.chat_dir)
-    payload["n"] = n
-    chat_emit(model, payload)
-    append_plan(model.chat_session, msg)
-    return NoStream()
-end
-
-# Fallback for `SessionUpdate` kinds we don't model — primarily
-# `UnknownUpdate`, which `parse_session_update` returns when claude-agent-acp
-# sends a `sessionUpdate` we haven't taught the chat layer about (protocol
-# evolution: new event types added upstream, we lag). Treating these as a
-# no-op preserves the current streaming state and lets the dispatcher
-# continue. Without this method, `do_apply!(::AgentUpdate)` would raise a
-# `MethodError`, which the outer dispatcher catches + logs — noisy in
-# production logs and a real risk if it ever fires mid-finalize before the
-# state could be committed.
-ingest!(::ChatModel, state::StreamingState, ::AgentClientProtocol.SessionUpdate) = state
-
-# ── ChatEvent: the only way to mutate ChatModel state ──────────────────────
-#
-# Every state change the chat undergoes — an agent chunk arrived, the user
-# typed a message, the prompt returned, the user cancelled, the session
-# restarted — is modelled as a `ChatEvent`. The single entry point `apply!`
-# takes the model lock and dispatches `do_apply!(model, event)` per type.
-#
-# Together with the FIFO dispatcher task on ACP's `Connection`, this gives:
-#
-#   1. **Strict order of agent updates.** ACP's dispatcher drains its
-#      Channel one update at a time → `on_update(::ChatHandler, ...)` is
-#      called once per update in wire order → `apply!(AgentUpdate(...))` is
-#      called once per update in wire order. No `@async` shuffle.
-#
-#   2. **Atomic transitions across mixed inputs.** A user submit and an
-#      arriving agent chunk both go through `apply!` → they fight for the
-#      same lock → whichever wins is the one whose entire `do_apply!`
-#      runs to completion before the other starts. No half-mutated
-#      observable state for anyone to see.
-#
-#   3. **Exhaustiveness by type.** `do_apply!(model, ::ChatEvent)` is the
-#      catch-all that raises — adding a new `ChatEvent` subtype without
-#      a method gets a loud error on first occurrence, not a silent skip.
-#
-#   4. **No forgotten lock.** Callers never write `lock(model.lock)`; they
-#      call `apply!(model, event)`. The lock is structurally inside the
-#      mutation API, not a discipline.
-#
-# Public entries (`ChatHandler.on_update`, `send_message!`,
-# `restart_chat_session!`, the `CancelCommand` handler) all bottom out in
-# `apply!` — there is no other path that touches `streaming` / `msgs_store`
-# in a way the dispatcher could race with.
-abstract type ChatEvent end
-
-# ACP delivered one `session/update` notification (in wire order from the
-# Connection's single dispatcher task).
-struct AgentUpdate <: ChatEvent
-    upd::AgentClientProtocol.SessionUpdate
-end
-
-# User submitted a message (typed + send, auto-prompt, or scripted).
-struct UserSubmitted <: ChatEvent
-    msg::UserMsg
-    images::Vector{AgentClientProtocol.ImageAttachment}
-end
-
-# The active ACP prompt returned (end_turn, cancelled, or after an error).
-struct PromptCompleted <: ChatEvent end
-
-# ACP `prompt!` raised. `:session_dead` ⇒ surface as a banner (transport-
-# level failure, user must restart). `:transient` ⇒ surface as an inline
-# error bubble (one bad turn; the session is still alive).
-struct PromptFailed <: ChatEvent
-    message::String
-    kind::Symbol      # :session_dead | :transient
-end
-
-# User clicked stop. We notify the agent and let the prompt return
-# normally — that fires `PromptCompleted`, which handles the finalize.
-struct UserCancelled <: ChatEvent end
-
-# `restart_chat_session!` finished bringing up a fresh client. Reset any
-# streaming state left over from the prior session.
-struct SessionRestarted <: ChatEvent end
-
-# The lock-anchored entry point. Resolves to the shared parent so writes
-# broadcast to every connected tab (see `shared(::ChatModel)`).
-function apply!(model::ChatModel, event::ChatEvent)
-    s = shared(model)
-    lock(s.lock) do
-        do_apply!(s, event)
+# Pull the output-file path from a background-launch result, e.g.
+# "… Output is being written to: /tmp/…/<id>.output".
+function parse_bg_output_path(content)
+    for c in content
+        txt = try
+            hasproperty(c, :text) ? String(getproperty(c, :text)) :
+                (c isa AbstractDict ? String(get(c, "text", "")) : "")
+        catch
+            ""
+        end
+        mm = match(r"written to:\s*(\S+)", txt)
+        mm === nothing || return String(mm.captures[1])
     end
     return nothing
 end
 
-# Total fallback: a new ChatEvent subtype without a `do_apply!` method
-# raises immediately rather than being silently skipped.
-do_apply!(::ChatModel, event::ChatEvent) =
-    error("ChatModel: no do_apply! method for $(typeof(event))")
+# ── Background-task output poller ───────────────────────────────────────────
+# ONE server-wide loop streams every live background bash. The agent backgrounds
+# the shell and only returns a file path (it does NOT stream), so we tail that
+# file ourselves. Per task we back off 0.5s → 1 → 2 → 4 → 5s (responsive while
+# fresh, cheap once settled). "Done" is the output file's fd closing — the shell
+# exited (see the worker's `file_held_open`); a non-Linux worker falls back to
+# output quiescence.
+const BG_POLL_BASE    = 0.5
+const BG_POLL_MAX     = 5.0
+const BG_QUIESCE_SECS = 20.0   # non-Linux fallback: no growth this long ⇒ done
 
-function do_apply!(model::ChatModel, event::AgentUpdate)
-    model.streaming[] = ingest!(model, model.streaming[], event.upd)
+function start_background_task_poller!(state::ServerState)
+    Base.errormonitor(@async background_task_poll_loop(state))
     return nothing
 end
 
-function do_apply!(model::ChatModel, event::UserSubmitted)
-    # 1. Abandon any in-flight agent/thought stream — user interrupted
-    #    before the agent finished. Rendering half a sentence as final
-    #    HTML would lie about completeness, so we drop the streaming
-    #    state without finalizing; the partial bubble keeps its
-    #    streaming text but no further chunks will glue onto it
-    #    (next chunk starts a fresh AgentStream from NoStream).
-    model.streaming[] = NoStream()
+bg_worker_id(state::ServerState, model::ChatModel) =
+    let pid = model.project_id
+        (isempty(pid) || !haskey(state.projects[], pid)) ? nothing :
+            state.projects[][pid].worker_id
+    end
 
-    # 2. Push the user message into the store + persist + announce.
-    push!(model.msgs_store, event.msg)
-    append_user(model.chat_session, event.msg)
-    n = length(model.msgs_store)
-    payload = msg_to_dict(event.msg, model.chat_dir)
-    payload["n"] = n
-    chat_emit(model, payload)
-
-    # 3. Consume any armed one-shot history prelude (see
-    #    `arm_history_replay!`). Empty in steady state — only set right
-    #    after a session restart that lost claude's session jsonl.
-    prelude = model.pending_history_replay[]
-    isempty(prelude) || (model.pending_history_replay[] = "")
-
-    # 4. Mark busy.
-    model.busy_active[] = true
-    chat_emit(model, Dict{String,Any}("type" => "busy_start"))
-
-    # 5. Spawn the ACP prompt OFF the lock — `prompt!` blocks until
-    #    end_turn / cancel, which may take minutes. The worker task
-    #    will `apply!` `PromptFailed` (on error) and `PromptCompleted`
-    #    (always) back through this same entry point.
-    client = model.client[]
-    full_text = prelude * event.msg.text
-    images = event.images
-    Base.errormonitor(@async drive_prompt!(model, client, full_text, images))
-    return nothing
-end
-
-function do_apply!(model::ChatModel, event::PromptFailed)
-    if event.kind === :session_dead
-        # Transport-level failure. Banner + last_error; the user has to
-        # click Restart.
-        model.session_alive[] = false
-        model.last_error[] = event.message
-    else
-        id = string(uuid4())
-        err_msg = AgentMsg(id, "[error: $(event.message)]")
-        push!(model.msgs_store, err_msg)
-        finalize_agent(model.chat_session, err_msg)
-        n = length(model.msgs_store)
-        payload = msg_to_dict(err_msg, model.chat_dir)
-        payload["n"] = n
-        chat_emit(model, payload)
+function write_bg_content!(chat_dir::AbstractString, m::BashToolMsg)
+    body = isempty(strip(m.command)) ? m.bg_text : "\$ $(m.command)\n\n$(m.bg_text)"
+    open(tool_file(chat_dir, m.id), "w") do io
+        JSON.print(io, Dict("content" => [Dict("type" => "text", "text" => body)]))
     end
     return nothing
 end
 
-function do_apply!(model::ChatModel, ::PromptCompleted)
-    finalize_stream!(model, model.streaming[])
-    model.streaming[] = NoStream()
-    model.busy_active[] = false
-    chat_emit(model, Dict{String,Any}("type" => "busy_end"))
+bg_line_count(m::BashToolMsg) = count(==('\n'), m.bg_text)
+
+function stream_bg_update!(model::ChatModel, m::BashToolMsg)
+    write_bg_content!(model.chat_dir, m)
+    n = bg_line_count(m)
+    m.summary = "running… $n line$(n == 1 ? "" : "s")"
+    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => m.id,
+        "status" => "in_progress", "summary" => m.summary,
+        "background" => true, "taskbar" => true))
     return nothing
 end
 
-function do_apply!(model::ChatModel, ::UserCancelled)
-    # `cancel!` is a JSON-RPC notification (fire and forget). The agent
-    # closes the active turn and `prompt!` in `drive_prompt!` returns —
-    # whose `finally` fires `PromptCompleted` for us. No state mutation
-    # needed here besides the cancel notification itself.
-    c = model.client[]
-    c === nothing && return nothing
-    AgentClientProtocol.cancel!(c)
-    return nothing
-end
-
-function do_apply!(model::ChatModel, ::SessionRestarted)
-    # The old client is closed; anything that was streaming is over. We
-    # don't `finalize_stream!` (the old conversation jsonl has been
-    # superseded — persisting a partial bubble would mislabel it as
-    # belonging to the new session) — just wipe the state.
-    model.streaming[] = NoStream()
-    model.busy_active[] = false
-    return nothing
-end
-
-# Off-lock prompt driver. Spawned by `do_apply!(UserSubmitted)`. Its job
-# is to bridge the blocking `prompt!` call (which we can't run under the
-# model lock) back into the ChatEvent pipeline: classify exceptions,
-# fire the matching event, always fire `PromptCompleted` on the way out.
-# The `drain_updates` synchronization is internal to `prompt!` now —
-# returning from `prompt!` already implies "every session/update for
-# this turn has been delivered to the handler".
-function drive_prompt!(model::ChatModel,
-                       client::AgentClientProtocol.Client,
-                       full_text::AbstractString,
-                       images::Vector{AgentClientProtocol.ImageAttachment})
+function finalize_bg_task!(model::ChatModel, m::BashToolMsg)
+    m.bg_running = false
+    m.status = "completed"
+    m.finished_at === nothing && (m.finished_at = time())
+    write_bg_content!(model.chat_dir, m)
     try
-        AgentClientProtocol.prompt!(client, String(full_text); images)
+        append_tool(model.chat_session, m)
     catch e
-        kind = is_session_dead_error(e) ? :session_dead : :transient
-        apply!(model, PromptFailed(sprint(showerror, e), kind))
-    finally
-        apply!(model, PromptCompleted())
+        @warn "append_tool for finished bg task failed" id = m.id exception = e
+    end
+    n = bg_line_count(m)
+    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => m.id,
+        "status" => "completed", "summary" => "done · $n line$(n == 1 ? "" : "s")",
+        "finished_at" => m.finished_at))
+    return nothing
+end
+
+# Tail one task's output; stream new bytes to the bubble. Returns the worker's
+# tail result (or `nothing` on a transient error → retry next tick).
+function poll_background_task!(state::ServerState, model::ChatModel, m::BashToolMsg)
+    wid = bg_worker_id(state, model)
+    wid === nothing && return nothing
+    r = try
+        tail_worker_file(state, wid, m.bg_output_path; offset = m.bg_offset, timeout = 10.0)
+    catch e
+        @debug "tail_file failed (will retry)" id = m.id exception = e
+        return nothing
+    end
+    if r.exists && !isempty(r.chunk)
+        m.bg_text  *= r.chunk
+        m.bg_offset = r.offset
+        stream_bg_update!(model, m)
+    end
+    return r
+end
+
+function background_task_poll_loop(state::ServerState)
+    sched = Dict{String,NTuple{3,Float64}}()   # id → (next poll, interval, last-grew)
+    while true
+        try
+            for (_, model) in collect(state.chat_models)
+                for m in collect(model.msgs_store)
+                    (m isa BashToolMsg && m.is_background && m.bg_running &&
+                        !isempty(m.bg_output_path)) || continue
+                    nextt, interval, lastgrow = get(sched, m.id, (0.0, BG_POLL_BASE, time()))
+                    time() < nextt && continue
+                    before = m.bg_offset
+                    r = poll_background_task!(state, model, m)
+                    grew = m.bg_offset > before
+                    grew && (lastgrow = time())
+                    done = r !== nothing &&
+                        (r.open_known ? (r.exists && !r.open) :
+                                        (time() - lastgrow > BG_QUIESCE_SECS))
+                    if done
+                        finalize_bg_task!(model, m)
+                        delete!(sched, m.id)
+                    else
+                        sched[m.id] = (time() + interval, min(interval * 2, BG_POLL_MAX), lastgrow)
+                    end
+                end
+            end
+            for id in collect(keys(sched))
+                any(mm -> any(x -> x isa BashToolMsg && x.id == id && x.bg_running,
+                              mm.msgs_store), values(state.chat_models)) || delete!(sched, id)
+            end
+        catch e
+            @warn "background task poll loop tick failed" exception = e
+        end
+        sleep(0.25)
+    end
+end
+
+# Edit tools show an inline diff preview on the collapsed header. The diff is
+# only on disk AFTER the persist above, but `wire_new` (which builds the header)
+# already fired — so we ship the preview as a follow-up `tool_update`. No-op for
+# non-edit tools, so the bt_show / generic tool flow is untouched.
+function ship_edit_preview!(b::ToolMsg)
+    b.kind == "edit" || return nothing
+    prev = render_edit_preview(b.chat.chat_dir, b.id)
+    prev === nothing && return nothing
+    chat_emit(b.chat, Dict{String,Any}("type" => "tool_update", "id" => b.id, "preview" => prev))
+    return nothing
+end
+
+# Todos are one-shot snapshots — nothing to stream, just finalize (persist).
+process_update!(b::TodoListMsg, ::AgentClientProtocol.Plan) = (close(b); nothing)
+process_update!(b::TodoListMsg, ::AgentClientProtocol.TodoWriteCall) = (close(b); nothing)
+
+# ── TodoList absorption ────────────────────────────────────────────────────
+# Both Claude tooling paths land here: a `tool_call/TodoWrite` (the SDK tool)
+# AND a separate `plan` SessionUpdate (the older PlanUpdate channel). We
+# *don't* push a fresh `TodoListMsg` if a live one already exists — instead
+# the previous bubble absorbs the new entries and emits a `wire_update`. End
+# result: ONE pill in the chat that animates as the todos move, plus one
+# slot in the taskbar that mirrors it (see is_taskbar_item).
+function process!(chat::ChatModel, m::AgentClientProtocol.TodoWriteCall)
+    if !try_absorb_todo!(chat, m.entries)
+        msg = TodoListMsg(chat, m.entries)
+        close(send!(chat, msg))
+    end
+    for _ in m.updates; end                # drain any straggler updates (rare)
+    return nothing
+end
+
+function process!(chat::ChatModel, m::AgentClientProtocol.Plan)
+    try_absorb_todo!(chat, m.entries) ||
+        close(send!(chat, TodoListMsg(chat, m.entries)))
+    return nothing
+end
+
+# Find the last live `TodoListMsg` in the store and replace its entries with
+# `new_entries`. Returns `true` if absorption happened; `false` means there's
+# nothing live to update and the caller should push a fresh bubble.
+function try_absorb_todo!(chat::ChatModel, new_entries)
+    entries = collect(PlanEntry, new_entries)
+    target = lock(chat.lock) do
+        for i in length(chat.msgs_store):-1:1
+            m = chat.msgs_store[i]
+            m isa TodoListMsg || continue
+            return is_live(m) ? m : nothing   # done lists stop absorbing — start fresh
+        end
+        return nothing
+    end
+    target === nothing && return false
+    target.entries = entries
+    is_live(target) || (target.finished_at = time())
+    # Persist as a new chat.md plan section so a reload sees the latest state
+    # (until we teach `load_history` to dedupe by `id`, this also keeps the
+    # iteration trail visible on disk).
+    target.chat === nothing || append_plan(target.chat.chat_session, target)
+    # Emit a `plan_update` rather than a fresh `plan`: the JS dispatch keys
+    # the existing bubble by id and patches its html / live class / timer,
+    # instead of treating it as a new message arriving at the next index.
+    chat_emit(chat, plan_update_dict(target))
+    return true
+end
+
+plan_update_dict(m::TodoListMsg) = merge(msg_to_dict(m),
+    Dict{String,Any}("type" => "plan_update"))
+
+# ── The chat consumer loop ──────────────────────────────────────────────────
+# ONE task per ChatModel drains `user_messages` and drives one prompt turn at a
+# time. ALL chat-state mutation (`send!`/`append!`/`close`) happens on THIS
+# task, so there is no funnel lock and the "user-submit lands mid agent-chunk"
+# race cannot occur. Started in `start_chat_client!`; ends when `user_messages`
+# is closed (chat teardown).
+function run_chat!(chat::ChatModel)
+    for user_msg in chat.user_messages
+        try
+            run_turn!(chat, user_msg)
+        catch e
+            @error "chat turn failed" exception = (e, catch_backtrace())
+        end
     end
     return nothing
 end
 
-# Classify an exception from `prompt!`. "Session dead" = the transport is
-# torn down and the only path forward is a full reconnect (banner shown,
-# user clicks Restart). "Transient" = one bad turn, the session itself is
-# still live (rendered as an inline error bubble).
-#
-# We dispatch on the exception type — NOT on `sprint(showerror, e)` —
-# because string-matching is brittle (any wording change upstream breaks
-# the classifier silently). ACP raises a typed `ConnectionClosed` for
-# transport teardown; subprocess EOF and TCP errors surface as
-# `EOFError` / `Base.IOError` from `readline`/`write`; the WS transport
-# surfaces them as `HTTP.WebSockets.WebSocketError`.
-is_session_dead_error(::AgentClientProtocol.ConnectionClosed)     = true
-is_session_dead_error(::EOFError)                                 = true
-is_session_dead_error(::Base.IOError)                             = true
-is_session_dead_error(::HTTP.WebSockets.WebSocketError)           = true
-is_session_dead_error(::Exception)                                = false
-
-# ACP Handler: routes session/update notifications to per-update-type
-# methods via multiple dispatch (no `if upd isa ...` chain), and delegates
-# agent→client RPCs (fs/read_text_file etc.) to AgentClientProtocol's
-# `FSRequestHandler`. One instance per ACP session — lives for the session's
-# lifetime, swapped on `restart_chat_session!`.
-struct ChatHandler <: AgentClientProtocol.Handler
-    model::ChatModel
-    fs::AgentClientProtocol.FSRequestHandler
+# One user turn: drive the prompt and render each whole message of the agent's
+# reply. The user bubble is ALREADY rendered + persisted — `send_message!` did
+# that synchronously when the user hit send, so the message appears in the
+# chat instantly (even when a prior turn is still running, where it shows up
+# as a "queued" bubble). Here we just promote any queued bubble that's about
+# to be processed, then prompt. `busy_active` is the single source of truth
+# for the spinner (set here, cleared in `finally`).
+function run_turn!(chat::ChatModel, user_msg::UserMessage)
+    promote_queued_user_bubble!(chat)
+    client = chat.client[]
+    client === nothing && return nothing
+    chat.busy_active[] = true
+    try
+        for m in AgentClientProtocol.prompt!(client, with_prelude(chat, user_msg.text);
+            images=user_msg.images)
+            process!(chat, m)
+        end
+    catch e
+        # `prompt!` runs the turn's producer in a bound task, so a dead session
+        # surfaces as a TaskFailedException wrapping the real cause — unwrap it
+        # before classifying.
+        e = e isa TaskFailedException ? e.task.result : e
+        if is_session_dead_error(e)
+            chat.session_alive[] = false
+            chat.last_error[] = sprint(showerror, e)
+        else
+            close(send!(chat, AgentMsg(chat, "[error: $(sprint(showerror, e))]")))
+        end
+    finally
+        chat.busy_active[] = false
+    end
+    return nothing
 end
 
-# `fs_cwd` is the path the *agent* sees: `model.cwd` for `LocalTransport`,
-# `worker_path` for `WorkerTransport`. Agent→client `fs/...` RPCs carry
-# absolute paths the agent thinks it can address, so the handler reads
-# from the server fs at the agent's cwd (server mirror for worker).
-ChatHandler(model::ChatModel, fs_cwd::AbstractString) =
-    ChatHandler(model, AgentClientProtocol.FSRequestHandler(String(fs_cwd)))
-
-# Agent→client RPCs: delegate to the generic FS request handler. The chat
-# layer doesn't add any RPCs of its own today; if it ever does, override
-# selected methods here before falling through.
-AgentClientProtocol.on_request(h::ChatHandler, method::AbstractString, params) =
-    AgentClientProtocol.on_request(h.fs, method, params)
-
-# Session updates: every incoming update becomes an `AgentUpdate` ChatEvent
-# and goes through `apply!` so it's locked + sequenced against any user-
-# initiated state changes. ACP's `Connection` already delivers updates to
-# `on_update` in strict FIFO via its dispatcher task; `apply!` then takes
-# the model lock for the full transition. The `Handler` abstract's default
-# `on_update(::Handler, ::Any) = nothing` silently drops anything
-# unmodelled (e.g. `UnknownUpdate` from a future protocol version).
-AgentClientProtocol.on_update(h::ChatHandler, upd::AgentClientProtocol.SessionUpdate) =
-    apply!(h.model, AgentUpdate(upd))
+# Classify a turn exception. "Session dead" ⇒ the transport is torn down and the
+# only path forward is a reconnect (banner shown, user clicks Restart).
+# "Transient" ⇒ one bad turn, the session is still live (inline error bubble).
+# We dispatch on the exception TYPE, never `showerror` text. ACP raises a typed
+# `ConnectionClosed` for transport teardown; subprocess EOF / TCP errors surface
+# as `EOFError` / `Base.IOError`; the WS transport as `WebSocketError`.
+is_session_dead_error(::AgentClientProtocol.ConnectionClosed) = true
+is_session_dead_error(::EOFError) = true
+is_session_dead_error(::Base.IOError) = true
+is_session_dead_error(::HTTP.WebSockets.WebSocketError) = true
+is_session_dead_error(::Exception) = false
 
 # ── Client lifecycle ───────────────────────────────────────────────────────
 function start_chat_client!(model::ChatModel)
-    handler = ChatHandler(model, agent_cwd(model.transport))
-    # All transport-specific bring-up (subprocess spawn / worker WS dial /
-    # mock channel setup) lives in `start_session(::ChatTransport, handler)`
-    # — see src/transport.jl.
-    #
+    # The agent→client fs/* RPCs are the only thing the handler does now —
+    # session updates arrive as a message channel from `prompt!`, not via a
+    # handler callback. `agent_cwd` is the path the agent sees (cwd locally,
+    # worker_path remotely) so fs reads resolve against the right root.
+    handler = AgentClientProtocol.FSRequestHandler(agent_cwd(model.transport))
+
     # Capture the recorded session id BEFORE start_session so we can detect
-    # "fresh session, not a resume" afterwards. A mismatch means claude has
-    # no memory of `msgs_store` (e.g. the project was just synced to a
-    # different worker), so we arm a one-shot history prelude that
-    # `do_apply!(::UserSubmitted)` will consume into the next user prompt.
+    # "fresh session, not a resume". A mismatch means claude has no memory of
+    # `msgs_store` (e.g. project synced to a different worker), so we arm a
+    # one-shot history prelude that the next prompt consumes (`with_prelude`).
     prev_session_id = model.chat_session.session_id
-    model.client[] = start_session(model.transport, handler)
-    new_session_id = model.client[].session_id
-    if !isempty(model.msgs_store) && prev_session_id != new_session_id
-        arm_history_replay!(model)
+    # `on_frame` taps every raw ACP frame (both directions) into
+    # chat_dir/acp.jsonl — inspectable live via GET /acp-log/<project_id>.
+    client, replay = start_session(model.transport, handler;
+                                   on_frame = acp_frame_logger(model.chat_dir))
+    # Header metadata: typed views over the raw session-setup result. A future
+    # agent kind extends this line with additional parsers over the same dict.
+    # (What the header SHOWS is a separate, display-side decision — see
+    # `show_in_header`.)
+    shared(model).session_meta[] =
+        Any[AgentClientProtocol.parse_config_options(client.session_result)...]
+    model.client[] = client
+    new_session_id = client.session_id
+    if isempty(replay)
+        # No replay (fresh session/new, or a transport without resume). If WE
+        # have history but claude doesn't (the session changed under us), feed
+        # ours forward as a one-shot text prelude on the next prompt.
+        if !isempty(model.msgs_store) && prev_session_id != new_session_id
+            arm_history_replay!(model)
+        end
+    else
+        # claude resumed and re-streamed its history — reconcile into chat.md
+        # (keep ours canonical, adopt only what we're missing). Mutually
+        # exclusive with the prelude: claude HAS memory here, so we never
+        # double-feed it ours.
+        reconcile_replay!(model, replay)
     end
     update_session_id!(model.chat_session, new_session_id)
 
-    # Browser-side handlers (range requests + lazy tool/thought renders) are
-    # wired in `Bonito.jsrender(::Session, ::ChatModel)` — once per mount,
-    # session-scoped via `Observables.on(f, session, obs)` so they tear down
-    # automatically when that tab closes. No more `bonito_session :: Ref`,
-    # no more "wire once + dispatch via the latest session" shenanigans.
+    # Start the single consumer loop ONCE (it survives restarts, which only
+    # swap `client[]`). Runs on the shared parent so all per-session views and
+    # producers feed the one queue / one consumer.
+    s = shared(model)
+    if s.consumer_task[] === nothing
+        s.consumer_task[] = Base.errormonitor(@async run_chat!(s))
+    end
 
-    # Cache the live model so the unified app's sidebar can swap to this chat
-    # instantly on second visit, and test rigs can drive prompts via
-    # state.chat_models[pid].client[] without going through the UI.
+    # Cache the live model so the sidebar can swap to this chat instantly and
+    # test rigs can drive prompts via state.chat_models[pid] without the UI.
     if !isempty(model.project_id)
         @info "registering chat model" project_id = model.project_id session_id = model.client[].session_id
         lock(model.state.lock) do
             model.state.chat_models[model.project_id] = model
         end
+        notify_chats!(model.state)   # surface in the active-chats sidebar
     end
     return nothing
 end
 
 function restart_chat_session!(model::ChatModel)
-    old = model.client[]
+    s = shared(model)
     try
-        if old !== nothing
-            # close is idempotent + total: stdin EOF for a subprocess /
-            # peer close for a WS makes the agent exit cleanly. Also
-            # closes the Connection's update_inbox, which terminates the
-            # dispatcher task — so no stale ACP updates from the dead
-            # session can sneak through after the new client is up.
-            #
-            # We deliberately do NOT send a `session/cancel` notification
-            # first. It would be redundant (the close immediately follows)
-            # and used to need a discriminating try/catch for the
-            # transport-already-dead race — the close handles tear-down
-            # without that surface.
-            close(old)
-        end
-        start_chat_client!(model)
-        # Wipe any streaming state left from the prior session (its old
-        # `msg_id`s point to AgentMsgs that may not be in the new session's
-        # store at all). Goes through `apply!` so it serializes with any
-        # AgentUpdate that the new dispatcher might fire concurrently.
-        apply!(model, SessionRestarted())
-        # Broadcast the recovery to every connected tab via the shared
-        # parent — never the per-session view, which would leave other
-        # tabs (and external observers) seeing the stale `false`.
-        s = shared(model)
+        old = model.client[]
+        # close is idempotent + total: stdin EOF / WS peer close makes the
+        # agent exit cleanly and cascades through the Connection teardown, so
+        # any in-flight `prompt!` errors out (its turn loop ends) without stale
+        # updates leaking into the new session.
+        old === nothing || close(old)
+        s.busy_active[] = false        # any in-flight turn is dead now
+        start_chat_client!(model)      # brings up a fresh client[]; consumer keeps running
+        # Broadcast recovery to every connected tab via the shared parent.
         s.session_alive[] = true
         s.last_error[] = ""
     catch e
-        shared(model).last_error[] = "restart failed: $(sprint(showerror, e))"
+        s.last_error[] = "restart failed: $(sprint(showerror, e))"
     end
 end
 
-# Single-entry "user submitted a message" path. Every call site that wants
-# to deliver a user message — typed in the input area, fired by the
-# auto-prompt template, future scripted hooks — goes through here, which
-# in turn goes through `apply!(UserSubmitted)`. The whole transition (
-# abandon old stream + push UserMsg + emit + take history-replay prelude
-# + mark busy + spawn prompt task) happens under the model lock as one
-# atomic step — see `do_apply!(::UserSubmitted)`.
+# Single-entry "user submitted a message" path. Every call site (input area,
+# auto-prompt, scripted hooks) goes through here. We render + persist the user
+# bubble synchronously so the message appears the instant the user hits send —
+# previously the bubble was created inside `run_turn!`, which meant messages
+# submitted while an earlier turn was still running stayed invisible (queued
+# silently on the channel) until that turn finished. Now they show up as
+# "queued" bubbles immediately; `promote_queued_user_bubble!` clears the
+# `queued` flag when `run_turn!` actually picks them up.
 #
 # `images` are sent to the agent as multimodal content blocks; the caller is
-# responsible for already having embedded any file-path reference into
-# `msg.text` so the display + replay see the same thing claude does.
+# responsible for embedding any file-path reference into `msg.text` so display
+# + replay see what claude does.
 function send_message!(model::ChatModel, msg::UserMsg;
-    images = AgentClientProtocol.ImageAttachment[])
-    apply!(model, UserSubmitted(msg, collect(AgentClientProtocol.ImageAttachment, images)))
+    images=AgentClientProtocol.ImageAttachment[])
+    s = shared(model)
+    # If there's a turn in flight, the bubble joins the queue (visually dim).
+    bubble = UserMsg(model, msg.text)
+    bubble.queued = s.busy_active[]
+    close(send!(model, bubble))   # send! pushes + emits wire_new; close persists
+    put!(s.user_messages,
+        UserMessage(msg.text, collect(AgentClientProtocol.ImageAttachment, images)))
+    backfill_project_title!(model, msg.text)
+    return nothing
+end
+
+# Strip claude-agent-acp injected context blocks (`<ide_opened_file>…`,
+# `<system-reminder>…`, `<local-command-*>…`, …) and the "Caveat" prefix.
+# A duplicate of BonitoWorker's `strip_injected_context`/`meaningful_prompt`
+# kept here so the server side doesn't depend on the deployed worker's
+# version of those helpers (older workers pre-date them).
+const TITLE_CONTEXT_TAGS = ("ide_opened_file", "ide_selection", "system-reminder",
+                            "command-message", "command-name", "command-args",
+                            "command-contents", "local-command-stdout",
+                            "local-command-stderr", "bash-input", "bash-stdout",
+                            "bash-stderr")
+
+function meaningful_title(raw::AbstractString)
+    s = String(raw)
+    for tag in TITLE_CONTEXT_TAGS
+        s = replace(s, Regex("<\\s*$tag\\s*>.*?<\\s*/\\s*$tag\\s*>", "is") => " ")
+    end
+    s = strip(s)
+    isempty(s) && return nothing
+    startswith(s, "Caveat: The messages below were generated by the user") && return nothing
+    (startswith(s, "<command-") || startswith(s, "<local-command") ||
+     startswith(s, "<bash-")    || startswith(s, "<ide_") ||
+     startswith(s, "<system-reminder")) && return nothing
+    # Collapse whitespace runs, then truncate to a sidebar-friendly length.
+    s = strip(replace(s, r"\s+" => " "))
+    isempty(s) && return nothing
+    return length(s) > 80 ? String(first(s, 79)) * "…" : String(s)
+end
+
+# Set `p.title` from the user's first meaningful prompt — what makes the
+# sidebar / project card read `[DT] resume the build refactor` instead of
+# `[DT] ClaudeExperiments`. Idempotent: only fires while `title` is still
+# `nothing` (a user edit pins it forever). No-op for projects whose
+# state.projects[] entry is gone (project removed mid-send).
+function backfill_project_title!(model::ChatModel, prompt::AbstractString)
+    pid = model.project_id
+    isempty(pid) && return
+    haskey(model.state.projects[], pid) || return
+    p = model.state.projects[][pid]
+    p.title === nothing || return
+    t = meaningful_title(prompt)
+    t === nothing && return
+    p.title = t
+    try
+        save_projects!(model.state)
+    catch e
+        @warn "backfill_project_title!: persist failed" exception=e
+    end
+    safe_notify!(model.state.projects)
+    return nothing
+end
+
+# `run_turn!` calls this right before driving the agent prompt for a popped
+# `UserMessage`. Finds the oldest UserMsg in `msgs_store` still marked queued
+# (FIFO matches the channel order under `send_message!`) and emits a
+# `user_unqueue` event so the browser drops the "queued" class. No-op when
+# the chat was idle — the just-pushed bubble was never queued.
+function promote_queued_user_bubble!(chat::ChatModel)
+    target = lock(chat.lock) do
+        for m in chat.msgs_store
+            if m isa UserMsg && m.queued
+                m.queued = false
+                return m
+            end
+        end
+        return nothing
+    end
+    target === nothing && return nothing
+    chat_emit(chat, Dict{String,Any}("type" => "user_unqueue"))
+    return nothing
 end
 
 # Auto-prompt: if the project carries an `auto_prompt` (set by the "From
@@ -1413,14 +1977,194 @@ function arm_history_replay!(model::ChatModel)
     return nothing
 end
 
-# NOTE: the former `take_history_replay!` and `send_prompt_async!` are gone
-# — their work moved into `do_apply!(::UserSubmitted)` (prelude consumption,
-# busy_start, prompt spawn) and `drive_prompt!` + `do_apply!(::PromptFailed,
-# ::PromptCompleted)` (error classification, finalize, busy_end). Single
-# mutation surface, single locked entry.
+# Prepend any armed one-shot history prelude to `text`, consuming it. Empty in
+# steady state — only set right after a session change that lost claude's jsonl.
+function with_prelude(model::ChatModel, text::AbstractString)
+    p = model.pending_history_replay[]
+    isempty(p) || (model.pending_history_replay[] = "")
+    return p * text
+end
+
+# ── Reconcile claude's resumed history into chat.md (keep ours, fill gaps) ───
+# On `session/load` claude re-streams the resumed session's full history (see
+# `ACP.replay_history`). `chat.md` is canonical, so we adopt only what we're
+# missing: the whole replay when chat.md is empty (importing a claude session),
+# or the tail beyond our last recorded turn (e.g. the user used the Claude Code
+# CLI directly). Our history is always an in-order prefix of claude's — every
+# turn goes through claude — so we match the shared prefix and append the rest.
+
+# Which replayed messages belong in persisted history. Redacted/empty thoughts
+# and empty text turns leave no trace (consistent with `process!(::Thought)`).
+keep_in_history(m::AgentClientProtocol.AgentMessage) = !isempty(strip(m.text))
+keep_in_history(m::AgentClientProtocol.UserMessage)  = !isempty(strip(m.text))
+keep_in_history(m::AgentClientProtocol.Thought)      = false
+keep_in_history(m::AgentClientProtocol.ToolCall)     = true
+keep_in_history(m::AgentClientProtocol.Plan)         = true
+
+# Does an existing (chat.md) message correspond to a replayed one? Tools key on
+# claude's tool_use id (the one id that survives the replay, stored as ToolMsg.id);
+# user/agent turns on text; plans on entries. Different shapes never match.
+msg_matches(a::ToolMsg,  b::AgentClientProtocol.ToolCall)     = a.id == b.id
+msg_matches(a::UserMsg,  b::AgentClientProtocol.UserMessage)  =
+    !is_summary_text(b.text) && strip(a.text) == strip(b.text)
+msg_matches(a::SummaryMsg, b::AgentClientProtocol.UserMessage) =
+    is_summary_text(b.text) && strip(a.text) == strip(b.text)
+msg_matches(a::AgentMsg, b::AgentClientProtocol.AgentMessage) = strip(a.text) == strip(b.text)
+msg_matches(a::TodoListMsg, b::AgentClientProtocol.Plan)         = plan_entries_equal(a.entries, b.entries)
+msg_matches(a::TodoListMsg, b::AgentClientProtocol.TodoWriteCall) = plan_entries_equal(a.entries, b.entries)
+msg_matches(::ChatMsg,   ::AgentClientProtocol.Message)       = false
+
+plan_entries_equal(a, b) = length(a) == length(b) &&
+    all(ea.content == eb.content && ea.status == eb.status for (ea, eb) in zip(a, b))
+
+# Length of the leading run where our store and the replay candidates line up
+# index-for-index (the shared prefix). Everything after is claude-only → adopt.
+function longest_matched_prefix(existing, candidates)
+    n = min(length(existing), length(candidates))
+    i = 1
+    while i <= n && msg_matches(existing[i], candidates[i])
+        i += 1
+    end
+    return i - 1
+end
+
+# Persist + store one replayed message as history (chat === nothing; never emits
+# live UI events — the single `msgs.count` from `reconcile_replay!` covers it).
+function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.AgentMessage)
+    msg = AgentMsg(string(uuid4()), m.text)
+    lock(model.lock) do; push!(model.msgs_store, msg); end
+    finalize_agent(model.chat_session, msg)
+end
+function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.UserMessage)
+    if is_summary_text(m.text)
+        msg = SummaryMsg(m.text)
+        lock(model.lock) do; push!(model.msgs_store, msg); end
+        append_summary(model.chat_session, msg)
+    else
+        msg = UserMsg(m.text)
+        lock(model.lock) do; push!(model.msgs_store, msg); end
+        append_user(model.chat_session, msg)
+    end
+end
+function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.ToolCall)
+    isempty(m.content) || persist_tool_content!(model.chat_dir, m)
+    # Pick the typed BonitoTeam variant per ACP subtype. Replay always lands
+    # as a finished call (no live updates afterwards), so `finished_at = now`.
+    msg = replayed_tool_msg(m)
+    lock(model.lock) do; push!(model.msgs_store, msg); end
+    msg.status in ("completed", "failed") && append_tool(model.chat_session, msg)
+end
+function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.TodoWriteCall)
+    msg = TodoListMsg(string(uuid4()), collect(PlanEntry, m.entries),
+                      time(), time(), nothing)
+    lock(model.lock) do; push!(model.msgs_store, msg); end
+    append_plan(model.chat_session, msg)
+end
+function adopt_replayed!(model::ChatModel, m::AgentClientProtocol.Plan)
+    msg = TodoListMsg(string(uuid4()), collect(PlanEntry, m.entries),
+                      time(), time(), nothing)
+    lock(model.lock) do; push!(model.msgs_store, msg); end
+    append_plan(model.chat_session, msg)
+end
+
+# Mirror of `build_tool_msg` for the replay path: no `chat`, finished_at
+# stamped now so the timer doesn't tick. The typed variants persist their
+# subtype-specific fields too (so e.g. a replayed background bash still
+# rendered the right way).
+# Replayed live app — content is on disk (so the app id is available now); same
+# type-driven recognition as the live path (`is_bonito_app`).
+replayed_bonito_app_msg(tc, server) =
+    BonitoAppMsg(tc.id, "bonito_app", tc.title, tc.status,
+                 content_summary("bonito_app", tc.content),
+                 time(), time(), server,
+                 something(find_app_reference(tc.content), ""), nothing)
+
+replayed_tool_msg(tc::AgentClientProtocol.GenericTool) =
+    is_bonito_app(tc) ? replayed_bonito_app_msg(tc, "") :
+    GenericToolMsg(tc.id, tc.kind, tc.name, tc.title, tc.status,
+                   content_summary(tc.kind, tc.content),
+                   time(), time(), nothing)
+replayed_tool_msg(tc::AgentClientProtocol.BashCall) =
+    BashToolMsg(tc.id, tc.kind, tc.title, tc.status,
+                content_summary(tc.kind, tc.content),
+                time(), time(),
+                tc.command, tc.run_in_background,
+                "", 0, false, "", nothing)   # bg fields: history → already done
+replayed_tool_msg(tc::AgentClientProtocol.TaskCall) =
+    TaskToolMsg(tc.id, tc.kind, tc.title, tc.status,
+                content_summary(tc.kind, tc.content),
+                time(), time(),
+                tc.description, tc.run_in_background, tc.task_name, nothing)
+replayed_tool_msg(tc::AgentClientProtocol.MCPCall) =
+    is_bonito_app(tc) ? replayed_bonito_app_msg(tc, tc.server) :
+    MCPToolMsg(tc.id, tc.kind, tc.title, tc.status,
+               content_summary(tc.kind, tc.content),
+               time(), time(),
+               tc.server, tc.tool_name, nothing)
+
+function reconcile_replay!(model::ChatModel, replay)
+    candidates = filter(keep_in_history, replay)
+    adopt = lock(model.lock) do
+        existing = model.msgs_store
+        isempty(existing) ? candidates :
+            candidates[(longest_matched_prefix(existing, candidates) + 1):end]
+    end
+    isempty(adopt) && return nothing
+    for m in adopt
+        adopt_replayed!(model, m)
+    end
+    chat_emit(model, Dict{String,Any}(
+        "type" => "msgs.count", "n" => length(model.msgs_store)))
+    @info "reconciled claude history" project_id = model.project_id adopted = length(adopt)
+    return nothing
+end
 
 # ── DOM building (split into header / messages / input / banner) ──────────
-function chat_header(model::ChatModel)
+# ── Header metadata line ─────────────────────────────────────────────────────
+# One `header_pill` method per metadata kind in `session_meta` — future agents
+# add a struct + a method here, never touch the header skeleton. Display-only:
+# plain text spans (tooltip carries the full description), joined with " · "
+# on a second header line below the title/sync row.
+
+function pill_tooltip(o::AgentClientProtocol.ConfigOption)
+    c = AgentClientProtocol.current_choice(o)
+    c === nothing && return "$(o.name): $(o.current_value)"
+    isnothing(c.description) || isempty(c.description) ?
+        "$(o.name): $(c.name)" : "$(o.name): $(c.name) — $(c.description)"
+end
+
+# The model label ("Opus 4.7 with 1M context") is self-explanatory; the other
+# options need their name as a prefix to read well ("mode: Default").
+header_pill(o::AgentClientProtocol.ConfigOption) =
+    DOM.span(o.category == "model" ? AgentClientProtocol.pill_label(o) :
+             "$(lowercase(o.name)): $(AgentClientProtocol.pill_label(o))";
+        class = "bt-header-meta-item", title = pill_tooltip(o))
+# Fallback so an unknown meta kind degrades to its string form, not an error.
+header_pill(x) = DOM.span(string(x); class = "bt-header-meta-item")
+
+# Display policy: which meta items make it into the header line. Of claude's
+# config options only the MODEL is shown — the agent reports mode/effort as
+# unhelpful "default"s (and we won't fire extra RPCs just to fix a label).
+# All of them stay parsed on `session_meta` for future use; future meta kinds
+# default to visible.
+show_in_header(o::AgentClientProtocol.ConfigOption) = o.category == "model"
+show_in_header(::Any) = true
+
+# The most informative item (the model) leads the line.
+meta_order(x) = x isa AgentClientProtocol.ConfigOption && x.category == "model" ? 0 : 1
+
+function header_meta_line(items)
+    shown = sort(filter(show_in_header, collect(Any, items)); by = meta_order)
+    isempty(shown) && return DOM.span()
+    parts = Any[]
+    for (i, x) in enumerate(shown)
+        i > 1 && push!(parts, " · ")
+        push!(parts, header_pill(x))
+    end
+    DOM.div(parts...; class = "bt-header-meta")
+end
+
+function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state::Observable)
     state = model.state
     project_id = model.project_id
     cwd = model.cwd
@@ -1430,34 +2174,76 @@ function chat_header(model::ChatModel)
             title=alive ? "session live" : "session ended")
     end
 
+    # Session config (model / mode / effort …) as a plain-text second header
+    # line; re-renders whenever the agent reports a change (bring-up,
+    # config_option_update).
+    meta_line = map(header_meta_line, model.session_meta)
+
     sync_status = Observable("")
     sync_button = DOM.button(map(s -> isempty(s) ? "Sync" : s, sync_status);
         class="bt-header-sync",
         title="Pull this project from the worker to the server",
         onclick=js"event => $(sync_status).notify('__click__')")
-    on(sync_status) do s
+    on(session, sync_status) do s
         s == "__click__" || return
         sync_status[] = ""
         isempty(project_id) && (sync_status[] = "no project bound"; return)
         handle_chat_sync_click(state, project_id, sync_status)
     end
 
+    # Cross-worker sync: only present when this project has a same-named
+    # sibling on another worker. Clicking inspects both sides and opens the
+    # comparison modal (see `render_sync_modal`). Computed at header build
+    # time — re-navigating refreshes it if siblings appear/disappear.
+    sibs = isempty(project_id) ? ProjectInfo[] : same_name_siblings(state, project_id)
+    xsync_control = if isempty(sibs)
+        DOM.span()
+    else
+        other = first(sibs)
+        other_label = haskey(state.workers[], other.worker_id) ?
+            state.workers[][other.worker_id].name : other.worker_id
+        xsync_status = Observable("")
+        xsync_button = DOM.button(map(s -> isempty(s) ? "⇄ $other_label" : s, xsync_status);
+            class="bt-header-sync",
+            title="Compare and sync this project with $other_label",
+            onclick=js"event => $(xsync_status).notify('__click__')")
+        on(session, xsync_status) do s
+            s == "__click__" || return
+            xsync_status[] = "comparing…"
+            cur = state.projects[][project_id]
+            @async begin
+                try
+                    cmp = compare_projects(state, cur, other)
+                    sync_modal_state[] = (current = cur, other = other, comparison = cmp)
+                    safe_set!(xsync_status, "")
+                catch e
+                    @warn "cross-worker compare failed" exception=e
+                    safe_set!(xsync_status, "compare failed")
+                end
+            end
+        end
+        xsync_button
+    end
+
     # No back arrow — the unified app's sidebar Home icon is the way home.
+    # The session-config meta line renders as a second row BELOW the main one.
     DOM.div(
         DOM.div(
             status_dot,
             DOM.div(
                 DOM.span(basename(rstrip(cwd, '/')); title=cwd),
                 class="bt-header-title"),
+            xsync_control,
             sync_button;
-            class="bt-header-row");
+            class="bt-header-row"),
+        meta_line;
         class="bt-header")
 end
 
-function chat_session_banner(model::ChatModel)
+function chat_session_banner(session::Bonito.Session, model::ChatModel)
     restart_btn = Bonito.Button("Restart session"; style=nothing,
         class="bt-btn bt-btn-secondary")
-    on(restart_btn.value) do clicked
+    on(session, restart_btn.value) do clicked
         clicked && @async restart_chat_session!(model)
     end
     map(model.session_alive, model.last_error) do alive, err
@@ -1652,6 +2438,15 @@ end
 # turn (notification, non-blocking).
 struct CancelCommand <: ChatCommand end
 
+# Wire `{type: "stop_tool", id: "<tool_id>"}` — user clicked the ⊗ on a
+# taskbar slot. Background bash / Task run on the worker outside of any
+# ACP-defined cancel primitive (the SDK doesn't surface a KillShell tool;
+# only `TaskStop` exists). The handler routes per concrete `ToolMsg`
+# subtype — see `request_tool_stop!` below for the per-variant strategy.
+struct StopToolCommand <: ChatCommand
+    tool_id::String
+end
+
 # Used when `msg` doesn't match any known shape — handler is a no-op.
 # Lets `chat_dispatch!` stay total without `return` plumbing.
 struct UnknownCommand <: ChatCommand end
@@ -1671,9 +2466,12 @@ function parse_chat_command(msg::AbstractDict)::ChatCommand
     elseif type == "send"
         atts = get(msg, "attachments", Any[])
         return SendCommand(String(get(msg, "text", "")),
-                           atts isa AbstractVector ? collect(atts) : Any[])
+            atts isa AbstractVector ? collect(atts) : Any[])
     elseif type == "cancel"
         return CancelCommand()
+    elseif type == "stop_tool"
+        id = String(get(msg, "id", ""))
+        return isempty(id) ? UnknownCommand() : StopToolCommand(id)
     end
     return UnknownCommand()
 end
@@ -1705,22 +2503,57 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
     isempty(cmd.tool_id) && return nothing
     idx = findfirst(m -> m isa ToolMsg && m.id == cmd.tool_id, model.msgs_store)
     idx === nothing && return nothing
-    body = render_tool_body(model.state, model.msgs_store[idx],
-        model.cwd, model.chat_dir; project_id = model.project_id)
-    # `dom_in_js` schedules an async DOM mount through Bonito's session
-    # bridge. The renderer can legitimately error on stale tool ids
-    # (browser kept the row but the server-side msg was evicted), so a
-    # discriminating catch + warn is the right shape — bubbling would
-    # kill the whole comm-handling task for one stale render.
-    try
-        Bonito.dom_in_js(session, body, js"""(elem) => {
-            const slot = document.querySelector(
-                '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
-            if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
-        }""")
+    msg = model.msgs_store[idx]
+    # Run the render OFF the comm task. `render_tool_body` for a `bonito_app`
+    # ToolMsg mounts a `RemoteAppPlaceholder` whose `jsrender` calls
+    # `embed_remote_app` → `call_ctrl(eb, "delegate")`, which blocks up to 30 s
+    # on the worker bridge. If we ran it inline, that 30 s would stop EVERY
+    # other chat event for this tab (scroll fetches, sends, tab switches) until
+    # the timeout — multiple stuck tools compound to minutes of frozen UI.
+    #
+    # Each render is fire-and-forget — no return value the comm handler needs.
+    # Concurrent renders are safe: `call_ctrl` uses per-request channels +
+    # serial WS writes under `eb.wlock`, and `dom_in_js` opens its own
+    # subsession per call. The catch keeps a stale tool id / dead bridge from
+    # leaking out as an uncaught task error.
+    Base.errormonitor(@async try
+        body = render_tool_body(model.state, msg,
+            model.cwd, model.chat_dir; project_id=model.project_id)
+        # `_btToolSlot` (bonitoteam.js) also finds slots on nodes the virtual
+        # scroll holds DETACHED (cache window / prefetch) — a plain
+        # document.querySelector misses those and the body would be stuck on
+        # "loading…". Fallback covers a not-yet-loaded chat module.
+        Bonito.dom_in_js(
+            session,
+            body,
+            js"""(elem) => {
+    const slot = window._btToolSlot ? window._btToolSlot($(cmd.tool_id)) :
+        document.querySelector(
+            '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
+    if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
+}"""
+        )
     catch e
         @warn "tool render failed" tool_id = cmd.tool_id exception = e
-    end
+        # Replace the stale "loading…" with a visible failure so the user knows
+        # the body is gone (typically: the eval bridge was rebuilt since this
+        # turn, so the `shown_app:` id is no longer registered on the worker).
+        # We `dom_in_js` a tiny static node — no RemoteAppPlaceholder, no
+        # control round-trip, can't repeat the failure.
+        try
+            Bonito.dom_in_js(
+                session,
+                DOM.div("tool body unavailable: $(sprint(showerror, e))";
+                        class = "bt-tool-error"),
+                js"""(elem) => {
+    const slot = window._btToolSlot ? window._btToolSlot($(cmd.tool_id)) :
+        document.querySelector(
+            '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
+    if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
+}""")
+        catch
+        end
+    end)
     return nothing
 end
 
@@ -1754,12 +2587,102 @@ function handle_command!(model::ChatModel, ::Session, cmd::SendCommand)
     # submit. Errors (attachment-rejection above, or ACP send failures
     # surfaced by `send_message!`'s downstream code) flow back through
     # their own events.
-    send_message!(model, UserMsg(display_text); images = blocks)
+    send_message!(model, UserMsg(display_text); images=blocks)
     return nothing
 end
 
-handle_command!(model::ChatModel, ::Session, ::CancelCommand) =
-    apply!(model, UserCancelled())
+# A re-cancel only escalates to a force-close after the agent has had a real
+# chance to honor the first one. Set well past the worst observed cold-start
+# honor latency (warm ≈ 0.1s, cold-fresh ≈ 3.9s, cold-resumed ≈ 6–18s) so an
+# impatient double-click never force-closes a turn that's about to honor.
+const CANCEL_ESCALATE_WAIT = 20.0
+
+function handle_command!(model::ChatModel, ::Any, ::CancelCommand)
+    # Off-band, instant: cancel is a lone ACP notification, not a chat-state
+    # mutation, so it never goes through the `run_chat!` consumer. Reading
+    # `model.client[]` is a single-Ref read. (Session arg is unused here — typed
+    # `::Any` so the cancel path is unit-testable without a live Bonito.Session.)
+    c = model.client[]
+    c === nothing && return nothing
+    s = shared(model)
+
+    # A graceful `session/cancel` makes ACP close the active turn's update
+    # channel; the `prompt!` loop ends, `run_turn!`'s `finally` clears
+    # `busy_active`, and the partial bubble is sealed. We do NOT force-close on a
+    # timer: the agent's honor latency is large + unbounded on a cold/resumed turn,
+    # so a timer races it, and a premature mid-turn teardown leaves an orphaned
+    # tool_use that wedges every future resume (a doom loop). A clean cancel always
+    # honors eventually.
+    #
+    # The hammer is reserved for a genuinely-wedged agent (resumed onto an
+    # already-orphaned tool call, ignores cancel, connection still alive so no
+    # `ConnectionClosed` fires) — and it's the USER's call: cancel AGAIN, after the
+    # agent's had a real chance (≥ CANCEL_ESCALATE_WAIT) and it's STILL busy. That
+    # distinguishes a deliberate "force it" from both an impatient double-click
+    # (< the wait → graceful re-send) and a slow-but-honoring cold cancel.
+    now      = time()
+    first_at = (@atomic c.conn.cancel_at)              # 0.0 ⇒ first cancel this turn
+    escalate = first_at > 0 && (now - first_at) ≥ CANCEL_ESCALATE_WAIT && s.busy_active[]
+    first_at > 0 || (@atomic c.conn.cancel_at = now)   # stamp the first cancel
+    AgentClientProtocol.cancel!(c)                      # graceful (idempotent re-send)
+    if escalate
+        @warn "deliberate re-cancel: agent not honoring — force-closing" project_id = model.project_id
+        s.last_error[] = "The agent didn't respond to cancel; session stopped. Click Restart to reconnect."
+        try
+            close(c)
+        catch e
+            @warn "force-close after cancel failed" exception = e
+        end
+    end
+    return nothing
+end
+
+# ── Stop background tool ───────────────────────────────────────────────────
+# Find the tool by id, then dispatch on its concrete subtype so each tool
+# family decides its own honest stop strategy. We deliberately don't fake
+# anything: the SDK has no `KillShell`, only `TaskStop` for subagents and
+# `BashOutput` polling for background bashes. So we route a synthetic user
+# message asking Claude to stop the thing — visible in the chat history,
+# honest about what the agent is being asked to do. The slot keeps pulsing
+# until the actual tool transitions to terminal status (no fake "Stopping…"
+# state that might never resolve).
+function handle_command!(model::ChatModel, ::Any, cmd::StopToolCommand)
+    isempty(cmd.tool_id) && return nothing
+    target = lock(model.lock) do
+        idx = findfirst(m -> m isa ToolMsg && m.id == cmd.tool_id, model.msgs_store)
+        idx === nothing ? nothing : model.msgs_store[idx]
+    end
+    target === nothing && return nothing
+    request_tool_stop!(model, target)
+    return nothing
+end
+
+# Per-variant: each tool kind we surface in the taskbar gets its own arm.
+# The default (`::ToolMsg`) is a no-op — we'd never have shown a slot for a
+# one-shot tool, so a stop click on it is the user clicking a transient UI
+# affordance after the tool already finished. Silent ignore is correct.
+request_tool_stop!(::ChatModel, ::ToolMsg) = nothing
+
+function request_tool_stop!(model::ChatModel, t::BashToolMsg)
+    t.is_background || return
+    cmd_snippet = isempty(t.command) ? t.title : t.command
+    text = "Please stop the background bash command immediately. " *
+           "Tool id: `$(t.id)`. Command: `$(cmd_snippet)`. " *
+           "Use the most direct mechanism the SDK provides; if none does, " *
+           "just acknowledge the cancellation so the chat reflects it."
+    send_message!(model, UserMsg(text))
+    return nothing
+end
+
+function request_tool_stop!(model::ChatModel, t::TaskToolMsg)
+    t.is_background || return
+    name_clause = t.task_name === nothing ? "" : " (name: `$(t.task_name)`)"
+    text = "Please stop the background task immediately. " *
+           "Tool id: `$(t.id)`$(name_clause). " *
+           "Call `TaskStop` with that id."
+    send_message!(model, UserMsg(text))
+    return nothing
+end
 
 # Thin entry point for the per-session `comm` listener wired up in
 # `jsrender(::ChatModel)`. Parses once, dispatches once. The
@@ -1791,29 +2714,81 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         chat_dispatch!(model, session, msg)
     end
 
+    # Spinner class follows the shared busy_active observable so the
+    # `bt-busy-active` class is set correctly on remount — the comm
+    # `busy_start` / `busy_end` events only forward to FUTURE bridges,
+    # so a tab that opens mid-prompt would otherwise miss the start.
+    busy_class = map(b -> b ? "bt-busy bt-busy-active" : "bt-busy", model.busy_active)
+
     messages_container = DOM.div(
         DOM.div(class="bt-spacer-top"),
-        DOM.div(class="bt-spacer-bottom");
+        DOM.div(class="bt-spacer-bottom"),
+        # Busy dots + transient "reasoning…" indicator live INSIDE the
+        # scroll content, after the bottom spacer (message nodes insert
+        # before it) and before the overscroll tail — so they show up
+        # directly under the last message, not below the tail's empty
+        # space down by the composer. Like the tail, they're plain
+        # content the virtual-scroll geometry never tracks.
+        DOM.div(DOM.div(class="bt-busy-dot"),
+            DOM.div(class="bt-busy-dot"),
+            DOM.div(class="bt-busy-dot");
+            class=busy_class),
+        # Idle indicator — visible when the busy dots are NOT (CSS
+        # adjacent-sibling rule on `.bt-busy`, so it MUST stay the dots'
+        # immediate next sibling) AND the chat has agent replies on display
+        # (`bt-waiting-on`, toggled by `_updateWaiting` in bonitoteam.js).
+        # The slot under the last message thus says what the agent is
+        # doing: dots/reasoning mid-turn, waiting between turns — and
+        # nothing at all in a chat that hasn't been asked anything yet.
+        DOM.div("Waiting for your next instruction"; class="bt-waiting"),
+        # Transient "reasoning…" indicator (toggled by the `thinking` comm
+        # event in bonitoteam.js). Hidden until an agent thought is in flight.
+        DOM.div("💭 reasoning…"; class="bt-thinking"),
+        # Overscroll tail: empty space the user can scroll into below the
+        # last message (~30% of the pane; JS sizes it from clientHeight).
+        DOM.div(class="bt-messages-tail");
         class="bt-messages")
 
     init_script = js"""
         $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm)))
     """
 
-    # Spinner class follows the shared busy_active observable so the
-    # `bt-busy-active` class is set correctly on remount — the comm
-    # `busy_start` / `busy_end` events only forward to FUTURE bridges,
-    # so a tab that opens mid-prompt would otherwise miss the start.
-    busy_class = map(b -> b ? "bt-busy bt-busy-active" : "bt-busy", model.busy_active)
+    # Cross-worker sync modal state + apply. `nothing` ⇒ hidden; otherwise
+    # `(current, other, comparison)`. `on_apply(src, dst)` runs the
+    # directional overwrite in a Task and closes the modal when done.
+    sync_modal_state = Observable{Union{Nothing,NamedTuple}}(nothing)
+    sync_modal = render_sync_modal(session, model.state, sync_modal_state,
+        (src, dst) -> @async begin
+            try
+                sync_across_workers!(model.state, src, dst)
+            catch e
+                @warn "cross-worker sync failed" src=src.name dst=dst.name exception=e
+            finally
+                sync_modal_state[] = nothing
+            end
+        end)
+
     Bonito.jsrender(session, DOM.div(
-        chat_header(model),
-        chat_session_banner(model),
+        chat_header(session, model, sync_modal_state),
+        chat_session_banner(session, model),
+        sync_modal,
         messages_container,
         init_script,
-        DOM.div(DOM.div(class="bt-busy-dot"),
-            DOM.div(class="bt-busy-dot"),
-            DOM.div(class="bt-busy-dot");
-            class=busy_class),
+        # Taskbar — floats over the messages area, top-left of the chat panel.
+        # Populated entirely client-side by scanning live tool/todo pills (see
+        # `setupTaskbar` in bonitoteam.js); the server never tracks slot state.
+        DOM.div(class = "bt-taskbar"),
         chat_input_area(session, model),
+        # Toolbar below the composer. Populated entirely client-side by
+        # BonitoChat (`noteType`): one show/hide checkbox per message type the
+        # first time that type occurs. Sized to host future controls too.
+        DOM.div(class = "bt-chat-toolbar"),
+        # NOTE: there is deliberately NO mount curtain here. The dashboard's
+        # load overlay (`chat_waiting_view`, sidebar.jl) covers this pane
+        # from the moment the user clicks until the chat module reports the
+        # geometry settled (`bt-chat-settling` / `bt-chat-settled` events
+        # from `_startSettle` in bonitoteam.js) — one continuous loading
+        # surface instead of the old bring-up pane → bare gap → per-chat
+        # curtain relay.
         class="bt-app"))
 end

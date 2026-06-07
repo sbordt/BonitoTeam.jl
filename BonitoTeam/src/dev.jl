@@ -56,9 +56,9 @@ BonitoTeam.dev_server() do h
 end
 ```
 """
-function dev_server(; port::Union{Int,Nothing} = nothing,
-                      name::String             = BonitoWorker.friendly_hostname(),
-                      auto_open::Bool          = false)
+function dev_server(; port::Union{Int,Nothing}             = nothing,
+                      name::Union{String,Nothing}          = nothing,
+                      auto_open::Bool                      = false)
     # port=0 lets the kernel pick a free ephemeral port; Bonito.Server
     # writes the real port back to srv.port after start.
     chosen_port = port === nothing ? 0 : port
@@ -67,6 +67,11 @@ function dev_server(; port::Union{Int,Nothing} = nothing,
     working_dir = mktempdir(; prefix = "bonitoteam-dev-work-")
     worker_root = mktempdir(; prefix = "bonitoteam-dev-worker-")
     worker_id   = "dev-" * randstring(8)
+    # Route through `default_worker_name` so a machine whose
+    # `friendly_hostname()` is empty (no `hostnamectl --pretty` configured,
+    # `gethostname()` = "localhost") falls back to `<user>-<4 chars>` —
+    # otherwise dev_server registered every worker as "localhost".
+    actual_name = name === nothing ? BonitoWorker.default_worker_name(worker_id) : name
 
     state = serve(; host          = "127.0.0.1",
                     port          = chosen_port,
@@ -86,7 +91,7 @@ function dev_server(; port::Union{Int,Nothing} = nothing,
             server_url    = server_url,
             secret        = secret,
             worker_id     = worker_id,
-            name          = name,
+            name          = actual_name,
             mcp_command   = BonitoWorker.julia_bin(),
             mcp_arguments = BonitoWorker.mcp_args(),
             projects_root = worker_root,
@@ -112,7 +117,7 @@ function dev_server(; port::Union{Int,Nothing} = nothing,
     Base.atexit(() -> close(handle))
 
     println()
-    @info "BonitoTeam dev server running" url=server_url worker_name=name
+    @info "BonitoTeam dev server running" url=server_url worker_name=actual_name
     println("  State dirs (auto-cleaned on close):")
     println("    state    $state_dir")
     println("    working  $working_dir")

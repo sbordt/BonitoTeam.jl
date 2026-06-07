@@ -21,10 +21,60 @@
 
 using Malt
 using Dates: format, now
+import Pkg
 
 const HELPER_PATH = abspath(joinpath(@__DIR__, "helper_payload.jl"))
 const PKG_PATTERN = r"\bPkg\."
 const DEFAULT_TIMEOUT = 30.0
+const BONITO_UUID = Base.UUID("824d6782-a2ef-11e9-3a09-e5662e0c26f8")
+
+# Locate Bonito's source directory in BonitoMCP's own active project, so a
+# temp eval env can path-dep on the *same* Bonito BonitoMCP itself runs
+# against. Returns `nothing` if Bonito isn't in the active project (e.g.
+# BonitoMCP installed standalone) — caller falls back gracefully.
+function _find_bonito_path()
+    try
+        deps = Pkg.dependencies()
+        haskey(deps, BONITO_UUID) || return nothing
+        src = deps[BONITO_UUID].source
+        src isa AbstractString && isdir(src) ? String(src) : nothing
+    catch e
+        @debug "_find_bonito_path failed" exception = e
+        nothing
+    end
+end
+
+# Seed a fresh temp project so `using Bonito` on the Malt worker resolves to
+# the proxy-aware dev Bonito (`id_prefix` & friends) rather than the
+# registered version. Writes Project.toml + resolves it in a side julia
+# subprocess so the worker can `using Bonito` immediately. Best-effort — a
+# failure here just leaves the temp env empty, same as before.
+function seed_temp_env_with_bonito!(env_dir::AbstractString)
+    bonito_path = _find_bonito_path()
+    bonito_path === nothing && return false
+    proj_toml = joinpath(env_dir, "Project.toml")
+    try
+        open(proj_toml, "w") do io
+            print(io, """
+                [deps]
+                Bonito = "$(BONITO_UUID)"
+
+                [sources]
+                Bonito = {path = $(repr(bonito_path))}
+                """)
+        end
+        # Resolve in a side julia process (so the parent's project state isn't
+        # disturbed and the Malt worker can `using Bonito` without doing its
+        # own Pkg.resolve at first call).
+        julia = joinpath(Sys.BINDIR::String, Base.julia_exename())
+        run(pipeline(`$julia --project=$env_dir --startup-file=no -e "using Pkg; Pkg.resolve()"`;
+                     stdout = devnull, stderr = devnull))
+        true
+    catch e
+        @warn "seed_temp_env_with_bonito!: Pkg.resolve failed; bt_show_app may fail until env_path is given explicitly" env_dir exception = e
+        false
+    end
+end
 
 # ── JuliaSession ────────────────────────────────────────────────────────────
 mutable struct JuliaSession
@@ -42,6 +92,7 @@ mutable struct JuliaSession
     in_flight_started::Float64
     lock::ReentrantLock                 # serialises eval/continue/interrupt
     log_path::Union{String,Nothing}
+    dialed_back::Bool                   # `ensure_eval_dialed!` dedupes against this; flipped under `lock`
 end
 
 function JuliaSession(env_path;
@@ -53,7 +104,7 @@ function JuliaSession(env_path;
                         nothing, IOBuffer(), ReentrantLock(),
                         nothing, nothing,
                         nothing, "", 0.0,
-                        ReentrantLock(), log_path)
+                        ReentrantLock(), log_path, false)
 end
 
 is_alive(s::JuliaSession) = s.worker !== nothing && Malt.isrunning(s.worker)
@@ -74,6 +125,85 @@ function build_exeflags(env_path, julia_cmd)::Vector{String}
     return base
 end
 
+"""
+    ensure_eval_dialed!(s::JuliaSession)
+
+If the server injected WebSocket dial-back coordinates (via the MCP `env`),
+bootstrap the worker-side proxy bridge and have the worker dial the server. This
+one Malt call (over BonitoMCP's OWN link to the worker) includes `RemoteProxy` +
+builds the bridge; the worker then opens the dial-back WebSocket and runs
+`RemoteProxy.serve_bridge`, which pipes the Bonito protocol over it RAW (no Malt
+on that socket — see RemoteProxy.jl). Lets the server drive this worker to render
+interactive Bonito apps into the chat. Idempotent + lazy (call when Bonito is
+loaded, e.g. from `bt_show_app`).
+"""
+function ensure_eval_dialed!(s::JuliaSession)
+    wsurl = get(ENV, "BONITOTEAM_EVAL_WS", "")
+    isempty(wsurl) && return s
+    is_alive(s) || start!(s)
+    secret     = get(ENV, "BONITOTEAM_SECRET", "")
+    project_id = get(ENV, "BONITOTEAM_PROJECT_ID", "")
+    # Dedupe against this session's own state — avoids a Main-global
+    # idempotency flag on the worker (Julia 1.12 strict-globals would force
+    # a `Core.eval`/world-age dance, and we'd be inventing the dedupe twice).
+    s.dialed_back && return s
+    try
+        # Bootstrap over BonitoMCP's OWN Malt link: include RemoteProxy + build the
+        # bridge, get its namespace prefix. The dial-back socket itself carries NO
+        # Malt — it's a raw Bonito frame pipe (see RemoteProxy.serve_bridge); Malt
+        # is only this one-time setup call.
+        prefix = Malt.remote_eval_fetch(s.worker, quote
+            using Bonito
+            # Re-include if RemoteProxy is absent OR only PARTIALLY loaded. A failed
+            # include (e.g. the resolved Bonito lacks the remote-app proxy API the
+            # module touches at load time) leaves a PARTIAL module registered in
+            # Main — early defs present, late ones (`register_app!`, `render_embed`)
+            # missing — and the include THREW. The old bare `isdefined(Main,
+            # :RemoteProxy)` guard then skipped re-include forever, so the next call
+            # built a bridge on the broken module and the missing def surfaced later
+            # as a cryptic `register_app! not defined`. `render_embed` is the
+            # module's last def ⇒ its presence means a complete load; otherwise
+            # re-include, which re-throws the REAL load error if the env is wrong.
+            if !(isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :render_embed))
+                include($(REMOTE_PROXY_PATH))
+            end
+            Main.RemoteProxy.ensure_bridge!()
+        end)
+        # Drive a self-reconnecting dial loop on the worker. Handshake carries
+        # the prefix so the host knows the namespace before any frame flows.
+        # `dial_loop` survives transient WS drops by reconnecting with backoff —
+        # `BRIDGE[].routes` is preserved across drops, so already-registered
+        # apps keep working without re-running their code.
+        Malt.remote_eval_fetch(s.worker, quote
+            @async try
+                Main.RemoteProxy.dial_loop(
+                    $wsurl,
+                    $(secret * " " * project_id * " " * prefix))
+            catch e
+                @warn "BonitoMCP eval-ws dial loop crashed" exception = (e, catch_backtrace())
+            end
+            nothing
+        end)
+        # Wait until the dial actually connects (serve_bridge sets the socket) so
+        # callers can immediately reach the bridge over the raw transport.
+        ready = false
+        for _ in 1:120   # ~30s budget — covers cold include + first dial
+            if Malt.remote_eval_fetch(s.worker,
+                    :(isdefined(Main, :RemoteProxy) && Main.RemoteProxy.BRIDGE[] !== nothing &&
+                      Main.RemoteProxy.BRIDGE[].driver.ws[] !== nothing))
+                ready = true; break
+            end
+            sleep(0.25)
+        end
+        ready || @warn "BonitoMCP: bridge dial not connected 30s after setup" wsurl
+        s.dialed_back = true
+    catch e
+        s.dialed_back = false   # allow retry on the next call
+        @warn "BonitoMCP: eval dial-back setup failed" exception = (e, catch_backtrace())
+    end
+    return s
+end
+
 function start!(s::JuliaSession)
     is_alive(s) && return s
     s.worker = Malt.Worker(
@@ -92,6 +222,9 @@ function start!(s::JuliaSession)
     # Malt can't serialise a `Module` reference back to the parent.
     Malt.remote_eval_fetch(s.worker, :(try; using Revise; catch; end; nothing))
     Malt.remote_eval_fetch(s.worker, :(include($HELPER_PATH); nothing))
+
+    # Interactive-app dial-back is lazy (ensure_eval_dialed! from bt_show_app),
+    # so non-Bonito eval sessions don't pay for it.
 
     if s.is_test
         Malt.remote_eval_fetch(s.worker,
@@ -201,6 +334,9 @@ end
 # completed (drained partial → stdout block + the value blocks) or running.
 function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
     deadline = timeout === nothing ? Inf : time() + timeout
+    # The loop also exits promptly when the eval task dies — e.g. an MCP
+    # `notifications/cancelled` SIGINTs it via `handle_cancelled!`, which makes
+    # `istaskdone` true and falls through to the completed (interrupted) result.
     while !istaskdone(s.in_flight) && time() < deadline
         sleep(0.05)
     end
@@ -297,6 +433,15 @@ function get_or_create!(m::SessionManager, env_path::Union{String,Nothing};
 
         is_temp = env_path === nothing
         env_dir = is_temp ? mktempdir(; prefix = "bonitoteam-mcp-") : abspath(env_path)
+        # Temp envs are otherwise empty, so `using Bonito` on the Malt worker
+        # falls back to the user depot and resolves the REGISTERED Bonito —
+        # which doesn't have the remote-app proxy API (`id_prefix`, …) that
+        # RemoteProxy.jl needs. Pre-populate the temp env with a Bonito
+        # path-dep on whatever Bonito BonitoMCP's own active project uses, so
+        # the worker resolves to the *same* Bonito. Best-effort: if we can't
+        # locate Bonito (BonitoMCP installed standalone), bt_show_app will
+        # still fail loudly, but bt_julia_eval keeps working in the bare env.
+        is_temp && seed_temp_env_with_bonito!(env_dir)
         is_test = !is_temp && basename(rstrip(env_dir, '/')) == "test"
 
         s = JuliaSession(env_dir;

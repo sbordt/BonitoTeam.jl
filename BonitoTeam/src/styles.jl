@@ -46,8 +46,11 @@ const ChatStyles = Bonito.Styles(
     # ── Header ───────────────────────────────────────────────────────────────
     # Outer spans full width (border-bottom looks correct); inner row caps at
     # the same content width as messages/input on desktop.
+    # Column: the main title/sync row, plus an optional session-config meta
+    # line below it (see `header_meta_line`).
     CSS(".bt-header",
-        "display" => "flex", "justify-content" => "center",
+        "display" => "flex", "flex-direction" => "column",
+        "justify-content" => "center",
         "padding" => "10px 16px",
         "background" => "var(--bt-surface)",
         "border-bottom" => "1px solid var(--bt-border)",
@@ -56,7 +59,7 @@ const ChatStyles = Bonito.Styles(
         "box-sizing" => "border-box"),
     CSS(".bt-header-row",
         "display" => "flex", "align-items" => "center", "gap" => "10px",
-        "width" => "100%", "max-width" => "880px"),
+        "width" => "100%"),
     CSS(".bt-header-back",
         "color" => "var(--bt-text)", "text-decoration" => "none",
         "font-size" => "20px", "line-height" => "1",
@@ -100,6 +103,18 @@ const ChatStyles = Bonito.Styles(
         "transition" => "background 80ms"),
     CSS(".bt-header-sync:hover",
         "background" => "var(--bt-surface-2)"),
+    # ── Session-config meta line (model / mode / effort — `header_meta_line`).
+    # Plain muted text below the title row; items joined with " · ", full
+    # descriptions in the per-item tooltip.
+    CSS(".bt-header-meta",
+        "font-size" => "12px",
+        "color" => "var(--bt-text-muted)",
+        "margin-top" => "2px",
+        "white-space" => "nowrap",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis"),
+    CSS(".bt-header-meta-item",
+        "cursor" => "default"),
 
     # ── Status dot (online/offline/streaming) ────────────────────────────────
     CSS(".bt-dot",
@@ -140,10 +155,11 @@ const ChatStyles = Bonito.Styles(
         "background" => "var(--bt-surface-2)"),
 
     # ── Messages container ───────────────────────────────────────────────────
-    # On wide screens the column self-centers (max-width + align-self), so
-    # bubbles don't sprawl across a 1440px+ viewport. Scrollbar stays at the
-    # right edge of the column rather than the screen edge — natural for a
-    # chat app with content margins.
+    # Fills `.bt-main` (no centered 880px column) — the user complained that a
+    # centered messages column left a dead band of empty space between its
+    # right scrollbar and the shell border. Individual bubbles still cap their
+    # own width (see `.bt-user-msg`/`.bt-agent-msg` `max-width: min(…)`) so a
+    # very wide viewport doesn't sprawl any single message.
     CSS(".bt-messages",
         "flex" => "1 1 0", "min-height" => "0",
         "overflow-y" => "auto", "overflow-x" => "hidden",
@@ -153,8 +169,7 @@ const ChatStyles = Bonito.Styles(
         "padding" => "16px",
         "display" => "flex", "flex-direction" => "column",
         "gap" => "10px",
-        "width" => "100%", "max-width" => "880px",
-        "align-self" => "center",
+        "width" => "100%",
         "box-sizing" => "border-box"),
     CSS(".bt-spacer-top, .bt-spacer-bottom",
         "flex-shrink" => "0", "overflow-anchor" => "none"),
@@ -173,7 +188,22 @@ const ChatStyles = Bonito.Styles(
         "padding" => "10px 14px",
         "font-size" => "14px", "line-height" => "1.5",
         "white-space" => "pre-wrap", "word-break" => "break-word",
-        "box-shadow" => "var(--bt-shadow-sm)"),
+        "box-shadow" => "var(--bt-shadow-sm)",
+        "position" => "relative",
+        "transition" => "opacity 160ms ease"),
+    # Queued state: the user submitted while a prior turn was still running.
+    # Dim the bubble and badge it "queued" until `user_unqueue` promotes it.
+    CSS(".bt-user-msg.bt-queued",
+        "opacity" => "0.65"),
+    CSS(".bt-user-msg.bt-queued::after",
+        "content" => "\"queued\"",
+        "position" => "absolute",
+        "right" => "10px", "bottom" => "-16px",
+        "font-size" => "10px",
+        "font-weight" => "500",
+        "letter-spacing" => "0.04em",
+        "color" => "var(--bt-text-faint)",
+        "text-transform" => "uppercase"),
 
     # ── Agent message ────────────────────────────────────────────────────────
     CSS(".bt-agent-msg",
@@ -256,13 +286,77 @@ const ChatStyles = Bonito.Styles(
         "border-radius" => "var(--bt-radius-sm)",
         "font-size" => "13px",
         "box-shadow" => "var(--bt-shadow-sm)",
-        "overflow" => "hidden"),
+        "overflow" => "hidden",
+        # Positioning context for the absolute `.bt-tool-fullwidth` button that
+        # floats at the bubble's right-edge center.
+        "position" => "relative",
+        # Transition so flipping the wide toggle animates smoothly rather than
+        # snapping in at a different width and tearing the layout.
+        "transition" => "max-width 160ms ease, align-self 160ms ease"),
+    # Full-chat-width toggle. Spans the entire message column so wide content
+    # (diffs / tables / `bt_show_app` embeds) has the room it needs. Flipped by
+    # the .bt-tool-wide button in the tool header.
+    CSS(".bt-tool-msg.bt-tool-wide-active",
+        "align-self" => "stretch",
+        "max-width" => "100%"),
+    # Detach button in the tool header (rendered only for bonito_app tools).
+    # ⤢ is the conventional "open in a window" glyph; clicking pops the embed
+    # into the floating window. Small, neutral, sits at the right of the header.
+    CSS(".bt-tool-detach",
+        "margin-left" => "4px",
+        "background" => "transparent",
+        "border" => "none",
+        "padding" => "2px 6px",
+        "cursor" => "pointer",
+        "color" => "var(--bt-text-faint)",
+        "font-size" => "13px",
+        "line-height" => "1",
+        "border-radius" => "var(--bt-radius-sm)",
+        "transition" => "background 80ms, color 80ms"),
+    CSS(".bt-tool-detach:hover",
+        "background" => "var(--bt-surface-2)",
+        "color" => "var(--bt-accent)"),
+    # Full-chat-width toggle, vertically centered on the bubble's RIGHT edge.
+    # Hidden by default; revealed only while the tool body is expanded (the
+    # sibling rule below) — there's nothing to widen on a collapsed header.
+    CSS(".bt-tool-fullwidth",
+        "display" => "none",
+        "position" => "absolute", "right" => "4px", "top" => "50%",
+        "transform" => "translateY(-50%)",
+        "z-index" => "3",
+        "align-items" => "center", "justify-content" => "center",
+        "width" => "22px", "height" => "30px",
+        "background" => "var(--bt-surface-2)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "cursor" => "pointer",
+        "color" => "var(--bt-text-muted)",
+        "font-size" => "13px", "line-height" => "1",
+        "opacity" => "0.55",
+        "transition" => "opacity 80ms, background 80ms, color 80ms"),
+    CSS(".bt-tool-fullwidth:hover",
+        "opacity" => "1", "background" => "var(--bt-surface)",
+        "color" => "var(--bt-accent)"),
+    # Reveal the full-width toggle only while the body is expanded. `~` reaches
+    # the button (a later sibling of the header) once Collapsable flips
+    # `data-expanded="true"` on the header.
+    CSS(".bt-tool-header[data-expanded=\"true\"] ~ .bt-tool-fullwidth",
+        "display" => "flex"),
     CSS(".bt-tool-header",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "padding" => "8px 12px",
         "cursor" => "pointer",
         "user-select" => "none",
         "transition" => "background 80ms"),
+    # The title (and summary, and MCP server badge) carry the actual content
+    # the user wants to grab — Read shows the file path here, Edit the path,
+    # MCP tools their server name. Override the header's `user-select: none`
+    # so a drag-select copies the path. The icon / status badge / toggle
+    # stay non-selectable so click-to-expand isn't confused by stray drags.
+    # The browser treats a drag-select as a drag (not a click), so the
+    # expand-on-click handler still fires only on real clicks.
+    CSS(".bt-tool-title, .bt-tool-summary, .bt-tool-server",
+        "user-select" => "text", "cursor" => "text"),
     CSS(".bt-tool-header:hover",
         "background" => "var(--bt-surface-2)"),
     # The expand/collapse glyph (`▶` / `▼`) is swapped directly in JS
@@ -274,7 +368,7 @@ const ChatStyles = Bonito.Styles(
         "width" => "10px"),
     CSS(".bt-tool-kind",
         "font-size" => "13px", "flex-shrink" => "0"),
-    # MCP server badge — dim pill before the tool name (e.g. "bonitoteam").
+    # MCP server badge — dim pill before the tool name (e.g. "btworker").
     CSS(".bt-tool-server",
         "flex-shrink" => "0",
         "font-size" => "10.5px", "font-weight" => "600",
@@ -309,6 +403,104 @@ const ChatStyles = Bonito.Styles(
         "background" => "rgba(16,185,129,0.12)", "color" => "#047857"),
     CSS(".bt-status-failed",
         "background" => "rgba(239,68,68,0.12)", "color" => "#b91c1c"),
+
+    # ── Live tool/todo pulse ─────────────────────────────────────────────────
+    # Subtle box-shadow oscillation while a tool is mid-flight. Two layers:
+    # the rest-state shadow keeps `.bt-tool-msg`'s normal lift, the keyframes
+    # add a softly-pulsing ring on top. `prefers-reduced-motion` disables it
+    # for users who don't want movement.
+    CSS("@keyframes bt-pulse-glow",
+        CSS("0%, 100%",
+            "box-shadow" => "var(--bt-shadow-sm), 0 0 0 0 rgba(59,130,246,0.35)"),
+        CSS("50%",
+            "box-shadow" => "var(--bt-shadow-sm), 0 0 0 6px rgba(59,130,246,0.00)")),
+    CSS(".bt-tool-msg.bt-tool-live, .bt-plan-msg.bt-plan-live",
+        "animation" => "bt-pulse-glow 1.6s ease-in-out infinite",
+        "border-color" => "rgba(59,130,246,0.42)"),
+    CSS("@media (prefers-reduced-motion: reduce)",
+        CSS(".bt-tool-msg.bt-tool-live, .bt-plan-msg.bt-plan-live",
+            "animation" => "none")),
+
+    # ── Tool elapsed timer ───────────────────────────────────────────────────
+    # Small monospace span next to the status pill. JS sets `data-tool-started`
+    # on the bubble; a 1-second ticker writes `data-tool-elapsed-ms` and only
+    # renders text once we cross > 1s (so a fast Read never flashes "0s").
+    CSS(".bt-tool-timer",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "10.5px",
+        "color" => "var(--bt-text-muted)",
+        "flex-shrink" => "0",
+        "min-width" => "20px",
+        "text-align" => "right"),
+    CSS(".bt-tool-msg.bt-tool-live .bt-tool-timer",
+        "color" => "var(--bt-accent)"),
+
+    # ── Taskbar ──────────────────────────────────────────────────────────────
+    # Floats over the messages area, anchored top-left of the chat panel.
+    # `position: absolute` (NOT fixed and NOT sticky-in-scroll): it stays put
+    # relative to `.bt-app` while the messages scroll underneath, but doesn't
+    # poke out of the chat panel when other panels (sidebar, plotpane) resize.
+    # No background or border on the container — each slot is a free-floating
+    # capsule with its own surface, so multiple slots read as a stack rather
+    # than a bordered widget.
+    CSS(".bt-taskbar",
+        "position" => "absolute",
+        "top" => "8px", "left" => "8px",
+        "z-index" => "6",
+        "display" => "flex", "flex-direction" => "column",
+        "gap" => "6px",
+        "pointer-events" => "none",   # slots re-enable so we don't catch the messages scroll
+        "max-width" => "260px"),
+    CSS(".bt-taskbar:empty",
+        "display" => "none"),
+
+    # One slot per live tool/todo. Capsule shape, accent-tinted; click jumps
+    # back to the source bubble via scrollIntoView (set in bonitoteam.js).
+    CSS(".bt-taskbar-slot",
+        "pointer-events" => "auto",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "padding" => "4px 10px",
+        "border-radius" => "999px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid rgba(59,130,246,0.42)",
+        "box-shadow" => "var(--bt-shadow-sm)",
+        "font-size" => "11.5px",
+        "color" => "var(--bt-text)",
+        "cursor" => "pointer",
+        "user-select" => "none",
+        "max-width" => "100%",
+        "white-space" => "nowrap",
+        "transition" => "background 80ms, transform 80ms"),
+    CSS(".bt-taskbar-slot:hover",
+        "background" => "var(--bt-surface-2)",
+        "transform" => "translateX(2px)"),
+    CSS(".bt-taskbar-slot-icon",
+        "flex-shrink" => "0", "font-size" => "13px"),
+    CSS(".bt-taskbar-slot-label",
+        "flex" => "1 1 auto", "min-width" => "0",
+        "overflow" => "hidden", "text-overflow" => "ellipsis"),
+    CSS(".bt-taskbar-slot-timer",
+        "flex-shrink" => "0",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "10.5px",
+        "color" => "var(--bt-accent)"),
+    # Stop affordance — visible on slot-hover. A click sends `stop_tool`
+    # over comm; `StopToolCommand` translates that into a synthetic user
+    # message asking Claude to stop the bash/task. Honest UX: the slot
+    # keeps pulsing until the tool reports terminal status (we don't lie
+    # with a "Stopping…" state that the SDK can't guarantee).
+    CSS(".bt-taskbar-slot-stop",
+        "opacity" => "0",
+        "flex-shrink" => "0",
+        "color" => "var(--bt-text-faint)",
+        "border-radius" => "999px",
+        "padding" => "0 4px",
+        "cursor" => "pointer",
+        "transition" => "opacity 80ms, color 80ms"),
+    CSS(".bt-taskbar-slot:hover .bt-taskbar-slot-stop",
+        "opacity" => "1"),
+    CSS(".bt-taskbar-slot-stop:hover",
+        "color" => "var(--bt-error)"),
 
     CSS(".bt-tool-body",
         "padding" => "0 12px 10px",
@@ -503,6 +695,29 @@ const ChatStyles = Bonito.Styles(
         "color" => "var(--bt-text-muted)",
         "font-weight" => "600"),
 
+    # ── Compact-summary separator ────────────────────────────────────────────
+    # `/compact` boundary — rendered as a centered, muted, narrower block with
+    # subtle horizontal rules on each side so it visually reads "session
+    # continued here." Not a bubble: no alignment, no border, no shadow.
+    CSS(".bt-summary-msg",
+        "align-self" => "center",
+        "max-width" => "min(80%, 720px)",
+        "margin" => "8px 0",
+        "padding" => "10px 18px",
+        "text-align" => "center",
+        "color" => "var(--bt-text-muted)",
+        "font-size" => "12.5px",
+        "font-style" => "italic",
+        "border-top" => "1px solid var(--bt-border)",
+        "border-bottom" => "1px solid var(--bt-border)"),
+    CSS(".bt-summary-msg .bt-summary-body",
+        "display" => "block",
+        # Tighten the markdown render so the centered block reads like a
+        # caption, not a wall of body text.
+        "line-height" => "1.5"),
+    CSS(".bt-summary-msg .bt-summary-body > *:first-child", "margin-top" => "0"),
+    CSS(".bt-summary-msg .bt-summary-body > *:last-child",  "margin-bottom" => "0"),
+
     # ── Markdown inside agent bubble ─────────────────────────────────────────
     CSS(".bt-agent-msg .markdown-body, .bt-agent-msg .markdown",
         "background" => "none", "border" => "none", "padding" => "0",
@@ -512,31 +727,69 @@ const ChatStyles = Bonito.Styles(
         "margin-top" => "0"),
     CSS(".bt-agent-msg .markdown-body > *:last-child, .bt-agent-msg .markdown > *:last-child",
         "margin-bottom" => "0"),
-    CSS(".bt-agent-msg pre",
+    # The doubled `.bt-agent-msg .markdown-body …` arms are deliberate: they
+    # out-rank Bonito's markdown.css (`.markdown-body pre`, specificity 0,1,1)
+    # regardless of stylesheet order. Without them, markdown.css's GitHub
+    # light-gray pre background (#f6f8fa) could win the tie while our light
+    # `color` (meant for the dark block) still applied → near-invisible code
+    # ("opacity overlay" bug).
+    CSS(".bt-agent-msg pre, .bt-agent-msg .markdown-body pre",
         "background" => "#0f172a", "color" => "#e2e8f0",
         "border-radius" => "var(--bt-radius-sm)",
         "padding" => "10px 14px",
         "overflow-x" => "auto",
         "font-size" => "12px", "line-height" => "1.5",
         "margin" => "8px 0"),
-    CSS(".bt-agent-msg code",
+    CSS(".bt-agent-msg code, .bt-agent-msg .markdown-body code",
         "background" => "rgba(15,23,42,0.06)",
         "border-radius" => "3px",
         "padding" => "1px 5px",
         "font-size" => "12.5px",
         "font-family" => "ui-monospace, monospace"),
-    CSS(".bt-agent-msg pre code",
+    CSS(".bt-agent-msg pre code, .bt-agent-msg .markdown-body pre code",
         "background" => "none", "padding" => "0",
         "color" => "inherit"),
 
+    # Overscroll tail — empty space below the last message the user can
+    # scroll into (sized to ~30% of the pane by `_sizeTail`). All "bottom"
+    # math (atBottom / scrollToBottom / pins) targets the CONTENT bottom,
+    # treating the tail as beyond-the-end.
+    CSS(".bt-messages-tail",
+        "flex-shrink" => "0", "overflow-anchor" => "none"),
+
+    # Off-screen measuring host (`_measureNodes`): prefetched message nodes
+    # are laid out here — same width as the messages content box — to get
+    # real heights before they're ever rendered. Hidden but NOT display:none
+    # (children must lay out); zero own height so it never affects the page.
+    CSS(".bt-measure",
+        "position" => "absolute", "left" => "0", "top" => "0",
+        "height" => "0", "overflow" => "hidden",
+        "visibility" => "hidden",
+        "pointer-events" => "none",
+        "z-index" => "-1"),
+
+    # (The per-chat mount curtain used to live here — the dashboard's load
+    # overlay now covers the pane until settle; see `chat_waiting_view` in
+    # sidebar.jl and `_startSettle` in bonitoteam.js.)
+
     # ── Busy indicator ───────────────────────────────────────────────────────
+    # Lives inside `.bt-messages` (between the bottom spacer and the
+    # overscroll tail) so it shows directly under the last message. The
+    # container already pads 16px, so no own horizontal padding; opted out
+    # of scroll anchoring like the spacers/tail (the chase owns scrollTop).
+    # margin-top -10px cancels the flex row gap that precedes each of the
+    # three indicator children (zero-height or not, every flex item costs a
+    # gap slot — three indicators after the bottom spacer would push the
+    # visible one 30px under the last message). Safe: indicators are plain
+    # content the virtual-scroll height math never tracks.
     CSS(".bt-busy",
         "flex-shrink" => "0", "height" => "0", "overflow" => "hidden",
+        "overflow-anchor" => "none", "margin-top" => "-10px",
         "display" => "flex", "gap" => "4px", "align-items" => "center",
-        "padding" => "0 16px",
+        "padding" => "0",
         "transition" => "height 150ms ease, padding 150ms ease"),
     CSS(".bt-busy.bt-busy-active",
-        "height" => "28px", "padding" => "4px 16px"),
+        "height" => "28px", "padding" => "4px 0"),
     CSS(".bt-busy-dot",
         "width" => "7px", "height" => "7px", "border-radius" => "50%",
         "background" => "var(--bt-accent)",
@@ -546,6 +799,44 @@ const ChatStyles = Bonito.Styles(
     CSS("@keyframes bt-pulse",
         CSS("0%, 100%", "opacity" => "0.3", "transform" => "scale(0.8)"),
         CSS("50%",      "opacity" => "1",   "transform" => "scale(1.2)")),
+
+    # ── Idle "waiting" indicator ─────────────────────────────────────────────
+    # Visible when the busy dots are NOT (keyed off `.bt-busy`'s class via
+    # the adjacent-sibling rule — busy_start/busy_end flips and the
+    # server-rendered remount class drive both elements in lockstep) AND
+    # the chat has agent replies on display: `bt-waiting-on` is toggled by
+    # `_updateWaiting` in bonitoteam.js — set once an agent message exists
+    # and the Agent filter shows them. An empty chat (nothing asked yet) or
+    # a filtered-out agent stream gets no dangling "waiting" line. Same
+    # placement rules as `.bt-busy` above (inside `.bt-messages`).
+    CSS(".bt-waiting",
+        "flex-shrink" => "0", "height" => "0", "overflow" => "hidden",
+        "overflow-anchor" => "none", "margin-top" => "-10px",
+        "display" => "flex", "align-items" => "center",
+        "padding" => "0", "font-size" => "12.5px", "font-style" => "italic",
+        "color" => "var(--bt-text-muted)",
+        "transition" => "height 150ms ease, padding 150ms ease"),
+    CSS(".bt-busy:not(.bt-busy-active) + .bt-waiting.bt-waiting-on",
+        "height" => "22px", "padding" => "2px 0"),
+
+    # ── Transient "reasoning…" indicator ──────────────────────────────────────
+    # Shown for the lifetime of an agent thought (most are redacted/empty, so
+    # this is usually the only visible trace of the model thinking). Collapsed
+    # to zero height until `.bt-thinking-active` is toggled by the JS.
+    # Same placement rules as `.bt-busy` above (inside `.bt-messages`).
+    CSS(".bt-thinking",
+        "flex-shrink" => "0", "height" => "0", "overflow" => "hidden",
+        "overflow-anchor" => "none", "margin-top" => "-10px",
+        "display" => "flex", "align-items" => "center",
+        "padding" => "0", "font-size" => "12.5px", "font-style" => "italic",
+        "color" => "var(--bt-text-muted)",
+        "transition" => "height 150ms ease, padding 150ms ease"),
+    CSS(".bt-thinking.bt-thinking-active",
+        "height" => "22px", "padding" => "2px 0"),
+    CSS(".bt-collapsable-loading",
+        "color" => "var(--bt-text-faint)",
+        "font-style" => "italic", "font-size" => "12px",
+        "padding" => "4px 0"),
 
     # ── New-messages pill ────────────────────────────────────────────────────
     # Floats above the input area when followMode is off and new content
@@ -601,7 +892,86 @@ const ChatStyles = Bonito.Styles(
         "background" => "var(--bt-surface)"),
     CSS(".bt-input-row",
         "display" => "flex", "gap" => "8px", "align-items" => "flex-end",
-        "width" => "100%", "max-width" => "880px"),
+        "width" => "100%"),
+
+    # ── Chat toolbar (below the composer) ───────────────────────────────────
+    # Hosts the message-type filter checkboxes (populated client-side by
+    # `noteType` in bonitoteam.js) and future per-chat options. Deliberately
+    # roomy (min-height) so it doesn't jump when the first checkbox appears.
+    # Two rows: the dynamic message-filter checkboxes (top) and static
+    # display options (bottom, e.g. "Depict Images Natively in Chat").
+    CSS(".bt-chat-toolbar",
+        "flex-shrink" => "0",
+        "min-height" => "38px",
+        "box-sizing" => "border-box",
+        "display" => "flex", "flex-direction" => "column",
+        # Roomy row separation so the display options read as their own
+        # group, distinct from the filter checkboxes above.
+        "gap" => "10px",
+        "padding" => "8px 14px",
+        "border-top" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "font-size" => "12px",
+        "color" => "var(--bt-text-muted)"),
+    CSS(".bt-toolbar-filters",
+        "display" => "flex", "align-items" => "center", "flex-wrap" => "wrap",
+        "gap" => "14px", "min-height" => "18px"),
+    CSS(".bt-toolbar-options",
+        "display" => "flex", "align-items" => "center", "flex-wrap" => "wrap",
+        "gap" => "14px"),
+    CSS(".bt-filter-toggle",
+        "display" => "inline-flex", "align-items" => "center", "gap" => "5px",
+        "cursor" => "pointer",
+        "user-select" => "none",
+        "white-space" => "nowrap"),
+    CSS(".bt-filter-toggle input",
+        "cursor" => "pointer", "margin" => "0"),
+    CSS(".bt-filter-toggle:hover",
+        "color" => "var(--bt-text)"),
+    # "Tools:" group separator before the per-tool checkboxes. (Hiding itself
+    # is inline display:none managed by bonitoteam.js `setKeyHidden` — the
+    # per-tool key set is open, so no static rules.)
+    CSS(".bt-filter-group-label",
+        "margin-left" => "8px",
+        "font-weight" => "600",
+        "user-select" => "none"),
+
+    # ── Native media display (bt_show + "Native Images" / "Native Videos") ──
+    # The bt-tool-native class strips the pill chrome so the body's <img> or
+    # <video> sits bare in the chat flow like an agent reply; bonitoteam.js
+    # applies it (and auto-mounts the body) when the matching toggle is on
+    # and the tool's show_mime is image/* / video/*.
+    CSS(".bt-tool-msg.bt-tool-native",
+        "background" => "none",
+        "border" => "none",
+        "box-shadow" => "none",
+        "overflow" => "visible"),
+    CSS(".bt-tool-native .bt-tool-header", "display" => "none"),
+    # The expanded-state reveal rule (`.bt-tool-header[data-expanded="true"]
+    # ~ .bt-tool-fullwidth`, 0,2,1) out-ranks a plain `.bt-tool-native
+    # .bt-tool-fullwidth` (0,2,0) — and native mode IS expanded. Match its
+    # shape with the native class prefixed so hiding wins.
+    CSS(".bt-tool-native .bt-tool-fullwidth, " *
+        ".bt-tool-native .bt-tool-header[data-expanded=\"true\"] ~ .bt-tool-fullwidth",
+        "display" => "none"),
+    CSS(".bt-tool-native .bt-tool-body",
+        "border-top" => "none",
+        "padding" => "0"),
+    CSS(".bt-tool-native .bt-tool-body img",
+        "border-radius" => "var(--bt-radius-sm)",
+        "box-shadow" => "var(--bt-shadow-sm)",
+        # Subtle hover lift: barely-there zoom + deeper shadow. transform
+        # doesn't reflow the layout, so the virtual-scroll heights are
+        # untouched by hovering.
+        "transition" => "transform 150ms ease, box-shadow 150ms ease"),
+    CSS(".bt-tool-native .bt-tool-body img:hover",
+        "transform" => "scale(1.015)",
+        "box-shadow" => "var(--bt-shadow-md)"),
+    # Videos get the same dressing but NOT the hover lift — a zoom under
+    # the pointer while scrubbing/watching reads as jitter, not polish.
+    CSS(".bt-tool-native .bt-tool-body video",
+        "border-radius" => "var(--bt-radius-sm)",
+        "box-shadow" => "var(--bt-shadow-sm)"),
 
     # ── Attachment thumbnail strip ──────────────────────────────────────────
     # Sits above .bt-input-row. Hidden (display:none) when there's nothing
@@ -610,7 +980,7 @@ const ChatStyles = Bonito.Styles(
     # in the same screen position regardless of attachment count.
     CSS(".bt-attachments",
         "display" => "none",
-        "width" => "100%", "max-width" => "880px"),
+        "width" => "100%"),
     CSS(".bt-attachments.bt-attachments-active",
         "display" => "flex",
         "gap" => "8px",
@@ -735,6 +1105,7 @@ const ChatStyles = Bonito.Styles(
         CSS(".bt-user-msg, .bt-agent-msg", "max-width" => "88%"),
         CSS(".bt-tool-msg",                "max-width" => "100%"),
         CSS(".bt-plan-msg",                "max-width" => "100%"),
+        CSS(".bt-summary-msg",             "max-width" => "92%"),
         # Hide the cwd path in the header — not enough room
         CSS(".bt-header-cwd", "display" => "none"),
         # Title takes the available horizontal space and ellipsizes; the

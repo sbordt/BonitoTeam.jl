@@ -4,9 +4,21 @@
 # Structured logger (stderr) — never write non-MCP content to stdout
 log_info(msg) = println(stderr, "[$SERVER_NAME] ", msg)
 
+# `tools/call`s are dispatched on their own tasks (so a long eval can't block
+# the read loop from processing a `notifications/cancelled`), so multiple tasks
+# may write a response concurrently. One line per frame must stay atomic.
+const OUT_LOCK = ReentrantLock()
+
+# How long to give `Malt.interrupt` to land before the nuclear fallback (kill the
+# worker). Generous because user code in a `try/catch` may swallow the first
+# InterruptException for a bit; the existing `interrupt!` tool uses the same 30s.
+const CANCEL_KILL_GRACE = 30.0
+
 function send!(out::IO, payload::AbstractDict)
-    println(out, JSON.json(payload))
-    flush(out)
+    lock(OUT_LOCK) do
+        println(out, JSON.json(payload))
+        flush(out)
+    end
     return nothing
 end
 
@@ -74,6 +86,67 @@ function dispatch!(out, req::AbstractDict)
     return nothing
 end
 
+# MCP `notifications/cancelled`: claude-agent-acp asking us to abort an in-flight
+# request — how an ACP `session/cancel` reaches a long-running tool.
+#
+# An arbitrary user eval (`sleep`, `while true`, a blocking fetch) has NO
+# cooperative stop — it checks no flag — so the only lever to actually STOP it is
+# `Malt.interrupt` (SIGINT). It's unreliable and can crash the worker, so we don't
+# use it for OUR OWN loops (those stop via messages); but for stopping user code
+# it's the only tool, used deliberately here. A worker-kill fallback
+# (`finalize_cancelled_eval!`) covers code that swallows InterruptException so a
+# cancelled eval can never orphan-run forever.
+#
+# We don't take a session's `lock` (the in-flight poll may hold it); `Malt.interrupt`
+# is a lock-free signal and the in-flight `await_or_yield` clears `in_flight` when
+# the task dies. `requestId` is logged to confirm the agent forwards cancellation.
+function handle_cancelled!(req::AbstractDict)
+    params = get(req, "params", Dict{String,Any}())
+    rid = get(params, "requestId", get(params, "id", nothing))
+    m = manager()
+    # `JuliaSession` isn't defined yet at this file's include time (session.jl
+    # loads after server.jl), so stay untyped here — runtime values are sessions.
+    targets = Any[]
+    lock(m.global_lock) do
+        for s in values(m.sessions)
+            s.in_flight !== nothing && push!(targets, s)
+        end
+    end
+    for s in targets
+        try
+            is_alive(s) && Malt.interrupt(s.worker)
+        catch e
+            log_info("cancelled: Malt.interrupt failed: $(sprint(showerror, e))")
+        end
+        @async finalize_cancelled_eval!(s)
+    end
+    log_info("notifications/cancelled (requestId=$rid) → interrupted $(length(targets)) in-flight eval(s)")
+    return nothing
+end
+
+# After the grace: if the interrupt landed, the eval task is done — clear
+# `in_flight` (an in-flight `await_or_yield` normally does this, but a cancel can
+# abandon the eval with no poll active, so do it here too) so the session stays
+# reusable. If the eval is STILL running, it swallowed the interrupt — take the
+# worker down so it can't orphan-run forever (that session's loaded state is lost;
+# the reliable last step).
+function finalize_cancelled_eval!(s)   # s::JuliaSession (typed at call time)
+    sleep(CANCEL_KILL_GRACE)
+    f = s.in_flight
+    f === nothing && return
+    if istaskdone(f)
+        @lock s.lock (s.in_flight === f && (s.in_flight = nothing))
+    elseif is_alive(s)
+        log_info("eval ignored interrupt after $(CANCEL_KILL_GRACE)s → killing worker (session lost)")
+        try
+            kill_session!(s)
+        catch e
+            log_info("kill_session! failed: $(sprint(showerror, e))")
+        end
+    end
+    return
+end
+
 """
     run_stdio(; in=stdin, out=stdout)
 
@@ -94,13 +167,35 @@ function run_stdio(; in::IO = stdin, out::IO = stdout)
             send_error!(out, nothing, -32700, "Parse error")
             continue
         end
-        try
-            dispatch!(out, req)
-        catch e
-            bt = sprint(showerror, e, catch_backtrace())
-            log_info("dispatch error: $bt")
-            id = get(req, "id", nothing)
-            id !== nothing && send_error!(out, id, -32603, "Internal error: $(string(e))")
+        method = get(req, "method", nothing)
+        if method == "notifications/cancelled"
+            # Process inline + immediately: it must run WHILE a `tools/call` poll
+            # is in flight, which is exactly why those are dispatched off-loop.
+            try
+                handle_cancelled!(req)
+            catch e
+                log_info("cancelled handler error: $(sprint(showerror, e))")
+            end
+        elseif method == "tools/call"
+            # Off-loop so a long-running eval can't block the read loop from
+            # reaching the next line (e.g. the cancel that should yield it).
+            Base.errormonitor(@async try
+                dispatch!(out, req)
+            catch e
+                bt = sprint(showerror, e, catch_backtrace())
+                log_info("dispatch error: $bt")
+                id = get(req, "id", nothing)
+                id !== nothing && send_error!(out, id, -32603, "Internal error: $(string(e))")
+            end)
+        else
+            try
+                dispatch!(out, req)
+            catch e
+                bt = sprint(showerror, e, catch_backtrace())
+                log_info("dispatch error: $bt")
+                id = get(req, "id", nothing)
+                id !== nothing && send_error!(out, id, -32603, "Internal error: $(string(e))")
+            end
         end
     end
     log_info("stdin closed; exiting")

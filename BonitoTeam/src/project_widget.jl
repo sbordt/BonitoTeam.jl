@@ -18,15 +18,64 @@ Base.:(==)(a::ProjectCard, b::ProjectCard) = a.project_id == b.project_id
 function Bonito.jsrender(session::Bonito.Session, c::ProjectCard)
     state, pid = c.state, c.project_id
 
-    project_obs = map(state.projects) do projects
+    project_obs = map(session, state.projects) do projects
         get(projects, pid, nothing)
     end
+
+    # Editable title — `[WW] <title>` shown in the card heading. The user can
+    # click to edit; the auto-backfill in `send_message!` fills it from the
+    # first meaningful prompt if it's still nothing.
+    initial_title = let p0 = get(state.projects[], pid, nothing)
+        p0 === nothing ? "" : project_display_title(p0)
+    end
+    title_obs = Observable(initial_title)
+    on(session, title_obs) do v
+        new = strip(String(v))
+        haskey(state.projects[], pid) || return
+        cur = project_display_title(state.projects[][pid])
+        # Empty string clears to fallback (p.name); same value is a no-op.
+        new == cur && return
+        try
+            set_project_title!(state, pid, new)
+            title_obs[] = project_display_title(state.projects[][pid])
+            c.error_obs[] = ""
+        catch e
+            c.error_obs[] = "Title update failed: $(sprint(showerror, e))"
+            title_obs[] = cur
+        end
+    end
+    title_input = DOM.input(
+        type  = "text",
+        value = title_obs,
+        class = "bt-card-name bt-card-name-edit bt-card-title-input",
+        title = "Click to rename this chat — Enter to save, Esc to cancel. Empty = fall back to folder name.",
+        onblur    = js"event => $(title_obs).notify(event.target.value)",
+        onkeydown = js"""event => {
+            if (event.key === 'Enter')  { event.target.blur(); }
+            if (event.key === 'Escape') {
+                event.target.value = event.target.defaultValue;
+                event.target.blur();
+            }
+        }""")
 
     # Card body is a single map over project + workers; project-level
     # updates are infrequent so rebuilding the inner DOM each notify is fine.
     body = map(project_obs, state.workers) do p, workers
         # Project removed (KeyedList is about to detach us) — render empty.
         p === nothing && return DOM.div()
+        # Keep `title_obs` in sync if the project's title changed elsewhere
+        # (auto-backfill in send_message!, another tab's edit, etc.).
+        let canon = project_display_title(p)
+            title_obs[] == canon || (title_obs[] = canon)
+        end
+        worker_tag = haskey(workers, p.worker_id) ?
+                        worker_initials(workers[p.worker_id]) :
+                        derive_initials(p.worker_id)
+        tag = DOM.span("[$(worker_tag)]";
+                       class = "bt-card-worker-tag",
+                       title = haskey(workers, p.worker_id) ?
+                               "Lives on $(workers[p.worker_id].name)" :
+                               "Lives on worker $(p.worker_id)")
         badge = p.locked_by === nothing ? DOM.span() :
             DOM.span("active";
                      class = "bt-pill bt-pill-active",
@@ -70,17 +119,22 @@ function Bonito.jsrender(session::Bonito.Session, c::ProjectCard)
                 }""")
         end
 
-        # Display name (renameable) with a short worker_id prefix fallback.
+        # The folder name as a meta line — when an explicit title is set the
+        # original folder name still lives here so the user doesn't lose track
+        # of which directory the chat is bound to.
         worker_label = haskey(workers, p.worker_id) ?
                         workers[p.worker_id].name :
                         "worker:$(first(p.worker_id, 8))"
+        folder_line = DOM.span(p.name; class = "bt-card-folder-name",
+                               title = "folder: $(p.name)")
 
         DOM.div(
             DOM.div(
-                DOM.div(DOM.span(p.name; class = "bt-card-name"),
-                        badge, backup_pill(p);
+                DOM.div(tag, title_input, badge, backup_pill(p);
                         class = "bt-card-title"),
                 DOM.div(
+                    folder_line,
+                    DOM.span("·"; class = "bt-stat-sep"),
                     DOM.span(worker_label),
                     DOM.span("·"; class = "bt-stat-sep"),
                     DOM.span(p.worker_path; class = "bt-mono",

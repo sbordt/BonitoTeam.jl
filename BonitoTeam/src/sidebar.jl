@@ -487,6 +487,23 @@ const UnifiedShellStyles = Bonito.Styles(
         "pointer-events" => "none"),
     CSS(".bt-view-overlay .bt-loading-wrap, .bt-view-overlay .bt-empty",
         "pointer-events" => "auto"),
+    # The loading card doubles as the chat's mount curtain (phases 2/3, see
+    # chat_waiting_view): full height + opaque so the pane's initial geometry
+    # churn (estimate→measured heights, image mounts, scrollbar pumping)
+    # never shows around or below the card. The wrap stays a PLAIN block, so
+    # `.bt-loading`'s flex centering is inert and the card hugs the top —
+    # the same spot across all phases.
+    CSS(".bt-view-overlay .bt-loading-wrap",
+        "height" => "100%",
+        "background" => "var(--bt-bg)",
+        "transition" => "opacity 200ms ease"),
+    # Hidden-until-onload: a card over an already-settled pane (kept-alive
+    # revisit) is dismissed before it ever paints.
+    CSS(".bt-loading-wrap.bt-loading-pending",
+        "visibility" => "hidden"),
+    # The settle fade — mirrors the old curtain reveal.
+    CSS(".bt-loading-wrap.bt-loading-hide",
+        "opacity" => "0", "pointer-events" => "none"),
 )
 
 # Per-session bring-up bookkeeping for the loading view. `inflight` holds the
@@ -580,6 +597,84 @@ function project_loading_view(state::ServerState, pid::String,
     return DOM.div(body; class = "bt-loading-wrap")
 end
 
+# Phases 2+3 of the load screen: the card for a chat whose ChatModel IS
+# cached but whose pane hasn't finished mounting and settling yet. Before
+# this existed the overlay vanished the instant the model landed server-side
+# — but the pane's DOM still had to ship, mount, and settle, so the user saw
+# bring-up card → ~1s of bare background → a separate per-chat curtain.
+# Now ONE card (identical classes/geometry to `project_loading_view`'s) stays
+# up from click to settle and only its sub-text changes:
+#
+#   "Connecting to <worker>…"   project_loading_view, while session/load runs
+#   "Loading the chat…"         this card, pane DOM shipping + mounting
+#   "Rendering messages…"       chat module mounted, settle watch running
+#
+# The chat module drives the hand-offs: `_startSettle` (bonitoteam.js)
+# dispatches `bt-chat-settling` / `bt-chat-settled` window events carrying
+# the pane pid, and mirrors them as `data-bt-settling` / `data-bt-settled`
+# flags on the `.bt-chatpane` so a card that mounts AFTER an event fired
+# (kept-alive revisit, rapid navigation) can read the current state
+# synchronously instead of waiting for the next event.
+#
+# A struct + jsrender (not a plain function) for the same reason as
+# ChatPaneRef below: `Bonito.onload` must register against the SUBSESSION
+# that renders this card (the overlay re-renders one per `current_view`
+# change) — registered on the parent session, whose document loaded long
+# ago, the mount hook would never fire.
+struct ChatWaitingView
+    state :: ServerState
+    pid   :: String
+end
+
+function Bonito.jsrender(session::Bonito.Session, v::ChatWaitingView)
+    p     = get(v.state.projects[], v.pid, nothing)
+    title = p === nothing ? "Opening chat…" : "Opening $(p.name)…"
+    wrap  = DOM.div(
+        DOM.div(
+            DOM.div(class = "bt-loading-spinner"),
+            DOM.div(title; class = "bt-loading-title"),
+            DOM.div("Loading the chat…"; class = "bt-loading-sub");
+            class = "bt-loading");
+        # Starts hidden (`bt-loading-pending`): navigating back to an
+        # already-settled pane must not flash a loading card. The onload
+        # below either keeps it hidden and bails, or reveals it.
+        class = "bt-loading-wrap bt-loading-pending",
+        dataWaitingFor = v.pid)
+    Bonito.onload(session, wrap, js"""(wrap) => {
+        const pid = wrap.dataset.waitingFor;
+        const sub = wrap.querySelector('.bt-loading-sub');
+        const pane = document.querySelector(
+            '.bt-chatpane[data-pane-pid="' + pid + '"]');
+        const phase3 = () => { if (sub) sub.textContent = 'Rendering messages…'; };
+        let cap = null;
+        const cleanup = () => {
+            window.removeEventListener('bt-chat-settling', onSettling);
+            window.removeEventListener('bt-chat-settled',  onSettled);
+            if (cap) clearTimeout(cap);
+        };
+        const hide = () => {
+            cleanup();
+            wrap.classList.add('bt-loading-hide');
+            setTimeout(() => { wrap.style.display = 'none'; }, 250);
+        };
+        const onSettling = (e) => { if (e.detail === pid) phase3(); };
+        const onSettled  = (e) => { if (e.detail === pid) hide(); };
+        if (pane && pane.dataset.btSettled) {       // kept-alive revisit
+            wrap.style.display = 'none';
+            return;
+        }
+        wrap.classList.remove('bt-loading-pending');
+        if (pane && pane.dataset.btSettling) phase3();  // mounted mid-settle
+        window.addEventListener('bt-chat-settling', onSettling);
+        window.addEventListener('bt-chat-settled',  onSettled);
+        // Failsafe: a pane that dies during render must not leave an opaque
+        // overlay forever. The chat's own settle watch hard-caps at 5s, so
+        // this only fires when something is genuinely broken.
+        cap = setTimeout(hide, 15000);
+    }""")
+    return Bonito.jsrender(session, wrap)
+end
+
 # Max number of chat panes kept mounted (DOM-preserved) at once. Beyond this,
 # the least-recently-viewed chat's pane is dropped — its live embeds tear down
 # and re-delegate on the next visit. Generous enough that normal back-and-forth
@@ -652,13 +747,23 @@ function unified_main(session::Bonito.Session, state::ServerState,
     chats_host = DOM.div(KeyedList(chatpanes_obs; key = r -> r.pid);
                          class = "bt-view bt-view-chats")
 
-    # ── Overlay: loading / unknown for a pid that has no pane yet ────────────
-    # Empty (invisible, click-through) once the chat is cached; until then it
-    # shows the loading card, which also kicks the bring-up and re-notifies
-    # `current_view` on success → we re-enter and the chat becomes a pane.
+    # ── Overlay: the single, continuous load screen ──────────────────────────
+    # Model not cached yet → `project_loading_view` (kicks the bring-up and
+    # re-notifies `current_view` on success → we re-enter). Model cached →
+    # `chat_waiting_view`: cached ≠ pixels ready — the pane still has to
+    # ship, mount, and settle, and the overlay must hold the SAME card up
+    # until the chat module's settle events dismiss it. (It used to go
+    # display:none here, exposing ~1s of bare background before the
+    # now-removed per-chat curtain painted.)
     overlay = map(session, current_view) do pid
-        if isempty(pid) || haskey(state.chat_models, pid)
+        if isempty(pid)
             DOM.div(; style = Styles("display" => "none"))
+        elseif haskey(state.chat_models, pid)
+            # The wrapper div keeps this branch a Node (like the others) so
+            # Bonito renders it directly; height:100% hands the overlay's
+            # full height down to the card's `.bt-loading-wrap`.
+            DOM.div(ChatWaitingView(state, pid);
+                    style = Styles("height" => "100%"))
         elseif haskey(state.projects[], pid)
             project_loading_view(state, pid, current_view, ls)
         else
@@ -739,12 +844,16 @@ function unified_app(state::ServerState)
             plotpane;
             class = "bt-stage")
         shell = DOM.div(
+            # MarkdownCSS FIRST: it's the base sheet our styles override.
+            # Stylesheet order breaks specificity ties — with MarkdownCSS
+            # last, its `.markdown-body pre` light-gray background beat the
+            # chat's dark code blocks (see ChatStyles' agent-pre comment).
+            Bonito.MarkdownCSS,
             UnifiedShellStyles,
             DashboardStyles,
             ChatStyles,
             SidebarStyles,
             PopupStyles,
-            Bonito.MarkdownCSS,
             Bonito.ConnectionIndicator(),
             sidebar,
             stage,

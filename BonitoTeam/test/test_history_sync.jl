@@ -69,8 +69,9 @@ end
         t = BT.MockTransport(load_responder(frames))
         t.on_setup(t.outgoing, t.incoming)
         conn = ACP.Connection(t, ACP.FSRequestHandler("/tmp"))
-        replay = ACP.replay_history(conn, Dict("sessionId"=>"s","cwd"=>"/tmp","mcpServers"=>[]))
+        replay, load_result = ACP.replay_history(conn, Dict("sessionId"=>"s","cwd"=>"/tmp","mcpServers"=>[]))
         close(conn)
+        @test load_result isa AbstractDict   # raw session/load response surfaced
 
         @test length(replay) == 4
         @test replay[1] isa ACP.UserMessage  && replay[1].text == "hi claude"

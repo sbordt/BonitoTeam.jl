@@ -71,6 +71,14 @@ mutable struct ChatModel
     # class to this, so no separate busy_start/busy_end comm events are needed.
     busy_active::Observable{Bool}
 
+    # Session metadata for the chat header: a heterogeneous list of TYPED
+    # items rendered by `header_pill` dispatch. Today: the agent's
+    # `ACP.ConfigOption`s (model / permission mode / effort) parsed from the
+    # session-setup result; future agents add their own item types + a
+    # `header_pill` method — the header skeleton never changes. Reset on every
+    # bring-up (`start_chat_client!`); ephemeral, never persisted.
+    session_meta::Observable{Vector{Any}}
+
     # The single `run_chat!` consumer task. Started once (guarded) by
     # `start_chat_client!`; survives `restart_chat_session!` (which only swaps
     # the ACP client, not the consumer). Shared across per-session views.
@@ -106,6 +114,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(true),
         Observable(""),
         Observable(false),          # busy_active
+        Observable(Any[]),          # session_meta
         Ref{Union{Task,Nothing}}(nothing),   # consumer_task
         nothing,                    # parent: this is the shared instance itself
     )
@@ -129,6 +138,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.session_alive),
             map(identity, session, m.last_error),
             map(identity, session, m.busy_active),
+            map(identity, session, m.session_meta),
             m.consumer_task,           # shared → only the parent runs the loop
             m,    # parent → the shared instance we copied from
         )
@@ -235,6 +245,7 @@ abstract type ToolMsg <: ChatMsg end
 mutable struct GenericToolMsg <: ToolMsg
     id::String
     kind::String
+    name::String                          # ACP tool name ("Read", "ToolSearch", …); "" if the agent sent no meta
     title::String
     status::String
     summary::String                       # cached header summary; full content on disk
@@ -242,6 +253,11 @@ mutable struct GenericToolMsg <: ToolMsg
     finished_at::Union{Float64,Nothing}
     chat::Union{ChatModel,Nothing}
 end
+
+# Back-compat 8-arg form (pre-`name`): used by test fixtures and any caller
+# without a tool name to hand over.
+GenericToolMsg(id, kind, title, status, summary, started_at, finished_at, chat) =
+    GenericToolMsg(id, kind, "", title, status, summary, started_at, finished_at, chat)
 
 mutable struct BashToolMsg <: ToolMsg
     id::String
@@ -493,12 +509,25 @@ end
 # `started_at` / `finished_at` are shared across every concrete variant.
 # Subtype-specific augmentations (e.g. the `server` badge for `MCPToolMsg`)
 # patch the dict in their own dispatch arm below.
+# Stable per-tool filter key, the identity the message-type filter toolbar
+# groups by. The ACP tool NAME, not the title (a Bash title is the literal
+# command line). Reloads land as `GenericToolMsg` with the persisted key in
+# `name` (see `append_tool`); pre-name chats fall back to the ACP kind.
+tool_key(m::GenericToolMsg) = isempty(m.name) ? m.kind : m.name
+tool_key(::BashToolMsg)     = "Bash"
+tool_key(::TaskToolMsg)     = "Task"
+tool_key(m::MCPToolMsg)     = m.tool_name          # bare name: "bt_show", "bt_julia_eval"
+tool_key(::BonitoAppMsg)    = "bt_show_app"
+
 function tool_header_dict(m::ToolMsg, chat_dir::AbstractString="")
     pretty_title, server = pretty_tool_title(m.title)
     d = Dict{String,Any}(
         "type" => "tool",
         "id" => m.id,
         "kind" => m.kind,
+        # Filter identity for the per-tool show/hide toolbar (see filterKey
+        # in bonitoteam.js).
+        "tool" => tool_key(m),
         "icon" => tool_icon(m.kind),
         "title" => pretty_title,
         # "" for non-MCP tools; the MCP server name otherwise so the JS
@@ -552,9 +581,15 @@ function augment_generic_header!(d::Dict, chat_dir::AbstractString)
         prev = render_edit_preview(chat_dir, d["id"])
         prev === nothing || (d["preview"] = prev)
     end
-    isempty(chat_dir) ||
-        has_show_reference(load_tool_content(chat_dir, d["id"])) &&
-            (d["expand"] = true)
+    if !isempty(chat_dir)
+        content = load_tool_content(chat_dir, d["id"])
+        # bt_show references auto-expand the pill; inline image content
+        # (Read on a PNG, …) only ships its mime — the client's Native
+        # Images mode decides the depiction.
+        has_show_reference(content) && (d["expand"] = true)
+        mime = tool_media_mime(content)
+        mime === nothing || (d["show_mime"] = mime)
+    end
     return d
 end
 
@@ -878,12 +913,12 @@ has_show_reference(content) = find_show_reference(content) !== nothing
 
 # ── bt_show: render a worker file inline (ShowTool) ─────────────────────────
 # A `shown: <path> …` text block (emitted by the `bt_show` MCP tool) becomes a
-# `ShowTool`. Its `jsrender` kicks off an async fetch of the file to the
-# server and hands the result to Bonito's `jsrender(::Task)` — a spinner shows
-# until the bytes land, then the right element renders. Video plays because
-# Bonito's asset server now honours HTTP Range requests, and we point
-# `<video src>` at a served `Bonito.Asset` URL (not a multi-MB `data:` blob).
-# No bytes pass through claude; the path is the only thing on the wire.
+# `ShowTool`. Its `jsrender` fetches the file to the server (blocking the
+# per-render task — the Collapsable's "loading…" placeholder shows meanwhile)
+# and renders the right element. Video plays because Bonito's asset server
+# honours HTTP Range requests, and we point `<video src>` at a served
+# `Bonito.Asset` URL (not a multi-MB `data:` blob). No bytes pass through
+# claude; the path is the only thing on the wire.
 
 # Pull the path out of a `shown: <path>` header (tolerates a trailing
 # ` (<mime>, <size>)` from older tool output). `nothing` if not a show ref.
@@ -892,6 +927,30 @@ function parse_show_path(text::AbstractString)
     header = nl === nothing ? text : text[1:prevind(text, nl)]
     m = match(r"^shown:\s+(.+?)(?:\s+\([^)]*\))?\s*$", header)
     m === nothing ? nothing : String(m.captures[1])
+end
+
+# Pull the mime out of the `shown: <path> (<mime>, <size>)` reference. The
+# wire ships it as `show_mime` so the client can decide how to depict the
+# show (e.g. the "Native Images" toggle keys on image/*). `nothing` for
+# refs without the parenthesized tail or a mime-shaped token.
+function parse_show_mime(text::AbstractString)
+    nl = findfirst('\n', text)
+    header = nl === nothing ? text : text[1:prevind(text, nl)]
+    m = match(r"\(([a-z0-9.+-]+/[a-z0-9.+-]+)\s*,", header)
+    m === nothing ? nothing : String(m.captures[1])
+end
+
+# The displayable-media mime of a tool's content, if any: a bt_show
+# reference's mime, or the mime of inline image content (e.g. the Read tool
+# on a PNG ships an ACP ImageContent block). This is what the wire's
+# `show_mime` field carries — the client's "Native Images" mode keys on it.
+function tool_media_mime(content)
+    ref = find_show_reference(content)
+    ref === nothing || return parse_show_mime(ref)
+    for c in content
+        c isa ImageContent && return c.mime_type
+    end
+    return nothing
 end
 
 # A bt_show reference, rendered inline. Pure data — the fetch starts at render
@@ -903,14 +962,18 @@ struct ShowTool
     path::String        # path as the WORKER sees it (absolute, or relative to its cwd)
 end
 
-# If the file is already on the server (first fetch done, or RemoteSync mirror),
-# render synchronously — no spinner flash on collapse/re-expand. Only the very
-# first show, when the bytes still have to come off the worker, goes through the
-# async `jsrender(::Task)` spinner path.
+# Always render synchronously: the fetch (minutes for a multi-GB video)
+# blocks only the per-render @async task in `handle_command!(::ToolRender-
+# Command)`, and the finished element ships through that handler's
+# `dom_in_js` → `_btToolSlot` mount, which finds nodes the virtual scroll
+# holds DETACHED. The earlier `@async` + `jsrender(::Task)` spinner path
+# swapped the result in via Bonito's Observable machinery, whose
+# document-scoped uuid lookup polls for 30s and then gives up — a video
+# whose fetch outlived that window (or whose node was off-window at swap
+# time) kept its spinner forever; only a manual re-render, by then on the
+# isfile fast path, showed it.
 Bonito.jsrender(session::Bonito.Session, st::ShowTool) =
-    isfile(show_server_path(st)) ?
-    Bonito.jsrender(session, render_show_file(st)) :
-    Bonito.jsrender(session, Base.errormonitor(@async render_show_file(st)))
+    Bonito.jsrender(session, render_show_file(st))
 
 # The server-side path a ShowTool's file resolves to — no IO. Files under the
 # project tree map straight onto the server mirror (cwd ⟷ worker_path); an
@@ -926,17 +989,34 @@ function show_server_path(st::ShowTool)
     end
 end
 
+# Single-flight per destination: concurrent `tool.render` calls for the same
+# file (native-toggle spam, several tabs) would otherwise both stream into the
+# same `<dst>.partial` and corrupt it. The loser blocks until the winner's
+# fetch lands, re-checks isfile, and returns without a second transfer.
+# Entries are kept (one small lock per distinct shown file) — dropping them
+# would re-open the two-writers window for a fetch that errors and retries.
+const SHOW_FETCH_LOCKS = ReentrantLock()
+const SHOW_FETCH_INFLIGHT = Dict{String,ReentrantLock}()
+
 # Resolve `st.path` to a file on the SERVER's disk, fetching it from the worker
-# if we don't already have it. Throws if it can't be obtained.
+# if we don't already have it. Blocks for the transfer (multi-GB videos take
+# a while — receive_file streams into `<dst>.partial` and renames, so isfile
+# never sees a torso). Throws if it can't be obtained.
 function fetch_show_file(st::ShowTool)
     server_dst = show_server_path(st)
     isfile(server_dst) && return server_dst        # already mirrored or cached
-    proj = get(st.state.projects[], st.project_id, nothing)
-    proj === nothing && error("bt_show: file not on server and no worker to fetch from: $(st.path)")
-    worker_src = isabspath(st.path) ? st.path : joinpath(proj.worker_path, st.path)
-    mkpath(dirname(server_dst))
-    fetch_file_from_worker(st.state, proj.worker_id, worker_src, server_dst; handoff_timeout=60.0)
-    return server_dst
+    dst_lock = lock(SHOW_FETCH_LOCKS) do
+        get!(ReentrantLock, SHOW_FETCH_INFLIGHT, server_dst)
+    end
+    lock(dst_lock) do
+        isfile(server_dst) && return server_dst    # the racer fetched it
+        proj = get(st.state.projects[], st.project_id, nothing)
+        proj === nothing && error("bt_show: file not on server and no worker to fetch from: $(st.path)")
+        worker_src = isabspath(st.path) ? st.path : joinpath(proj.worker_path, st.path)
+        mkpath(dirname(server_dst))
+        fetch_file_from_worker(st.state, proj.worker_id, worker_src, server_dst; handoff_timeout=60.0)
+        return server_dst
+    end
 end
 
 # MIME inferred from extension → the right element. Media point `src` at a
@@ -1193,6 +1273,28 @@ function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
     return nothing
 end
 
+# Session-config changes mid-turn: pure header metadata — update the shared
+# observable, no chat bubble, no persistence (config is ephemeral per
+# connection; the next bring-up resets it from the session-setup result).
+function process!(chat::ChatModel, m::AgentClientProtocol.ConfigUpdate)
+    s = shared(chat)
+    # The spec payload is the COMPLETE config state: replace the ConfigOption
+    # items, preserve any other meta kinds a future parser may have added.
+    rest = [x for x in s.session_meta[] if !(x isa AgentClientProtocol.ConfigOption)]
+    s.session_meta[] = Any[m.options..., rest...]
+    return nothing
+end
+
+function process!(chat::ChatModel, m::AgentClientProtocol.ModeUpdate)
+    s = shared(chat)
+    s.session_meta[] = Any[map(s.session_meta[]) do x
+        x isa AgentClientProtocol.ConfigOption && x.id == "mode" ?
+            AgentClientProtocol.ConfigOption(x.id, x.name, x.description,
+                x.category, m.mode_id, x.choices) : x
+    end...]
+    return nothing
+end
+
 to_message(chat::ChatModel, m::AgentClientProtocol.AgentMessage) = AgentMsg(chat, m.text)
 # Compact-summary "user" messages get their own centered kind. ACP doesn't carry
 # Claude Code's `isCompactSummary` flag, so we route on the verbatim opening.
@@ -1223,7 +1325,7 @@ bonito_app_msg(tc, server, chat) =
 
 build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.GenericTool) =
     is_bonito_app(tc) ? bonito_app_msg(tc, "", chat) :
-    GenericToolMsg(tc.id, tc.kind, tc.title, tc.status,
+    GenericToolMsg(tc.id, tc.kind, tc.name, tc.title, tc.status,
                    content_summary(tc.kind, tc.content),
                    time(), nothing, chat)
 
@@ -1280,7 +1382,13 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
         # Auto-expand the body: a live Bonito app always (it IS the point), or a
         # `bt_show` tool once its content carries a `shown:` ref. `auto_expand_body`
         # dispatches on the type — no content sniffing to decide.
-        (auto_expand_body(b) || has_show_reference(snap.content)) && (d["expand"] = true)
+        (auto_expand_body(b) || has_show_reference(snap.content)) &&
+            (d["expand"] = true)
+        # Displayable media (bt_show mime, or inline image content from
+        # e.g. Read on a PNG) — the client's Native Images mode keys on
+        # this; ship it with the update that carries the result.
+        mime = tool_media_mime(snap.content)
+        mime === nothing || (d["show_mime"] = mime)
         chat_emit(b.chat, d)
         ship_edit_preview!(b)
     end
@@ -1637,7 +1745,16 @@ function start_chat_client!(model::ChatModel)
     # `msgs_store` (e.g. project synced to a different worker), so we arm a
     # one-shot history prelude that the next prompt consumes (`with_prelude`).
     prev_session_id = model.chat_session.session_id
-    client, replay = start_session(model.transport, handler)
+    # `on_frame` taps every raw ACP frame (both directions) into
+    # chat_dir/acp.jsonl — inspectable live via GET /acp-log/<project_id>.
+    client, replay = start_session(model.transport, handler;
+                                   on_frame = acp_frame_logger(model.chat_dir))
+    # Header metadata: typed views over the raw session-setup result. A future
+    # agent kind extends this line with additional parsers over the same dict.
+    # (What the header SHOWS is a separate, display-side decision — see
+    # `show_in_header`.)
+    shared(model).session_meta[] =
+        Any[AgentClientProtocol.parse_config_options(client.session_result)...]
     model.client[] = client
     new_session_id = client.session_id
     if isempty(replay)
@@ -1964,7 +2081,7 @@ replayed_bonito_app_msg(tc, server) =
 
 replayed_tool_msg(tc::AgentClientProtocol.GenericTool) =
     is_bonito_app(tc) ? replayed_bonito_app_msg(tc, "") :
-    GenericToolMsg(tc.id, tc.kind, tc.title, tc.status,
+    GenericToolMsg(tc.id, tc.kind, tc.name, tc.title, tc.status,
                    content_summary(tc.kind, tc.content),
                    time(), time(), nothing)
 replayed_tool_msg(tc::AgentClientProtocol.BashCall) =
@@ -2003,6 +2120,50 @@ function reconcile_replay!(model::ChatModel, replay)
 end
 
 # ── DOM building (split into header / messages / input / banner) ──────────
+# ── Header metadata line ─────────────────────────────────────────────────────
+# One `header_pill` method per metadata kind in `session_meta` — future agents
+# add a struct + a method here, never touch the header skeleton. Display-only:
+# plain text spans (tooltip carries the full description), joined with " · "
+# on a second header line below the title/sync row.
+
+function pill_tooltip(o::AgentClientProtocol.ConfigOption)
+    c = AgentClientProtocol.current_choice(o)
+    c === nothing && return "$(o.name): $(o.current_value)"
+    isnothing(c.description) || isempty(c.description) ?
+        "$(o.name): $(c.name)" : "$(o.name): $(c.name) — $(c.description)"
+end
+
+# The model label ("Opus 4.7 with 1M context") is self-explanatory; the other
+# options need their name as a prefix to read well ("mode: Default").
+header_pill(o::AgentClientProtocol.ConfigOption) =
+    DOM.span(o.category == "model" ? AgentClientProtocol.pill_label(o) :
+             "$(lowercase(o.name)): $(AgentClientProtocol.pill_label(o))";
+        class = "bt-header-meta-item", title = pill_tooltip(o))
+# Fallback so an unknown meta kind degrades to its string form, not an error.
+header_pill(x) = DOM.span(string(x); class = "bt-header-meta-item")
+
+# Display policy: which meta items make it into the header line. Of claude's
+# config options only the MODEL is shown — the agent reports mode/effort as
+# unhelpful "default"s (and we won't fire extra RPCs just to fix a label).
+# All of them stay parsed on `session_meta` for future use; future meta kinds
+# default to visible.
+show_in_header(o::AgentClientProtocol.ConfigOption) = o.category == "model"
+show_in_header(::Any) = true
+
+# The most informative item (the model) leads the line.
+meta_order(x) = x isa AgentClientProtocol.ConfigOption && x.category == "model" ? 0 : 1
+
+function header_meta_line(items)
+    shown = sort(filter(show_in_header, collect(Any, items)); by = meta_order)
+    isempty(shown) && return DOM.span()
+    parts = Any[]
+    for (i, x) in enumerate(shown)
+        i > 1 && push!(parts, " · ")
+        push!(parts, header_pill(x))
+    end
+    DOM.div(parts...; class = "bt-header-meta")
+end
+
 function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state::Observable)
     state = model.state
     project_id = model.project_id
@@ -2012,6 +2173,11 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         DOM.span(""; class=alive ? "bt-dot bt-dot-online" : "bt-dot bt-dot-offline",
             title=alive ? "session live" : "session ended")
     end
+
+    # Session config (model / mode / effort …) as a plain-text second header
+    # line; re-renders whenever the agent reports a change (bring-up,
+    # config_option_update).
+    meta_line = map(header_meta_line, model.session_meta)
 
     sync_status = Observable("")
     sync_button = DOM.button(map(s -> isempty(s) ? "Sync" : s, sync_status);
@@ -2060,6 +2226,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     end
 
     # No back arrow — the unified app's sidebar Home icon is the way home.
+    # The session-config meta line renders as a second row BELOW the main one.
     DOM.div(
         DOM.div(
             status_dot,
@@ -2068,7 +2235,8 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
                 class="bt-header-title"),
             xsync_control,
             sync_button;
-            class="bt-header-row");
+            class="bt-header-row"),
+        meta_line;
         class="bt-header")
 end
 
@@ -2351,12 +2519,17 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
     Base.errormonitor(@async try
         body = render_tool_body(model.state, msg,
             model.cwd, model.chat_dir; project_id=model.project_id)
+        # `_btToolSlot` (bonitoteam.js) also finds slots on nodes the virtual
+        # scroll holds DETACHED (cache window / prefetch) — a plain
+        # document.querySelector misses those and the body would be stuck on
+        # "loading…". Fallback covers a not-yet-loaded chat module.
         Bonito.dom_in_js(
             session,
             body,
             js"""(elem) => {
-    const slot = document.querySelector(
-        '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
+    const slot = window._btToolSlot ? window._btToolSlot($(cmd.tool_id)) :
+        document.querySelector(
+            '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
     if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
 }"""
         )
@@ -2373,8 +2546,9 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
                 DOM.div("tool body unavailable: $(sprint(showerror, e))";
                         class = "bt-tool-error"),
                 js"""(elem) => {
-    const slot = document.querySelector(
-        '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
+    const slot = window._btToolSlot ? window._btToolSlot($(cmd.tool_id)) :
+        document.querySelector(
+            '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
     if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
 }""")
         catch
@@ -2540,20 +2714,44 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         chat_dispatch!(model, session, msg)
     end
 
-    messages_container = DOM.div(
-        DOM.div(class="bt-spacer-top"),
-        DOM.div(class="bt-spacer-bottom");
-        class="bt-messages")
-
-    init_script = js"""
-        $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm)))
-    """
-
     # Spinner class follows the shared busy_active observable so the
     # `bt-busy-active` class is set correctly on remount — the comm
     # `busy_start` / `busy_end` events only forward to FUTURE bridges,
     # so a tab that opens mid-prompt would otherwise miss the start.
     busy_class = map(b -> b ? "bt-busy bt-busy-active" : "bt-busy", model.busy_active)
+
+    messages_container = DOM.div(
+        DOM.div(class="bt-spacer-top"),
+        DOM.div(class="bt-spacer-bottom"),
+        # Busy dots + transient "reasoning…" indicator live INSIDE the
+        # scroll content, after the bottom spacer (message nodes insert
+        # before it) and before the overscroll tail — so they show up
+        # directly under the last message, not below the tail's empty
+        # space down by the composer. Like the tail, they're plain
+        # content the virtual-scroll geometry never tracks.
+        DOM.div(DOM.div(class="bt-busy-dot"),
+            DOM.div(class="bt-busy-dot"),
+            DOM.div(class="bt-busy-dot");
+            class=busy_class),
+        # Idle indicator — visible when the busy dots are NOT (CSS
+        # adjacent-sibling rule on `.bt-busy`, so it MUST stay the dots'
+        # immediate next sibling) AND the chat has agent replies on display
+        # (`bt-waiting-on`, toggled by `_updateWaiting` in bonitoteam.js).
+        # The slot under the last message thus says what the agent is
+        # doing: dots/reasoning mid-turn, waiting between turns — and
+        # nothing at all in a chat that hasn't been asked anything yet.
+        DOM.div("Waiting for your next instruction"; class="bt-waiting"),
+        # Transient "reasoning…" indicator (toggled by the `thinking` comm
+        # event in bonitoteam.js). Hidden until an agent thought is in flight.
+        DOM.div("💭 reasoning…"; class="bt-thinking"),
+        # Overscroll tail: empty space the user can scroll into below the
+        # last message (~30% of the pane; JS sizes it from clientHeight).
+        DOM.div(class="bt-messages-tail");
+        class="bt-messages")
+
+    init_script = js"""
+        $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm)))
+    """
 
     # Cross-worker sync modal state + apply. `nothing` ⇒ hidden; otherwise
     # `(current, other, comparison)`. `on_apply(src, dst)` runs the
@@ -2576,17 +2774,21 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         sync_modal,
         messages_container,
         init_script,
-        DOM.div(DOM.div(class="bt-busy-dot"),
-            DOM.div(class="bt-busy-dot"),
-            DOM.div(class="bt-busy-dot");
-            class=busy_class),
-        # Transient "reasoning…" indicator (toggled by the `thinking` comm event
-        # in bonitoteam.js). Hidden until an agent thought is in flight.
-        DOM.div("💭 reasoning…"; class="bt-thinking"),
         # Taskbar — floats over the messages area, top-left of the chat panel.
         # Populated entirely client-side by scanning live tool/todo pills (see
         # `setupTaskbar` in bonitoteam.js); the server never tracks slot state.
         DOM.div(class = "bt-taskbar"),
         chat_input_area(session, model),
+        # Toolbar below the composer. Populated entirely client-side by
+        # BonitoChat (`noteType`): one show/hide checkbox per message type the
+        # first time that type occurs. Sized to host future controls too.
+        DOM.div(class = "bt-chat-toolbar"),
+        # NOTE: there is deliberately NO mount curtain here. The dashboard's
+        # load overlay (`chat_waiting_view`, sidebar.jl) covers this pane
+        # from the moment the user clicks until the chat module reports the
+        # geometry settled (`bt-chat-settling` / `bt-chat-settled` events
+        # from `_startSettle` in bonitoteam.js) — one continuous loading
+        # surface instead of the old bring-up pane → bare gap → per-chat
+        # curtain relay.
         class="bt-app"))
 end

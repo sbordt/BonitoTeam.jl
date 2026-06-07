@@ -56,6 +56,38 @@ end
 
 session_file(chat_dir::AbstractString) = joinpath(String(chat_dir), "chat.md")
 
+# ── ACP wire-frame log ──────────────────────────────────────────────────────
+# Raw ACP JSON-RPC traffic (both directions), one envelope per line:
+#   {"ts": "2026-06-05T12:34:56.789Z", "dir": "in"|"out", "msg": <frame>}
+# Append-only, lives next to chat.md; served read-only via /acp-log/<pid>.
+
+acp_log_file(chat_dir::AbstractString) = joinpath(String(chat_dir), "acp.jsonl")
+
+"""
+    acp_frame_logger(chat_dir) -> Function
+
+Build an `on_frame` tap (see `AgentClientProtocol.Connection`) that appends
+every ACP frame to `chat_dir/acp.jsonl`. Per-call open-append: frames are
+low-rate (claude-agent-acp chunks are paragraph-sized), and holding no handle
+means restarts / external deletion need no lifecycle handling. The lock
+serializes the reader task (`:in`) against sender tasks (`:out`).
+"""
+function acp_frame_logger(chat_dir::AbstractString)
+    path = acp_log_file(chat_dir)
+    lk = ReentrantLock()
+    return function (dir::Symbol, msg::AbstractDict)
+        ts = Dates.format(now(UTC), dateformat"yyyy-mm-dd\THH:MM:SS.sss\Z")
+        lock(lk) do
+            open(path, "a") do io
+                JSON.print(io, Dict{String,Any}(
+                    "ts" => ts, "dir" => String(dir), "msg" => msg))
+                println(io)
+            end
+        end
+        return nothing
+    end
+end
+
 # Per-tool JSON snapshot of the latest ACP params (the wire format itself), so
 # tool bodies survive restarts and don't have to live in process memory.
 function tools_dir(chat_dir::AbstractString)
@@ -193,7 +225,10 @@ end
 
 function append_tool(session::ChatSession, msg::ToolMsg)
     open(session.path, "a") do io
-        meta = "$(msg.kind) · $(msg.status) · $(msg.id)"
+        # 4th field: the resolved filter key (`tool_key`) — persisting it makes
+        # the typed variants (Bash/Task/MCP…) reload with stable per-tool
+        # filter identities even though reload lands as `GenericToolMsg`.
+        meta = "$(msg.kind) · $(msg.status) · $(msg.id) · $(tool_key(msg))"
         println(io, "!!! tool \"$meta\"")
         println(io, "    `$(msg.title)`")
         # Brief summary on the collapsed header; full ACP body lives in
@@ -284,9 +319,13 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
         elseif category == "assistant"
             push!(msgs, AgentMsg(string(length(msgs)), String(body)))
         elseif category == "tool"
-            # title encodes "kind · status · id"
-            parts = split(title, " · "; limit = 3)
-            kind, status, id = length(parts) == 3 ? parts : ("other", "completed", "")
+            # title encodes "kind · status · id · name" — the 4th field (the
+            # tool's filter key) was added later; legacy 3-field chats parse
+            # with an empty name and fall back to filtering by kind.
+            parts = split(title, " · "; limit = 4)
+            kind, status, id, name =
+                length(parts) == 4 ? parts :
+                length(parts) == 3 ? (parts..., "") : ("other", "completed", "", "")
             # body is `` `<tool title>` `` then an optional summary line.
             title_line = match(r"`([^`]*)`", body)
             tool_title = title_line !== nothing ? String(title_line.captures[1]) : ""
@@ -300,8 +339,8 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
             # subtype-specific fields (background flag, MCP server, …) no
             # longer drive any live UX. New tool calls in the resumed session
             # come through the typed dispatcher again.
-            push!(msgs, GenericToolMsg(string(id), string(kind), tool_title,
-                                       string(status), summary,
+            push!(msgs, GenericToolMsg(string(id), string(kind), string(name),
+                                       tool_title, string(status), summary,
                                        time(), time(), nothing))
         elseif category == "plan"
             entries = PlanEntry[]

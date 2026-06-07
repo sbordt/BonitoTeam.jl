@@ -20,7 +20,21 @@ mutable struct Client
     conn::Connection
     session_id::String
     cwd::String
+    # The raw, untouched session-setup result (`session/new` / `session/load`)
+    # — mirrors `ToolCallNotif.raw`. The protocol layer stays lossless and
+    # unopinionated here; typed views are FUNCTIONS over this dict (e.g.
+    # `parse_config_options`), so agents with different metadata need no
+    # Client/transport changes.
+    session_result::Dict{String,Any}
 end
+
+# Back-compat: existing call sites (and tests) construct without a result.
+Client(conn::Connection, session_id::AbstractString, cwd::AbstractString) =
+    Client(conn, String(session_id), String(cwd), Dict{String,Any}())
+
+# Normalize whatever JSON gave us (Dict{String,Any} in practice).
+_result_dict(r) = r isa AbstractDict ?
+    Dict{String,Any}(String(k) => v for (k, v) in r) : Dict{String,Any}()
 
 # Default request handler for the local-subprocess Client. Handles the
 # fs/terminal/permission RPCs claude-agent-acp can fire. Holds the cwd so
@@ -118,7 +132,7 @@ function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
                           Dict("cwd" => cwd, "mcpServers" => mcp_list))
     session_id = result["sessionId"]
 
-    return Client(conn, session_id, cwd)
+    return Client(conn, session_id, cwd, _result_dict(result))
 end
 
 # One attached image for a multimodal prompt.
@@ -181,7 +195,9 @@ end
 # closes (so a long message can't deadlock on the bounded per-message channel).
 #
 # `params` is the `session/load` params dict (`sessionId`, `cwd`, `mcpServers`).
-# Returns after the load response arrives (the whole replay is drained). Throws
+# Returns `(msgs, result)` after the load response arrives (the whole replay is
+# drained) — `result` is the raw `session/load` response, which carries the same
+# session-config blocks as `session/new` (models/modes/configOptions). Throws
 # the rpc error / ConnectionClosed if the load fails.
 function replay_history(conn::Connection, params)
     updates, response = request_updates(conn, "session/load", params)
@@ -205,7 +221,7 @@ function replay_history(conn::Connection, params)
     wait(feeder)
     result = take!(response)
     result isa Exception && throw(result)
-    return msgs
+    return msgs, result
 end
 
 # Cancel the active turn (notification, non-blocking).

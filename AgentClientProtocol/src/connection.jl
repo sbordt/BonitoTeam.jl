@@ -93,6 +93,13 @@ mutable struct Connection
     next_id::Int
     handler::Handler
 
+    # Optional wire tap: called as `on_frame(dir::Symbol, msg::AbstractDict)`
+    # with dir ∈ (:in, :out) for every ACP JSON-RPC frame that crosses the
+    # connection — and ONLY those (internal events never pass through here).
+    # `nothing` = disabled. A throwing tap never breaks the connection
+    # (see `notify_frame`).
+    on_frame::Union{Function,Nothing}
+
     # The currently-active prompt turn. `prompt_updates` sets these; the
     # dispatcher feeds `session/update` notifications into `active_updates`
     # and closes it when the matching `session/prompt` response (id ==
@@ -151,10 +158,12 @@ mutable struct Connection
     @atomic cancel_at::Float64
 end
 
-function Connection(transport::Transport, handler::Handler = DiscardHandler())
+function Connection(transport::Transport, handler::Handler = DiscardHandler();
+                    on_frame::Union{Function,Nothing} = nothing)
     conn = Connection(transport,
                       Dict{Int,Channel{Any}}(), 0,
                       handler,
+                      on_frame,
                       nothing, nothing,          # active_updates, active_id
                       Channel{Any}(1024),
                       ReentrantLock(), nothing, nothing, false,
@@ -167,8 +176,21 @@ end
 
 # Convenience: `Connection(proc::Base.Process)` still works for the local
 # subprocess case — wraps `proc` in a SubprocessTransport.
-Connection(proc::Base.Process, handler::Handler = DiscardHandler()) =
-    Connection(SubprocessTransport(proc), handler)
+Connection(proc::Base.Process, handler::Handler = DiscardHandler();
+           on_frame::Union{Function,Nothing} = nothing) =
+    Connection(SubprocessTransport(proc), handler; on_frame)
+
+# Feed one frame to the wire tap. Isolated so a throwing tap can never take
+# down the reader loop or fail a send — the tap is observability, not flow.
+function notify_frame(conn::Connection, dir::Symbol, msg::AbstractDict)
+    conn.on_frame === nothing && return nothing
+    try
+        conn.on_frame(dir, msg)
+    catch e
+        @warn "ACP frame tap failed" exception=e maxlog=3
+    end
+    return nothing
+end
 
 # Single consumer of the inbox. Drains every inbound frame in wire order
 # and routes by kind via `dispatch_message`. Per-frame exceptions are
@@ -201,6 +223,9 @@ end
 # ── Writing ───────────────────────────────────────────────────────────────────
 
 function send_raw(conn::Connection, msg::AbstractDict)
+    # Tap outside `conn.lock` — the tap (e.g. a file logger) does its own
+    # locking and must not serialize against wire writes.
+    notify_frame(conn, :out, msg)
     line = JSON.json(msg) * "\n"
     lock(conn.lock) do
         send(conn.transport, line)
@@ -348,6 +373,7 @@ function reader_loop(conn::Connection)
                 @warn "ACP: failed to parse line" exception=e line
                 continue
             end
+            notify_frame(conn, :in, msg)
             put!(conn.inbox, msg)
         end
     catch e

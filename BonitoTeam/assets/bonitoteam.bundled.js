@@ -52,6 +52,24 @@ class Collapsable {
         this.loaded = true;
     }
 }
+const TYPE_LABELS = {
+    user: 'User',
+    agent: 'Agent',
+    thought: 'Thoughts',
+    plan: 'Todos',
+    summary: 'Summaries'
+};
+const TYPE_ORDER = [
+    'user',
+    'agent',
+    'thought',
+    'plan',
+    'summary'
+];
+const filterKey = (msg)=>msg.type === 'tool' ? 'tool:' + (msg.tool || 'other') : msg.type;
+const DEFAULT_HIDDEN = [
+    'tool:ToolSearch'
+];
 class BonitoChat {
     constructor(container, comm){
         this.container = container;
@@ -66,13 +84,48 @@ class BonitoChat {
         this.EST_HEIGHT = 80;
         this.OVERSCAN = 8;
         this.initialLoad = false;
+        this.ITEM_GAP = parseFloat(getComputedStyle(container).rowGap) || 0;
         this.followMode = true;
         this.unreadCount = 0;
         this.AT_BOTTOM_PX = 20;
         this.spacerTop = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
-        this.busyEl = container.parentElement.querySelector('.bt-busy');
-        this.thinkingEl = container.parentElement.querySelector('.bt-thinking');
+        this.toolbarEl = container.parentElement.querySelector('.bt-chat-toolbar');
+        this.hiddenTypes = new Set(DEFAULT_HIDDEN);
+        this.seenTypes = new Set();
+        this.keyByIdx = new Map();
+        this.filterRow = null;
+        this.optionsRow = null;
+        this.nativeImages = true;
+        this.nativeVideos = true;
+        if (this.toolbarEl) {
+            this.filterRow = document.createElement('div');
+            this.filterRow.className = 'bt-toolbar-filters';
+            this.optionsRow = document.createElement('div');
+            this.optionsRow.className = 'bt-toolbar-options';
+            this.toolbarEl.append(this.filterRow, this.optionsRow);
+            const addOption = (text, checked, onChange)=>{
+                const label = document.createElement('label');
+                label.className = 'bt-filter-toggle';
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.checked = checked;
+                cb.addEventListener('change', ()=>onChange(cb.checked));
+                label.append(cb, text);
+                this.optionsRow.appendChild(label);
+            };
+            addOption('Native Images', this.nativeImages, (on)=>this._setNativeMedia('image/', on));
+            addOption('Native Videos', this.nativeVideos, (on)=>this._setNativeMedia('video/', on));
+        }
+        this.busyEl = container.querySelector('.bt-busy');
+        this.waitingEl = container.querySelector('.bt-waiting');
+        this.thinkingEl = container.querySelector('.bt-thinking');
+        this.tailEl = container.querySelector('.bt-messages-tail');
+        this._sizeTail();
+        this.measureEl = document.createElement('div');
+        this.measureEl.className = 'bt-measure';
+        container.parentElement.appendChild(this.measureEl);
+        this._startSettle();
         comm.on((msg)=>{
             if (this.destroyed) return;
             if (msg && typeof msg === 'object') this.dispatch(msg);
@@ -81,7 +134,9 @@ class BonitoChat {
         if (cur && cur.type === 'msgs.count' && cur.n > 0) {
             this.applyCount(cur.n);
         } else if (cur && cur.type === 'msgs.range') {
+            this._startSettle();
             this.onRange(cur);
+            this._startPrefetch();
         }
         comm.notify({
             type: 'init'
@@ -103,8 +158,31 @@ class BonitoChat {
             passive: true
         });
         this._markUserInput = markUserInput;
+        this._scrollbarDrag = false;
+        this._onContainerMouseDown = ()=>{
+            this._scrollbarDrag = true;
+            markUserInput();
+        };
+        this._onWindowMouseUp = ()=>{
+            if (!this._scrollbarDrag) return;
+            this._scrollbarDrag = false;
+            markUserInput();
+            for (const node of this.cache.values()){
+                if (node.isConnected && node.dataset.btAutoExpand) {
+                    delete node.dataset.btAutoExpand;
+                    node.collapsable?.setExpanded(true);
+                }
+            }
+            this._queueRefresh();
+        };
+        container.addEventListener('mousedown', this._onContainerMouseDown, {
+            passive: true
+        });
+        window.addEventListener('mouseup', this._onWindowMouseUp, {
+            passive: true
+        });
         this._onScroll = ()=>{
-            const userDriven = performance.now() - this._lastUserInputT < 400;
+            const userDriven = this._scrollbarDrag || performance.now() - this._lastUserInputT < 400;
             const atBot = this.atBottom();
             if (userDriven) {
                 this.setFollowMode(atBot);
@@ -119,9 +197,13 @@ class BonitoChat {
         });
         this._containerRO = new ResizeObserver(()=>{
             if (this.destroyed) return;
+            this._sizeTail();
             if (this.followMode) this._queueScrollToBottom();
         });
         this._containerRO.observe(this.container);
+        if (this.busyEl) this._containerRO.observe(this.busyEl);
+        if (this.waitingEl) this._containerRO.observe(this.waitingEl);
+        if (this.thinkingEl) this._containerRO.observe(this.thinkingEl);
         if (window.visualViewport) {
             this._onVPResize = ()=>this.onViewportResize();
             window.visualViewport.addEventListener('resize', this._onVPResize);
@@ -141,6 +223,12 @@ class BonitoChat {
             this.container.removeEventListener('touchstart', this._markUserInput);
             this.container.removeEventListener('touchmove', this._markUserInput);
             this.container.removeEventListener('keydown', this._markUserInput);
+        }
+        if (this._onContainerMouseDown) {
+            this.container.removeEventListener('mousedown', this._onContainerMouseDown);
+        }
+        if (this._onWindowMouseUp) {
+            window.removeEventListener('mouseup', this._onWindowMouseUp);
         }
         if (this._scrollRafId !== null && this._scrollRafId !== undefined) {
             cancelAnimationFrame(this._scrollRafId);
@@ -171,6 +259,12 @@ class BonitoChat {
             this._onDrop && this.app.removeEventListener('drop', this._onDrop);
         }
         clearTimeout(this._attachErrorTimer);
+        clearTimeout(this._prefetchTimer);
+        if (!this._settleDone && this._paneEl) delete this._paneEl.dataset.btSettling;
+        if (this.measureEl) {
+            this.measureEl.remove();
+            this.measureEl = null;
+        }
         if (this._tickerId) {
             clearInterval(this._tickerId);
             this._tickerId = null;
@@ -228,10 +322,99 @@ class BonitoChat {
         }
     }
     applyCount(n) {
-        if (n <= 0) return;
+        if (n <= 0) {
+            this._startSettle();
+            this._settle();
+            return;
+        }
         this.totalCount = n;
         this.initialLoad = true;
+        this._startSettle();
         this.refresh();
+        this._startPrefetch();
+    }
+    _startSettle() {
+        if (this._settleWatch || this._settleDone) return;
+        this._settleWatch = true;
+        this._settleT0 = performance.now();
+        this._settleLastH = -1;
+        this._settleStable = 0;
+        this._paneEl = this.container.closest('.bt-chatpane');
+        if (this._paneEl) {
+            delete this._paneEl.dataset.btSettled;
+            this._paneEl.dataset.btSettling = '1';
+        }
+        this._announceSettle('bt-chat-settling');
+        const watch = ()=>{
+            if (this.destroyed || this._settleDone) return;
+            const h = this.container.scrollHeight;
+            if (h === this._settleLastH) this._settleStable++;
+            else {
+                this._settleStable = 0;
+                this._settleLastH = h;
+            }
+            const elapsed = performance.now() - this._settleT0;
+            const pendingBody = [
+                ...this.container.querySelectorAll('.bt-collapsable-loading')
+            ].some((el)=>!(el.closest('.bt-tool-msg')?.dataset.showMime || '').startsWith('video/'));
+            const pendingImg = [
+                ...this.container.querySelectorAll('img')
+            ].some((img)=>!img.complete);
+            const settled = this._settleStable >= 10 && elapsed > 400 && !this.initialLoad && !pendingBody && !pendingImg;
+            if (settled || elapsed > 5000) this._settle();
+            else requestAnimationFrame(watch);
+        };
+        requestAnimationFrame(watch);
+    }
+    _settle() {
+        if (this._settleDone) return;
+        this._settleDone = true;
+        this._settleWatch = false;
+        this.setFollowMode(true);
+        this.scrollToBottom();
+        if (this._paneEl) {
+            delete this._paneEl.dataset.btSettling;
+            this._paneEl.dataset.btSettled = '1';
+        }
+        this._announceSettle('bt-chat-settled');
+    }
+    _announceSettle(name) {
+        const pid = this._paneEl?.dataset.panePid || '';
+        window.dispatchEvent(new CustomEvent(name, {
+            detail: pid
+        }));
+    }
+    _startPrefetch() {
+        if (this._prefetchStarted) return;
+        this._prefetchStarted = true;
+        this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 600);
+    }
+    _prefetchTick() {
+        if (this.destroyed) return;
+        let e = -1;
+        for(let i = Math.min(this._prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--){
+            if (!this.cache.has(i)) {
+                e = i;
+                break;
+            }
+        }
+        if (e < 0) return;
+        let s = e;
+        while(s > 0 && !this.cache.has(s - 1) && e - s < 63)s--;
+        this._prefetchCursor = s - 1;
+        this._prefetchPending = [
+            s,
+            e
+        ];
+        this.comm.notify({
+            type: 'msgs.request',
+            range: [
+                s,
+                e
+            ]
+        });
+        clearTimeout(this._prefetchTimer);
+        this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 2000);
     }
     visibleRange() {
         if (this.totalCount === 0) return [
@@ -247,45 +430,78 @@ class BonitoChat {
             Math.min(this.totalCount - 1, e)
         ];
     }
+    effHeight(i) {
+        if (this.hiddenTypes.has(this.keyByIdx.get(i))) return 0;
+        return (this.heights.get(i) ?? this.EST_HEIGHT) + this.ITEM_GAP;
+    }
     indexAt(offset) {
         let h = 0;
         for(let i = 0; i < this.totalCount; i++){
-            h += this.heights.get(i) ?? this.EST_HEIGHT;
+            h += this.effHeight(i);
             if (h > offset) return i;
         }
         return Math.max(0, this.totalCount - 1);
     }
     cumHeight(from, to) {
         let h = 0;
-        for(let i = from; i < to; i++)h += this.heights.get(i) ?? this.EST_HEIGHT;
+        for(let i = from; i < to; i++)h += this.effHeight(i);
         return h;
     }
     refresh() {
         if (this.totalCount === 0) return;
+        const wasAtBottom = this.atBottom();
+        const preHeight = this.container.scrollHeight;
         const [s, e] = this.visibleRange();
-        const missing = [];
-        for(let i = s; i <= e; i++)if (!this.cache.has(i)) missing.push(i);
-        if (missing.length > 0) {
-            this.comm.notify({
-                type: 'msgs.request',
-                range: [
-                    missing[0],
-                    missing[missing.length - 1]
-                ]
-            });
+        if (!this._scrollbarDrag) {
+            const missing = [];
+            for(let i = s; i <= e; i++)if (!this.cache.has(i)) missing.push(i);
+            if (missing.length > 0) {
+                this.comm.notify({
+                    type: 'msgs.request',
+                    range: [
+                        missing[0],
+                        missing[missing.length - 1]
+                    ]
+                });
+            }
         }
         this.updateDOM(s, e);
+        if (wasAtBottom && !this._scrollbarDrag && this.container.scrollHeight !== preHeight) {
+            this.container.scrollTop = this.container.scrollHeight;
+        }
     }
     onRange({ start , msgs  }) {
         const messages = msgs ?? [];
+        const fresh = [];
         messages.forEach((data, i)=>{
             const idx = start + i;
             if (this.cache.has(idx)) return;
             const node = this.createNode(data);
             this.cache.set(idx, node);
+            this.keyByIdx.set(idx, filterKey(data));
             if (data.id) this.nodeById.set(data.id, node);
             this.observe(idx, node);
+            fresh.push([
+                idx,
+                node
+            ]);
         });
+        this._measureNodes(fresh);
+        if (this._prefetchStarted) {
+            clearTimeout(this._prefetchTimer);
+            this._prefetchTimer = setTimeout(()=>this._prefetchTick(), 30);
+        }
+        const pf = this._prefetchPending;
+        if (pf && start === pf[0]) {
+            this._prefetchPending = null;
+            const [vs, ve] = this.visibleRange();
+            const end = start + messages.length - 1;
+            if (end >= vs && start <= ve && !this._scrollbarDrag) {
+                this.updateDOM(vs, ve);
+            }
+            return;
+        }
+        if (this._scrollbarDrag) return;
         this.updateDOM(...this.visibleRange());
         if (this.initialLoad) {
             this.initialLoad = true;
@@ -305,15 +521,40 @@ class BonitoChat {
             this._queueScrollToBottom();
         }
     }
+    _measureNodes(pairs) {
+        if (!this.measureEl || pairs.length === 0) return;
+        const cs = getComputedStyle(this.container);
+        const w = this.container.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+        if (w <= 0) return;
+        this.measureEl.style.width = w + 'px';
+        const toMeasure = pairs.filter(([idx, node])=>!node.isConnected && !this.heights.has(idx));
+        for (const [, node] of toMeasure)this.measureEl.appendChild(node);
+        for (const [idx, node] of toMeasure){
+            const h = node.offsetHeight;
+            if (h > 0) this.heights.set(idx, h);
+        }
+        for (const [, node] of toMeasure){
+            if (node.parentNode === this.measureEl) this.measureEl.removeChild(node);
+        }
+    }
     observe(idx, node) {
         const ro = new ResizeObserver(([e])=>{
             const h = e.contentRect.height;
-            if (h > 0) {
+            if (h > 0 && this.heights.get(idx) !== h) {
                 this.heights.set(idx, h);
+                if (!this._scrollbarDrag) this._queueRefresh();
             }
         });
         ro.observe(node);
         this.ros.set(idx, ro);
+    }
+    _queueRefresh() {
+        if (this._refreshQueued || this.destroyed) return;
+        this._refreshQueued = true;
+        requestAnimationFrame(()=>{
+            this._refreshQueued = false;
+            if (!this.destroyed) this.refresh();
+        });
     }
     updateDOM(s, e) {
         if (s > e) return;
@@ -340,12 +581,17 @@ class BonitoChat {
         ].filter((i)=>i > idx).sort((a, b)=>a - b);
         const before = sorted.length ? this.cache.get(sorted[0]) : this.spacerBottom;
         this.container.insertBefore(node, before);
+        if (node.dataset && node.dataset.btAutoExpand && !this._scrollbarDrag) {
+            delete node.dataset.btAutoExpand;
+            node.collapsable?.setExpanded(true);
+        }
     }
     appendNewMessage(msg) {
         const idx = this.totalCount - 1;
         if (!this.cache.has(idx)) {
             const node = this.createNode(msg);
             this.cache.set(idx, node);
+            this.keyByIdx.set(idx, filterKey(msg));
             if (msg.id) this.nodeById.set(msg.id, node);
             this.observe(idx, node);
         }
@@ -432,12 +678,101 @@ class BonitoChat {
             }
             prev.innerHTML = msg.preview;
         }
-        if (msg.expand && node.collapsable) node.collapsable.setExpanded(true);
+        if (msg.show_mime) node.dataset.showMime = msg.show_mime;
+        if (this._wantsNative(node)) {
+            this._applyNative(node);
+        } else if (msg.expand && node.collapsable) {
+            if (node.isConnected) node.collapsable.setExpanded(true);
+            else node.dataset.btAutoExpand = '1';
+        }
         if (msg.taskbar) node.dataset.toolTaskbar = '1';
         this._refreshTaskbar();
     }
+    noteKey(msg) {
+        const key = filterKey(msg);
+        if (!key || this.seenTypes.has(key) || !this.filterRow) return;
+        this.seenTypes.add(key);
+        if (key === 'agent') this._updateWaiting();
+        const isTool = key.startsWith('tool:');
+        const text = isTool ? key.slice(5) : TYPE_LABELS[key] ?? key;
+        const label = document.createElement('label');
+        label.className = 'bt-filter-toggle';
+        label.dataset.key = key;
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !this.hiddenTypes.has(key);
+        cb.addEventListener('change', ()=>this.setKeyHidden(key, !cb.checked));
+        label.append(cb, text);
+        const toggles = ()=>[
+                ...this.filterRow.querySelectorAll('.bt-filter-toggle')
+            ];
+        if (isTool) {
+            this.ensureToolGroupLabel();
+            const next = toggles().find((el)=>el.dataset.key.startsWith('tool:') && el.dataset.key.slice(5).localeCompare(text) > 0);
+            this.filterRow.insertBefore(label, next ?? null);
+        } else {
+            const order = (t)=>{
+                const i = TYPE_ORDER.indexOf(t);
+                return i < 0 ? TYPE_ORDER.length : i;
+            };
+            const next = toggles().find((el)=>!el.dataset.key.startsWith('tool:') && order(el.dataset.key) > order(key)) ?? this.filterRow.querySelector('.bt-filter-group-label');
+            this.filterRow.insertBefore(label, next ?? null);
+        }
+    }
+    ensureToolGroupLabel() {
+        if (this.filterRow.querySelector('.bt-filter-group-label')) return;
+        const span = document.createElement('span');
+        span.className = 'bt-filter-group-label';
+        span.textContent = 'Tools:';
+        this.filterRow.appendChild(span);
+    }
+    _wantsNative(node) {
+        const mime = node.dataset.showMime || '';
+        if (mime.startsWith('image/')) return this.nativeImages;
+        if (mime.startsWith('video/')) return this.nativeVideos;
+        return false;
+    }
+    _applyNative(node) {
+        node.classList.add('bt-tool-native');
+        if (node.isConnected) {
+            node.collapsable?.setExpanded(true);
+        } else {
+            node.dataset.btAutoExpand = '1';
+        }
+    }
+    _removeNative(node) {
+        node.classList.remove('bt-tool-native');
+        delete node.dataset.btAutoExpand;
+        node.collapsable?.setExpanded(false);
+    }
+    _setNativeMedia(prefix, on) {
+        if (prefix === 'image/') this.nativeImages = on;
+        else this.nativeVideos = on;
+        for (const node of this.cache.values()){
+            if (!(node.dataset.showMime || '').startsWith(prefix)) continue;
+            on ? this._applyNative(node) : this._removeNative(node);
+        }
+        this.refresh();
+    }
+    setKeyHidden(key, hidden) {
+        this.hiddenTypes[hidden ? 'add' : 'delete'](key);
+        for (const node of this.cache.values()){
+            if (node.dataset.filterKey === key) node.style.display = hidden ? 'none' : '';
+        }
+        if (key === 'agent') this._updateWaiting();
+        this.refresh();
+        if (this.followMode) this._queueScrollToBottom();
+    }
+    _updateWaiting() {
+        if (!this.waitingEl) return;
+        const on = this.seenTypes.has('agent') && !this.hiddenTypes.has('agent');
+        this.waitingEl.classList.toggle('bt-waiting-on', on);
+    }
     createNode(msg) {
         const div = document.createElement('div');
+        const fkey = filterKey(msg);
+        div.dataset.filterKey = fkey;
+        this.noteKey(msg);
         switch(msg.type){
             case 'user':
                 div.className = 'bt-user-msg';
@@ -502,7 +837,13 @@ class BonitoChat {
                         wideBtn.textContent = active ? '«' : '»';
                         wideBtn.title = active ? 'Collapse to default width' : 'Expand to full chat width';
                     });
-                    if (msg.expand) queueMicrotask(()=>div.collapsable.setExpanded(true));
+                    if (msg.show_mime) div.dataset.showMime = msg.show_mime;
+                    if (this._wantsNative(div)) {
+                        div.classList.add('bt-tool-native');
+                        div.dataset.btAutoExpand = '1';
+                    } else if (msg.expand) {
+                        div.dataset.btAutoExpand = '1';
+                    }
                     break;
                 }
             case 'plan':
@@ -530,6 +871,7 @@ class BonitoChat {
                     break;
                 }
         }
+        if (this.hiddenTypes.has(fkey)) div.style.display = 'none';
         return div;
     }
     unqueueOldestUser() {
@@ -659,11 +1001,16 @@ class BonitoChat {
         this.taskbarEl.replaceChildren(frag);
         this._tickLiveTimers();
     }
+    _sizeTail() {
+        if (!this.tailEl) return;
+        this.tailEl.style.height = Math.round(this.container.clientHeight * 0.3) + 'px';
+    }
     atBottom() {
         const { scrollTop , scrollHeight , clientHeight  } = this.container;
         return scrollHeight - scrollTop - clientHeight < this.AT_BOTTOM_PX;
     }
     _queueScrollToBottom() {
+        if (this._scrollbarDrag) return;
         if (this._scrollQueued || this.destroyed) return;
         this._scrollQueued = true;
         this._scrollRafId = requestAnimationFrame(()=>{
@@ -673,9 +1020,11 @@ class BonitoChat {
         });
     }
     scrollToBottom() {
+        if (this._scrollbarDrag) return;
         this.container.scrollTop = this.container.scrollHeight;
-        if (this.spacerBottom) {
-            this.spacerBottom.scrollIntoView({
+        const anchor = this.tailEl || this.spacerBottom;
+        if (anchor) {
+            anchor.scrollIntoView({
                 block: 'end',
                 behavior: 'auto'
             });
@@ -943,9 +1292,21 @@ function arrayBufferToBase64(buf) {
     }
     return btoa(binary);
 }
+const CHAT_INSTANCES = new Set();
+window._btToolSlot = (id)=>{
+    const direct = document.querySelector(`.bt-tool-body[data-tool-id="${CSS.escape(id)}"]`);
+    if (direct) return direct;
+    for (const chat of CHAT_INSTANCES){
+        const node = chat.nodeById.get(id);
+        const slot = node && node.querySelector('.bt-tool-body');
+        if (slot) return slot;
+    }
+    return null;
+};
 function connect(node, comm) {
     const chat = new BonitoChat(node, comm);
     node.__bt_chat = chat;
+    CHAT_INSTANCES.add(chat);
     const parent = node.parentNode;
     if (parent) {
         const mo = new MutationObserver(()=>{
@@ -953,6 +1314,7 @@ function connect(node, comm) {
                 try {
                     chat.destroy();
                 } catch (_) {}
+                CHAT_INSTANCES.delete(chat);
                 mo.disconnect();
             }
         });

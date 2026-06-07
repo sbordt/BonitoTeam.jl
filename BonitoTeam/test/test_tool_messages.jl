@@ -421,3 +421,77 @@ end
         @test BT.parse_chat_command(Dict("type" => "stop_tool")) isa BT.UnknownCommand
     end
 end
+
+# ── Per-tool filter keys (toolbar show/hide is keyed on the ACP tool name) ──
+@testset "per-tool filter keys" begin
+
+    @testset "tool_key dispatch" begin
+        named = BT.GenericToolMsg("g1", "other", "ToolSearch", "Search tools",
+                                  "completed", "", 0.0, 0.0, nothing)
+        @test BT.tool_key(named) == "ToolSearch"
+        # 8-arg back-compat ctor → name="" → kind fallback (old chats,
+        # agents without the claudeCode meta).
+        nameless = BT.GenericToolMsg("g2", "read", "cat x", "completed", "",
+                                     0.0, 0.0, nothing)
+        @test nameless.name == ""
+        @test BT.tool_key(nameless) == "read"
+
+        bash = BT.BashToolMsg("b1", "execute", "ls -la", "completed", "",
+                              0.0, 0.0, "ls -la", false, "", 0, false, "", nothing)
+        @test BT.tool_key(bash) == "Bash"
+        task = BT.TaskToolMsg("t1", "execute", "Explore", "completed", "",
+                              0.0, 0.0, "explore", false, nothing, nothing)
+        @test BT.tool_key(task) == "Task"
+        mcp = BT.MCPToolMsg("m1", "other", "bt_show", "completed", "",
+                            0.0, 0.0, "btworker", "bt_show", nothing)
+        @test BT.tool_key(mcp) == "bt_show"
+        app = BT.BonitoAppMsg("a1", "bonito_app", "plot", "completed", "",
+                              0.0, 0.0, "btworker", "app-1", nothing)
+        @test BT.tool_key(app) == "bt_show_app"
+    end
+
+    @testset "wire header carries the filter key" begin
+        named = BT.GenericToolMsg("g1", "other", "ToolSearch", "Search tools",
+                                  "completed", "", 0.0, 0.0, nothing)
+        @test BT.tool_header_dict(named)["tool"] == "ToolSearch"
+        bash = BT.BashToolMsg("b1", "execute", "ls -la", "completed", "",
+                              0.0, 0.0, "ls -la", false, "", 0, false, "", nothing)
+        @test BT.tool_header_dict(bash)["tool"] == "Bash"
+        mcp = BT.MCPToolMsg("m1", "other", "bt_show", "completed", "",
+                            0.0, 0.0, "btworker", "bt_show", nothing)
+        @test BT.tool_header_dict(mcp)["tool"] == "bt_show"
+    end
+
+    @testset "persistence: filter key survives reload" begin
+        dir = mktempdir()
+        session = BT.load_session(dir, dir)
+        # A typed Bash tool persists its resolved key…
+        BT.append_tool(session, BT.BashToolMsg("b1", "execute", "ls -la",
+            "completed", "12 files", 0.0, 0.0, "ls -la", false, "", 0, false, "", nothing))
+        # …and so does a named generic tool.
+        BT.append_tool(session, BT.GenericToolMsg("g1", "other", "ToolSearch",
+            "Search tools", "completed", "", 0.0, 0.0, nothing))
+        loaded = filter(m -> m isa BT.ToolMsg, BT.load_history(session))
+        @test [m.name for m in loaded] == ["Bash", "ToolSearch"]
+        @test [BT.tool_key(m) for m in loaded] == ["Bash", "ToolSearch"]
+        # Reload lands as GenericToolMsg, key intact.
+        @test all(m -> m isa BT.GenericToolMsg, loaded)
+    end
+
+    @testset "persistence: legacy 3-field tool meta still parses" begin
+        dir = mktempdir()
+        session = BT.load_session(dir, dir)
+        open(session.path, "a") do io
+            println(io, "!!! tool \"read · completed · old1\"")
+            println(io, "    `cat file.txt`")
+            println(io)
+        end
+        loaded = filter(m -> m isa BT.ToolMsg, BT.load_history(session))
+        @test length(loaded) == 1
+        t = loaded[1]
+        @test t.id == "old1" && t.kind == "read" && t.status == "completed"
+        @test t.name == ""
+        @test BT.tool_key(t) == "read"    # kind fallback
+    end
+
+end

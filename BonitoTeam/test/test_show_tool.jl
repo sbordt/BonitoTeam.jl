@@ -148,4 +148,50 @@ newstate() = BT.ServerState(; state_dir = mktempdir(),
         @test !haskey(BT.tool_header_dict(BT.GenericToolMsg("tid2","read","cat","completed","",
                                                               0.0, 0.0, nothing), chat_dir), "expand")
     end
+
+    @testset "show_mime on the wire (native-image toggle)" begin
+        # parse_show_mime: extracts the mime from the reference tail.
+        @test BT.parse_show_mime("shown: /a/b.png (image/png, 34 KB)") == "image/png"
+        @test BT.parse_show_mime("shown: /a/b c.png (image/png, 1.2 MB)") == "image/png"
+        @test BT.parse_show_mime("shown: /x/v.mp4 (video/mp4, 1MB)") == "video/mp4"
+        # Older refs without the parenthesized tail → no mime, no crash.
+        @test BT.parse_show_mime("shown: /a/plain") === nothing
+        @test BT.parse_show_mime("not a show ref") === nothing
+
+        # tool_header_dict ships show_mime alongside expand for image shows.
+        ACP = BonitoTeam.AgentClientProtocol
+        chat_dir = mktempdir()
+        imgtc = ACP.GenericTool("img1", "other", "bt_show", "completed",
+                                 ACP.ToolContent[ACP.TextContent("shown: /p/plot.png (image/png, 34 KB)")],
+                                 Channel{ACP.ToolCall}(1))
+        BT.persist_tool_content!(chat_dir, imgtc)
+        d = BT.tool_header_dict(BT.GenericToolMsg("img1","other","bt_show","completed","",
+                                                   0.0, 0.0, nothing), chat_dir)
+        @test d["expand"] == true
+        @test d["show_mime"] == "image/png"
+
+        # Non-show tools carry no show_mime.
+        plaintc = ACP.GenericTool("p1", "read", "cat", "completed",
+                                   ACP.ToolContent[ACP.TextContent("file contents")],
+                                   Channel{ACP.ToolCall}(1))
+        BT.persist_tool_content!(chat_dir, plaintc)
+        @test !haskey(BT.tool_header_dict(BT.GenericToolMsg("p1","read","cat","completed","",
+                                                              0.0, 0.0, nothing), chat_dir), "show_mime")
+
+        # Inline image content (e.g. Read on a PNG) ships its mime too —
+        # but does NOT auto-expand (that's bt_show's behavior only).
+        imgread = ACP.GenericTool("r1", "read", "Read x.png", "completed",
+                                   ACP.ToolContent[ACP.ImageContent("aGk=", "image/png")],
+                                   Channel{ACP.ToolCall}(1))
+        BT.persist_tool_content!(chat_dir, imgread)
+        d2 = BT.tool_header_dict(BT.GenericToolMsg("r1","read","Read x.png","completed","",
+                                                    0.0, 0.0, nothing), chat_dir)
+        @test d2["show_mime"] == "image/png"
+        @test !haskey(d2, "expand")
+
+        # tool_media_mime: show ref wins over inline images; text-only → nothing.
+        @test BT.tool_media_mime(Any[ACP.TextContent("shown: /a.png (image/png, 1 KB)"),
+                                     ACP.ImageContent("aGk=", "image/jpeg")]) == "image/png"
+        @test BT.tool_media_mime(Any[ACP.TextContent("hello")]) === nothing
+    end
 end

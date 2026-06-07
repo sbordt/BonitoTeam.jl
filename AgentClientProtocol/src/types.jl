@@ -90,6 +90,119 @@ struct UnknownUpdate <: SessionUpdate
     raw::AbstractDict
 end
 
+# ── Session config options ────────────────────────────────────────────────────
+# ACP "Session Config Options": the session-setup response MAY carry a list of
+# select-type options (`configOptions`) with their current values; the agent
+# notifies changes via `config_option_update` / `current_mode_update` session
+# updates. claude-agent-acp reports mode/model/effort this way (plus legacy
+# `modes` / claude-specific `models` blocks, which `parse_config_options`
+# falls back to for agents that don't send `configOptions`).
+
+struct ConfigOptionChoice
+    value::String
+    name::String
+    description::Union{String,Nothing}
+end
+
+struct ConfigOption
+    id::String                           # "mode" | "model" | "effort" | …
+    name::String                         # human label, e.g. "Model"
+    description::Union{String,Nothing}
+    category::Union{String,Nothing}      # "mode" | "model" | "thought_level" | …
+    current_value::String
+    choices::Vector{ConfigOptionChoice}
+end
+
+struct ConfigOptionUpdateNotif <: SessionUpdate
+    options::Vector{ConfigOption}        # spec: payload is the COMPLETE state
+end
+
+struct CurrentModeUpdateNotif <: SessionUpdate
+    mode_id::String
+end
+
+_opt_desc(x) = x isa AbstractString && !isempty(x) ? String(x) : nothing
+
+function parse_config_option(d::AbstractDict)::ConfigOption
+    choices = ConfigOptionChoice[]
+    for c in get(d, "options", [])
+        c isa AbstractDict || continue
+        push!(choices, ConfigOptionChoice(
+            String(get(c, "value", "")),
+            String(get(c, "name", "")),
+            _opt_desc(get(c, "description", nothing))))
+    end
+    return ConfigOption(
+        String(get(d, "id", "")),
+        String(get(d, "name", "")),
+        _opt_desc(get(d, "description", nothing)),
+        _opt_desc(get(d, "category", nothing)),
+        String(get(d, "currentValue", "")),
+        choices)
+end
+
+"""
+    parse_config_options(result) -> Vector{ConfigOption}
+
+Typed view over a raw session-setup result (`session/new` / `session/load`).
+Primary source is the spec'd `configOptions` list. When absent, synthesizes
+options from the legacy `modes` block (ACP spec) and the claude-agent-acp
+`models` block, so spec-only agents still yield a usable list.
+"""
+function parse_config_options(result::AbstractDict)::Vector{ConfigOption}
+    raw = get(result, "configOptions", nothing)
+    if raw isa AbstractVector && !isempty(raw)
+        return [parse_config_option(d) for d in raw if d isa AbstractDict]
+    end
+    # Fallback synthesis for agents without configOptions.
+    opts = ConfigOption[]
+    modes = get(result, "modes", nothing)
+    if modes isa AbstractDict
+        choices = [ConfigOptionChoice(String(get(m, "id", "")),
+                                      String(get(m, "name", "")),
+                                      _opt_desc(get(m, "description", nothing)))
+                   for m in get(modes, "availableModes", []) if m isa AbstractDict]
+        isempty(choices) || push!(opts, ConfigOption(
+            "mode", "Mode", nothing, "mode",
+            String(get(modes, "currentModeId", "")), choices))
+    end
+    models = get(result, "models", nothing)
+    if models isa AbstractDict
+        choices = [ConfigOptionChoice(String(get(m, "modelId", "")),
+                                      String(get(m, "name", "")),
+                                      _opt_desc(get(m, "description", nothing)))
+                   for m in get(models, "availableModels", []) if m isa AbstractDict]
+        isempty(choices) || push!(opts, ConfigOption(
+            "model", "Model", nothing, "model",
+            String(get(models, "currentModelId", "")), choices))
+    end
+    return opts
+end
+
+current_choice(o::ConfigOption)::Union{ConfigOptionChoice,Nothing} =
+    (i = findfirst(c -> c.value == o.current_value, o.choices);
+     i === nothing ? nothing : o.choices[i])
+
+"""
+    pill_label(o::ConfigOption) -> String
+
+Short display label for the option's current value. For the MODEL option,
+"default" is an ALIAS in claude-agent-acp — the substance lives in the
+resolved choice's description ("Opus 4.7 with 1M context · Most capable for
+complex work"), so we surface its first segment instead of the word
+"Default". Everything else (mode, effort, …) shows its plain choice name —
+their descriptions are explanations, not values.
+"""
+function pill_label(o::ConfigOption)::String
+    c = current_choice(o)
+    c === nothing && return o.current_value
+    if c.value == "default" && o.category == "model" &&
+       c.description !== nothing && !isempty(strip(c.description))
+        return String(strip(first(split(c.description, '·'))))
+    end
+    return c.name
+end
+
 # ── Parsing helpers ───────────────────────────────────────────────────────────
 
 function parse_content_block(d::AbstractDict)::ContentBlock
@@ -176,6 +289,13 @@ function parse_session_update(params::AbstractDict)::SessionUpdate
             isempty(rinput) ? nothing : rinput,
             params
         )
+    elseif kind == "config_option_update"
+        # Spec: the payload is the COMPLETE updated configuration state.
+        opts = [parse_config_option(d)
+                for d in get(params, "configOptions", []) if d isa AbstractDict]
+        return ConfigOptionUpdateNotif(opts)
+    elseif kind == "current_mode_update"
+        return CurrentModeUpdateNotif(String(get(params, "modeId", "")))
     else
         return UnknownUpdate(kind, params)
     end

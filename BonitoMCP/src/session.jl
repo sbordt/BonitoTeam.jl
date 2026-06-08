@@ -138,8 +138,13 @@ interactive Bonito apps into the chat. Idempotent + lazy (call when Bonito is
 loaded, e.g. from `bt_show_app`).
 """
 function ensure_eval_dialed!(s::JuliaSession)
-    wsurl = get(ENV, "BONITOTEAM_EVAL_WS", "")
-    isempty(wsurl) && return s
+    # `BONITOTEAM_SERVER_URL` is set by the BonitoWorker daemon (the install
+    # URL it dialed in on) and inherited down through claude-agent-acp → MCP
+    # child. Single source of truth for "where the server is", shared with the
+    # worker-control WS so the two dial-backs can't disagree.
+    server_url = get(ENV, "BONITOTEAM_SERVER_URL", "")
+    isempty(server_url) && return s
+    wsurl = replace(rstrip(server_url, '/'), r"^http" => "ws") * "/eval-ws"
     is_alive(s) || start!(s)
     secret     = get(ENV, "BONITOTEAM_SECRET", "")
     project_id = get(ENV, "BONITOTEAM_PROJECT_ID", "")

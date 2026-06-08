@@ -309,12 +309,13 @@ function teardown_eval_bridge!(state::ServerState, project_id::AbstractString)
 end
 
 # Env the server injects into the BonitoMCP MCP server so its eval worker can
-# dial `/eval-ws` back. `state.srv` gives the public base URL (http→ws, https→wss).
+# dial `/eval-ws` back. The dial-back URL itself is NOT set here — the
+# BonitoWorker daemon supplies `BONITOTEAM_SERVER_URL` (the URL it dialed in
+# on), and BonitoMCP derives the eval-ws path from it. That keeps the two
+# dial-backs (worker-control WS + eval WS) keyed off the same proven URL
+# and avoids the server having to guess its own outward-facing address.
 function eval_dialback_env(state::ServerState, project_id::AbstractString)
-    state.srv === nothing && return Dict{String,String}()
-    wsurl = replace(Bonito.online_url(state.srv, "/eval-ws"), r"^http" => "ws")
     return Dict{String,String}(
-        "BONITOTEAM_EVAL_WS"    => wsurl,
         "BONITOTEAM_SECRET"     => state.worker_secret,
         "BONITOTEAM_PROJECT_ID" => String(project_id),
     )

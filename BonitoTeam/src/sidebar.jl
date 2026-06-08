@@ -796,8 +796,25 @@ function unified_main(session::Bonito.Session, state::ServerState,
         root.dataset.activeView = pid || '';
         const dash = root.querySelector('.bt-view-dash');
         if (dash) dash.style.display = (!pid) ? 'flex' : 'none';
+        // Per-pane visibility + an `onShown` ping on the one we just
+        // revealed. The ping lets BonitoChat re-anchor to the bottom on
+        // each open while followMode is on (user was at the bottom), and
+        // preserves the user's scroll position otherwise. Without this,
+        // a kept-alive pane keeps the scrollTop the browser had when we
+        // hid it — fine when the user had scrolled up to read history,
+        // but stale ("missing the latest message") when they had been
+        // following the conversation. Brand-new chats use this same
+        // path: followMode defaults true on construction, so first open
+        // also lands at the bottom even if the initial mount's scroll
+        // attempts raced against late image / virtual-scroll measuring.
         root.querySelectorAll('.bt-view-chats .bt-chatpane').forEach(p => {
-            p.style.display = (p.dataset.panePid === pid) ? 'flex' : 'none';
+            const visible = (p.dataset.panePid === pid);
+            p.style.display = visible ? 'flex' : 'none';
+            if (visible) {
+                const msgs = p.querySelector('.bt-messages');
+                const chat = msgs && msgs.__bt_chat;
+                if (chat && typeof chat.onShown === 'function') chat.onShown();
+            }
         });
     }""")
     return container

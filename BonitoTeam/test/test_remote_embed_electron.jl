@@ -48,6 +48,7 @@ end
         pid = "elec-" * string(rand(UInt16))
         env = BT.eval_dialback_env(h.state, pid)
         for (k,v) in env; ENV[k] = v; end
+        ENV["BONITOTEAM_SERVER_URL"] = Bonito.online_url(h.state.srv, "")
         BonitoMCP.restart!(BonitoMCP.manager(), ROOT)
 
         res = BonitoMCP.julia_show_app_handler(Dict("code"=>APPCODE, "env_path"=>ROOT))
@@ -107,7 +108,7 @@ end
         @test Malt.remote_eval_fetch(root_worker(), :(E2E_COUNT[])) == 9
         println("✓ real browser: bt_show_app renders, is interactive, and survives a dom_in_js re-render")
     finally
-        for k in ("BONITOTEAM_EVAL_WS","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
+        for k in ("BONITOTEAM_SERVER_URL","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
         win === nothing || (try; close(win.window); catch; end)
         try; close(h); catch; end
     end

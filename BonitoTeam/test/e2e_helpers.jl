@@ -43,6 +43,10 @@ function fake_agent_project!(h, n::Int; name::AbstractString = "churn", code::Ab
     wid = first(keys(h.state.workers[]))
     p = BT.create_project_from_worker!(h.state, wid, ROOT; name = name, start_session = false)
     for (k, v) in BT.eval_dialback_env(h.state, p.id); ENV[k] = v; end
+    # In production this is set by the BonitoWorker daemon from its install
+    # URL. Tests bypass that daemon (spawn BonitoMCP directly), so we plug it
+    # in from the local Bonito server's URL.
+    ENV["BONITOTEAM_SERVER_URL"] = Bonito.online_url(h.state.srv, "")
     BonitoMCP.restart!(BonitoMCP.manager(), ROOT)        # eval worker that dials THIS server, keyed to p.id
     appids = String[]
     for _ in 1:n
@@ -92,7 +96,7 @@ end
 function close_browser(appE)
     EC = Bonito.HTTPServer.current_electron()
     appE === nothing || try EC.close(appE) catch end
-    for k in ("BONITOTEAM_EVAL_WS", "BONITOTEAM_SECRET", "BONITOTEAM_PROJECT_ID")
+    for k in ("BONITOTEAM_SERVER_URL", "BONITOTEAM_SECRET", "BONITOTEAM_PROJECT_ID")
         haskey(ENV, k) && delete!(ENV, k)
     end
 end

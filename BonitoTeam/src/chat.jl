@@ -201,16 +201,25 @@ mutable struct AgentMsg <: ChatMsg
     # `msgs.request`, but a stale cache would silently lose the trailing chunks).
     html::String
     chat::Union{ChatModel,Nothing}
+    # True between `send!` (streaming start) and `close` (turn-end finalize).
+    # The orphan sweep keys on this so an ACP session that drops mid-stream
+    # — and never runs the normal `close` — gets the bubble finalized + the
+    # `agent_final` wire event emitted from `sweep_turn_orphans!`. Also makes
+    # `close` idempotent: re-close on an already-final bubble is a no-op
+    # instead of double-appending to chat.md.
+    in_flight::Bool
 end
 # Cache starts empty in BOTH paths (history-load/replay-adopt AND streaming):
 # `ensure_html!` populates on first request, then every subsequent fetch is free.
 # Eagerly pre-building here would push the per-message parse onto chat-open;
 # lazy distributes it across the scroll events that actually need it (~3 ms
 # per 30-msg visible window) while keeping repeat fetches allocation-free.
+# History-load / replay-adopt: `in_flight = false` (text is already final).
+# Streaming construction: `in_flight = true`, flipped in `close(::AgentMsg)`.
 AgentMsg(id::AbstractString, text::AbstractString) =
-    AgentMsg(String(id), String(text), "", nothing)
+    AgentMsg(String(id), String(text), "", nothing, false)
 AgentMsg(chat::ChatModel, text::AbstractString) =
-    AgentMsg(string(uuid4()), String(text), "", chat)
+    AgentMsg(string(uuid4()), String(text), "", chat, true)
 
 # Lazy cache populate. Used by `msg_to_dict` / `wire_final`.
 ensure_html!(m::AgentMsg) =
@@ -338,9 +347,12 @@ mutable struct ThoughtMsg <: ChatMsg
     id::String
     text::String
     chat::Union{ChatModel,Nothing}
+    # Same semantics as `AgentMsg.in_flight` — orphan-sweep target + makes
+    # `close` idempotent (so a session-died sweep can't double-persist).
+    in_flight::Bool
 end
-ThoughtMsg(id::AbstractString, text::AbstractString) = ThoughtMsg(String(id), String(text), nothing)
-ThoughtMsg(chat::ChatModel, text::AbstractString) = ThoughtMsg(string(uuid4()), String(text), chat)
+ThoughtMsg(id::AbstractString, text::AbstractString) = ThoughtMsg(String(id), String(text), nothing, false)
+ThoughtMsg(chat::ChatModel, text::AbstractString)    = ThoughtMsg(string(uuid4()), String(text), chat, true)
 
 # TodoWrite stays a top-level ChatMsg (NOT under ToolMsg) because it arrives
 # as its own `Plan` wire variant — distinct from the `tool_call` channel —
@@ -380,6 +392,39 @@ is_live(t::TodoListMsg) =
     t.finished_at === nothing &&
     any(e -> e.status in ("pending", "in_progress"), t.entries)
 is_live(::ChatMsg) = false
+
+# "This tool started but never reached terminal status" — used by the
+# `run_turn!` end-of-turn sweep as a defense-in-depth backstop. Keyed on
+# `status` (NOT `is_live`) so it does NOT match a backgrounded bash whose
+# tool_call already reported `"completed"` at launch (those have a separate
+# lifecycle owned by the bg poller). A live worker app (`BonitoAppMsg`) also
+# stays terminal-status here for the same reason — its app lifetime is owned
+# by the EvalBridge, not the chat-message close.
+is_turn_orphan(m::ToolMsg)    = !(m.status in ("completed", "failed"))
+# Streaming AgentMsg / ThoughtMsg whose `close` never ran (session died
+# mid-stream so `process_update!` / `process!` exited via exception before
+# their close-in-finally). The sweep's `close(m)` ships the missing wire
+# final and persists to chat.md — without this they'd remain forever as
+# half-rendered streaming bubbles in JS and missing from disk.
+is_turn_orphan(m::AgentMsg)   = m.in_flight
+is_turn_orphan(m::ThoughtMsg) = m.in_flight
+# Live plan (any pending/in_progress entry) whose driving agent disappeared:
+# `close(::TodoListMsg)` stamps `finished_at` so the JS taskbar removes
+# the slot and the next agent's first `TodoWrite` starts a fresh plan
+# instead of absorbing into the abandoned one. A plan whose entries are
+# all-done already has `finished_at` set; `is_live` is false; we skip.
+is_turn_orphan(m::TodoListMsg) = is_live(m)
+# NOTE: background `BashToolMsg` (status="completed" + bg_running=true) is
+# DELIBERATELY NOT an orphan. The shell IS a child of the ACP subprocess
+# we just killed — it may or may not have died with its parent depending
+# on process-group / nohup setup. What's stable is the OUTPUT FILE
+# already on disk (and the tail RPC over the WS to the worker), so the
+# poller's existing "fd closed / no growth" detection finalises the
+# bubble naturally if the shell did die, or keeps streaming if it
+# didn't. Force-failing in the sweep would discard accumulated output
+# and skip the natural completion event — worse UX than letting the
+# poller settle it.
+is_turn_orphan(::ChatMsg)     = false
 
 # A background-or-streamy task that deserves a taskbar slot. Default false;
 # Bash with `run_in_background`, Task/Agent with `run_in_background`, and
@@ -1176,23 +1221,85 @@ Base.append!(m::SummaryMsg, t::AbstractString) = (m.text *= t; m.html = ""; m)
 # event. UserMsg / TodoListMsg have no `*_final` event; a ToolMsg only persists once
 # it reaches a terminal status. AgentMsg builds its rendered html ONCE here so
 # later `msgs.request` round-trips (scroll-back, re-mount) reuse the cache.
-Base.close(m::AgentMsg) = (ensure_html!(m); finalize_agent(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
-Base.close(m::ThoughtMsg) = (append_thought(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
+function Base.close(m::AgentMsg)
+    # Idempotent: the orphan sweep can race with `process_update!`'s own
+    # close-in-finally. Without this guard a second close would re-append to
+    # chat.md (not idempotent on disk) and re-emit `agent_final` to JS.
+    m.in_flight || return nothing
+    m.in_flight = false
+    ensure_html!(m)
+    finalize_agent(m.chat.chat_session, m)
+    chat_emit(m.chat, wire_final(m))
+    return nothing
+end
+function Base.close(m::ThoughtMsg)
+    m.in_flight || return nothing
+    m.in_flight = false
+    append_thought(m.chat.chat_session, m)
+    chat_emit(m.chat, wire_final(m))
+    return nothing
+end
 Base.close(m::UserMsg) = (append_user(m.chat.chat_session, m); nothing)
 # Persist only. The previous version also stamped `finished_at = time()`,
 # which made every just-created TodoListMsg immediately stop being "live"
 # and broke cross-turn absorption (the next TodoWrite found the prior
 # bubble as not-live and spawned a fresh one — visible in the chat
 # history as a parallel stack of duplicate todo bubbles, each with its
-# own timer ticking). `finished_at` is now set exclusively by
-# `try_absorb_todo!` when the absorbed entries become all-done.
+# own timer ticking). Normal lifecycle: persist initial snapshot only —
+# `try_absorb_todo!` is the path that flips `finished_at` once entries
+# go all-done; mid-life updates keep landing through there. This close
+# runs at INITIAL emit (a fresh `TodoListMsg` that couldn't absorb into
+# a prior bubble), so it must NOT touch `finished_at` — otherwise a
+# brand-new plan with pending entries lands non-live and the JS taskbar
+# misses it. The orphan sweep on `restart_chat_session!` uses the
+# `finalize_orphan!` verb below, NOT this close.
 Base.close(m::TodoListMsg) =
     (append_plan(m.chat.chat_session, m); nothing)
+
+# `finalize_orphan!` — what the restart orphan sweep calls. For most
+# kinds it IS `close` (their normal finalize): AgentMsg / ThoughtMsg
+# close is already idempotent + ships the trailing wire_final; ToolMsg
+# close force-fails non-terminal status + emits the terminal
+# tool_update. For TodoListMsg the two are distinct verbs: `close` is
+# the initial-persist step the live-emit path uses, while
+# `finalize_orphan!` is the "your driving agent went away — stop being
+# live so a fresh one doesn't absorb into you" path. Splitting them
+# avoids the trap where the initial-emit close accidentally drops
+# liveness off a plan whose entries are still pending.
+finalize_orphan!(m::AgentMsg)   = close(m)
+finalize_orphan!(m::ThoughtMsg) = close(m)
+finalize_orphan!(m::ToolMsg)    = close(m)
+function finalize_orphan!(m::TodoListMsg)
+    m.finished_at === nothing || return nothing
+    m.finished_at = time()
+    append_plan(m.chat.chat_session, m)
+    chat_emit(m.chat, plan_update_dict(m))
+    return nothing
+end
+# Default for kinds we don't sweep (UserMsg, SummaryMsg, BashToolMsg in
+# background mode, …). Explicit no-op so dispatch never falls into a
+# generic `close` for something we deliberately don't want finalised.
+finalize_orphan!(::ChatMsg) = nothing
+# Close is TOTAL: every reachable status finalizes. If the status isn't already
+# terminal (cancel mid-tool, EOF, an upstream backstop that closed `updates`
+# without a final snap), treat that as failure — flip to "failed", emit one
+# trailing `tool_update` so the browser freezes the timer + stops the pulse,
+# then persist. The old guarded form silently no-op'd on non-terminal status,
+# which left the bubble pulsing forever AND skipped the chat.md append (so a
+# reload couldn't show the tool either). Callers should not need to satisfy a
+# precondition on `status` — that's exactly the "wrong-by-construction" shape
+# we're trying to avoid here.
 function Base.close(m::ToolMsg)
-    if m.status in ("completed", "failed")
+    if !(m.status in ("completed", "failed"))
+        m.status = "failed"
+        pretty_title, _ = pretty_tool_title(m.title)
         m.finished_at === nothing && (m.finished_at = time())
-        append_tool(m.chat.chat_session, m)
+        chat_emit(m.chat, Dict{String,Any}("type" => "tool_update", "id" => m.id,
+            "status" => "failed", "title" => pretty_title,
+            "summary" => m.summary, "finished_at" => m.finished_at))
     end
+    m.finished_at === nothing && (m.finished_at = time())
+    append_tool(m.chat.chat_session, m)
     nothing
 end
 Base.close(m::SummaryMsg) = (ensure_html!(m); append_summary(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
@@ -1265,10 +1372,19 @@ process!(chat::ChatModel, m::AgentClientProtocol.Message) =
 function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
     chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => true))
     text = m.text
-    for delta in m.updates
-        text *= delta
+    try
+        for delta in m.updates
+            text *= delta
+        end
+    finally
+        # MUST fire even if the update iteration threw (session died mid-
+        # thought / channel closed with InvalidStateException). Without
+        # this, the JS `bt-thinking-active` class stays on forever — the
+        # whole "reasoning…" indicator is stuck until another full thought
+        # turn completes successfully. `run_turn!`'s finally has a second
+        # defensive emit as a belt-and-suspenders backstop.
+        chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => false))
     end
-    chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => false))
     isempty(strip(text)) || close(send!(chat, ThoughtMsg(chat, text)))
     return nothing
 end
@@ -1351,10 +1467,19 @@ build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.MCPCall) =
 
 # Default: stream the message's text deltas into the bubble, then finalize.
 function process_update!(b::ChatMsg, m::AgentClientProtocol.Message)
-    for delta in m.updates
-        append!(b, delta)
+    try
+        for delta in m.updates
+            append!(b, delta)
+        end
+    finally
+        # The `close(b)` MUST fire even when the update iteration threw
+        # (session died mid-stream). `Base.close(::AgentMsg/::ThoughtMsg)`
+        # is now idempotent + emits `agent_final`/`thought_final`, so the
+        # browser sees a finalized bubble instead of one stuck in
+        # `bt-stream-active`. If we somehow miss this path the orphan
+        # sweep catches it via `is_turn_orphan(::AgentMsg) = m.in_flight`.
+        close(b)
     end
-    close(b)
     return nothing
 end
 
@@ -1364,35 +1489,38 @@ end
 # `b::ToolMsg` covers every concrete variant — they all carry the same five
 # header fields the update path touches.
 function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
-    persist_tool_content!(b.chat.chat_dir, m)
-    ship_edit_preview!(b)
-    for snap in m.updates
-        prev_status = b.status
-        b.status = snap.status
-        b.title = snap.title
-        b.summary = content_summary(snap.kind, snap.content)
-        # Stamp `finished_at` on terminal-transition so the live timer freezes.
-        prev_status in ("completed", "failed") || !(b.status in ("completed", "failed")) ||
-            (b.finished_at = time())
-        persist_tool_content!(b.chat.chat_dir, snap)
-        pretty_title, _ = pretty_tool_title(b.title)
-        d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
-            "status" => b.status, "title" => pretty_title, "summary" => b.summary)
-        b.finished_at === nothing || (d["finished_at"] = b.finished_at)
-        # Auto-expand the body: a live Bonito app always (it IS the point), or a
-        # `bt_show` tool once its content carries a `shown:` ref. `auto_expand_body`
-        # dispatches on the type — no content sniffing to decide.
-        (auto_expand_body(b) || has_show_reference(snap.content)) &&
-            (d["expand"] = true)
-        # Displayable media (bt_show mime, or inline image content from
-        # e.g. Read on a PNG) — the client's Native Images mode keys on
-        # this; ship it with the update that carries the result.
-        mime = tool_media_mime(snap.content)
-        mime === nothing || (d["show_mime"] = mime)
-        chat_emit(b.chat, d)
+    try
+        persist_tool_content!(b.chat.chat_dir, m)
         ship_edit_preview!(b)
+        for snap in m.updates
+            prev_status = b.status
+            b.status = snap.status
+            b.title = snap.title
+            b.summary = content_summary(snap.kind, snap.content)
+            # Stamp `finished_at` on terminal-transition so the live timer freezes.
+            prev_status in ("completed", "failed") || !(b.status in ("completed", "failed")) ||
+                (b.finished_at = time())
+            persist_tool_content!(b.chat.chat_dir, snap)
+            pretty_title, _ = pretty_tool_title(b.title)
+            d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
+                "status" => b.status, "title" => pretty_title, "summary" => b.summary)
+            b.finished_at === nothing || (d["finished_at"] = b.finished_at)
+            # Auto-expand the body: a live Bonito app always (it IS the point), or a
+            # `bt_show` tool once its content carries a `shown:` ref. `auto_expand_body`
+            # dispatches on the type — no content sniffing to decide.
+            (auto_expand_body(b) || has_show_reference(snap.content)) &&
+                (d["expand"] = true)
+            # Displayable media (bt_show mime, or inline image content from
+            # e.g. Read on a PNG) — the client's Native Images mode keys on
+            # this; ship it with the update that carries the result.
+            mime = tool_media_mime(snap.content)
+            mime === nothing || (d["show_mime"] = mime)
+            chat_emit(b.chat, d)
+            ship_edit_preview!(b)
+        end
+    finally
+        close(b)        # total: finalizes the bubble even if the loop body threw
     end
-    close(b)
     return nothing
 end
 
@@ -1423,51 +1551,56 @@ end
 # the background-task poller then streams the file and finalizes when the shell
 # exits. Non-background bashes fall through to the generic ToolMsg handling.
 function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
-    persist_tool_content!(b.chat.chat_dir, m)
-    for snap in m.updates
-        b.status  = snap.status
-        b.title   = snap.title
-        b.summary = content_summary(snap.kind, snap.content)
-        persist_tool_content!(b.chat.chat_dir, snap)
-        # Detect a background launch from the RESULT ("…running in background…
-        # Output is being written to: <path>"), NOT from rawInput's
-        # `run_in_background` — some agent builds don't forward it, so
-        # `is_background` reads false even for a real background bash. The result
-        # text is the reliable signal; flip `is_background` on so the taskbar +
-        # `is_live` treat it as the live task it is.
-        if isempty(b.bg_output_path)
-            path = parse_bg_output_path(snap.content)
-            if path !== nothing
-                @debug "background task detected from result" id = b.id path = basename(path)
-                b.is_background  = true
-                b.bg_output_path = path
-                b.bg_offset      = 0
-                b.bg_running     = true       # the poller now owns its lifecycle
+    try
+        persist_tool_content!(b.chat.chat_dir, m)
+        for snap in m.updates
+            b.status  = snap.status
+            b.title   = snap.title
+            b.summary = content_summary(snap.kind, snap.content)
+            persist_tool_content!(b.chat.chat_dir, snap)
+            # Detect a background launch from the RESULT ("…running in background…
+            # Output is being written to: <path>"), NOT from rawInput's
+            # `run_in_background` — some agent builds don't forward it, so
+            # `is_background` reads false even for a real background bash. The result
+            # text is the reliable signal; flip `is_background` on so the taskbar +
+            # `is_live` treat it as the live task it is.
+            if isempty(b.bg_output_path)
+                path = parse_bg_output_path(snap.content)
+                if path !== nothing
+                    @debug "background task detected from result" id = b.id path = basename(path)
+                    b.is_background  = true
+                    b.bg_output_path = path
+                    b.bg_offset      = 0
+                    b.bg_running     = true       # the poller now owns its lifecycle
+                end
             end
+            # Foreground bash (or a failed launch): stamp finished_at on terminal.
+            # A live background task is left unstamped — the poller finalizes it.
+            if !b.bg_running && b.status in ("completed", "failed")
+                b.finished_at === nothing && (b.finished_at = time())
+            end
+            pretty_title, _ = pretty_tool_title(b.title)
+            d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
+                "status" => b.bg_running ? "in_progress" : b.status,
+                "title" => pretty_title, "summary" => b.summary)
+            if b.bg_running
+                d["background"] = true
+                # `wire_new` shipped `taskbar=false` (is_background was still false —
+                # rawInput omits run_in_background); now that we know it IS a
+                # background task, flip the taskbar slot on so it joins the bar.
+                d["taskbar"] = true
+            elseif b.finished_at !== nothing
+                d["finished_at"] = b.finished_at
+            end
+            chat_emit(b.chat, d)
         end
-        # Foreground bash (or a failed launch): stamp finished_at on terminal.
-        # A live background task is left unstamped — the poller finalizes it.
-        if !b.bg_running && b.status in ("completed", "failed")
-            b.finished_at === nothing && (b.finished_at = time())
-        end
-        pretty_title, _ = pretty_tool_title(b.title)
-        d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
-            "status" => b.bg_running ? "in_progress" : b.status,
-            "title" => pretty_title, "summary" => b.summary)
-        if b.bg_running
-            d["background"] = true
-            # `wire_new` shipped `taskbar=false` (is_background was still false —
-            # rawInput omits run_in_background); now that we know it IS a
-            # background task, flip the taskbar slot on so it joins the bar.
-            d["taskbar"] = true
-        elseif b.finished_at !== nothing
-            d["finished_at"] = b.finished_at
-        end
-        chat_emit(b.chat, d)
+    finally
+        # A live background task is finalized later (by `finalize_bg_task!` when the
+        # shell exits); only persist-to-chat.md here if it already terminated. The
+        # guard belongs inside `finally` so a thrown loop body doesn't accidentally
+        # close (= mark "failed") a still-running background shell.
+        b.bg_running || close(b)
     end
-    # A live background task is finalized later (by `finalize_bg_task!` when the
-    # shell exits); only persist-to-chat.md here if it already terminated.
-    b.bg_running || close(b)
     return nothing
 end
 
@@ -1494,12 +1627,40 @@ end
 # fresh, cheap once settled). "Done" is the output file's fd closing — the shell
 # exited (see the worker's `file_held_open`); a non-Linux worker falls back to
 # output quiescence.
-const BG_POLL_BASE    = 0.5
-const BG_POLL_MAX     = 5.0
-const BG_QUIESCE_SECS = 20.0   # non-Linux fallback: no growth this long ⇒ done
+# Non-Linux fallback: if the worker can't report `open_known` on the
+# output file's fd, we infer "the shell exited" from "no growth in 20 s".
+const BG_QUIESCE_SECS = 20.0
 
-function start_background_task_poller!(state::ServerState)
-    Base.errormonitor(@async background_task_poll_loop(state))
+# Per-chat background-output poller. Spawned on `start_chat_client!`,
+# torn down when the chat closes. The task IS the taskbar's bookkeeping
+# loop from the server's side: every second it walks THIS chat's live
+# bg items (the same set the JS `_refreshTaskbar` paints) and tails
+# their output. No global loop walking every model's msgs_store; no
+# global cadence constant — the 1 s sleep is inline, the task's
+# lifetime is the chat's, and a closed chat takes its poller with it.
+#
+# We use an IdDict keyed on the shared model rather than a field so the
+# struct layout stays stable (= no precompile rebuild). Lookups are
+# O(1) and the dict only ever has one entry per live chat.
+const BG_POLLERS         = IdDict{ChatModel,Task}()
+const BG_POLLERS_GC_LOCK = ReentrantLock()
+
+function start_background_poller!(state::ServerState, model::ChatModel)
+    s = shared(model)
+    lock(BG_POLLERS_GC_LOCK) do
+        existing = get(BG_POLLERS, s, nothing)
+        existing === nothing || istaskdone(existing) || return  # already live
+        BG_POLLERS[s] = Base.errormonitor(@async begin
+            try
+                background_poll_loop(state, s)
+            finally
+                lock(BG_POLLERS_GC_LOCK) do
+                    delete!(BG_POLLERS, s)
+                end
+            end
+        end)
+        return nothing
+    end
     return nothing
 end
 
@@ -1565,39 +1726,40 @@ function poll_background_task!(state::ServerState, model::ChatModel, m::BashTool
     return r
 end
 
-function background_task_poll_loop(state::ServerState)
-    sched = Dict{String,NTuple{3,Float64}}()   # id → (next poll, interval, last-grew)
+function background_poll_loop(state::ServerState, model::ChatModel)
+    # Per-tool state lives in the loop's closure: `last_grew` tracks the
+    # last time each id's output file grew (only consulted for the non-
+    # Linux quiesce fallback). When a tool finalizes we drop its entry.
+    last_grew = Dict{String,Float64}()
     while true
         try
-            for (_, model) in collect(state.chat_models)
-                for m in collect(model.msgs_store)
-                    (m isa BashToolMsg && m.is_background && m.bg_running &&
-                        !isempty(m.bg_output_path)) || continue
-                    nextt, interval, lastgrow = get(sched, m.id, (0.0, BG_POLL_BASE, time()))
-                    time() < nextt && continue
-                    before = m.bg_offset
-                    r = poll_background_task!(state, model, m)
-                    grew = m.bg_offset > before
-                    grew && (lastgrow = time())
-                    done = r !== nothing &&
-                        (r.open_known ? (r.exists && !r.open) :
-                                        (time() - lastgrow > BG_QUIESCE_SECS))
-                    if done
-                        finalize_bg_task!(model, m)
-                        delete!(sched, m.id)
-                    else
-                        sched[m.id] = (time() + interval, min(interval * 2, BG_POLL_MAX), lastgrow)
-                    end
+            for m in collect(model.msgs_store)
+                (m isa BashToolMsg && m.is_background && m.bg_running &&
+                    !isempty(m.bg_output_path)) || continue
+                before = m.bg_offset
+                r = poll_background_task!(state, model, m)
+                if m.bg_offset > before
+                    last_grew[m.id] = time()
+                end
+                lg = get(last_grew, m.id, time())
+                done = r !== nothing &&
+                    (r.open_known ? (r.exists && !r.open) :
+                                    (time() - lg > BG_QUIESCE_SECS))
+                if done
+                    finalize_bg_task!(model, m)
+                    delete!(last_grew, m.id)
                 end
             end
-            for id in collect(keys(sched))
-                any(mm -> any(x -> x isa BashToolMsg && x.id == id && x.bg_running,
-                              mm.msgs_store), values(state.chat_models)) || delete!(sched, id)
+            # GC `last_grew` for ids that are no longer live (finalized
+            # on a previous tick or an orphan sweep cleared them).
+            for id in collect(keys(last_grew))
+                any(x -> x isa BashToolMsg && x.id == id && x.bg_running,
+                    model.msgs_store) || delete!(last_grew, id)
             end
         catch e
             @warn "background task poll loop tick failed" exception = e
         end
-        sleep(0.25)
+        sleep(1.0)
     end
 end
 
@@ -1716,6 +1878,40 @@ function run_turn!(chat::ChatModel, user_msg::UserMessage)
         end
     finally
         chat.busy_active[] = false
+        # Defensive thinking=off. `process!(::Thought)` already emits this
+        # in its own finally, but in the multi-thought turn case the LAST
+        # thought may not be reached if an exception unwinds through
+        # `prompt!`'s consumer; this one-line backstop guarantees the JS
+        # indicator is cleared regardless. Idempotent in the JS handler.
+        chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => false))
+        # Defense in depth: anything still in non-terminal status at end-of-turn is
+        # an orphan — the `process_update!` per-tool drain SHOULD have finalized it
+        # via `close(b)` once the ACP `close(::TurnState)` backstop force-failed
+        # any tool the agent never resolved (see messages.jl). This sweep catches
+        # the case where `process!` itself threw before reaching that close. Keyed
+        # on `is_turn_orphan` — `ToolMsg` keys on status, `AgentMsg`/`ThoughtMsg`
+        # on `in_flight`, so background bashes (status already "completed" at
+        # launch) and live worker apps are correctly left alone, but a half-
+        # streamed agent reply / thought lands properly finalized in JS.
+        sweep_turn_orphans!(chat)
+    end
+    return nothing
+end
+
+function sweep_turn_orphans!(chat::ChatModel)
+    orphans = lock(chat.lock) do
+        ChatMsg[m for m in chat.msgs_store if is_turn_orphan(m)]
+    end
+    for m in orphans
+        try
+            # Dispatch to the kind-specific orphan verb (close for agent/
+            # thought/tool, the dedicated final stamp for TodoListMsg).
+            # Going through `close` directly would force a live plan into
+            # its initial-persist path AGAIN instead of finalising it.
+            finalize_orphan!(m)
+        catch e
+            @warn "turn-orphan sweep finalize failed" id = getfield(m, :id) exception = e
+        end
     end
     return nothing
 end
@@ -1780,6 +1976,11 @@ function start_chat_client!(model::ChatModel)
     if s.consumer_task[] === nothing
         s.consumer_task[] = Base.errormonitor(@async run_chat!(s))
     end
+    # And the per-chat background-output poller (one task that ticks every
+    # second, walks THIS chat's live `BashToolMsg`s with `bg_running=true`).
+    # Idempotent: re-calls on restart find the existing task still alive and
+    # do nothing. The task ends when the chat closes.
+    start_background_poller!(model.state, s)
 
     # Cache the live model so the sidebar can swap to this chat instantly and
     # test rigs can drive prompts via state.chat_models[pid] without the UI.
@@ -1793,22 +1994,100 @@ function start_chat_client!(model::ChatModel)
     return nothing
 end
 
+# Serializer for `restart_chat_session!` — keyed on the SHARED parent
+# ChatModel (so per-session views funnel to one gate). Two concurrent
+# restart calls would otherwise both close(old_client), both wait, both
+# call start_chat_client! — at best one of them losing its newly-spawned
+# client into the wind, at worst deadlocking because each blocks the
+# consumer task's `sweep_turn_orphans!` from acquiring `model.lock`. The
+# module-level IdDict avoids adding a struct field — restart is rare
+# (user click) so an IdDict lookup per call is fine; the entry lifetime
+# is one restart so no GC pressure either. The companion `RESTART_LOCK`
+# guards the dict itself across the read-test-set sequence.
+const RESTART_LOCK   = ReentrantLock()
+const RESTART_INFLIGHT = IdDict{ChatModel,Bool}()
+
 function restart_chat_session!(model::ChatModel)
     s = shared(model)
+    # Compare-and-swap the in-flight flag. If another restart is already
+    # running for this shared model, wait for it to clear and then return:
+    # whatever the user wanted to achieve (a fresh, alive session) is
+    # what that restart is delivering — we don't need to redo it. The
+    # bounded wait caps a misbehaving in-flight restart at 10 s so we
+    # can't wedge the caller indefinitely.
+    already = lock(RESTART_LOCK) do
+        if get(RESTART_INFLIGHT, s, false)
+            true
+        else
+            RESTART_INFLIGHT[s] = true
+            false
+        end
+    end
+    if already
+        deadline = time() + 10.0
+        while time() < deadline &&
+              lock(RESTART_LOCK) do; get(RESTART_INFLIGHT, s, false); end
+            sleep(0.02)
+        end
+        return nothing
+    end
     try
-        old = model.client[]
-        # close is idempotent + total: stdin EOF / WS peer close makes the
-        # agent exit cleanly and cascades through the Connection teardown, so
-        # any in-flight `prompt!` errors out (its turn loop ends) without stale
-        # updates leaking into the new session.
-        old === nothing || close(old)
-        s.busy_active[] = false        # any in-flight turn is dead now
-        start_chat_client!(model)      # brings up a fresh client[]; consumer keeps running
-        # Broadcast recovery to every connected tab via the shared parent.
-        s.session_alive[] = true
-        s.last_error[] = ""
-    catch e
-        s.last_error[] = "restart failed: $(sprint(showerror, e))"
+        try
+            old = model.client[]
+            # close is idempotent + total: stdin EOF / WS peer close makes the
+            # agent exit cleanly and cascades through the Connection teardown, so
+            # any in-flight `prompt!` errors out (its turn loop ends) without stale
+            # updates leaking into the new session.
+            if old !== nothing
+                close(old)
+                # Wait for the in-flight turn (if any) to actually exit so its
+                # try/catch/finally in `run_turn!` runs to completion BEFORE we
+                # boot a fresh client. That finally is what:
+                #   • emits the trailing `thinking=false`
+                #   • runs `sweep_turn_orphans!` (finalises half-streamed
+                #     AgentMsg / ThoughtMsg, fails open ToolMsg pills)
+                #   • clears `busy_active`
+                # If we raced past it the new client could start emitting
+                # chunks against the same comm while the old finally was still
+                # running — undefined ordering on the wire. Bounded wait so a
+                # wedged consumer can't block us forever; the explicit cleanup
+                # below covers any state that didn't settle in time.
+                deadline = time() + 2.0
+                while s.busy_active[] && time() < deadline
+                    sleep(0.02)
+                end
+            end
+            # Force-clean defensively even if the wait timed out / there was no
+            # in-flight turn to begin with.
+            s.busy_active[] = false
+            chat_emit(s, Dict{String,Any}("type" => "thinking", "active" => false))
+            sweep_turn_orphans!(s)
+            # ── JS-side reset ───────────────────────────────────────────────
+            # Single event the browser handler treats as "drop any UI state
+            # attached to the dead session" — clears `bt-thinking-active`,
+            # `bt-busy-active`, cancels any pending chase rAF, strips
+            # `bt-stream-active` from leftover streaming nodes. Emitted BEFORE
+            # the new client so a chunk from the fresh session can't be applied
+            # to a node that hasn't been cleared yet. The followup `msgs.count`
+            # below tells the virtual scroll the post-restart truth so any
+            # bubble whose final-form HTML changed during the orphan sweep
+            # gets re-fetched on next range request.
+            chat_emit(s, Dict{String,Any}("type" => "session_reset"))
+
+            start_chat_client!(model)      # brings up a fresh client[]; consumer keeps running
+            # Broadcast recovery to every connected tab via the shared parent.
+            s.session_alive[] = true
+            s.last_error[] = ""
+            chat_emit(s, Dict{String,Any}(
+                "type" => "msgs.count", "n" => length(s.msgs_store)))
+        catch e
+            s.last_error[] = "restart failed: $(sprint(showerror, e))"
+            @error "restart_chat_session! failed" exception=(e, catch_backtrace())
+        end
+    finally
+        lock(RESTART_LOCK) do
+            delete!(RESTART_INFLIGHT, s)
+        end
     end
 end
 
@@ -1842,23 +2121,23 @@ end
 # A duplicate of BonitoWorker's `strip_injected_context`/`meaningful_prompt`
 # kept here so the server side doesn't depend on the deployed worker's
 # version of those helpers (older workers pre-date them).
-const TITLE_CONTEXT_TAGS = ("ide_opened_file", "ide_selection", "system-reminder",
-                            "command-message", "command-name", "command-args",
-                            "command-contents", "local-command-stdout",
-                            "local-command-stderr", "bash-input", "bash-stdout",
-                            "bash-stderr")
+#
+# Generic strategy: strip ANY leading `<tag>…</tag>` block (closer matches
+# opener via backreference); after that, if the remainder still starts with a
+# bare `<tag>` opener it's system commentary (e.g. `<ide_opened_file>The user
+# opened …` with no closing tag) and contains no user prose, so we skip it.
+const TITLE_LEADING_TAG_BLOCK  = r"\A\s*<\s*([A-Za-z][\w-]*)\s*>.*?<\s*/\s*\1\s*>"is
+const TITLE_LEADING_TAG_OPENER = r"\A\s*<\s*[A-Za-z][\w-]*\s*>"
 
 function meaningful_title(raw::AbstractString)
     s = String(raw)
-    for tag in TITLE_CONTEXT_TAGS
-        s = replace(s, Regex("<\\s*$tag\\s*>.*?<\\s*/\\s*$tag\\s*>", "is") => " ")
+    while occursin(TITLE_LEADING_TAG_BLOCK, s)
+        s = replace(s, TITLE_LEADING_TAG_BLOCK => ""; count = 1)
     end
     s = strip(s)
     isempty(s) && return nothing
+    occursin(TITLE_LEADING_TAG_OPENER, s) && return nothing
     startswith(s, "Caveat: The messages below were generated by the user") && return nothing
-    (startswith(s, "<command-") || startswith(s, "<local-command") ||
-     startswith(s, "<bash-")    || startswith(s, "<ide_") ||
-     startswith(s, "<system-reminder")) && return nothing
     # Collapse whitespace runs, then truncate to a sidebar-friendly length.
     s = strip(replace(s, r"\s+" => " "))
     isempty(s) && return nothing
@@ -2225,6 +2504,45 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         xsync_button
     end
 
+    # Header-level restart: the ONE affordance for restarting the ACP session.
+    # Previously a banner showed only on session death + had its own button;
+    # that banner used Bonito.Button inside a conditional `map(…)` output,
+    # which re-rendered the DOM each `session_alive` toggle and on some
+    # cycles left the click handler bound to an orphaned element — "click
+    # does nothing". The permanent header button avoids that entirely:
+    # plain `DOM.button` + Observable click (same pattern as the sync
+    # buttons above), one DOM element for the lifetime of the chat.
+    #
+    # When the session dies, the button gains `bt-header-restart-dead` →
+    # CSS pulses it red and the title flips to the error message, so a
+    # failure is visible without a separate banner. Mid-restart the label
+    # reads "Restarting…" so the click is acknowledged synchronously.
+    restart_status = Observable("")
+    restart_label  = map(s -> isempty(s) ? "Restart" : s, restart_status)
+    restart_class  = map(model.session_alive) do alive
+        alive ? "bt-header-restart" : "bt-header-restart bt-header-restart-dead"
+    end
+    restart_title  = map(model.session_alive, model.last_error) do alive, err
+        alive  && return "Stop and respawn the agent process for this chat"
+        isempty(err) ? "Session ended — click to reconnect" :
+                       "Session ended: $err — click to reconnect"
+    end
+    restart_button = DOM.button(restart_label;
+        class   = restart_class,
+        title   = restart_title,
+        onclick = js"event => $(restart_status).notify('__click__')")
+    on(session, restart_status) do s
+        s == "__click__" || return
+        restart_status[] = "Restarting…"
+        @async begin
+            try
+                restart_chat_session!(model)
+            finally
+                safe_set!(restart_status, "")
+            end
+        end
+    end
+
     # No back arrow — the unified app's sidebar Home icon is the way home.
     # The session-config meta line renders as a second row BELOW the main one.
     DOM.div(
@@ -2234,29 +2552,11 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
                 DOM.span(basename(rstrip(cwd, '/')); title=cwd),
                 class="bt-header-title"),
             xsync_control,
-            sync_button;
+            sync_button,
+            restart_button;
             class="bt-header-row"),
         meta_line;
         class="bt-header")
-end
-
-function chat_session_banner(session::Bonito.Session, model::ChatModel)
-    restart_btn = Bonito.Button("Restart session"; style=nothing,
-        class="bt-btn bt-btn-secondary")
-    on(session, restart_btn.value) do clicked
-        clicked && @async restart_chat_session!(model)
-    end
-    map(model.session_alive, model.last_error) do alive, err
-        alive && return DOM.div()
-        DOM.div(
-            DOM.div(
-                DOM.span("⚠ Session ended"; style=Styles("font-weight" => "600")),
-                DOM.div(isempty(err) ? "The agent connection was closed." : err;
-                    class="bt-banner-detail");
-                style=Styles("flex" => "1 1 auto", "min-width" => "0")),
-            restart_btn;
-            class="bt-banner-error")
-    end
 end
 
 # Icons live as standalone SVG files under assets/icons/ and ship as
@@ -2770,7 +3070,6 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
 
     Bonito.jsrender(session, DOM.div(
         chat_header(session, model, sync_modal_state),
-        chat_session_banner(session, model),
         sync_modal,
         messages_container,
         init_script,

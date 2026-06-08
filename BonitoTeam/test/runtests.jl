@@ -100,6 +100,8 @@ include("test_cancel_stress.jl")
 
 include("test_tool_messages.jl")
 
+include("test_tool_close_total.jl")
+
 include("test_acp_log.jl")
 
 include("test_session_config.jl")

@@ -51,6 +51,7 @@ end
     try
         pid = "chat-" * string(rand(UInt16))
         for (k,v) in BT.eval_dialback_env(h.state, pid); ENV[k] = v; end
+        ENV["BONITOTEAM_SERVER_URL"] = Bonito.online_url(h.state.srv, "")
         BonitoMCP.restart!(BonitoMCP.manager(), ROOT)
         # Establish the dial-back bridge: a trivial bt_show_app makes the worker dial.
         @test BonitoMCP.julia_show_app_handler(
@@ -82,7 +83,7 @@ end
         @test Malt.remote_eval_fetch(root_worker(), :(COUNT[])) == 7
         println("✓ live worker app renders + drives as a real ChatModel bubble in a browser")
     finally
-        for k in ("BONITOTEAM_EVAL_WS","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
+        for k in ("BONITOTEAM_SERVER_URL","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
         win === nothing || (try; close(win.window); catch; end)
         try; close(h); catch; end
     end

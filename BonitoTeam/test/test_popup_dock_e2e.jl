@@ -64,6 +64,7 @@ Bonito.App(s -> Bonito.DOM.div("popup-dock test"; id = "dock_app_root"))
         # 3. Boot the eval dial-back: a trivial bt_show_app makes the worker
         #    dial back over /eval-ws and populate EVAL_WORKERS[pid].
         for (k, v) in BT.eval_dialback_env(h.state, pid); ENV[k] = v; end
+        ENV["BONITOTEAM_SERVER_URL"] = Bonito.online_url(h.state.srv, "")
         BonitoMCP.restart!(BonitoMCP.manager(), ROOT)
         @test BonitoMCP.julia_show_app_handler(Dict(
             "code"     => "using Bonito; Bonito.App(s -> Bonito.DOM.div(\"dial\"))",
@@ -139,7 +140,7 @@ Bonito.App(s -> Bonito.DOM.div("popup-dock test"; id = "dock_app_root"))
         println("✓ Detach + dock E2E: embed migrates through bubble → popup → plotpane, bt-plotpane-visible toggles")
 
     finally
-        for k in ("BONITOTEAM_EVAL_WS", "BONITOTEAM_SECRET", "BONITOTEAM_PROJECT_ID")
+        for k in ("BONITOTEAM_SERVER_URL", "BONITOTEAM_SECRET", "BONITOTEAM_PROJECT_ID")
             haskey(ENV, k) && delete!(ENV, k)
         end
         win === nothing || (try; close(win.window); catch; end)

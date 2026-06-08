@@ -84,10 +84,11 @@ function serve(; host::String        = "0.0.0.0",
     add_acp_log_routes!(srv, state)
     add_worker_ws_routes!(srv, state)
 
-    # ONE server-wide loop that tails every live background bash's output file
-    # and finalizes it when the shell exits (the agent backgrounds the shell and
-    # only hands back a file path — it doesn't stream). See chat.jl.
-    start_background_task_poller!(state)
+    # The background-output poller is no longer a server-wide loop — it's
+    # per-ChatModel now, spawned in `start_chat_client!` and torn down
+    # when the chat goes away. Closes the "global loop forever walking
+    # every chat's msgs_store" mismatch with the taskbar's per-chat
+    # mental model. See `start_background_poller!` in chat.jl.
 
     @info "BonitoTeam dashboard running" url=Bonito.online_url(srv, "") state=sd
     @info "Worker install — run on each agent machine" *

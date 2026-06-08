@@ -103,6 +103,39 @@ const ChatStyles = Bonito.Styles(
         "transition" => "background 80ms"),
     CSS(".bt-header-sync:hover",
         "background" => "var(--bt-surface-2)"),
+    # Header-level restart: visually quieter than Sync (no wide stable
+    # min-width — its label only flips between "Restart" and
+    # "Restarting…", neither long), but the same chrome so the row reads
+    # as a uniform control strip.
+    CSS(".bt-header-restart",
+        "appearance" => "none",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
+        "font-size" => "12px", "padding" => "4px 10px",
+        "border-radius" => "6px",
+        "cursor" => "pointer",
+        "white-space" => "nowrap",
+        "transition" => "background 80ms"),
+    CSS(".bt-header-restart:hover",
+        "background" => "var(--bt-surface-2)"),
+    # Session-dead flash: replaces the old session-ended banner. The
+    # permanent restart button itself becomes the failure indicator —
+    # gentle red pulse on a danger-tinted background so it's hard to
+    # miss without being jarring. The title attribute (set in JS via
+    # the Observable bridge) carries the actual error text so the user
+    # can read it on hover. ~1.4 s loop is slow enough to read as
+    # "needs attention" rather than "everything is broken".
+    CSS(".bt-header-restart-dead",
+        "background" => "#fee2e2",
+        "border-color" => "#fca5a5",
+        "color" => "#b91c1c",
+        "animation" => "bt-restart-pulse 1.4s ease-in-out infinite"),
+    CSS(".bt-header-restart-dead:hover",
+        "background" => "#fecaca"),
+    CSS("@keyframes bt-restart-pulse",
+        CSS("0%, 100%", "box-shadow" => "0 0 0 0 rgba(220,38,38,0.0)"),
+        CSS("50%",      "box-shadow" => "0 0 0 6px rgba(220,38,38,0.15)")),
     # ── Session-config meta line (model / mode / effort — `header_meta_line`).
     # Plain muted text below the title row; items joined with " · ", full
     # descriptions in the per-item tooltip.
@@ -126,26 +159,11 @@ const ChatStyles = Bonito.Styles(
         "box-shadow" => "0 0 0 3px rgba(16,185,129,0.18)"),
     CSS(".bt-dot-offline", "background" => "var(--bt-text-faint)"),
 
-    # ── Session-ended banner ─────────────────────────────────────────────────
-    # Shown when the ACP connection drops mid-conversation. Mirrors the
-    # bt-error style but adds a Restart action; sits between header and
-    # message scroll so it's always visible.
-    CSS(".bt-banner-error",
-        "background" => "#fef2f2", "color" => "#b91c1c",
-        "border" => "1px solid #fecaca",
-        "border-radius" => "var(--bt-radius)",
-        "padding" => "10px 14px",
-        "margin" => "12px 16px 0",
-        "display" => "flex", "align-items" => "center", "gap" => "12px",
-        "font-size" => "13px"),
-    CSS(".bt-banner-error .bt-btn",
-        "flex-shrink" => "0"),
-    CSS(".bt-banner-detail",
-        "color" => "#7f1d1d", "font-size" => "12px",
-        "margin-top" => "2px",
-        "font-family" => "ui-monospace, monospace",
-        "white-space" => "nowrap", "overflow" => "hidden",
-        "text-overflow" => "ellipsis"),
+    # (The old `.bt-banner-error` / `.bt-banner-detail` session-ended
+    # banner has been removed: the permanent header restart button is
+    # now the failure indicator — see `.bt-header-restart-dead` above
+    # for the pulse + danger tint; the error text rides on its title
+    # attribute, set reactively from `model.last_error`.)
     CSS(".bt-btn-secondary",
         "background" => "var(--bt-surface)", "color" => "var(--bt-text)",
         "border" => "1px solid var(--bt-border-strong)",
@@ -173,6 +191,26 @@ const ChatStyles = Bonito.Styles(
         "box-sizing" => "border-box"),
     CSS(".bt-spacer-top, .bt-spacer-bottom",
         "flex-shrink" => "0", "overflow-anchor" => "none"),
+
+    # Rubberband for the grab-to-pan handler (bonitoteam.js): when the
+    # user drags past either edge, JS accumulates an overscroll distance
+    # into `--bt-overscroll` on the container; each direct child of
+    # `.bt-messages` mirrors that translateY so the content rubberbands
+    # while the container box (and its scrollbar) stay put. Identity
+    # `translateY(0)` is the resting state so the rule is always live and
+    # paints aren't gated on JS having ever set the var. Native scrolling
+    # is untouched — overscroll-behavior-y: contain (above) just stops
+    # the bounce from leaking to the parent; rubberband is exclusively
+    # the pan handler's affordance.
+    CSS(".bt-messages > *",
+        "transform" => "translateY(var(--bt-overscroll, 0px))"),
+    # While the user is panning, the cursor lands as grabbing on any
+    # child (text bubbles included): the gesture has hijacked the
+    # selection cursor for the duration. Cleared on pointerup so reading
+    # cursors snap back without ghost-state.
+    CSS(".bt-messages-grabbing, .bt-messages-grabbing *",
+        "cursor" => "grabbing !important",
+        "user-select" => "none"),
 
     # ── User message ─────────────────────────────────────────────────────────
     # max-width caps the bubble at a comfortable reading width on wide screens.

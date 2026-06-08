@@ -144,6 +144,7 @@ class BonitoChat {
         this._lastUserInputT = 0;
         const markUserInput = ()=>{
             this._lastUserInputT = performance.now();
+            this._cancelPendingScroll();
         };
         container.addEventListener('wheel', markUserInput, {
             passive: true
@@ -181,6 +182,148 @@ class BonitoChat {
         window.addEventListener('mouseup', this._onWindowMouseUp, {
             passive: true
         });
+        const PAN_FRICTION = 0.94;
+        this._overscroll = 0;
+        this._panState = null;
+        this._momentumRaf = null;
+        this._springRaf = null;
+        const setOverscroll = (v)=>{
+            this._overscroll = v;
+            this.container.style.setProperty('--bt-overscroll', v + 'px');
+        };
+        this._cancelMomentum = ()=>{
+            if (this._momentumRaf !== null) {
+                cancelAnimationFrame(this._momentumRaf);
+                this._momentumRaf = null;
+            }
+            if (this._springRaf !== null) {
+                cancelAnimationFrame(this._springRaf);
+                this._springRaf = null;
+            }
+        };
+        const springStep = ()=>{
+            this._springRaf = null;
+            if (this.destroyed) return;
+            if (Math.abs(this._overscroll) < 0.5) {
+                setOverscroll(0);
+                return;
+            }
+            setOverscroll(this._overscroll * 0.72);
+            this._springRaf = requestAnimationFrame(springStep);
+        };
+        const startSpring = ()=>{
+            if (this._springRaf !== null || this._overscroll === 0) return;
+            this._springRaf = requestAnimationFrame(springStep);
+        };
+        const momentumStep = (vel)=>{
+            this._momentumRaf = null;
+            if (this.destroyed) return;
+            const delta = vel * 16;
+            const maxScroll = this.container.scrollHeight - this.container.clientHeight;
+            let newTop = this.container.scrollTop - delta;
+            let hitEdge = false;
+            if (newTop < 0) {
+                setOverscroll(this._overscroll + -newTop * 0.40);
+                this.container.scrollTop = 0;
+                hitEdge = true;
+            } else if (newTop > maxScroll) {
+                setOverscroll(this._overscroll - (newTop - maxScroll) * 0.40);
+                this.container.scrollTop = maxScroll;
+                hitEdge = true;
+            } else {
+                this.container.scrollTop = newTop;
+            }
+            this._lastUserInputT = performance.now();
+            vel = hitEdge ? 0 : vel * PAN_FRICTION;
+            if (Math.abs(vel) < 0.03) {
+                startSpring();
+                return;
+            }
+            this._momentumRaf = requestAnimationFrame(()=>momentumStep(vel));
+        };
+        const onPanDown = (e)=>{
+            if (e.pointerType === 'touch') return;
+            if (e.button !== 0) return;
+            if (this._scrollbarDrag) return;
+            if (e.target.closest('input, textarea, button, a, select, [contenteditable]')) return;
+            this._cancelMomentum();
+            this._panState = {
+                pointerId: e.pointerId,
+                startY: e.clientY,
+                lastY: e.clientY,
+                lastT: performance.now(),
+                velocity: 0,
+                engaged: false
+            };
+        };
+        const onPanMove = (e)=>{
+            const p = this._panState;
+            if (!p || e.pointerId !== p.pointerId) return;
+            if (!p.engaged) {
+                if (Math.abs(e.clientY - p.startY) < 6) return;
+                const sel = window.getSelection();
+                if (sel && sel.toString().length > 0) {
+                    this._panState = null;
+                    return;
+                }
+                p.engaged = true;
+                p.lastY = e.clientY;
+                p.lastT = performance.now();
+                try {
+                    this.container.setPointerCapture(e.pointerId);
+                } catch (_) {}
+                this.container.classList.add('bt-messages-grabbing');
+                this._lastUserInputT = performance.now();
+                this._cancelPendingScroll();
+            }
+            e.preventDefault();
+            const now = performance.now();
+            const stepDy = e.clientY - p.lastY;
+            const stepDt = now - p.lastT;
+            const maxScroll = this.container.scrollHeight - this.container.clientHeight;
+            const newTop = this.container.scrollTop - stepDy;
+            if (newTop < 0) {
+                setOverscroll(this._overscroll + -newTop * 0.55);
+                this.container.scrollTop = 0;
+            } else if (newTop > maxScroll) {
+                setOverscroll(this._overscroll - (newTop - maxScroll) * 0.55);
+                this.container.scrollTop = maxScroll;
+            } else {
+                if (this._overscroll !== 0) setOverscroll(0);
+                this.container.scrollTop = newTop;
+            }
+            if (stepDt > 0) {
+                const instant = stepDy / stepDt;
+                p.velocity = 0.65 * instant + 0.35 * p.velocity;
+            }
+            p.lastY = e.clientY;
+            p.lastT = now;
+            this._lastUserInputT = now;
+        };
+        const onPanUp = (e)=>{
+            const p = this._panState;
+            if (!p || e.pointerId !== p.pointerId) return;
+            const engaged = p.engaged;
+            const vel = p.velocity;
+            this._panState = null;
+            if (!engaged) return;
+            try {
+                this.container.releasePointerCapture(e.pointerId);
+            } catch (_) {}
+            this.container.classList.remove('bt-messages-grabbing');
+            if (Math.abs(vel) > 0.10) {
+                this._momentumRaf = requestAnimationFrame(()=>momentumStep(vel));
+            } else if (this._overscroll !== 0) {
+                startSpring();
+            }
+        };
+        container.addEventListener('pointerdown', onPanDown);
+        container.addEventListener('pointermove', onPanMove);
+        container.addEventListener('pointerup', onPanUp);
+        container.addEventListener('pointercancel', onPanUp);
+        this._onPanDown = onPanDown;
+        this._onPanMove = onPanMove;
+        this._onPanUp = onPanUp;
         this._onScroll = ()=>{
             const userDriven = this._scrollbarDrag || performance.now() - this._lastUserInputT < 400;
             const atBot = this.atBottom();
@@ -230,6 +373,13 @@ class BonitoChat {
         if (this._onWindowMouseUp) {
             window.removeEventListener('mouseup', this._onWindowMouseUp);
         }
+        if (this._onPanDown) {
+            this.container.removeEventListener('pointerdown', this._onPanDown);
+            this.container.removeEventListener('pointermove', this._onPanMove);
+            this.container.removeEventListener('pointerup', this._onPanUp);
+            this.container.removeEventListener('pointercancel', this._onPanUp);
+        }
+        if (this._cancelMomentum) this._cancelMomentum();
         if (this._scrollRafId !== null && this._scrollRafId !== undefined) {
             cancelAnimationFrame(this._scrollRafId);
         }
@@ -282,6 +432,8 @@ class BonitoChat {
                 return this.applyCount(msg.n);
             case 'msgs.range':
                 return this.onRange(msg);
+            case 'session_reset':
+                return this.onSessionReset();
             case 'busy_start':
                 this.busyEl?.classList.add('bt-busy-active');
                 if (this.followMode) this._queueScrollToBottom();
@@ -644,6 +796,14 @@ class BonitoChat {
         if (this.thinkingEl) this.thinkingEl.classList.toggle('bt-thinking-active', !!active);
         if (active && this.followMode) this._queueScrollToBottom();
     }
+    onSessionReset() {
+        this.thinkingEl?.classList.remove('bt-thinking-active');
+        this.busyEl?.classList.remove('bt-busy-active');
+        this._cancelPendingScroll();
+        for (const node of this.nodeById.values()){
+            node.classList?.remove('bt-stream-active');
+        }
+    }
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
@@ -1003,7 +1163,7 @@ class BonitoChat {
     }
     _sizeTail() {
         if (!this.tailEl) return;
-        this.tailEl.style.height = Math.round(this.container.clientHeight * 0.3) + 'px';
+        this.tailEl.style.height = '50px';
     }
     atBottom() {
         const { scrollTop , scrollHeight , clientHeight  } = this.container;
@@ -1016,7 +1176,9 @@ class BonitoChat {
         this._scrollRafId = requestAnimationFrame(()=>{
             this._scrollQueued = false;
             this._scrollRafId = null;
-            if (!this.destroyed) this.scrollToBottom();
+            if (this.destroyed) return;
+            if (performance.now() - this._lastUserInputT < 100) return;
+            this.scrollToBottom();
         });
     }
     scrollToBottom() {
@@ -1030,6 +1192,13 @@ class BonitoChat {
             });
         }
         this.refresh();
+    }
+    onShown() {
+        if (!this.followMode) return;
+        this.scrollToBottom();
+        requestAnimationFrame(()=>{
+            if (!this.destroyed && this.followMode) this.scrollToBottom();
+        });
     }
     _setupInputs() {
         if (this.destroyed) return;

@@ -1,9 +1,10 @@
 # ACP error paths in send_prompt_async!:
 #
 #   - Errors whose message contains "connection closed", "EOFError" or
-#     "BrokenPipe" → flip session_alive=false, surface the session-ended
-#     banner. (This is the *transport-died* class, where retrying makes
-#     no sense without a fresh client.)
+#     "BrokenPipe" → flip session_alive=false. The permanent header
+#     restart button gains `bt-header-restart-dead` and pulses red; its
+#     title attribute carries the underlying error. (No separate banner
+#     any more — the button IS the failure indicator.)
 #   - Any other error → push an inline `[error: ...]` AgentMsg bubble so
 #     the user sees the failure in line with the conversation.
 #
@@ -29,20 +30,21 @@ try
     @assert TH.wait_for(ctx1, "document.querySelector('.bt-text-input') !== null") "no chat"
 
     TH.section("Transport-died error → session-ended banner") do
-        record("no banner before send",
-               @TH.test_true !TH.dom_exists(ctx1, ".bt-banner-error"))
+        record("restart button is healthy before send",
+               @TH.test_true !TH.dom_exists(ctx1, ".bt-header-restart-dead"))
         TH.type_into(ctx1, ".bt-text-input", "go")
         TH.dom_click(ctx1, ".bt-send-btn")
-        record("session-ended banner appears",
+        record("restart button flips to the dead/flashing state",
                @TH.test_true TH.wait_for(ctx1,
-                   "document.querySelector('.bt-banner-error') !== null";
+                   "document.querySelector('.bt-header-restart-dead') !== null";
                    timeout = 5.0))
-        # Banner detail line should carry the error text we injected.
-        record("banner shows the underlying error message",
+        # Title attribute carries the error text we injected (replaces the
+        # old in-DOM `.bt-banner-detail`).
+        record("restart-button title shows the underlying error message",
                @TH.test_true TH.wait_for(ctx1, """
                    (() => {
-                       const det = document.querySelector('.bt-banner-detail');
-                       return det && det.innerText.indexOf('connection closed') !== -1;
+                       const btn = document.querySelector('.bt-header-restart-dead');
+                       return btn && (btn.getAttribute('title')||'').indexOf('connection closed') !== -1;
                    })()
                """; timeout = 3.0))
         # No inline [error: ...] bubble for this branch.
@@ -96,9 +98,9 @@ try
                        });
                    })()
                """; timeout = 5.0))
-        # No banner for this branch — the session is still alive.
-        record("no session-ended banner",
-               @TH.test_true !TH.dom_exists(ctx2, ".bt-banner-error"))
+        # Restart button stays healthy — the session is still alive.
+        record("restart button stays in the healthy state",
+               @TH.test_true !TH.dom_exists(ctx2, ".bt-header-restart-dead"))
         record("session_alive stays true",
                @TH.test_eq state2.chat_models["p-1"].session_alive[] true)
     end

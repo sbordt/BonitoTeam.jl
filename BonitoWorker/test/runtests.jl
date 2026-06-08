@@ -129,11 +129,21 @@ end
     @test BW.meaningful_prompt("<command-name>/compact</command-name><command-message>compact</command-message>") === nothing
     @test BW.meaningful_prompt("<system-reminder>As you answer…</system-reminder>") === nothing
     @test BW.meaningful_prompt("   ") === nothing
+    # Unknown / future tag names must NOT leak through — the stripper is generic.
+    @test BW.meaningful_prompt("<local-command-caveat>Caveat: …</local-command-caveat>") === nothing
+    @test BW.meaningful_prompt("<future_unknown_wrapper>noise</future_unknown_wrapper>") === nothing
+    # Bare opener with no closer (system commentary like `<ide_opened_file>The
+    # user opened …` followed by free text) is treated as commentary, not prose.
+    @test BW.meaningful_prompt("<ide_selection>The user selected lines 1 to 227 …") === nothing
+    @test BW.meaningful_prompt("<ide_opened_file>The user opened /x/a.md") === nothing
 
     # Real prose survives, and leading context blocks are stripped off it.
     @test BW.meaningful_prompt("fix the parser bug") == "fix the parser bug"
     @test BW.meaningful_prompt("<ide_selection>lines 1-2</ide_selection>Ich arbeite am Plan!") == "Ich arbeite am Plan!"
     @test BW.meaningful_prompt("<ide_opened_file>opened X</ide_opened_file>\n\nrun the tests") == "run the tests"
+    # Multiple adjacent leading blocks (slash-command lines) are all consumed,
+    # and an unknown leading tag is stripped just like a known one.
+    @test BW.meaningful_prompt("<local-command-caveat>x</local-command-caveat><ide_opened_file>y</ide_opened_file>do the thing") == "do the thing"
 
     # first_user_text: returns nothing for non-user / injected records, prose
     # (clean_preview-collapsed) for real ones.

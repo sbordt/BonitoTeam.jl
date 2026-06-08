@@ -80,27 +80,27 @@ try
                @TH.test_true btn_text != "Sync")
     end
 
-    TH.section("Session-ended banner appears + Restart works") do
-        # Banner is initially absent (session_alive == true).
-        record("no banner initially",
-               @TH.test_true !TH.dom_exists(ctx, ".bt-banner-error"))
+    TH.section("Dead-session pulse on the restart button + Restart works") do
+        # The permanent header restart button starts in the healthy state.
+        record("restart button healthy initially",
+               @TH.test_true !TH.dom_exists(ctx, ".bt-header-restart-dead"))
 
-        # Flip session_alive from Julia → banner should appear reactively.
+        # Flip session_alive from Julia → button gains the dead/pulse class.
         model.session_alive[] = false
         model.last_error[]    = "test-induced disconnect"
-        record("banner appears after session_alive=false",
-               @TH.test_true TH.wait_for(ctx, "document.querySelector('.bt-banner-error') !== null";
+        record("restart button flips to dead/pulse after session_alive=false",
+               @TH.test_true TH.wait_for(ctx, "document.querySelector('.bt-header-restart-dead') !== null";
                                          timeout = 3.0))
 
-        # Click "Restart session". The handler calls restart_chat_session!
-        # which rebuilds the client via the factory (our mock factory
-        # supports re-init), and sets session_alive back to true.
+        # Click the (now-pulsing) restart button. The handler calls
+        # `restart_chat_session!` which rebuilds the client via the mock
+        # factory and sets session_alive back to true.
         TH.eval_js(ctx, """
-            const btns = document.querySelectorAll('.bt-banner-error button');
-            if (btns.length) btns[btns.length - 1].click();
+            const btn = document.querySelector('.bt-header-restart-dead');
+            if (btn) btn.click();
         """)
-        record("banner disappears after restart",
-               @TH.test_true TH.wait_for(ctx, "document.querySelector('.bt-banner-error') === null";
+        record("restart button returns to healthy after restart",
+               @TH.test_true TH.wait_for(ctx, "document.querySelector('.bt-header-restart-dead') === null";
                                          timeout = 5.0))
         record("session_alive observable is true again",
                @TH.test_eq model.session_alive[] true)

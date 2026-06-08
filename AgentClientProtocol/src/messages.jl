@@ -270,10 +270,23 @@ end
 TurnState() = TurnState(nothing, Dict{String,ToolCall}())
 
 # Closing the turn finishes the trailing message and any still-open tools.
+#
+# Any tool still in `st.tools` is one the agent NEVER reported terminal for —
+# the turn ended (cancel, EOF, peer hang-up) before its `tool_call_update` with
+# a completed/failed status arrived. Force it to `"failed"` and push ONE final
+# snapshot through its `updates` channel BEFORE closing, so downstream consumers
+# (BonitoTeam's `process_update!`) see a terminal status and finalize naturally —
+# instead of draining a channel that just-closed with the status frozen mid-flight.
 function Base.close(st::TurnState)
     st.current_message === nothing || close(st.current_message)
     st.current_message = nothing
-    foreach(close, values(st.tools))
+    for tc in values(st.tools)
+        if !is_terminal(tc.status)
+            tc.status = "failed"
+            put!(tc.updates, tc)
+        end
+        close(tc)
+    end
     empty!(st.tools)
     return nothing
 end

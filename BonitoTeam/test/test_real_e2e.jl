@@ -60,8 +60,11 @@ end
     try
         pid = "e2e-" * string(rand(UInt16))
         env = BT.eval_dialback_env(h.state, pid)
-        @test startswith(env["BONITOTEAM_EVAL_WS"], "ws://")
         for (k,v) in env; ENV[k] = v; end           # the server normally injects these into BonitoMCP
+        # In production this is set by the BonitoWorker daemon. Here we plug it
+        # in from the local dev server's URL so BonitoMCP can derive `/eval-ws`.
+        ENV["BONITOTEAM_SERVER_URL"] = Bonito.online_url(h.state.srv, "")
+        @test startswith(ENV["BONITOTEAM_SERVER_URL"], "http://")
         # Drop any eval worker from a previous test — its `__BT_DIALED` is true
         # against the OLD dev_server's WS that's long gone, so without a fresh
         # worker it won't dial THIS dev_server's `/eval-ws`.
@@ -116,7 +119,7 @@ end
         @test hasdoubled()                                          # relayed back to the browser
         println("✓ full chain: bt_show_app → eval worker dial-back → embed → round-trip")
     finally
-        for k in ("BONITOTEAM_EVAL_WS","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
+        for k in ("BONITOTEAM_SERVER_URL","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
         try; close(h); catch; end
     end
 end
@@ -134,6 +137,7 @@ end
         pid = "e2e-asset-" * string(rand(UInt16))
         env = BT.eval_dialback_env(h.state, pid)
         for (k,v) in env; ENV[k] = v; end
+        ENV["BONITOTEAM_SERVER_URL"] = Bonito.online_url(h.state.srv, "")
         BonitoMCP.restart!(BonitoMCP.manager(), ROOT)
         res = BonitoMCP.julia_show_app_handler(Dict("code"=>APPCODE, "env_path"=>ROOT))
         @test res["isError"] == false
@@ -173,7 +177,7 @@ end
         @test timedwait(()->!haskey(eb.asset_host.parent.files, rwa2.init_url), 5.0) === :ok
         println("✓ init asset outlives a render-sub teardown; re-render supersedes + tab close release the worker sub")
     finally
-        for k in ("BONITOTEAM_EVAL_WS","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
+        for k in ("BONITOTEAM_SERVER_URL","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
         try; close(h); catch; end
     end
 end

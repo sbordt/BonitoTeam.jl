@@ -57,7 +57,7 @@ else
     finally
         win  === nothing || try EC.close(appE) catch end
         try close(h) catch end
-        for k in ("BONITOTEAM_EVAL_WS","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
+        for k in ("BONITOTEAM_SERVER_URL","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
     end
 end
 
@@ -107,7 +107,7 @@ end
     finally
         win  === nothing || try EC.close(appE) catch end
         try close(h) catch end
-        for k in ("BONITOTEAM_EVAL_WS","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
+        for k in ("BONITOTEAM_SERVER_URL","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
     end
 end
 
@@ -140,7 +140,7 @@ end
     finally
         win  === nothing || try EC.close(appE) catch end
         try close(h) catch end
-        for k in ("BONITOTEAM_EVAL_WS","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
+        for k in ("BONITOTEAM_SERVER_URL","BONITOTEAM_SECRET","BONITOTEAM_PROJECT_ID"); haskey(ENV,k) && delete!(ENV,k); end
     end
 end
 end

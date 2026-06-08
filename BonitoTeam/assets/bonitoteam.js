@@ -236,8 +236,21 @@ class BonitoChat {
         // (viewport resize, container RO re-render, attachment-bar
         // pop-in). Only user-initiated scrolls toggle followMode —
         // a layout shift never disengages chase.
+        //
+        // ALSO synchronously cancels any pending chase rAF. A chunk that
+        // landed milliseconds before the gesture queues a chase rAF for
+        // the NEXT frame; the scroll event from the wheel/touch fires
+        // ASYNCHRONOUSLY (next task), so without an early cancel the
+        // chase rAF wins the race and snaps the viewport back to the
+        // bottom — the user sees "wheel did nothing" or "jumped back to
+        // bottom" while an agent/tool/thinking turn is running. The
+        // gesture is the authoritative signal; the chase queued under
+        // stale followMode must yield to it.
         this._lastUserInputT = 0;
-        const markUserInput = () => { this._lastUserInputT = performance.now(); };
+        const markUserInput = () => {
+            this._lastUserInputT = performance.now();
+            this._cancelPendingScroll();
+        };
         container.addEventListener('wheel',      markUserInput, { passive: true });
         container.addEventListener('touchstart', markUserInput, { passive: true });
         container.addEventListener('touchmove',  markUserInput, { passive: true });
@@ -273,6 +286,188 @@ class BonitoChat {
         };
         container.addEventListener('mousedown', this._onContainerMouseDown, { passive: true });
         window.addEventListener('mouseup', this._onWindowMouseUp, { passive: true });
+
+        // ── Grab-to-pan with fling momentum + rubberband ──────────────
+        // Click and drag anywhere in the messages area pans the viewport
+        // like a camera: pointer delta → scrollTop delta. Release with
+        // motion → momentum (rAF deceleration). Overscroll past either
+        // edge accumulates rubberband distance (CSS var translates the
+        // content) with resistance and springs back on release.
+        //
+        // Disambiguation from text selection + clicks: pan engages ONLY
+        // after the pointer has moved ≥ PAN_THRESHOLD px AND no text was
+        // selected during the gesture. So a static click still selects
+        // text / triggers buttons, and a short text-select-drag still
+        // selects text without hijacking. Touch input is left to native
+        // scrolling (mobile / trackpad already have momentum + bounce).
+        const PAN_THRESHOLD       = 6;    // px; preserves click + small selects
+        const PAN_RESIST          = 0.55; // 0..1; lower = more rubberband resistance
+        const PAN_BOUNCE_RESIST   = 0.40; // fling-bounce: stronger than drag-bounce
+        const PAN_FRICTION        = 0.94; // momentum velocity decay / frame
+        const PAN_MIN_VELOCITY    = 0.03; // px/ms; below this momentum stops
+        const PAN_SPRING_DAMPING  = 0.72; // overscroll spring-back decay / frame
+        const PAN_FLING_THRESHOLD = 0.10; // px/ms; below this no fling on release
+
+        this._overscroll  = 0;
+        this._panState    = null;
+        this._momentumRaf = null;
+        this._springRaf   = null;
+
+        const setOverscroll = (v) => {
+            this._overscroll = v;
+            this.container.style.setProperty('--bt-overscroll', v + 'px');
+        };
+
+        this._cancelMomentum = () => {
+            if (this._momentumRaf !== null) {
+                cancelAnimationFrame(this._momentumRaf);
+                this._momentumRaf = null;
+            }
+            if (this._springRaf !== null) {
+                cancelAnimationFrame(this._springRaf);
+                this._springRaf = null;
+            }
+        };
+
+        const springStep = () => {
+            this._springRaf = null;
+            if (this.destroyed) return;
+            if (Math.abs(this._overscroll) < 0.5) { setOverscroll(0); return; }
+            setOverscroll(this._overscroll * PAN_SPRING_DAMPING);
+            this._springRaf = requestAnimationFrame(springStep);
+        };
+
+        const startSpring = () => {
+            if (this._springRaf !== null || this._overscroll === 0) return;
+            this._springRaf = requestAnimationFrame(springStep);
+        };
+
+        const momentumStep = (vel) => {
+            this._momentumRaf = null;
+            if (this.destroyed) return;
+            // vel is px/ms in the direction of pointer travel.
+            // dy > 0 means pointer moved down ⇒ content goes down ⇒
+            // scrollTop decreases. Same sign convention as the drag.
+            const dt = 16;
+            const delta = vel * dt;
+            const maxScroll = this.container.scrollHeight - this.container.clientHeight;
+            let newTop = this.container.scrollTop - delta;
+            let hitEdge = false;
+            if (newTop < 0) {
+                setOverscroll(this._overscroll + (-newTop) * PAN_BOUNCE_RESIST);
+                this.container.scrollTop = 0;
+                hitEdge = true;
+            } else if (newTop > maxScroll) {
+                setOverscroll(this._overscroll - (newTop - maxScroll) * PAN_BOUNCE_RESIST);
+                this.container.scrollTop = maxScroll;
+                hitEdge = true;
+            } else {
+                this.container.scrollTop = newTop;
+            }
+            // Keep the user-input timestamp fresh so the scroll handler
+            // continues classifying these programmatic scrollTop writes
+            // as user-driven (= the fling the user threw). Without this
+            // the 400 ms recency window lapses mid-fling and a stray
+            // layout shift re-engages chase, snapping to bottom in the
+            // middle of the user's read.
+            this._lastUserInputT = performance.now();
+            // Edge-hit: absorb the remaining velocity into the bounce
+            // and let the spring carry the rest. Otherwise decay.
+            vel = hitEdge ? 0 : vel * PAN_FRICTION;
+            if (Math.abs(vel) < PAN_MIN_VELOCITY) { startSpring(); return; }
+            this._momentumRaf = requestAnimationFrame(() => momentumStep(vel));
+        };
+
+        const onPanDown = (e) => {
+            if (e.pointerType === 'touch') return;
+            if (e.button !== 0) return;
+            if (this._scrollbarDrag) return;
+            // Don't engage on form controls / buttons / links — let their
+            // native semantics own the gesture. Closest is cheap.
+            if (e.target.closest('input, textarea, button, a, select, [contenteditable]')) return;
+            this._cancelMomentum();
+            this._panState = {
+                pointerId: e.pointerId,
+                startY:    e.clientY,
+                lastY:     e.clientY,
+                lastT:     performance.now(),
+                velocity:  0,
+                engaged:   false,
+            };
+        };
+
+        const onPanMove = (e) => {
+            const p = this._panState;
+            if (!p || e.pointerId !== p.pointerId) return;
+            if (!p.engaged) {
+                if (Math.abs(e.clientY - p.startY) < PAN_THRESHOLD) return;
+                // The user started a text selection during the threshold
+                // window: yield. Pan only fires when the gesture was
+                // intended as a pan.
+                const sel = window.getSelection();
+                if (sel && sel.toString().length > 0) { this._panState = null; return; }
+                p.engaged = true;
+                p.lastY = e.clientY;
+                p.lastT = performance.now();
+                try { this.container.setPointerCapture(e.pointerId); } catch (_) {}
+                this.container.classList.add('bt-messages-grabbing');
+                // Pan acts like a wheel: cancels pending chase + marks
+                // user input so the scroll handler treats subsequent
+                // scrollTop writes as user-driven.
+                this._lastUserInputT = performance.now();
+                this._cancelPendingScroll();
+            }
+            e.preventDefault();
+            const now = performance.now();
+            const stepDy = e.clientY - p.lastY;
+            const stepDt = now - p.lastT;
+            const maxScroll = this.container.scrollHeight - this.container.clientHeight;
+            const newTop = this.container.scrollTop - stepDy;
+            if (newTop < 0) {
+                setOverscroll(this._overscroll + (-newTop) * PAN_RESIST);
+                this.container.scrollTop = 0;
+            } else if (newTop > maxScroll) {
+                setOverscroll(this._overscroll - (newTop - maxScroll) * PAN_RESIST);
+                this.container.scrollTop = maxScroll;
+            } else {
+                if (this._overscroll !== 0) setOverscroll(0);
+                this.container.scrollTop = newTop;
+            }
+            if (stepDt > 0) {
+                // Exponentially-smoothed velocity (px/ms): noise-resistant
+                // and recency-biased so the release-instant velocity
+                // approximates the last ~30 ms of motion.
+                const instant = stepDy / stepDt;
+                p.velocity = 0.65 * instant + 0.35 * p.velocity;
+            }
+            p.lastY = e.clientY;
+            p.lastT = now;
+            this._lastUserInputT = now;
+        };
+
+        const onPanUp = (e) => {
+            const p = this._panState;
+            if (!p || e.pointerId !== p.pointerId) return;
+            const engaged = p.engaged;
+            const vel     = p.velocity;
+            this._panState = null;
+            if (!engaged) return;
+            try { this.container.releasePointerCapture(e.pointerId); } catch (_) {}
+            this.container.classList.remove('bt-messages-grabbing');
+            if (Math.abs(vel) > PAN_FLING_THRESHOLD) {
+                this._momentumRaf = requestAnimationFrame(() => momentumStep(vel));
+            } else if (this._overscroll !== 0) {
+                startSpring();
+            }
+        };
+
+        container.addEventListener('pointerdown',   onPanDown);
+        container.addEventListener('pointermove',   onPanMove);
+        container.addEventListener('pointerup',     onPanUp);
+        container.addEventListener('pointercancel', onPanUp);
+        this._onPanDown = onPanDown;
+        this._onPanMove = onPanMove;
+        this._onPanUp   = onPanUp;
 
         this._onScroll = () => {
             const userDriven = this._scrollbarDrag ||
@@ -345,6 +540,13 @@ class BonitoChat {
         if (this._onWindowMouseUp) {
             window.removeEventListener('mouseup', this._onWindowMouseUp);
         }
+        if (this._onPanDown) {
+            this.container.removeEventListener('pointerdown',   this._onPanDown);
+            this.container.removeEventListener('pointermove',   this._onPanMove);
+            this.container.removeEventListener('pointerup',     this._onPanUp);
+            this.container.removeEventListener('pointercancel', this._onPanUp);
+        }
+        if (this._cancelMomentum) this._cancelMomentum();
         if (this._scrollRafId !== null && this._scrollRafId !== undefined) {
             cancelAnimationFrame(this._scrollRafId);
         }
@@ -401,6 +603,7 @@ class BonitoChat {
         switch (msg.type) {
             case 'msgs.count':   return this.applyCount(msg.n);
             case 'msgs.range':   return this.onRange(msg);
+            case 'session_reset':return this.onSessionReset();
             case 'busy_start':
                 this.busyEl?.classList.add('bt-busy-active');
                 // bt-busy grows from 0 to 28px over 150ms; its own RO
@@ -909,6 +1112,37 @@ class BonitoChat {
     onThinking(active) {
         if (this.thinkingEl) this.thinkingEl.classList.toggle('bt-thinking-active', !!active);
         if (active && this.followMode) this._queueScrollToBottom();
+    }
+
+    // Julia called `restart_chat_session!` — the ACP subprocess was killed
+    // and a fresh one is coming up. Any UI state attached to the now-dead
+    // session must be cleared here, BEFORE the fresh session starts
+    // emitting chunks (Julia emits this event before spawning the new
+    // client and before re-broadcasting `msgs.count`).
+    //
+    // Concretely:
+    //   • `bt-thinking-active` may be stuck on (process!(::Thought) emit
+    //     races against teardown). Drop it.
+    //   • `bt-busy-active` is bound to a Julia Observable but its update
+    //     may not have shipped yet. Drop it defensively.
+    //   • Pending chase rAFs queued from the last stream's `appendChunk`
+    //     would otherwise fire AFTER the reset and snap to bottom — yank.
+    //   • Any DOM bubble still carrying `bt-stream-active` (the streaming-
+    //     class some renderers use) loses it; Julia's orphan sweep
+    //     finalised the message itself with the proper `agent_final` /
+    //     `thought_final` so the bubble's innerHTML is already updated.
+    //   • We deliberately KEEP `nodeById` so a finalising `agent_final`
+    //     event Julia emits during sweep (concurrent with this reset)
+    //     still finds its node. The next `msgs.count` from Julia re-
+    //     bootstraps the virtual scroll; any final-form HTML changes will
+    //     land via the resulting range-refetch path.
+    onSessionReset() {
+        this.thinkingEl?.classList.remove('bt-thinking-active');
+        this.busyEl?.classList.remove('bt-busy-active');
+        this._cancelPendingScroll();
+        for (const node of this.nodeById.values()) {
+            node.classList?.remove('bt-stream-active');
+        }
     }
 
     onToolUpdate(msg) {
@@ -1439,10 +1673,18 @@ class BonitoChat {
     // visible. No bottom-math special-cases — an earlier content-bottom-
     // excluding-tail model needed tail-awareness in four places and the
     // missed interactions made the scrollbar fight the user.
+    //
+    // Fixed-height (was ~30% of clientHeight): a tall pane wasted hundreds
+    // of pixels between the last message and the composer that the user
+    // had to scroll past. 50 px is enough for breathing room + the busy /
+    // waiting / thinking row to clear the bottom edge without dwarfing
+    // short replies in a tall window. (Pull-up past the bottom rubberbands
+    // via the pan handler — see the panning block in the constructor —
+    // so the tail no longer carries the "give me room to overscroll"
+    // job.)
     _sizeTail() {
         if (!this.tailEl) return;
-        this.tailEl.style.height =
-            Math.round(this.container.clientHeight * 0.3) + 'px';
+        this.tailEl.style.height = '50px';
     }
 
     atBottom() {
@@ -1473,7 +1715,18 @@ class BonitoChat {
         this._scrollRafId = requestAnimationFrame(() => {
             this._scrollQueued = false;
             this._scrollRafId = null;
-            if (!this.destroyed) this.scrollToBottom();
+            if (this.destroyed) return;
+            // A chunk that lands AFTER `markUserInput` cancelled the
+            // previous rAF, but BEFORE the user's scroll event flips
+            // followMode, will queue a fresh chase here. Defensive
+            // re-check: if the user gestured within the last 100 ms,
+            // assume their scroll-down/up intent is still in flight and
+            // skip the chase. 100 ms covers the wheel→scroll-event
+            // delay (typically one task ≪ 50 ms, generous for slow
+            // devices) without locking out chase for the steady-state
+            // stream-while-at-bottom case.
+            if ((performance.now() - this._lastUserInputT) < 100) return;
+            this.scrollToBottom();
         });
     }
 
@@ -1497,6 +1750,28 @@ class BonitoChat {
         // nothing past the initial range. `refresh()` is idempotent and
         // cheap, so call it explicitly.
         this.refresh();
+    }
+
+    // Called by the chat-pane visibility toggle whenever this pane goes
+    // display:flex (initial open, kept-alive re-open, dashboard ↔ chat).
+    // Re-anchors to the bottom ONLY when followMode is on — i.e. the user
+    // was at the bottom (or had never scrolled away) when they last left.
+    // If they had scrolled up to read history, followMode is false and the
+    // previous scrollTop is preserved. New chats default followMode=true,
+    // so opening one for the first time always lands at the latest message.
+    //
+    // The rAF retry catches the typical hidden→shown reveal: a display:none
+    // container's flex children skip layout, so showing it re-measures the
+    // last bubble's image/video bodies and scrollHeight grows for a frame
+    // or two. Without the retry the first scrollToBottom undershoots by
+    // the just-revealed delta and the latest message sits a hair below the
+    // fold.
+    onShown() {
+        if (!this.followMode) return;
+        this.scrollToBottom();
+        requestAnimationFrame(() => {
+            if (!this.destroyed && this.followMode) this.scrollToBottom();
+        });
     }
 
     // ── Image attachments ────────────────────────────────────────────────

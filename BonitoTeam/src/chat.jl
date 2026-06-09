@@ -611,11 +611,16 @@ function augment_header!(d::Dict, m::MCPToolMsg, chat_dir::AbstractString)
     augment_generic_header!(d, chat_dir)
 end
 # A live worker app. Its `kind` is already "bonito_app" (the JS gates the ⤢
-# detach button on that), and its body always auto-opens. Both come from the
-# TYPE — no content is read to decide either.
+# detach button on that). The body auto-opens — but ONLY once we know the
+# worker-registered app id; expanding on the initial "new" event (before
+# `bt_show_app` has returned its `shown_app: <id>` content and we've
+# populated `b.app_id`) would trigger a body render with `m.id` as the
+# app id, which the worker has no route for — a `KeyError "toolu_…"`
+# painted into the chat. The follow-up `process_update!` emits a fresh
+# `tool_update` with `expand=true` once `b.app_id` is captured.
 function augment_header!(d::Dict, m::BonitoAppMsg, chat_dir::AbstractString)
     isempty(m.server) || (d["server"] = m.server)
-    d["expand"] = true
+    isempty(m.app_id) || (d["expand"] = true)
     return d
 end
 
@@ -1501,13 +1506,23 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             prev_status in ("completed", "failed") || !(b.status in ("completed", "failed")) ||
                 (b.finished_at = time())
             persist_tool_content!(b.chat.chat_dir, snap)
+            # Per-type extraction from THIS snap (e.g. BonitoAppMsg pulls the
+            # worker-registered `shown_app: <id>` out of the result content).
+            # Runs BEFORE we decide expand — so the BonitoApp's auto_expand
+            # gate sees the freshly-captured app_id and emits expand=true on
+            # the SAME tool_update that carries the result. A separate
+            # process_update! override on BonitoAppMsg used to do this but
+            # consumed the snap from `m.updates`, so the generic loop never
+            # saw the result snap and never emitted any expand event.
+            update_from_snap!(b, snap)
             pretty_title, _ = pretty_tool_title(b.title)
             d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
                 "status" => b.status, "title" => pretty_title, "summary" => b.summary)
             b.finished_at === nothing || (d["finished_at"] = b.finished_at)
-            # Auto-expand the body: a live Bonito app always (it IS the point), or a
-            # `bt_show` tool once its content carries a `shown:` ref. `auto_expand_body`
-            # dispatches on the type — no content sniffing to decide.
+            # Auto-expand the body: a live Bonito app once we've captured its
+            # app_id, or a `bt_show` tool once content carries a `shown:` ref.
+            # `auto_expand_body` dispatches on the type + current state — no
+            # content sniffing inline.
             (auto_expand_body(b) || has_show_reference(snap.content)) &&
                 (d["expand"] = true)
             # Displayable media (bt_show mime, or inline image content from
@@ -1524,24 +1539,23 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
     return nothing
 end
 
-# Does this tool's body auto-open on render? Only a live Bonito app.
+# Does this tool's body auto-open on render? A live Bonito app once we've
+# captured its worker-registered id (otherwise the body would try to render
+# with the tool_id as app_id and the worker KeyErrors on the missing route).
 auto_expand_body(::ToolMsg) = false
-auto_expand_body(::BonitoAppMsg) = true
+auto_expand_body(m::BonitoAppMsg) = !isempty(m.app_id)
 
-# A live worker app: run the generic tool update, but first capture the worker's
-# registered app id from the result content ONCE (bt_show_app returns it there),
-# so render/header read `b.app_id` and never touch content again.
-function process_update!(b::BonitoAppMsg, m::AgentClientProtocol.ToolCall)
-    if isempty(b.app_id)
-        for snap in m.updates
-            ref = find_app_reference(snap.content)
-            if ref !== nothing
-                b.app_id = ref
-                break
-            end
-        end
-    end
-    invoke(process_update!, Tuple{ToolMsg, AgentClientProtocol.ToolCall}, b, m)
+# Per-snap state mutation, run inside the generic loop BEFORE the expand/emit
+# decisions so freshly-captured state (e.g. BonitoAppMsg's app_id from the
+# `shown_app: <id>` result block) participates in this snap's tool_update —
+# the browser receives the expand event on the SAME update that carried the
+# result, no second round-trip.
+update_from_snap!(::ToolMsg, _snap) = nothing
+function update_from_snap!(b::BonitoAppMsg, snap)
+    isempty(b.app_id) || return
+    ref = find_app_reference(snap.content)
+    ref === nothing || (b.app_id = ref)
+    return nothing
 end
 
 # Background bash (`run_in_background`): the agent "completes" the tool_call the

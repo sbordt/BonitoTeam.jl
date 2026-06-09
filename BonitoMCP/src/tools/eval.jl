@@ -14,21 +14,30 @@
 # of more round-trips; higher = less polling overhead.
 
 # ── Status helpers ──────────────────────────────────────────────────────────
-running_response(env_path::Union{String,Nothing}, partial::AbstractString,
-                  elapsed::Real) = Dict{String,Any}(
-    "content" => [Dict("type" => "text",
-                        "text" => string(
-            "status: running\n",
-            "elapsed: $(elapsed)s\n",
-            "env_path: ", env_path === nothing ? "<temp>" : env_path, "\n",
-            isempty(partial) ? "(no output captured yet)" :
-                "stdout so far:\n$partial",
-            "\n\n",
-            "Decide: bt_julia_continue (wait more), bt_julia_interrupt ",
-            "(SIGINT, keep state), or bt_julia_restart (lose state)."))],
-    "isError"   => false,
-    "_meta"     => Dict("status" => "running", "elapsed_s" => elapsed),
-)
+# Emit the same block shape as `completed_response` (```julia code echo +
+# `stdout:` block) so the chat renderer treats running/completed identically:
+# code under "Code", live stdout under "Output", `Bonito.RichText` keeps ANSI
+# colors, no Markdown.parse italicizing `bt_julia_continue` into bt_*julia*_*.
+# Trailing decision line goes inside the stdout block so it stays in the
+# console-block render (one section, no second block falling to markdown).
+function running_response(env_path::Union{String,Nothing},
+                          partial::AbstractString, elapsed::Real,
+                          code::AbstractString)
+    code_str = rstrip(String(code), '\n')
+    footer = string(
+        "\n--- still running (", round(elapsed; digits = 2), "s",
+        env_path === nothing ? "" : ", env=$env_path", ")",
+        " — next: bt_julia_continue / bt_julia_interrupt / bt_julia_restart")
+    stdout_body = (isempty(partial) ? "(no output captured yet)" : partial) * footer
+    return Dict{String,Any}(
+        "content" => [
+            Dict("type" => "text", "text" => "```julia\n$code_str\n```"),
+            Dict("type" => "text", "text" => "stdout:\n$stdout_body"),
+        ],
+        "isError" => false,
+        "_meta"   => Dict("status" => "running", "elapsed_s" => elapsed),
+    )
+end
 
 completed_response(blocks, is_error::Bool, elapsed::Real) = Dict{String,Any}(
     "content" => blocks,
@@ -73,7 +82,7 @@ function julia_eval_handler(args::AbstractDict)
 
     return res.status === :completed ?
         completed_response(res.blocks, res.is_error, res.elapsed_s) :
-        running_response(env_path, res.partial, res.elapsed_s)
+        running_response(env_path, res.partial, res.elapsed_s, res.code)
 end
 
 function julia_continue_handler(args::AbstractDict)
@@ -104,7 +113,7 @@ function julia_continue_handler(args::AbstractDict)
     end
     return res.status === :completed ?
         completed_response(res.blocks, res.is_error, res.elapsed_s) :
-        running_response(env_path, res.partial, res.elapsed_s)
+        running_response(env_path, res.partial, res.elapsed_s, res.code)
 end
 
 function julia_interrupt_handler(args::AbstractDict)
@@ -130,7 +139,7 @@ function julia_interrupt_handler(args::AbstractDict)
     end
     return res.status === :completed ?
         completed_response(res.blocks, res.is_error, res.elapsed_s) :
-        running_response(env_path, res.partial, res.elapsed_s)
+        running_response(env_path, res.partial, res.elapsed_s, res.code)
 end
 
 function julia_restart_handler(args::AbstractDict)

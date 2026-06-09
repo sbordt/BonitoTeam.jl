@@ -54,10 +54,11 @@ function send_tagged(eb::EvalBridge, tag::UInt8, payload::AbstractVector{UInt8})
         try
             HTTP.WebSockets.send(eb.ws, buf)
         catch e
-            # A send racing the dial-back socket dropping/swapping throws routinely;
-            # that's the only expected failure. Log (don't swallow) so a genuine
-            # transport fault is diagnosable.
-            @debug "eval bridge: frame send failed (socket closing?)" exception = e
+            # The expected failure here is a send racing the dial-back socket
+            # dropping/swapping. Anything else is real signal — `@debug` would
+            # silently hide it (default log level Info), so `@warn` so the
+            # actual exception type/message is visible during diagnosis.
+            @warn "eval bridge: frame send failed" exception = (e, catch_backtrace()) tag = Char(tag) bytes = length(buf) prefix = eb.prefix
         end
     end
     return nothing
@@ -168,14 +169,32 @@ end
 # Drain queued worker→browser frames to the current root connection, IN ORDER, on
 # a dedicated task — so a slow `write` stalls only this writer, never the relay
 # loop's control-frame handling.
+#
+# A `write(rc, payload)` failure means a worker→browser frame is dropped — and
+# dropping frames mid-render is exactly what produces "the plot loaded the
+# initial bundle but live updates never arrive" symptoms (the worker side sees
+# clean sends, the browser-side console sees nothing, and nothing's logged
+# because the original code only `@debug`'d the failure). Promote to `@warn`
+# so the actual exception is visible AND emit a one-shot info as soon as the
+# first frame after a failure DOES go through, so the recovery (tab reload,
+# WS swap, etc.) is also visible.
 function relay_writer(eb::EvalBridge, outbound::Channel{Vector{UInt8}})
+    just_failed = false
     for payload in outbound
         rc = eb.root_conn[]
-        rc === nothing && continue
+        if rc === nothing
+            just_failed && (@info "eval relay: no browser connection — frame dropped" prefix = eb.prefix; just_failed = true)
+            continue
+        end
         try
             write(rc, payload)
+            if just_failed
+                @info "eval relay: browser write recovered" prefix = eb.prefix
+                just_failed = false
+            end
         catch e
-            @debug "eval relay: browser write failed (tab closing/slow?)" exception = e
+            @warn "eval relay: browser write failed (frame dropped)" exception = (e, catch_backtrace()) bytes = length(payload) prefix = eb.prefix
+            just_failed = true
         end
     end
     return nothing
@@ -223,7 +242,11 @@ function handle_eval_ws(state::ServerState, ws)
         # Old bridge is a dead worker process — fail orphans, drop its asset host,
         # and clear its host-side wiring so the fresh bridge re-attaches cleanly.
         fail_pending!(to_retire, "eval bridge replaced by a new worker; in-flight request dropped")
-        try close(to_retire.asset_host) catch end
+        try
+            close(to_retire.asset_host)
+        catch e
+            @warn "eval bridge: asset_host close failed during worker-replace" exception = (e, catch_backtrace()) prefix = to_retire.prefix
+        end
         clear_bridge_wiring!(to_retire.prefix)
     end
 

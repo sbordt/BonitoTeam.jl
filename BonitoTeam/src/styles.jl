@@ -1156,5 +1156,21 @@ const ChatStyles = Bonito.Styles(
         CSS(".bt-header-title", "flex" => "1 1 auto"),
         CSS(".bt-header-sync",
             "min-width" => "0", "max-width" => "none",
-            "flex" => "0 1 auto")),
+            "flex" => "0 1 auto"),
+        # Tool/message hide-toggles toolbar: on desktop the two `flex-wrap:
+        # wrap` rows are fine; on mobile, 10–20 filter checkboxes at ~80px
+        # each wrap into 4–6 stacked rows, growing the toolbar to ~120px
+        # tall and eating the message column. Confine each row to a single
+        # horizontally-scrollable strip — the user swipes to reach the
+        # off-screen toggles, but the vertical footprint stays at one row.
+        CSS(".bt-chat-toolbar",
+            "padding" => "6px 10px",
+            "gap" => "6px",
+            "min-height" => "0"),
+        CSS(".bt-toolbar-filters, .bt-toolbar-options",
+            "flex-wrap" => "nowrap",
+            "overflow-x" => "auto",
+            "-webkit-overflow-scrolling" => "touch",
+            "gap" => "10px",
+            "padding-bottom" => "2px")),
 )

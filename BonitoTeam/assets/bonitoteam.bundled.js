@@ -1193,12 +1193,27 @@ class BonitoChat {
         }
         this.refresh();
     }
+    onHidden() {
+        this._savedScrollTop = this.container.scrollTop;
+        this._savedFollowMode = this.followMode;
+    }
     onShown() {
-        if (!this.followMode) return;
-        this.scrollToBottom();
-        requestAnimationFrame(()=>{
-            if (!this.destroyed && this.followMode) this.scrollToBottom();
-        });
+        const followNow = !!this.followMode;
+        const followThen = !!this._savedFollowMode;
+        const wantBottom = followNow || followThen;
+        const savedTop = this._savedScrollTop;
+        const apply = ()=>{
+            if (this.destroyed) return;
+            if (wantBottom) {
+                if (this.followMode) this.scrollToBottom();
+            } else if (savedTop != null) {
+                this.container.scrollTop = savedTop;
+            }
+        };
+        apply();
+        requestAnimationFrame(apply);
+        setTimeout(apply, 50);
+        setTimeout(apply, 200);
     }
     _setupInputs() {
         if (this.destroyed) return;

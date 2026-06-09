@@ -394,7 +394,18 @@ const SidebarStyles = Bonito.Styles(
     CSS("@media (max-width: 640px)",
         CSS(".bt-sidebar",  "width" => "56px"),
         CSS(".bt-side-name", "display" => "none"),
-        CSS(".bt-side-item", "justify-content" => "center")),
+        CSS(".bt-side-item", "justify-content" => "center"),
+        # `RUNNING ON WORKER` is ~68px wide at the chosen font/letter-spacing
+        # but the icons-only sidebar is 56px — the text wraps to three lines
+        # (`RUNNI` / `ON` / `WORKE`) and pushes the layout sideways. The
+        # section is purely a visual divider; with names hidden, there's no
+        # group to label anyway. Drop it on mobile.
+        CSS(".bt-side-section", "display" => "none"),
+        # Same story for the "No open chats yet — open one from the
+        # dashboard" empty state: a 56px column has no room for a sentence.
+        # The dashboard view that text refers to is already visible to the
+        # right; hide on mobile so the sidebar stays purely icons.
+        CSS(".bt-side-empty", "display" => "none")),
 )
 
 # ── Unified App ────────────────────────────────────────────────────────────
@@ -458,6 +469,16 @@ const UnifiedShellStyles = Bonito.Styles(
     CSS(".bt-stage:has(.bt-plotpane.bt-plotpane-visible) .bt-main",
         "flex"   => "0 0 clamp(var(--bt-main-min), var(--bt-chat-width, 820px), var(--bt-main-max))",
         "margin" => "0"),
+
+    # Mobile: drop the 480px desktop floor that keeps the chat readable on
+    # split screens. On a 393px-wide phone the floor forces .bt-main to
+    # 480px so the chat pane runs ~143px off the right edge of the viewport
+    # — header, messages, input and toolbar all shift right and clip. Let
+    # the column shrink to whatever the viewport gives us (sidebar takes
+    # 56px, the chat gets the rest).
+    CSS("@media (max-width: 640px)",
+        CSS(":root", "--bt-main-min" => "0px"),
+        CSS(".bt-main", "min-width" => "0")),
 
     # ── Keep-alive view stack ────────────────────────────────────────────────
     # The dashboard and every opened chat are all mounted at once and stacked on
@@ -808,7 +829,16 @@ function unified_main(session::Bonito.Session, state::ServerState,
         // also lands at the bottom even if the initial mount's scroll
         // attempts raced against late image / virtual-scroll measuring.
         root.querySelectorAll('.bt-view-chats .bt-chatpane').forEach(p => {
-            const visible = (p.dataset.panePid === pid);
+            const wasVisible = p.style.display === 'flex';
+            const visible    = (p.dataset.panePid === pid);
+            // Hiding edge: snapshot the user's scroll state BEFORE we
+            // flip display, so we read the still-valid scrollTop instead
+            // of the post-display:none collapsed one.
+            if (wasVisible && !visible) {
+                const msgs = p.querySelector('.bt-messages');
+                const chat = msgs && msgs.__bt_chat;
+                if (chat && typeof chat.onHidden === 'function') chat.onHidden();
+            }
             p.style.display = visible ? 'flex' : 'none';
             if (visible) {
                 const msgs = p.querySelector('.bt-messages');

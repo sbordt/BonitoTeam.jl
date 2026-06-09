@@ -153,6 +153,24 @@ function julia_show_app_handler(args::AbstractDict)
             "text"=>"error starting session: $(sprint(showerror, e))")], "isError"=>true)
     end
     ensure_eval_dialed!(s)   # also waits for RemoteProxy bridge to be installed
+    # Hard-verify the bridge ACTUALLY connected: if `ensure_eval_dialed!` ran
+    # but the worker's bridge WS still isn't open (dial wedged, server gone,
+    # secret mismatch), returning `shown_app:<id>` is a silent failure — the
+    # server's EVAL_WORKERS has no entry for this project, the chat renders
+    # "live app unavailable", and there's no signal back to the agent that
+    # the call WAS the failure. Fail explicitly here so the agent sees it.
+    bridge_live = try
+        Malt.remote_eval_fetch(s.worker,
+            :(isdefined(Main, :RemoteProxy) &&
+              Main.RemoteProxy.BRIDGE[] !== nothing &&
+              Main.RemoteProxy.BRIDGE[].driver.ws[] !== nothing))
+    catch
+        false
+    end
+    bridge_live || return Dict{String,Any}(
+        "content" => [Dict("type"=>"text",
+            "text"=>"error: eval-ws bridge not connected — the worker could not dial back to the BonitoTeam server. Common causes: server restarted while the worker session was running (the worker keeps a stale dial state); BONITOTEAM_SERVER_URL not set in the MCP env; BONITOTEAM_SECRET mismatch. Try bt_julia_restart to rebuild the worker process, or restart the BonitoTeam server cleanly.")],
+        "isError" => true)
     id = string(rand(UInt64); base = 16)
     try
         Malt.remote_eval_fetch(s.worker, quote

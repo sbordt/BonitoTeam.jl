@@ -45,9 +45,12 @@ function send_frame(d::BridgeDriver, tag::UInt8, payload::AbstractVector{UInt8})
         try
             WebSockets.send(ws, buf)
         catch e
-            # A send racing socket teardown/reconnect throws routinely; that's the
-            # only expected failure. Log (don't swallow) so a real fault is visible.
-            @debug "RemoteProxy: frame send failed (socket closing?)" exception = e
+            # A send racing socket teardown/reconnect is the expected failure
+            # mode (worker is supposed to redial via dial_loop). Anything else
+            # is real signal we don't want to lose — `@debug` would be silent
+            # at default log level, so use `@warn` so the actual exception
+            # type/message is visible during diagnosis.
+            @warn "RemoteProxy: frame send failed" exception = (e, catch_backtrace()) tag = Char(tag) bytes = length(buf)
         end
     end
     return nothing
@@ -239,22 +242,28 @@ register_app!(id::AbstractString, app::Bonito.App) =
 Bonito.HTTPServer.route!(b::RemoteBridge, p::Pair{String, <:Bonito.App}) =
     (b.routes[p.first] = p.second; nothing)
 
-# A fully-packed `(sub_id, html, init_url)` rendered at `bt_show_app` time, keyed
-# by app id, for the FIRST `delegate` to return verbatim — so the agent's app is
-# rendered exactly ONCE. Crucially the bundle is packed at prerender time (right
-# after the render, see `render_and_pack`), so it's byte-identical to what a
-# fresh delegate would produce — the browser mounts the SAME subsession from the
-# SAME bundle. Consumed by the first delegate.
-const PRERENDERED = Dict{String,Tuple{String,String,String}}()
+# Cache of (sub_id, html, init_url) bundles rendered at `bt_show_app` time,
+# keyed by app id. The first `delegate` returns the cached bundle verbatim;
+# subsequent delegates (re-expand, new tab) render fresh.
+#
+# Lifecycle / messages: `render_and_pack` drains `sub.message_queue` into the
+# bundle, but the sub stays alive in `b.parent.children`. Any messages emitted
+# AFTER the drain (Observable updates, plots that hand the session a Channel,
+# etc.) sit in the post-drain queue. When the browser mounts the bundle and
+# fires `JSDoneLoading`, the parent's protocol dispatcher routes it to this
+# sub, which invokes the default `on_connection_ready = init_session` —
+# `connection_ready` flips, `OPEN` is set, the post-drain queue flushes over
+# the dial-back. No need for the worker to keep a stash and drain later: the
+# queue-then-flush contract handles the entire window between render and
+# JSDoneLoading naturally.
+const PRERENDERED = Dict{String, Tuple{String,String,String}}()
 
-# Render an app into a fresh subsession and pack its init bundle ATOMICALLY: the
-# `get_messages!`/`BinaryAsset` must follow the render immediately, so the bundle
-# is exactly the render's output (draining later would sweep in any messages the
-# session emitted in between — e.g. a WGLMakie scene loop — and desync it).
-# Bonito's `handle_render_error` turns a throwing `jsrender`/`App` body into an
-# error-DOM but records the cause on `sub.init_error[]`; we re-raise it, which is
-# what makes a broken app's error PROPAGATE to the worker and to `bt_show_app`'s
-# caller instead of only painting into the browser. Returns (sub_id, html, init_url).
+# Render an app into a fresh subsession and pack its init bundle. Re-raises
+# any init/render error recorded on `sub.init_error[]` (by Bonito's
+# `handle_render_error`) so a broken `App`/`jsrender` body propagates to the
+# agent at `bt_show_app` time rather than only painting into the browser.
+# Drains messages here — late messages flow through Bonito's flush-on-open
+# (`JSDoneLoading` → `init_session(sub)`).
 function render_and_pack(b::RemoteBridge, app_id::AbstractString)
     app = b.routes.routes[String(app_id)]
     sub, dom = Bonito.render_subsession(b.parent, app; init = false)
@@ -269,9 +278,10 @@ function render_and_pack(b::RemoteBridge, app_id::AbstractString)
     return String(sub.id), html, init_url
 end
 
-# Called by `bt_show_app` right after `register_app!`: render once, cache the
-# packed bundle for the first display, and surface any render error to the agent
-# now (re-raised by `render_and_pack`).
+# Called by `bt_show_app` right after `register_app!`. Renders once, caches the
+# bundle for the first display. A throwing App body re-raises here, so the
+# agent's tool errors propagate at bt_show_app time instead of being a silent
+# "broken bubble appears later".
 function prerender_app(id::AbstractString)
     b = BRIDGE[]
     b === nothing && error("RemoteProxy bridge not installed")
@@ -279,9 +289,8 @@ function prerender_app(id::AbstractString)
     return nothing
 end
 
-# Render a registered app and return its init bundle. The first call after a
-# `bt_show_app` returns the pre-rendered bundle (no second render); later calls
-# (a new tab, a re-expand) render fresh.
+# Render-or-reuse for the host's `delegate` call: cached bundle if any
+# (consumed by this delegate), otherwise render fresh.
 function render_embed(b::RemoteBridge, app_id::AbstractString)
     cached = pop!(PRERENDERED, String(app_id), nothing)
     return cached === nothing ? render_and_pack(b, String(app_id)) : cached

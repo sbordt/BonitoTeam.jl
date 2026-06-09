@@ -1752,26 +1752,54 @@ class BonitoChat {
         this.refresh();
     }
 
+    // Save the user-visible scroll state at the instant the pane is
+    // about to be hidden. The browser's own `scrollTop` preservation
+    // across `display:none → display:flex` is unreliable on Chromium
+    // for our flex + virtual-scroll geometry: when the container has no
+    // layout box, a `scrollTop = X` write that happens during the
+    // un-hide frame gets silently clamped (typically to 0), so the user
+    // pops back to the top. By caching here and restoring through the
+    // multi-attempt cascade in `onShown` we treat the browser as opaque
+    // and just brute-force the right answer.
+    onHidden() {
+        this._savedScrollTop  = this.container.scrollTop;
+        this._savedFollowMode = this.followMode;
+    }
+
     // Called by the chat-pane visibility toggle whenever this pane goes
     // display:flex (initial open, kept-alive re-open, dashboard ↔ chat).
-    // Re-anchors to the bottom ONLY when followMode is on — i.e. the user
-    // was at the bottom (or had never scrolled away) when they last left.
-    // If they had scrolled up to read history, followMode is false and the
-    // previous scrollTop is preserved. New chats default followMode=true,
-    // so opening one for the first time always lands at the latest message.
+    // Two branches:
     //
-    // The rAF retry catches the typical hidden→shown reveal: a display:none
-    // container's flex children skip layout, so showing it re-measures the
-    // last bubble's image/video bodies and scrollHeight grows for a frame
-    // or two. Without the retry the first scrollToBottom undershoots by
-    // the just-revealed delta and the latest message sits a hair below the
-    // fold.
+    //   • Was at the bottom (followMode true now, OR it was true when we
+    //     hid the pane): re-anchor to the bottom on every retry so any
+    //     bubbles that streamed in while we were hidden land in view.
+    //   • Was scrolled up to read history (followMode false on both
+    //     sides): restore the SAVED scrollTop on every retry so a
+    //     mid-layout clamp can be undone on the next frame.
+    //
+    // Both branches use the same 0 / rAF / 50 ms / 200 ms cascade as the
+    // initial-mount path. The user observed that clicking the chat
+    // button TWICE landed on the right position — that's the symptom of
+    // a single-frame write losing to a still-in-progress flex relayout.
+    // The cascade replicates "click again later", just automatically.
     onShown() {
-        if (!this.followMode) return;
-        this.scrollToBottom();
-        requestAnimationFrame(() => {
-            if (!this.destroyed && this.followMode) this.scrollToBottom();
-        });
+        const followNow  = !!this.followMode;
+        const followThen = !!this._savedFollowMode;
+        const wantBottom = followNow || followThen;
+        const savedTop   = this._savedScrollTop;
+
+        const apply = () => {
+            if (this.destroyed) return;
+            if (wantBottom) {
+                if (this.followMode) this.scrollToBottom();
+            } else if (savedTop != null) {
+                this.container.scrollTop = savedTop;
+            }
+        };
+        apply();
+        requestAnimationFrame(apply);
+        setTimeout(apply,  50);
+        setTimeout(apply, 200);
     }
 
     // ── Image attachments ────────────────────────────────────────────────

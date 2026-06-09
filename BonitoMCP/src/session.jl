@@ -151,7 +151,30 @@ function ensure_eval_dialed!(s::JuliaSession)
     # Dedupe against this session's own state — avoids a Main-global
     # idempotency flag on the worker (Julia 1.12 strict-globals would force
     # a `Core.eval`/world-age dance, and we'd be inventing the dedupe twice).
-    s.dialed_back && return s
+    # Once we've dialed back, the worker's `dial_loop` task self-reconnects
+    # on WS drop — we do NOT want to spawn a duplicate dial_loop. Just verify
+    # the connection IS currently up; if it's between reconnect attempts
+    # (backoff sleep), wait briefly for it to come back before failing. This
+    # is the path that fires when bt_show_app runs against a worker whose WS
+    # was lost (e.g. after a BonitoTeam server restart).
+    if s.dialed_back
+        worker_ws_live() = try
+            Malt.remote_eval_fetch(s.worker,
+                :(isdefined(Main, :RemoteProxy) &&
+                  Main.RemoteProxy.BRIDGE[] !== nothing &&
+                  Main.RemoteProxy.BRIDGE[].driver.ws[] !== nothing))
+        catch
+            false
+        end
+        worker_ws_live() && return s
+        @info "BonitoMCP: eval-ws bridge currently disconnected — waiting for dial_loop to reconnect"
+        for _ in 1:40   # ~10s budget, covers max_backoff (8s) plus reconnect
+            worker_ws_live() && return s
+            sleep(0.25)
+        end
+        @warn "BonitoMCP: eval-ws bridge stayed disconnected; will not double-dial. Use bt_julia_restart to rebuild the worker if the issue persists."
+        return s
+    end
     try
         # Bootstrap over BonitoMCP's OWN Malt link: include RemoteProxy + build the
         # bridge, get its namespace prefix. The dial-back socket itself carries NO
@@ -265,7 +288,11 @@ drain_output!(s::JuliaSession) = @lock s.output_lock String(take!(s.output_buffe
 
 Returns one of:
   (status = :completed, blocks::Vector{Dict}, is_error::Bool, elapsed_s::Float64)
-  (status = :running,   partial::String, elapsed_s::Float64)
+  (status = :running,   partial::String, elapsed_s::Float64, code::String)
+
+The `code` field on the running variant carries the in-flight code so the chat
+renderer can show the ```julia code echo + partial stdout as eval-shaped
+content (same render as the completed case), instead of a raw status blob.
 
 Soft timeout — `:running` means the eval is still in flight; the caller can
 `continue_eval!` to wait more, `interrupt!` to SIGINT, or restart the session.
@@ -372,7 +399,8 @@ function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
         return (status = :completed, blocks = blocks,
                 is_error = is_error, elapsed_s = elapsed)
     end
-    return (status = :running, partial = partial, elapsed_s = elapsed)
+    return (status = :running, partial = partial, elapsed_s = elapsed,
+            code = s.in_flight_code)
 end
 
 # Build a one-block error array from a Malt task failure. Drills through the

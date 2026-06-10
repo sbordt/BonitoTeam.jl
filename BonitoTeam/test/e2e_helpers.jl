@@ -83,13 +83,25 @@ end
 
 # Open a fresh headless Electron window onto the dev server. Returns
 # (appE, win, R) where R(js) runs JS in the renderer and returns the value.
+# Electron args for the headless e2e tests. `--no-sandbox` (sandbox can't start
+# as root / in containers); `--use-gl=swiftshader` + `--enable-unsafe-swiftshader`
+# give software WebGL so WGLMakie `<canvas>` actually renders headless (no GPU) —
+# without these the plot canvases never paint and screenshots are blank. These
+# always run headless (show:false), so we want software GL unconditionally,
+# unlike Bonito's default_electron_args which only adds them under GITHUB_ACTIONS.
+const HEADLESS_WEBGL_ARGS = String[
+    "--no-sandbox",
+    # Software WebGL via ANGLE+SwiftShader. NB this Electron rejects the old
+    # `--use-gl=swiftshader` (resolves to gl=none); it wants the ANGLE form:
+    "--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
+    "--ignore-gpu-blocklist",
+]
+
 function open_browser(h; width = 1300, height = 850, logp = nothing)
     EC   = Bonito.HTTPServer.current_electron()
-    args = logp === nothing ? String["--no-sandbox"] :
-           String["--no-sandbox", "--enable-logging", "--log-file=$logp", "--v=0"]
-    # `--no-sandbox` replaces the old `sandbox=false` kwarg (ElectronCall's
-    # Application no longer accepts it) — Electron's sandbox can't start as root
-    # / in containers, which is where these e2e tests run.
+    args = vcat(HEADLESS_WEBGL_ARGS,
+                logp === nothing ? String[] :
+                String["--enable-logging", "--log-file=$logp", "--v=0"])
     appE = EC.Application(; additional_electron_args = args)
     win  = EC.Window(appE, EC.URI(h.url); options = Dict("show" => false, "width" => width, "height" => height))
     return appE, win, (c -> EC.run(win, c))

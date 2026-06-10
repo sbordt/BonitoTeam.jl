@@ -21,9 +21,36 @@ mutable struct WebSocketIO{WS} <: IO
     closed    :: Bool
     eof_seen  :: Bool                 # true once the peer has closed
     wlock     :: ReentrantLock        # serializes concurrent multi-write messages (Malt _serialize_msg)
+    # The read path (`inbuf`/`inpos`) is SINGLE-CONSUMER by contract — frames
+    # arrive in order on one ws and `_refill!` mutates shared cursor state with
+    # no lock. A second concurrent reader would interleave `inpos` updates and
+    # silently corrupt the byte stream. We can't make the read path safe for two
+    # readers cheaply (the whole frame-reassembly model assumes one), so instead
+    # we DETECT a second concurrent reader and throw, turning latent corruption
+    # into a loud, immediate error (R5). `reader` holds the owning task while a
+    # read is in progress (reentrant for that task, which lets the higher-level
+    # `read(io, n)` delegate to `readbytes!`).
+    @atomic reader :: Union{Task,Nothing}
 end
 
-WebSocketIO(ws) = WebSocketIO{typeof(ws)}(ws, UInt8[], 1, IOBuffer(), false, false, ReentrantLock())
+WebSocketIO(ws) = WebSocketIO{typeof(ws)}(ws, UInt8[], 1, IOBuffer(), false, false, ReentrantLock(), nothing)
+
+# Enforce the single-consumer read contract (R5): claim the read guard for the
+# duration of `f`, throwing if a DIFFERENT task already holds it. Same-task
+# reentry is allowed (our `read`/`readbytes!`/`unsafe_read` nest), and only the
+# outermost call releases the guard.
+function with_read_guard(f, io::WebSocketIO)
+    me = current_task()
+    owner, won = @atomicreplace io.reader nothing => me
+    if !won && owner !== me
+        error("WebSocketIO: concurrent read detected — the read path is single-consumer only")
+    end
+    try
+        return f()
+    finally
+        won && (@atomic io.reader = nothing)
+    end
+end
 
 # Transport surface: receive the next frame (returns `nothing` on close),
 # send one frame, and report whether the underlying transport is closed.
@@ -69,7 +96,12 @@ end
 
 function Base.eof(io::WebSocketIO)
     io.inpos <= length(io.inbuf) && return false
-    return !_refill!(io)
+    return with_read_guard(io) do
+        # Re-check after taking the guard: another (single) reader run could
+        # have refilled between the fast-path check and here.
+        io.inpos <= length(io.inbuf) && return false
+        return !_refill!(io)
+    end
 end
 
 Base.isopen(io::WebSocketIO) = !io.closed && !is_closed(io.ws)
@@ -77,17 +109,37 @@ Base.isopen(io::WebSocketIO) = !io.closed && !is_closed(io.ws)
 function Base.close(io::WebSocketIO)
     io.closed && return
     io.closed = true
+    # Flush whatever's still buffered before tearing the socket down. A failure
+    # here means the last chunk didn't make it (R4): log it, don't swallow it —
+    # the caller's transfer is incomplete and silently "succeeding" hides that.
+    # We still proceed to close the ws regardless so the fd is released.
     try
         # `position` rather than `bytesavailable`: after a series of writes,
         # `bytesavailable(IOBuffer)` returns 0 (it counts unread bytes from
         # the current position, not the total writes pending).
         position(io.outbuf) > 0 && send_frame!(io.ws, take!(io.outbuf))
-    catch
+    catch e
+        @warn "WebSocketIO: final flush failed on close (last chunk may be lost)" exception=(e, catch_backtrace())
+    end
+    # Actually close the underlying socket (R4) — previously the ws was left
+    # open until GC. Idempotent-friendly: tolerate an already-closed ws.
+    try
+        close_ws!(io.ws)
+    catch e
+        e isa HTTP.WebSockets.WebSocketError && return nothing
+        e isa Base.IOError                   && return nothing
+        e isa EOFError                       && return nothing
+        @warn "WebSocketIO: error closing underlying ws" exception=(e, catch_backtrace())
     end
     return nothing
 end
 
-function Base.read(io::WebSocketIO, ::Type{UInt8})
+# Close the underlying transport. Generic stub for non-HTTP transports; the
+# HTTP.WebSocket impl follows.
+function close_ws! end
+close_ws!(ws::HTTP.WebSockets.WebSocket) = close(ws)
+
+Base.read(io::WebSocketIO, ::Type{UInt8}) = with_read_guard(io) do
     while io.inpos > length(io.inbuf)
         _refill!(io) || throw(EOFError())
     end
@@ -96,7 +148,7 @@ function Base.read(io::WebSocketIO, ::Type{UInt8})
     return b
 end
 
-function Base.readbytes!(io::WebSocketIO, dst::Vector{UInt8}, n = length(dst))
+Base.readbytes!(io::WebSocketIO, dst::Vector{UInt8}, n = length(dst)) = with_read_guard(io) do
     n = Int(n)
     n > length(dst) && resize!(dst, n)
     written = 0
@@ -147,7 +199,7 @@ end
 # Read exactly `n` bytes into `p`, refilling frames as needed (or throw EOFError).
 # Needed by `Serialization.deserialize` and `read(io, ::Type{T})` for bitstypes
 # (e.g. the UInt64 message id in the Malt wire protocol).
-function Base.unsafe_read(io::WebSocketIO, p::Ptr{UInt8}, n::UInt)
+Base.unsafe_read(io::WebSocketIO, p::Ptr{UInt8}, n::UInt) = with_read_guard(io) do
     nr = 0
     while nr < n
         if io.inpos > length(io.inbuf)

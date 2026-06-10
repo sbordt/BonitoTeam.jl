@@ -69,6 +69,29 @@ using Test, Jail
                 @test work in ex
                 @test ex[end-1:end] == ["echo", "hi"]
             end
+
+            # ── R6: a non-existent whitelist dir must NOT abort the launch ────
+            # Previously bwrap got `--bind <missing>` which aborts the whole
+            # sandbox on a missing source. The dir should be created (it's RW)
+            # and bound, or fall back to --bind-try — never plain --bind of a
+            # path that doesn't exist.
+            @testset "R6 missing whitelist dir doesn't abort" begin
+                base = mktempdir()
+                missing_dir = joinpath(base, "not_there_yet")
+                @test !isdir(missing_dir)
+                c = jail(Cmd(["echo", "hi"]); whitelist = [missing_dir],
+                         backend = :bwrap, gpu = false)
+                ex = collect(String, c.exec)
+                # The whitelist dir is now bound (created → --bind, or --bind-try).
+                @test missing_dir in ex
+                # If we created it, the next index back is a bind verb; either
+                # way the source exists or is bound best-effort, not plain
+                # --bind of a missing path that would crash bwrap at runtime.
+                idx = findfirst(==(missing_dir), ex)
+                @test idx !== nothing
+                @test ex[idx - 1] in ("--bind", "--bind-try")
+                rm(base; recursive = true, force = true)
+            end
         end
     end
 
@@ -89,5 +112,22 @@ using Test, Jail
                 @test ex[end-1:end] == ["echo", "hi"]
             end
         end
+    end
+
+    # ── R2: Windows launcher aborts on integrity-label failure ───────────────
+    # The launcher is a standalone script that runs `main()` on load, so we
+    # can't include it here. Instead assert its labelling failure path now
+    # ERRORS (aborts the launch) rather than `@warn`+continue, which would run
+    # the child in a silently mislabeled sandbox. This is a source-contract
+    # regression guard that runs on every platform.
+    @testset "R2 launcher errors on icacls failure" begin
+        launcher = joinpath(dirname(@__DIR__), "src", "_lowbox_launcher.jl")
+        @test isfile(launcher)
+        src = read(launcher, String)
+        # The icacls block must turn a failure into an `error(...)` (abort).
+        @test occursin("setintegritylevel", src)
+        @test occursin("error(\"lowbox: failed to label", src)
+        # And must NOT merely warn-and-continue on that failure.
+        @test !occursin("@warn \"lowbox: failed to label", src)
     end
 end

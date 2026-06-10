@@ -283,7 +283,7 @@ function Base.close(st::TurnState)
     for tc in values(st.tools)
         if !is_terminal(tc.status)
             tc.status = "failed"
-            put!(tc.updates, tc)
+            push_snapshot!(tc.updates, tc)
         end
         close(tc)
     end
@@ -292,6 +292,34 @@ function Base.close(st::TurnState)
 end
 
 is_terminal(status::AbstractString) = status in ("completed", "failed")
+
+# Push the latest tool-call snapshot WITHOUT blocking (A7). A `ToolCall` is
+# mutated in place, so every queued entry is the SAME object — only the most
+# recent state matters. If a UI consumer abandoned `tc.updates` and let the
+# buffer fill, a plain `put!` would block the per-turn parse loop, which would
+# in turn stop draining the dispatcher's `updates` channel and wedge the whole
+# turn. Drop-oldest keeps us moving; a closed channel (consumer gone) is a
+# no-op.
+function push_snapshot!(ch::Channel{ToolCall}, tc::ToolCall)
+    while true
+        lock(ch)
+        try
+            isopen(ch) || return nothing
+            if Base.n_avail(ch) < ch.sz_max
+                put!(ch, tc)
+                return nothing
+            end
+        finally
+            unlock(ch)
+        end
+        try
+            take!(ch)
+        catch e
+            e isa InvalidStateException && return nothing
+            rethrow()
+        end
+    end
+end
 
 text_of(u::AgentMessageChunk) = u.content isa TextContent ? u.content.text : nothing
 text_of(u::AgentThoughtChunk) = u.content isa TextContent ? u.content.text : nothing
@@ -317,7 +345,7 @@ function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never 
     u.status !== nothing && (tc.status = u.status)
     u.title  !== nothing && (tc.title  = u.title)
     isempty(u.content) || (tc.content = Vector{ToolContent}(u.content))
-    put!(tc.updates, tc)
+    push_snapshot!(tc.updates, tc)
     is_terminal(tc.status) && (close(tc); delete!(st.tools, tc.id))
     return nothing
 end

@@ -14,6 +14,28 @@ const OUT_LOCK = ReentrantLock()
 # InterruptException for a bit; the existing `interrupt!` tool uses the same 30s.
 const CANCEL_KILL_GRACE = 30.0
 
+# Maps an in-flight `tools/call` requestId → the env_path it's evaluating in, so
+# `notifications/cancelled` can target ONLY the session the cancelled request
+# owns, instead of interrupting every in-flight eval across all sessions (M9 —
+# a stop in chat A previously SIGINT'd chat B's computation). Populated/cleared
+# in `dispatch!` around the eval-family handlers. `nothing` env_path = temp.
+const INFLIGHT_REQUESTS = Dict{Any,Union{String,Nothing}}()
+const INFLIGHT_LOCK = ReentrantLock()
+
+const EVAL_TOOL_NAMES = ("bt_julia_eval", "bt_julia_continue", "bt_julia_interrupt")
+
+function note_inflight_request!(id, env_path::Union{String,Nothing})
+    id === nothing && return nothing
+    @lock INFLIGHT_LOCK (INFLIGHT_REQUESTS[id] = env_path)
+    return nothing
+end
+
+function clear_inflight_request!(id)
+    id === nothing && return nothing
+    @lock INFLIGHT_LOCK (haskey(INFLIGHT_REQUESTS, id) && delete!(INFLIGHT_REQUESTS, id))
+    return nothing
+end
+
 function send!(out::IO, payload::AbstractDict)
     lock(OUT_LOCK) do
         println(out, JSON.json(payload))
@@ -62,6 +84,10 @@ function dispatch!(out, req::AbstractDict)
         if idx === nothing
             send_error!(out, id, -32602, "Unknown tool: $tool_name")
         else
+            # Record requestId → env_path for the eval family so a later
+            # `notifications/cancelled` can target just this session (M9).
+            track = tool_name in EVAL_TOOL_NAMES
+            track && note_inflight_request!(id, get(args, "env_path", nothing))
             try
                 result = TOOLS[idx].handler(args)
                 send_response!(out, id, result)
@@ -74,6 +100,8 @@ function dispatch!(out, req::AbstractDict)
                                        "text" => "tool handler threw:\n$bt")],
                     "isError" => true,
                 ))
+            finally
+                track && clear_inflight_request!(id)
             end
         end
     elseif method === nothing
@@ -106,19 +134,36 @@ function handle_cancelled!(req::AbstractDict)
     m = manager()
     # `JuliaSession` isn't defined yet at this file's include time (session.jl
     # loads after server.jl), so stay untyped here — runtime values are sessions.
+    #
+    # Target ONLY the session the cancelled request owns, when we can map it
+    # (M9). If the requestId isn't tracked (unknown id, or a cancel that arrived
+    # after the handler cleared it), fall back to interrupting all in-flight
+    # evals — never silently fail to stop a runaway computation.
+    target_env = rid === nothing ? nothing :
+        @lock INFLIGHT_LOCK get(INFLIGHT_REQUESTS, rid, :unknown)
+    scoped = rid !== nothing && target_env !== :unknown
     targets = Any[]
     lock(m.global_lock) do
         for s in values(m.sessions)
-            s.in_flight !== nothing && push!(targets, s)
+            s.in_flight === nothing && continue
+            if scoped
+                _key(s.env_path) == _key(target_env) && push!(targets, s)
+            else
+                push!(targets, s)
+            end
         end
     end
     for s in targets
+        # Capture the task being cancelled NOW, before any grace sleep — the
+        # finalizer must only ever escalate against THIS eval, never a fresh one
+        # that legitimately started during the grace window (M3).
+        f = s.in_flight
         try
             is_alive(s) && Malt.interrupt(s.worker)
         catch e
             log_info("cancelled: Malt.interrupt failed: $(sprint(showerror, e))")
         end
-        @async finalize_cancelled_eval!(s)
+        f === nothing || @async finalize_cancelled_eval!(s, f)
     end
     log_info("notifications/cancelled (requestId=$rid) → interrupted $(length(targets)) in-flight eval(s)")
     return nothing
@@ -130,13 +175,21 @@ end
 # reusable. If the eval is STILL running, it swallowed the interrupt — take the
 # worker down so it can't orphan-run forever (that session's loaded state is lost;
 # the reliable last step).
-function finalize_cancelled_eval!(s)   # s::JuliaSession (typed at call time)
+# `f` is the SPECIFIC task that was in flight when the cancel arrived (captured
+# by `handle_cancelled!` before the grace). We only act on `f` — never on
+# whatever `s.in_flight` happens to be after the sleep, which may be an innocent
+# NEW eval that started while we waited (the old code SIGKILLed that one; M3).
+function finalize_cancelled_eval!(s, f)   # s::JuliaSession, f::Task (typed at call time)
     sleep(CANCEL_KILL_GRACE)
-    f = s.in_flight
-    f === nothing && return
     if istaskdone(f)
+        # The cancel landed: clear in_flight iff it's still our task (an
+        # await_or_yield may have already cleared it; a new eval may already own
+        # the slot — leave that one alone).
         @lock s.lock (s.in_flight === f && (s.in_flight = nothing))
-    elseif is_alive(s)
+    elseif s.in_flight === f && is_alive(s)
+        # Our eval is STILL running after the grace → it swallowed the interrupt.
+        # Only escalate if it's still the in-flight one; otherwise a newer eval
+        # owns the worker and killing it would destroy innocent work.
         log_info("eval ignored interrupt after $(CANCEL_KILL_GRACE)s → killing worker (session lost)")
         try
             kill_session!(s)

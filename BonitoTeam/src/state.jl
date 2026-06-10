@@ -284,13 +284,52 @@ function safe_set!(obs::Observable, val)
     return nothing
 end
 
-# Best-effort `notify(obs)` — fires listeners without changing the value.
-# Use after in-place mutation of `state.workers[]` / `state.projects[]`.
+# Errors a stale browser session raises when we push an update to it: a Bonito
+# JSException (hashed asset 404 after redeploy), or a transport-level failure on
+# a half-dead socket. These are the "this one tab is gone" signals — NOT a bug in
+# our code — so `safe_notify!` tolerates them per-listener; anything else
+# rethrows (a real error must not be hidden, T6).
+is_stale_session_error(e) =
+    e isa Bonito.JSException ||
+    e isa Base.IOError ||
+    e isa HTTP.WebSockets.WebSocketError ||
+    e isa EOFError ||
+    (e isa ArgumentError && occursin("closed", lowercase(e.msg)))
+
+# Best-effort `notify(obs)` — fires listeners without changing the value. Use
+# after in-place mutation of `state.workers[]` / `state.projects[]`.
+#
+# `Base.notify(::Observable)` aborts at the FIRST throwing listener, so one stale
+# tab would starve every later-registered tab (T6). Instead we fire each listener
+# in its own try: a stale-session error deregisters just that dead listener (so
+# it stops costing us on every future notify) and we keep going; a real error is
+# rethrown so it surfaces. We iterate a SNAPSHOT of the listener list because we
+# mutate it (deregistration) and a listener may itself (de)register. The
+# `Consume` short-circuit semantics of `Base.notify` are preserved.
+# `Bonito.Observables` is the Observables module re-reachable through Bonito
+# (which `using`s it) — Observables isn't a direct dep of this package.
 function safe_notify!(obs::Observable)
-    try
-        notify(obs)
-    catch e
-        @debug "safe_notify!: observable propagation failed (likely stale browser session)" exception=e
+    val = obs[]
+    dead = Any[]
+    for (_, f) in copy(obs.listeners)
+        try
+            result = Base.invokelatest(f, val)
+            # Preserve `Base.notify`'s behaviour: a listener returning
+            # `Consume(true)` stops propagation to lower-priority listeners.
+            if result isa Bonito.Observables.Consume && result.x
+                break
+            end
+        catch e
+            if is_stale_session_error(e)
+                @warn "safe_notify!: dropping a stale browser-session listener" errtype=typeof(e)
+                push!(dead, f)
+            else
+                rethrow()
+            end
+        end
+    end
+    for f in dead
+        Bonito.Observables.off(obs, f)
     end
     return nothing
 end
@@ -304,16 +343,35 @@ end
 notify_chats!(s::ServerState) = safe_notify!(s.chat_signal)
 
 # ── Persistence ───────────────────────────────────────────────────────────
-# Atomic JSON write: serialise to a sibling .tmp first, then rename into place.
-# `rename(2)` on the same filesystem is atomic, so a crash mid-save can leave
-# only the old file or only the new — never a half-written file.
+# Atomic JSON write: serialise to a UNIQUE sibling temp file first, then rename
+# into place. `rename(2)` on the same filesystem is atomic, so a crash mid-save
+# can leave only the old file or only the new — never a half-written file.
+#
+# The temp name is per-call unique (`tempname(dir; cleanup=false)`) rather than a
+# fixed `path * ".tmp"`: two concurrent saves of the same target sharing one
+# fixed tmp path would have the second writer truncate the first's tmp under it,
+# and one `mv` could then rename a half-written file into place (T2). A unique
+# tmp per writer keeps each save's bytes disjoint; the final `mv` is still atomic
+# last-writer-wins. The savers also serialise under `state.lock` (below), so in
+# practice concurrent same-target writes don't happen — this is belt-and-braces.
 function atomic_write_json(path::String, data)
-    mkpath(dirname(path))
-    tmp = path * ".tmp"
-    open(tmp, "w") do io
-        JSON.print(io, data, 2)
+    dir = dirname(path)
+    mkpath(dir)
+    tmp = tempname(dir; cleanup = false)
+    try
+        open(tmp, "w") do io
+            JSON.print(io, data, 2)
+        end
+        mv(tmp, path; force = true)
+    catch
+        # Don't leave a stray temp file behind if the write or rename failed.
+        try
+            rm(tmp; force = true)
+        catch cleanup_err
+            @debug "atomic_write_json: could not remove temp file" tmp exception = cleanup_err
+        end
+        rethrow()
     end
-    mv(tmp, path; force = true)
 end
 
 # Read JSON with corruption tolerance: if the file is truncated/garbled (e.g.
@@ -340,16 +398,25 @@ function load_json_tolerant(path::String, label::String)
     end
 end
 
+# `state.lock` is a ReentrantLock, so a caller that already holds it (e.g. a
+# worker-registration critical section) re-enters harmlessly. We snapshot the
+# serialised rows UNDER the lock so an unlocked saver can't iterate
+# `values(s.workers[])` while a locked writer mutates the dict (T2), then write
+# the file outside the lock isn't necessary — the write is fast and keeping it
+# inside also serialises concurrent saves of the SAME file so they can't race
+# the rename.
 function save_workers!(s::ServerState)
-    data = [Dict("worker_id" => w.worker_id,
-                 "name" => w.name, "initials" => w.initials,
-                 "url" => w.url, "secret" => w.secret,
-                 "ssh_target" => w.ssh_target,
-                 "hostname" => w.hostname, "home" => w.home,
-                 "mcp_path" => w.mcp_path, "mcp_args" => w.mcp_args,
-                 "projects_root" => w.projects_root)
-            for w in values(s.workers[])]
-    atomic_write_json(workers_file(s), data)
+    lock(s.lock) do
+        data = [Dict("worker_id" => w.worker_id,
+                     "name" => w.name, "initials" => w.initials,
+                     "url" => w.url, "secret" => w.secret,
+                     "ssh_target" => w.ssh_target,
+                     "hostname" => w.hostname, "home" => w.home,
+                     "mcp_path" => w.mcp_path, "mcp_args" => w.mcp_args,
+                     "projects_root" => w.projects_root)
+                for w in values(s.workers[])]
+        atomic_write_json(workers_file(s), data)
+    end
 end
 
 function load_workers!(s::ServerState)
@@ -381,20 +448,28 @@ function load_workers!(s::ServerState)
     end
 end
 
+# Like `save_workers!`: snapshot + write under `state.lock` (reentrant, so
+# callers already holding it are unaffected). Without this, several savers ran
+# unlocked — `sync_project_to_server!`, `rename_worker!`, `sync_across_workers!`,
+# title backfill, etc. — iterating `values(s.projects[])` while locked writers
+# mutated the dict, and two of them could share a temp file and rename a
+# half-written projects.json into place (T2).
 function save_projects!(s::ServerState)
-    data = [Dict("id" => p.id, "name" => p.name, "worker_id" => p.worker_id,
-                 "server_path" => p.server_path, "worker_path" => p.worker_path,
-                 "created" => string(p.created),
-                 # `:syncing` is a runtime state — persist as `:stale` so a
-                 # crash mid-sync doesn't leave the next start-up reporting
-                 # "synced" for a half-transferred mirror.
-                 "backup_status" => string(p.backup_status === :syncing ? :stale : p.backup_status),
-                 "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at),
-                 "resume_session_id" => p.resume_session_id,
-                 "auto_prompt"   => p.auto_prompt,
-                 "title"         => p.title)
-            for p in values(s.projects[])]
-    atomic_write_json(projects_file(s), data)
+    lock(s.lock) do
+        data = [Dict("id" => p.id, "name" => p.name, "worker_id" => p.worker_id,
+                     "server_path" => p.server_path, "worker_path" => p.worker_path,
+                     "created" => string(p.created),
+                     # `:syncing` is a runtime state — persist as `:stale` so a
+                     # crash mid-sync doesn't leave the next start-up reporting
+                     # "synced" for a half-transferred mirror.
+                     "backup_status" => string(p.backup_status === :syncing ? :stale : p.backup_status),
+                     "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at),
+                     "resume_session_id" => p.resume_session_id,
+                     "auto_prompt"   => p.auto_prompt,
+                     "title"         => p.title)
+                for p in values(s.projects[])]
+        atomic_write_json(projects_file(s), data)
+    end
 end
 
 function load_projects!(s::ServerState)
@@ -434,7 +509,11 @@ end
 # Persist / restore the per-worker discovered-sessions cache. Best-effort:
 # it's a cache (re-derivable by Rescan), so a corrupt file just starts empty.
 function save_discovered!(s::ServerState)
-    atomic_write_json(discovered_file(s), s.discovered[])
+    lock(s.lock) do
+        # Snapshot under the lock so we don't serialise the dict while a
+        # locked writer (`scan_and_store!`) is mutating it (T2).
+        atomic_write_json(discovered_file(s), copy(s.discovered[]))
+    end
 end
 
 function load_discovered!(s::ServerState)
@@ -471,10 +550,13 @@ function find_project_by_location(state::ServerState,
                                    worker_id::AbstractString,
                                    worker_path::AbstractString)
     key = (String(worker_id), rstrip(String(worker_path), '/'))
-    for p in values(state.projects[])
-        project_location_key(p) == key && return p
+    # Iterate under the lock (T14) — writers rehash `state.projects[]`.
+    lock(state.lock) do
+        for p in values(state.projects[])
+            project_location_key(p) == key && return p
+        end
+        return nothing
     end
-    return nothing
 end
 
 """
@@ -518,11 +600,14 @@ function find_thread(state::ServerState,
                      chat_id::Union{AbstractString,Nothing})
     chat_id === nothing && return nothing
     key = (String(worker_id), rstrip(String(worker_path), '/'), String(chat_id))
-    for p in values(state.projects[])
-        (p.worker_id, rstrip(p.worker_path, '/'), p.resume_session_id) == key &&
-            return p
+    # Iterate under the lock (T14) — writers rehash `state.projects[]`.
+    lock(state.lock) do
+        for p in values(state.projects[])
+            (p.worker_id, rstrip(p.worker_path, '/'), p.resume_session_id) == key &&
+                return p
+        end
+        return nothing
     end
-    return nothing
 end
 
 """

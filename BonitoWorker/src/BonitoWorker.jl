@@ -640,6 +640,32 @@ function connect_and_serve(; server_url::String,
     end
 end
 
+# How long the control WS may go with NO inbound frame before we declare it
+# dead. The server pings well inside this window, so silence past it means a
+# half-open TCP (laptop suspend, NAT/VPN drop) where no RST ever arrives — the
+# `for frame in ws` loop would otherwise block forever and the reconnect loop in
+# `connect_and_serve` would be unreachable (M12). 3 missed ping cycles.
+const CONTROL_WS_IDLE_TIMEOUT = 90.0
+const CONTROL_WS_WATCHDOG_TICK = 5.0
+
+# Watchdog: closes `ws` (breaking the read loop → reconnect) if no frame has
+# arrived for CONTROL_WS_IDLE_TIMEOUT. `last_frame` is a Ref updated by the read
+# loop on every frame; `done` is set when the session ends so the watchdog exits.
+function control_ws_watchdog(ws, last_frame::Ref{Float64}, done::Ref{Bool})
+    while !done[]
+        sleep(CONTROL_WS_WATCHDOG_TICK)
+        done[] && return
+        if time() - last_frame[] > CONTROL_WS_IDLE_TIMEOUT
+            @warn "BonitoWorker: control WS idle > $(CONTROL_WS_IDLE_TIMEOUT)s (half-open?) — forcing reconnect"
+            try close(ws) catch e
+                @warn "BonitoWorker: watchdog close failed" exception=e
+            end
+            return
+        end
+    end
+    return
+end
+
 # Control WS lifecycle
 function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                                mcp_arguments, projects_root, agent_bin,
@@ -667,11 +693,19 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
         end
         @info "BonitoWorker: registered with server" name=name
 
+        # Last-frame watchdog: a half-open control WS (no RST) would hang the
+        # read loop forever, never reaching the reconnect loop. The watchdog
+        # closes the WS on prolonged silence so the loop exits and we redial.
+        last_frame = Ref(time())
+        done = Ref(false)
+        Base.errormonitor(Threads.@spawn control_ws_watchdog(ws, last_frame, done))
+        try
         for frame in ws
+            last_frame[] = time()
             cmd = JSON.parse(String(frame))
             t = get(cmd, "type", "")
             if t == "open_session"
-                @async handle_open_session(server_url, secret, agent_bin, cmd; agent_env)
+                @async handle_open_session(ws, server_url, secret, agent_bin, cmd; agent_env)
             elseif t == "open_transfer"
                 @async handle_open_transfer(server_url, secret, cmd)
             elseif t == "list_dir"
@@ -690,12 +724,32 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 @warn "BonitoWorker: unknown control frame" type=t
             end
         end
+        finally
+            done[] = true               # let the watchdog exit promptly
+        end
         @info "BonitoWorker: control WS closed by server"
     end
 end
 
 # Per-session WS handler
-function handle_open_session(server_url::String, secret::String, agent_bin::String,
+# Report an open_session early-failure back to the server over the control WS so
+# it stops waiting for a dial that will never come (M13). Best-effort: a dead
+# control WS is itself the larger failure and is handled by the reconnect loop.
+function report_open_session_failed(ws, sid::AbstractString, reason::AbstractString)
+    @error "BonitoWorker: open_session failed" sid reason
+    try
+        WebSockets.send(ws, JSON.json(Dict(
+            "type"  => "open_session_failed",
+            "sid"   => sid,
+            "error" => reason,
+        )))
+    catch e
+        @warn "BonitoWorker: could not report open_session failure" sid exception=e
+    end
+    return nothing
+end
+
+function handle_open_session(ws, server_url::String, secret::String, agent_bin::String,
                               cmd::AbstractDict;
                               agent_env::Dict{String,String} = Dict{String,String}())
     sid           = String(get(cmd, "sid", ""))
@@ -708,7 +762,19 @@ function handle_open_session(server_url::String, secret::String, agent_bin::Stri
                           Dict{String,String}(get(cmd, "env", Dict{String,String}())))
     isempty(sid) && (@error "open_session missing sid"; return)
 
-    isdir(cwd) || try mkpath(cwd) catch end
+    # Create the working dir if missing. A failure here (permissions, a file in
+    # the way) is fatal for this session — narrow the catch to filesystem errors,
+    # report it to the server, and bail instead of silently swallowing it and
+    # spawning the agent in the wrong cwd (M13).
+    if !isdir(cwd)
+        try
+            mkpath(cwd)
+        catch e
+            e isa Base.IOError || e isa SystemError || rethrow()
+            return report_open_session_failed(ws, sid,
+                "could not create cwd $cwd: $(sprint(showerror, e))")
+        end
+    end
 
     # `BONITOTEAM_SERVER_URL` flows from here all the way down to BonitoMCP's
     # eval-ws dial-back: claude-agent-acp inherits this env, and MCP children
@@ -726,12 +792,17 @@ function handle_open_session(server_url::String, secret::String, agent_bin::Stri
     proc = try
         open(Cmd(`$agent_bin`; env, dir = cwd), "r+")
     catch e
-        @error "BonitoWorker: failed to spawn agent" exception=e cwd
-        return
+        return report_open_session_failed(ws, sid,
+            "failed to spawn agent ($agent_bin): $(sprint(showerror, e))")
     end
     @info "BonitoWorker: ACP session started" sid cwd pid=getpid()
 
     acp_url = ws_url(server_url, "/worker-acp")
+    # Outer try/finally guarantees the agent process is reaped on EVERY exit
+    # path. The old code only killed/closed `proc` inside the relay's inner
+    # finally, which is reached ONLY after the WS dialed AND the ack succeeded —
+    # so a dial failure (server down) or a rejected ack orphaned the
+    # claude-agent-acp process with open pipes, one per failed open (M8).
     try
         WebSockets.open(acp_url) do ws
             # Tell the server which session this WS belongs to.
@@ -745,23 +816,39 @@ function handle_open_session(server_url::String, secret::String, agent_bin::Stri
             try
                 wait(ws_to_proc)
             finally
-                try
-                    isopen(proc) && kill(proc)
-                catch e
-                    @warn "BonitoWorker: kill failed" exception=e
-                end
+                # Kill proc FIRST so relay_proc_to_ws (blocked reading proc's
+                # stdout) sees EOF and returns, then drain it.
+                kill_proc!(proc)
                 wait(proc_to_ws)
-                try
-                    close(proc)
-                catch e
-                    e isa Base.IOError || @warn "BonitoWorker: close proc failed" exception=e
-                end
             end
         end
     catch e
-        @error "BonitoWorker: ACP session error" sid exception=e
+        # A dial/ack failure here means the server never bound this WS to the
+        # session, so it'd wait forever — tell it (M13). Mid-session transport
+        # errors are reported too; harmless if the session already came up.
+        report_open_session_failed(ws, sid, "ACP session error: $(sprint(showerror, e))")
+    finally
+        # Backstop reap: covers the paths the inner finally never reaches — dial
+        # failure, rejected ack, or any throw before the relays start. Idempotent
+        # with the inner kill (kill of an already-dead proc is a no-op).
+        kill_proc!(proc)
     end
     @info "BonitoWorker: ACP session ended" sid cwd
+end
+
+# Kill + close an agent process, tolerating an already-dead/closed one.
+function kill_proc!(proc)
+    try
+        isopen(proc) && kill(proc)
+    catch e
+        @warn "BonitoWorker: kill failed" exception=e
+    end
+    try
+        close(proc)
+    catch e
+        e isa Base.IOError || @warn "BonitoWorker: close proc failed" exception=e
+    end
+    return nothing
 end
 
 # Filesystem listing RPC
@@ -970,44 +1057,75 @@ function inspect_git_subrepo(abs_dir::AbstractString, root::AbstractString)
 end
 
 # Clone a GitHub repo into `dst_path` (must not exist yet). For PRs we then
-# fetch the PR head ref and check it out as a local branch `pr-<n>` so the
-# checkout uses a normal branch name. The server pre-derives `dst_path` so
-# we don't have to repeat the projects_root logic on the worker.
-function handle_clone_repo(ws, cmd::AbstractDict)
-    request_id = String(get(cmd, "request_id", ""))
-    url        = String(get(cmd, "url", ""))
-    dst_path   = String(get(cmd, "dst_path", ""))
-    pr_raw     = get(cmd, "pr_number", nothing)
-    pr_number  = pr_raw === nothing ? nothing :
-                 (pr_raw isa Integer ? Int(pr_raw) : parse(Int, String(pr_raw)))
+# fetch the PR head ref and check it out as a local branch `pr-<n>`. The server
+# pre-derives `dst_path` so we don't repeat the projects_root logic on the worker.
+#
+# Core clone flow, decoupled from the WS so it's unit-testable. `do_clone(url,
+# dst_path, pr_number)` performs the actual `git clone` (+ PR checkout); tests
+# inject a stub. Returns the response Dict.
+#
+# The cleanup invariant (M1): `created` flips true ONLY after the "already
+# exists" guard passes and we're about to run the clone. The catch's `rm` is
+# gated on it, so a name collision or a malformed pr_number can NEVER delete a
+# pre-existing tree — the old code threw the "exists" error into the same catch
+# that did `rm(dst_path)`, wiping the user's data.
+function clone_repo_response(request_id::AbstractString, url::AbstractString,
+                             dst_path::AbstractString, pr_raw, do_clone)
+    created = false
+    try
+        # pr_number parsing lives INSIDE the try: a malformed value must return
+        # an error response, not throw out of the bare @async with no reply ever
+        # sent (the server would wait forever).
+        pr_number = pr_raw === nothing ? nothing :
+                    (pr_raw isa Integer ? Int(pr_raw) : parse(Int, String(pr_raw)))
 
-    response = try
         isempty(url)      && error("missing url")
         isempty(dst_path) && error("missing dst_path")
         ispath(dst_path)  && error("dst_path already exists: $dst_path")
         mkpath(dirname(dst_path))
 
-        run(`git clone --depth 50 $url $dst_path`)
-        if pr_number !== nothing
-            ref   = "pull/$(pr_number)/head"
-            local_branch = "pr-$(pr_number)"
-            run(setenv(`git -C $dst_path fetch origin $ref:$local_branch`))
-            run(setenv(`git -C $dst_path checkout $local_branch`))
-        end
-        Dict("type"       => "clone_repo_response",
-             "request_id" => request_id,
-             "dst_path"   => dst_path)
+        created = true                     # from here on, the clone owns dst_path
+        do_clone(url, dst_path, pr_number)
+        return Dict("type"       => "clone_repo_response",
+                    "request_id" => request_id,
+                    "dst_path"   => dst_path)
     catch e
-        # If clone partially populated the dir, clean up so a retry can start
-        # fresh — leaving a half-cloned tree blocks the "already exists" check.
-        try
-            isdir(dst_path) && rm(dst_path; recursive = true, force = true)
-        catch
+        # Clean up ONLY a directory WE created (a partial clone), so a retry can
+        # start fresh. Never touch a pre-existing tree — `created` stays false on
+        # the "already exists" / bad-arg paths, so the user's data is safe.
+        if created
+            try
+                isdir(dst_path) && rm(dst_path; recursive = true, force = true)
+            catch rmerr
+                @warn "clone_repo cleanup failed" dst_path exception=rmerr
+            end
         end
-        Dict("type"       => "clone_repo_response",
-             "request_id" => request_id,
-             "error"      => sprint(showerror, e))
+        return Dict("type"       => "clone_repo_response",
+                    "request_id" => request_id,
+                    "error"      => sprint(showerror, e))
     end
+end
+
+# The real clone: shallow `git clone`, then for PRs fetch the head ref into a
+# local `pr-<n>` branch and check it out.
+function git_clone!(url::AbstractString, dst_path::AbstractString, pr_number)
+    run(`git clone --depth 50 $url $dst_path`)
+    if pr_number !== nothing
+        ref          = "pull/$(pr_number)/head"
+        local_branch = "pr-$(pr_number)"
+        run(setenv(`git -C $dst_path fetch origin $ref:$local_branch`))
+        run(setenv(`git -C $dst_path checkout $local_branch`))
+    end
+    return nothing
+end
+
+function handle_clone_repo(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    url        = String(get(cmd, "url", ""))
+    dst_path   = String(get(cmd, "dst_path", ""))
+    pr_raw     = get(cmd, "pr_number", nothing)
+
+    response = clone_repo_response(request_id, url, dst_path, pr_raw, git_clone!)
     try
         WebSockets.send(ws, JSON.json(response))
     catch e

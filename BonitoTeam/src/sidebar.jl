@@ -177,12 +177,18 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         isempty(pid) && return
         p = get(state.projects[], pid, nothing)
         p === nothing && return
-        try
-            stop_session!(state, p)
-        catch e
-            @warn "sidebar: closing chat failed" project = p.name exception = e
-        end
+        # Flip the view away FIRST, then tear the session down off the event
+        # task (T21). `stop_session!` closes the transport (network I/O) and the
+        # ChatModel, which can block for seconds — running it inline froze the
+        # tab's UI. The view change is what the user sees immediately.
         current_view[] == pid && (current_view[] = "")
+        @async begin
+            try
+                stop_session!(state, p)
+            catch e
+                @warn "sidebar: closing chat failed" project = p.name exception = (e, catch_backtrace())
+            end
+        end
     end
 
     # ONE unified "Open chats" list. A project is "open" iff the user has
@@ -298,9 +304,15 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # finishing) fans straight through to the sidebar without any polling.
     status_obs = Observable(Dict{String,String}())
     function recompute_status!()
+        # Snapshot (pid, project) pairs under the lock (T17) so we don't iterate
+        # `state.projects[]` across the `chat_status` call (which can yield) while
+        # a writer rehashes the dict. `chat_status` then runs on the snapshot.
+        pairs = lock(state.lock) do
+            [(pid, p) for (pid, p) in state.projects[]
+             if p.title !== nothing || p.resume_session_id !== nothing]
+        end
         new = Dict{String,String}()
-        for (pid, p) in state.projects[]
-            (p.title !== nothing || p.resume_session_id !== nothing) || continue
+        for (pid, p) in pairs
             new[pid] = string(chat_status(state, p))
         end
         status_obs[] = new
@@ -639,7 +651,15 @@ function project_loading_view(state::ServerState, pid::String,
                         onclick = js"() => $(ls.retry).notify($(pid))");
                 class = "bt-loading")
         end
-        if !(pid in ls.inflight) && !haskey(state.chat_models, pid)
+        # Gate the bring-up on the chat still being the one on screen (T5). This
+        # `map(state.workers)` body is NOT session-scoped, so it survives the
+        # user navigating away (or closing the chat via ✕) and re-runs on the
+        # next workers-notify. Without this gate that stale re-run would respawn
+        # the claude subprocess for a chat the user already closed. T1's funnel
+        # also collapses genuine duplicate bring-ups, but this stops the spurious
+        # kick at the source.
+        if current_view[] == pid &&
+           !(pid in ls.inflight) && !haskey(state.chat_models, pid)
             push!(ls.inflight, pid)
             proj = p
             @async begin

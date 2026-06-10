@@ -6,6 +6,12 @@
 #   AgentClientProtocol.prompt!(client, "hello")   # blocks until end_turn/cancelled
 #   AgentClientProtocol.cancel!(client)
 
+# Upper bound on how long the `initialize` / `session/new` setup RPCs may take
+# before `Client()` gives up on a wedged agent (A3). Generous: cold node start +
+# MCP server bring-up can legitimately take a while, but a hang must not be
+# forever.
+const SETUP_TIMEOUT_SECONDS = 120.0
+
 struct MCPServer
     name::String
     command::String
@@ -114,25 +120,36 @@ function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
     proc = open(Cmd(`$agent_bin`; env, dir=cwd), "r+")
     conn = Connection(proc, handler)
 
-    send_request(conn, "initialize", Dict(
-        "protocolVersion"    => 1,
-        "clientCapabilities" => Dict(
-            "fs" => Dict("readTextFile" => true, "writeTextFile" => true)
-        ),
-        "clientInfo" => Dict("name" => "AgentClientProtocol.jl", "version" => "0.1.0")
-    ))
+    # Any setup failure (RPC error, agent that never replies / wedges, a throw
+    # while building the session) must close the connection — which kills the
+    # subprocess and unblocks the reader/dispatcher — and rethrow, so we never
+    # leak an orphaned claude-agent-acp process or hang forever on a dead agent
+    # (A3). The setup RPCs carry a timeout for the same reason.
+    try
+        send_request(conn, "initialize", Dict(
+            "protocolVersion"    => 1,
+            "clientCapabilities" => Dict(
+                "fs" => Dict("readTextFile" => true, "writeTextFile" => true)
+            ),
+            "clientInfo" => Dict("name" => "AgentClientProtocol.jl", "version" => "0.1.0")
+        ), SETUP_TIMEOUT_SECONDS)
 
-    mcp_list = [Dict("name"    => s.name,
-                     "command" => s.command,
-                     "args"    => s.args,
-                     "env"     => [Dict("name" => k, "value" => v) for (k,v) in s.env])
-                for s in mcp_servers]
+        mcp_list = [Dict("name"    => s.name,
+                         "command" => s.command,
+                         "args"    => s.args,
+                         "env"     => [Dict("name" => k, "value" => v) for (k,v) in s.env])
+                    for s in mcp_servers]
 
-    result = send_request(conn, "session/new",
-                          Dict("cwd" => cwd, "mcpServers" => mcp_list))
-    session_id = result["sessionId"]
+        result = send_request(conn, "session/new",
+                              Dict("cwd" => cwd, "mcpServers" => mcp_list),
+                              SETUP_TIMEOUT_SECONDS)
+        session_id = result["sessionId"]
 
-    return Client(conn, session_id, cwd, _result_dict(result))
+        return Client(conn, session_id, cwd, _result_dict(result))
+    catch e
+        close(conn)
+        rethrow()
+    end
 end
 
 # One attached image for a multimodal prompt.
@@ -233,9 +250,33 @@ end
 # `session/cancel` notification so the agent actually winds the turn down and
 # resolves the prompt with `stopReason: cancelled`.
 function cancel!(client::Client)
-    @atomic client.conn.cancelling = true
-    send_notification(client.conn, "session/cancel",
+    conn = client.conn
+    # No-op when idle (A8): cancelling between turns would otherwise leave
+    # `cancelling` latched true and poison the NEXT turn (its consumer would
+    # fast-discard every update). Only flip the flag + send the notification
+    # when a turn is actually in flight. Checked under `conn.lock` so we read a
+    # consistent view of `active_id`.
+    has_turn = lock(() -> conn.active_id !== nothing, conn.lock)
+    has_turn || return nothing
+    @atomic conn.cancelling = true
+    send_notification(conn, "session/cancel",
                       Dict("sessionId" => client.session_id))
+    return nothing
+end
+
+# Set one of the session's configurable options (model / mode / effort / …).
+# Wire method: `session/set_config_option` with `{sessionId, configId, value}`,
+# per the ACP SDK (zSetSessionConfigOptionRequest) and claude-agent-acp's
+# setSessionConfigOption handler. Returns whatever the agent responds with
+# (claude-agent-acp returns an empty object). Throws on rpc error; the caller
+# is expected to either rely on the agent's follow-up `config_option_update`
+# notification to confirm the new value, or surface the error to the user.
+function set_config_option!(client::Client, config_id::AbstractString,
+                            value::AbstractString)
+    return send_request(client.conn, "session/set_config_option",
+        Dict("sessionId" => client.session_id,
+             "configId"  => String(config_id),
+             "value"     => String(value)))
 end
 
 Base.close(client::Client) = close(client.conn)

@@ -13,6 +13,38 @@
 # reason as everything else: dev on a synced project needs full history.
 const SNAPSHOT_IGNORE_DIRS = Set{String}()
 
+# ── Path-traversal guard (R1/R7) ────────────────────────────────────────────
+# A `rel` path arrives over the wire from the PEER's manifest/plan and is then
+# fed to `joinpath(root, rel)` on BOTH sides (receiver writes, sender reads). A
+# hostile or buggy peer can send an absolute path (`joinpath(root, "/etc/x")`
+# == "/etc/x") or a `..`-escaping relative path and walk straight out of the
+# sync root — arbitrary file write on the receiver, arbitrary file read /
+# exfiltration on the sender. Every wire-supplied `rel` MUST pass through here
+# before it touches the filesystem.
+#
+# `safe_rel(root, rel)` returns the normalized rel string when it stays inside
+# `root`, or `nothing` when it would escape (absolute, `..`-escaping, or empty).
+# Callers reject the entry on `nothing`. Comparison is done on normalized
+# absolute paths so `a/../b`, trailing slashes, and `.` segments all collapse
+# the same way (this also canonicalizes for the delete/membership pass, R7).
+function safe_rel(root::AbstractString, rel::AbstractString)
+    isempty(rel) && return nothing
+    # Reject absolute paths outright (covers POSIX "/x" and Windows "C:\x" /
+    # "\x"); `joinpath` would discard `root` entirely for these.
+    (startswith(rel, '/') || startswith(rel, '\\')) && return nothing
+    occursin(r"^[A-Za-z]:", rel) && return nothing
+    # Normalize and require the result to live under root.
+    rootabs = normpath(abspath(root))
+    target  = normpath(joinpath(rootabs, rel))
+    prefix  = endswith(rootabs, Base.Filesystem.path_separator) ?
+              rootabs : rootabs * Base.Filesystem.path_separator
+    (target == rootabs || startswith(target, prefix)) || return nothing
+    # The normalized rel, in forward-slash wire form, relative to root.
+    norm = relpath(target, rootabs)
+    Sys.iswindows() && (norm = replace(norm, '\\' => '/'))
+    return norm
+end
+
 """
     walk_directory(root) → Vector{ManifestEntry}
 
@@ -44,12 +76,25 @@ end
 function build_plan(local_root::AbstractString,
                     remote_manifest::Vector{ManifestEntry})
     plan = PlanEntry[]
-    remote_set = Set(e.rel for e in remote_manifest)
-
+    # Canonicalize every remote rel up front and drop anything that escapes the
+    # root (R1/R7). The membership set used by the delete pass is built from the
+    # SAME canonical forms so a normalization mismatch can't delete a valid
+    # local file.
+    safe_remote = Tuple{ManifestEntry,String}[]
     for e in remote_manifest
-        local_path = joinpath(local_root, e.rel)
+        sr = safe_rel(local_root, e.rel)
+        if sr === nothing
+            @warn "RemoteSync: rejecting unsafe manifest path" rel=e.rel
+            continue
+        end
+        push!(safe_remote, (e, sr))
+    end
+    remote_set = Set(sr for (_, sr) in safe_remote)
+
+    for (e, rel) in safe_remote
+        local_path = joinpath(local_root, rel)
         if !isfile(local_path)
-            push!(plan, PlanEntry(e.rel, ACTION_FULL, UInt8[]))
+            push!(plan, PlanEntry(rel, ACTION_FULL, UInt8[]))
             continue
         end
         st = stat(local_path)
@@ -58,11 +103,11 @@ function build_plan(local_root::AbstractString,
         # absorbs Float64 precision loss in the stat→wire→utimes→stat round-trip
         # (ns precision can't survive Float64 at modern Unix epoch values).
         if UInt64(st.size) == e.size && abs(Float64(st.mtime) - e.mtime) < 0.001
-            push!(plan, PlanEntry(e.rel, ACTION_SKIP, UInt8[]))
+            push!(plan, PlanEntry(rel, ACTION_SKIP, UInt8[]))
             continue
         end
         sig = full_signature_bytes(local_path)
-        push!(plan, PlanEntry(e.rel, ACTION_PATCH, sig))
+        push!(plan, PlanEntry(rel, ACTION_PATCH, sig))
     end
 
     # Anything local but not in remote → delete.
@@ -106,7 +151,13 @@ function send_directory(root::AbstractString, transport::IO;
                     (planned = length(plan), work = length(work)))
 
     for (i, p) in pairs(work)
-        local_path = joinpath(root, p.rel)
+        # The plan came from the REMOTE receiver; validate its rel before we
+        # open any local file (R1) — otherwise a malicious plan could make us
+        # read `/etc/shadow` and stream it back.
+        sr = safe_rel(root, p.rel)
+        sr === nothing &&
+            error("RemoteSync sender: refusing unsafe plan path: $(repr(p.rel))")
+        local_path = joinpath(root, sr)
         notify_progress(on_progress, :file_start,
                         (rel = p.rel, idx = i, total = length(work),
                          action = p.action == ACTION_FULL ? :full : :patch))
@@ -171,18 +222,31 @@ function receive_directory(root::AbstractString, transport::IO;
     deleted = 0
 
     expected = filter(p -> p.action == ACTION_FULL || p.action == ACTION_PATCH, plan)
-    by_rel   = Dict(e.rel => e for e in manifest)
+    # Key by the canonical rel (the form `build_plan` puts into the plan, and
+    # thus the form the DELTA frames echo back) so the mtime-touch lookup below
+    # actually hits (R7).
+    by_rel = Dict{String,ManifestEntry}()
+    for e in manifest
+        sr = safe_rel(root, e.rel)
+        sr === nothing || (by_rel[sr] = e)
+    end
     for (i, p) in pairs(expected)
         tag2, pl = read_frame(transport)
         tag2 == TAG_DELTA ||
             error("RemoteSync receiver: expected DELTA, got tag $(tag2)")
         rel, delta = decode_delta_frame(pl)
         rel == p.rel || error("RemoteSync receiver: delta order mismatch ($(rel) vs $(p.rel))")
+        # `p.rel` was produced by our own `build_plan` (already canonical+safe),
+        # and `rel` just matched it — but re-validate defensively before any
+        # write so a future plan-builder change can't silently reopen R1.
+        srel = safe_rel(root, rel)
+        srel === nothing &&
+            error("RemoteSync receiver: refusing unsafe delta path: $(repr(rel))")
 
         notify_progress(on_progress, :apply_start,
                         (rel = rel, idx = i, total = length(expected)))
 
-        dst = joinpath(root, rel)
+        dst = joinpath(root, srel)
         mkpath(dirname(dst))
         partial = dst * ".partial"
         try
@@ -204,9 +268,9 @@ function receive_directory(root::AbstractString, transport::IO;
 
         # Set mtime to the source's so the next-run shortcut (size+mtime ⇒ skip)
         # actually fires.
-        if haskey(by_rel, rel)
+        if haskey(by_rel, srel)
             try
-                touch_mtime(dst, by_rel[rel].mtime)
+                touch_mtime(dst, by_rel[srel].mtime)
             catch
                 # touch_mtime is a best-effort optimisation; failing it
                 # only costs us an extra rsync round-trip next time.
@@ -228,7 +292,12 @@ function receive_directory(root::AbstractString, transport::IO;
 
     for p in plan
         p.action == ACTION_DELETE || continue
-        full = joinpath(root, p.rel)
+        # DELETE entries are produced by our own `build_plan` from a local
+        # walkdir, so they're already canonical — but re-validate before `rm`
+        # so an unsafe path can NEVER drive a delete outside root (R1/R7).
+        srel = safe_rel(root, p.rel)
+        srel === nothing && (@warn "RemoteSync: skipping unsafe delete path" rel=p.rel; continue)
+        full = joinpath(root, srel)
         try
             isfile(full) && (rm(full); deleted += 1)
         catch e

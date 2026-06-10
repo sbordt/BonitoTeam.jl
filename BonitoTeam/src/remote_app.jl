@@ -45,6 +45,15 @@ make_eval_bridge(prefix::AbstractString, ws, host) = EvalBridge(
 
 const EVAL_WORKERS = Dict{String, EvalBridge}()    # project_id => EvalBridge
 
+# Read an eval bridge for `project_id` under `state.lock` (T11). Writers
+# (`handle_eval_ws`, `teardown_eval_bridge!`) mutate `EVAL_WORKERS` under the
+# same lock, so UI tasks that just `get(EVAL_WORKERS, …)` raced a concurrent
+# insert/delete (Dict rehash). All reads go through here.
+eval_bridge_for(state::ServerState, project_id::AbstractString) =
+    lock(state.lock) do
+        get(EVAL_WORKERS, String(project_id), nothing)
+    end
+
 # ── Raw frame transport to the worker ───────────────────────────────────────
 function send_tagged(eb::EvalBridge, tag::UInt8, payload::AbstractVector{UInt8})
     buf = Vector{UInt8}(undef, length(payload) + 1)
@@ -112,13 +121,29 @@ ctrl_bytes(x) = x === nothing ? nothing :
 function handle_worker_control(eb::EvalBridge, msg::AbstractDict)
     op = msg["op"]
     if op == "reply"
-        ch = lock(eb.pending_lock) do; get(eb.pending, Int(msg["id"]), nothing); end
+        # `pop!` (not `get`) under the lock so exactly ONE side owns the channel
+        # (T9). With a `get`, a concurrent `fail_pending!` could fill the
+        # capacity-1 channel first and this `put!` would then block the relay
+        # loop forever. Popping means whichever of {reply, fail_pending!} gets
+        # the entry first is the sole writer; the other finds it gone.
+        ch = lock(eb.pending_lock) do
+            id = Int(msg["id"])
+            haskey(eb.pending, id) ? pop!(eb.pending, id) : nothing
+        end
         # Worker can reply with `err` (string showerror) instead of `val` when
         # `handle_control` raised. Surface as an Exception so `call_ctrl` throws
-        # immediately — no 30 s timedwait, no swallowed failures.
-        ch === nothing || put!(ch,
-            haskey(msg, "err") ? ErrorException(String(msg["err"])) :
-                                 get(msg, "val", nothing))
+        # immediately — no 30 s timedwait, no swallowed failures. The `put!` is
+        # safe (we own the channel) but the caller may have already given up
+        # (closed it) on timeout — that's not an error.
+        if ch !== nothing
+            try
+                put!(ch,
+                    haskey(msg, "err") ? ErrorException(String(msg["err"])) :
+                                         get(msg, "val", nothing))
+            catch e
+                e isa InvalidStateException || rethrow()
+            end
+        end
     elseif op == "asset_add"
         k = String(msg["key"])
         cached = ctrl_bytes(msg["cached"])
@@ -183,7 +208,13 @@ function relay_writer(eb::EvalBridge, outbound::Channel{Vector{UInt8}})
     for payload in outbound
         rc = eb.root_conn[]
         if rc === nothing
-            just_failed && (@info "eval relay: no browser connection — frame dropped" prefix = eb.prefix; just_failed = true)
+            # One-shot log on the FIRST drop of a run (T12): the old condition
+            # `just_failed && (…; just_failed = true)` was inverted — it only
+            # logged once `just_failed` was ALREADY true, so the promised
+            # "frame dropped" line never fired on the first drop. Log when NOT
+            # already in a failed run, then latch.
+            just_failed || (@info "eval relay: no browser connection — frame dropped" prefix = eb.prefix)
+            just_failed = true
             continue
         end
         try
@@ -325,7 +356,14 @@ function teardown_eval_bridge!(state::ServerState, project_id::AbstractString)
     end
     eb === nothing && return nothing
     fail_pending!(eb, "eval bridge torn down (worker session ended)")
-    try; close(eb.asset_host); catch; end
+    # Don't swallow the asset-host close failure (T12) — mirror the sibling at
+    # the worker-replace path which logs it. The bridge is being retired either
+    # way, so we log and continue rather than abort the teardown.
+    try
+        close(eb.asset_host)
+    catch e
+        @warn "eval bridge: asset_host close failed during teardown" exception = (e, catch_backtrace()) prefix = eb.prefix
+    end
     clear_bridge_wiring!(eb.prefix)
     @info "eval bridge torn down with worker session" project_id prefix = eb.prefix
     return nothing
@@ -519,8 +557,9 @@ end
 # Build the placeholder for a `bonito_app` tool. `app_id` is the id the worker
 # registered the app under on its RemoteProxy bridge (via `RemoteProxy.register_app!`,
 # either through `bt_show_app` or `show_remote_app!`).
-function remote_app_placeholder(tool_id::AbstractString, project_id::AbstractString, app_id::AbstractString)
-    eb = get(EVAL_WORKERS, String(project_id), nothing)
+function remote_app_placeholder(state::ServerState, tool_id::AbstractString,
+                                project_id::AbstractString, app_id::AbstractString)
+    eb = eval_bridge_for(state, project_id)   # read under state.lock (T11)
     return RemoteAppPlaceholder(eb, String(app_id))
 end
 
@@ -566,7 +605,7 @@ Like `show_remote_app!`, but uses the eval bridge that dialed back for this
 model's project.
 """
 function show_remote_app_for_project!(model::ChatModel, code::AbstractString; title::AbstractString="Interactive app")
-    eb = get(EVAL_WORKERS, model.project_id, nothing)
+    eb = eval_bridge_for(model.state, model.project_id)   # read under state.lock (T11)
     eb === nothing && error("show_remote_app: no eval bridge dialed back for project $(model.project_id)")
     return show_remote_app!(model, eb, code; title)
 end

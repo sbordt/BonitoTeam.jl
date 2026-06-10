@@ -28,6 +28,14 @@ const PKG_PATTERN = r"\bPkg\."
 const DEFAULT_TIMEOUT = 30.0
 const BONITO_UUID = Base.UUID("824d6782-a2ef-11e9-3a09-e5662e0c26f8")
 
+# Hard cap on captured stdout. An abandoned printing eval (`for i in 1:10^8;
+# println(i); end`) would otherwise grow `output_buffer` without bound (OOM) and
+# pump tens of MB straight into the agent's MCP context. We keep only the LAST
+# `STDOUT_CAP_BYTES` bytes (the tail is what's relevant for "what was it doing
+# when I checked"), dropping the head with a one-line marker. Applied both in the
+# pump (memory bound) and again on the drained `partial` (context bound).
+const STDOUT_CAP_BYTES = 256 * 1024
+
 # Locate Bonito's source directory in BonitoMCP's own active project, so a
 # temp eval env can path-dep on the *same* Bonito BonitoMCP itself runs
 # against. Returns `nothing` if Bonito isn't in the active project (e.g.
@@ -93,6 +101,7 @@ mutable struct JuliaSession
     lock::ReentrantLock                 # serialises eval/continue/interrupt
     log_path::Union{String,Nothing}
     dialed_back::Bool                   # `ensure_eval_dialed!` dedupes against this; flipped under `lock`
+    closed::Bool                        # terminal: set by kill_session!; start! refuses to resurrect
 end
 
 function JuliaSession(env_path;
@@ -104,7 +113,7 @@ function JuliaSession(env_path;
                         nothing, IOBuffer(), ReentrantLock(),
                         nothing, nothing,
                         nothing, "", 0.0,
-                        ReentrantLock(), log_path, false)
+                        ReentrantLock(), log_path, false, false)
 end
 
 is_alive(s::JuliaSession) = s.worker !== nothing && Malt.isrunning(s.worker)
@@ -145,6 +154,17 @@ function ensure_eval_dialed!(s::JuliaSession)
     server_url = get(ENV, "BONITOTEAM_SERVER_URL", "")
     isempty(server_url) && return s
     wsurl = replace(rstrip(server_url, '/'), r"^http" => "ws") * "/eval-ws"
+    # The whole bootstrap (start! + RemoteProxy include + dial_loop spawn + the
+    # dedupe read/write of s.dialed_back) runs under s.lock. Two concurrent
+    # bt_show_app calls would otherwise each `start!` and each spawn an eternal
+    # dial_loop that steals d.ws[] from the other forever; the unlocked start!
+    # also raced execute's locked one (leaked Malt worker, interleaved pumps).
+    # s.lock is reentrant, so a caller already holding it (none today) is fine.
+    @lock s.lock ensure_eval_dialed_locked!(s, wsurl)
+    return s
+end
+
+function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
     is_alive(s) || start!(s)
     secret     = get(ENV, "BONITOTEAM_SECRET", "")
     project_id = get(ENV, "BONITOTEAM_PROJECT_ID", "")
@@ -233,7 +253,16 @@ function ensure_eval_dialed!(s::JuliaSession)
 end
 
 function start!(s::JuliaSession)
+    # Terminal-state guard: a session killed via kill_session! must never be
+    # resurrected into a fresh, untracked worker (it would be unreachable by the
+    # manager's restart/shutdown — a zombie holding a second live worker for the
+    # same env). Callers that hit a closed session must obtain a NEW session from
+    # the manager instead. (M6: make the wrong state impossible.)
+    s.closed && error("session is closed (killed); create a fresh one via the manager")
     is_alive(s) && return s
+    # A fresh worker means a fresh dial-back — the old worker's bridge died with
+    # it, so clear the dedupe flag (M10).
+    s.dialed_back = false
     s.worker = Malt.Worker(
         monitor_stdout = false,
         monitor_stderr = false,
@@ -267,7 +296,12 @@ function pump_pipe!(s::JuliaSession, pipe)
         while !eof(pipe)
             data = readavailable(pipe)
             isempty(data) && continue
-            @lock s.output_lock write(s.output_buffer, data)
+            @lock s.output_lock begin
+                write(s.output_buffer, data)
+                cap_output_buffer!(s.output_buffer)
+            end
+            # The on-disk log is uncapped on purpose — it's the full record and
+            # not part of the in-memory/MCP-context budget.
             log_io === nothing || (write(log_io, data); flush(log_io))
         end
     catch e
@@ -279,7 +313,38 @@ function pump_pipe!(s::JuliaSession, pipe)
     end
 end
 
+# Keep `buf` bounded to `STDOUT_CAP_BYTES` by dropping the OLDEST bytes when it
+# overflows (the tail is what matters for "what is it printing now"). Replaces
+# the buffer contents with a marker + the kept tail. Caller holds `output_lock`.
+function cap_output_buffer!(buf::IOBuffer)
+    n = buf.size
+    n <= STDOUT_CAP_BYTES && return buf
+    all = take!(buf)                       # drains + resets buf
+    tail = @view all[(end - STDOUT_CAP_BYTES + 1):end]
+    dropped = n - STDOUT_CAP_BYTES
+    write(buf, "[stdout truncated: dropped earliest $dropped bytes]\n")
+    write(buf, tail)
+    return buf
+end
+
 drain_output!(s::JuliaSession) = @lock s.output_lock String(take!(s.output_buffer))
+
+# Truncate a (already-drained) stdout string to a byte budget for the MCP
+# response, keeping the TAIL (most recent output). Pure so it's unit-testable.
+function cap_response_text(text::AbstractString, max_bytes::Int = STDOUT_CAP_BYTES)
+    bytes = codeunits(text)
+    length(bytes) <= max_bytes && return String(text)
+    dropped = length(bytes) - max_bytes
+    keep = String(bytes[(dropped + 1):end])
+    # The raw byte cut may have split a multibyte UTF-8 char, leaving invalid
+    # leading continuation bytes. Advance to the first valid char boundary.
+    start = 1
+    while start <= ncodeunits(keep) && !isvalid(keep, start)
+        start += 1
+    end
+    aligned = start == 1 ? keep : String(SubString(keep, start))
+    return "[stdout truncated: dropped earliest $dropped bytes]\n" * aligned
+end
 
 # ── Eval ────────────────────────────────────────────────────────────────────
 """
@@ -365,23 +430,49 @@ end
 # Poll the in-flight task for up to `timeout` seconds. Returns either
 # completed (drained partial → stdout block + the value blocks) or running.
 function await_or_yield(s::JuliaSession, timeout::Union{Real,Nothing})
+    # Snapshot the in-flight task ONCE. `kill_session!` (and a cancel) can null
+    # `s.in_flight` concurrently; polling the field directly would race a write
+    # to `nothing` → `istaskdone(nothing)` MethodError. We only ever inspect our
+    # own snapshot `f`; if it was nulled out from under us the session is gone
+    # and the manager will hand out a fresh one (M4).
+    f = s.in_flight
+    f === nothing && error("No eval in flight on this session.")
     deadline = timeout === nothing ? Inf : time() + timeout
     # The loop also exits promptly when the eval task dies — e.g. an MCP
     # `notifications/cancelled` SIGINTs it via `handle_cancelled!`, which makes
     # `istaskdone` true and falls through to the completed (interrupted) result.
-    while !istaskdone(s.in_flight) && time() < deadline
+    while !istaskdone(f) && time() < deadline
         sleep(0.05)
     end
     elapsed = round(time() - s.in_flight_started; digits = 2)
-    partial = drain_output!(s)
+    # Cap before it ever reaches the MCP response: even with the pump's
+    # in-memory bound, a single drain can still be the full cap (256KB) which is
+    # far too much to splice verbatim into the agent context.
+    partial = cap_response_text(drain_output!(s))
 
-    if istaskdone(s.in_flight)
+    if istaskdone(f)
         value_blocks, fetch_failed = try
-            (fetch(s.in_flight), false)
+            (fetch(f), false)
         catch e
             (interrupt_blocks(e), true)
         end
-        s.in_flight = nothing
+        # M11: the task is done, but the worker's final `println`s may still be
+        # in the OS pipe — the pump task hasn't necessarily flushed them into our
+        # buffer by the time `fetch` returns. Without a settle, that trailing
+        # stdout is invisible here and the NEXT execute's drain (after its own
+        # `drain_output!`) throws it away. Drain-until-quiet with a small upper
+        # bound: append late bytes to this result's `partial` so nothing is lost
+        # or misattributed, while keeping the common (no-late-output) case fast.
+        settle_deadline = time() + 0.3
+        while time() < settle_deadline
+            sleep(0.02)
+            late = drain_output!(s)
+            isempty(late) && break          # quiet → done settling
+            partial = cap_response_text(partial * late)
+        end
+        # Clear only if it's still OUR task — a concurrent kill may have already
+        # nulled/replaced it.
+        @lock s.lock (s.in_flight === f && (s.in_flight = nothing))
         # Worker's try/catch wraps user errors as `error:` blocks (returned
         # normally), so a successful fetch can still represent a user error.
         # Inspect the blocks to set is_error correctly.
@@ -416,6 +507,14 @@ function kill_session!(s::JuliaSession)
     if is_alive(s)
         try Malt.stop(s.worker) catch end
     end
+    # Deliberately NOT taken under s.lock: kill_session! must be able to reap a
+    # worker whose eval ignored the interrupt, and that eval's await_or_yield
+    # poll holds s.lock for its whole duration — locking here would deadlock the
+    # cancel-kill path. Safety against the `istaskdone(nothing)` race (M4) comes
+    # from await_or_yield snapshotting its task ONCE at entry and never re-reading
+    # s.in_flight in the poll loop. `closed` is the terminal flag (M6): start!
+    # refuses to resurrect, so a freed session can't spin up a second worker.
+    s.closed = true
     s.worker = nothing
     s.in_flight = nothing
     s.is_temp && s.env_path !== nothing && isdir(s.env_path) &&
@@ -483,6 +582,21 @@ function get_or_create!(m::SessionManager, env_path::Union{String,Nothing};
         start!(s)
         m.sessions[key] = s
         return s
+    end
+end
+
+# Pure lookup — never creates, replaces, or kills a session. `bt_julia_continue`
+# / `bt_julia_interrupt` MUST use this: routing them through `get_or_create!`
+# (with `julia_cmd=nothing`) would kill+replace the very session carrying the
+# in-flight eval on a `julia_cmd` mismatch or a transiently dead worker, then
+# error "No eval in flight" (M5). Errors if the session is absent.
+function lookup_session(m::SessionManager, env_path::Union{String,Nothing})
+    key = _key(env_path)
+    @lock m.global_lock begin
+        haskey(m.sessions, key) || error(
+            "No Julia session for $(env_path === nothing ? "<temp>" : env_path) — " *
+            "nothing to continue/interrupt. Start one with bt_julia_eval.")
+        return m.sessions[key]
     end
 end
 

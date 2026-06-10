@@ -208,4 +208,117 @@ option_by_id(opts, id) = opts[findfirst(o -> o.id == id, opts)]
         @test am[1].text == "hello world"
     end
 
+    @testset "model picker: <select> rendering" begin
+        opts = ACP.parse_config_options(session_result())
+        model = option_by_id(opts, "model")
+        pick = BT.Bonito.Observable(Tuple{String,String}(("", "")))
+
+        # With a picker AND >1 choices → renders a <select>, NOT a plain span.
+        s = string(BT.header_pill(model, pick))
+        @test occursin("<select", s)
+        @test occursin("bt-header-meta-pick", s)
+        @test occursin("bt-header-meta-select", s)
+        # Each choice ships as an <option> with value=choice.value + label=choice.name.
+        @test occursin("value=\"default\"", s)
+        @test occursin("value=\"sonnet\"", s)
+        @test occursin("Default (recommended)", s)
+        @test occursin("Sonnet", s)
+        # Exactly ONE option is marked `selected` (the current value's), and
+        # the same `<option>` tag carries `value="default"`. Bonito sorts
+        # attributes alphabetically, so we can't depend on left-of-value
+        # ordering — assert structurally instead: count + intra-tag pairing.
+        @test count("selected", s) == 1
+        @test occursin(r"<option[^>]*\bselected\b[^>]*value=\"default\"", s)
+
+        # Without a picker → plain span fallback, byte-identical to before.
+        plain = string(BT.header_pill(model))
+        @test occursin("<span", plain)
+        @test !occursin("<select", plain)
+    end
+
+    @testset "model picker: single-choice collapses to a span" begin
+        # An agent that only offers one model — no point showing a dropdown.
+        r = session_result()
+        r["configOptions"][2]["options"] =
+            [Dict("value"=>"default", "name"=>"Default", "description"=>"only")]
+        opts = ACP.parse_config_options(r)
+        model = option_by_id(opts, "model")
+        pick = BT.Bonito.Observable(Tuple{String,String}(("", "")))
+        @test !occursin("<select", string(BT.header_pill(model, pick)))
+    end
+
+    @testset "apply_config_pick! is a safe no-op without a live client" begin
+        state = BT.ServerState(; state_dir = mktempdir(),
+                                 working_dir = mktempdir(), worker_secret = "x")
+        chat = BT.ChatModel(state, mktempdir();
+                            transport = BT.MockTransport((o, i) -> nothing))
+        chat.session_meta[] = Any[ACP.parse_config_options(session_result())...]
+        # No client[] yet → no-op, session_meta untouched (no nil-deref).
+        BT.apply_config_pick!(chat, "model", "sonnet")
+        m = option_by_id([x for x in chat.session_meta[] if x isa ACP.ConfigOption], "model")
+        @test m.current_value == "default"
+    end
+
+    @testset "e2e: picking a model fires session/set_config_option" begin
+        sent_rpcs = Channel{Dict{String,Any}}(16)
+        resp(id, result) = JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,"result"=>result))
+        on_setup = (outgoing::Channel{String}, incoming::Channel{String}) -> begin
+            Base.errormonitor(@async try
+                for line in outgoing
+                    msg    = JSON.parse(line)
+                    put!(sent_rpcs, msg)
+                    method = get(msg, "method", "")
+                    id     = get(msg, "id", nothing)
+                    if method == "initialize" && id !== nothing
+                        put!(incoming, resp(id, Dict()))
+                    elseif method == "session/new" && id !== nothing
+                        put!(incoming, resp(id, session_result()))
+                    elseif method == "session/set_config_option" && id !== nothing
+                        # claude-agent-acp returns an empty object on success.
+                        put!(incoming, resp(id, Dict{String,Any}()))
+                    end
+                end
+            catch e
+                e isa InvalidStateException || @warn "responder failed" exception=e
+            end)
+            return nothing
+        end
+
+        state = BT.ServerState(; state_dir = mktempdir(),
+                                 working_dir = mktempdir(), worker_secret = "x")
+        model = BT.ChatModel(state, mktempdir();
+                             transport = BT.MockTransport(on_setup))
+        BT.start_chat_client!(model)
+
+        # Bring-up populated session_meta with the model option.
+        opts = [x for x in model.session_meta[] if x isa ACP.ConfigOption]
+        @test option_by_id(opts, "model").current_value == "default"
+
+        # Trigger a model switch directly (as the JS onchange handler would).
+        BT.apply_config_pick!(model, "model", "sonnet")
+
+        # Optimistic patch: session_meta reflects the new value immediately, BEFORE
+        # the agent's confirmation comes back.
+        opts = [x for x in model.session_meta[] if x isa ACP.ConfigOption]
+        @test option_by_id(opts, "model").current_value == "sonnet"
+
+        # The RPC is dispatched off-task; wait for it to land in sent_rpcs.
+        deadline = time() + 5.0
+        set_cfg = nothing
+        while time() < deadline && set_cfg === nothing
+            if isready(sent_rpcs)
+                m = take!(sent_rpcs)
+                get(m, "method", "") == "session/set_config_option" && (set_cfg = m)
+            else
+                sleep(0.05)
+            end
+        end
+        @test set_cfg !== nothing
+        @test set_cfg["params"]["sessionId"] == "s"
+        @test set_cfg["params"]["configId"]  == "model"
+        @test set_cfg["params"]["value"]     == "sonnet"
+        @test haskey(set_cfg, "id")          # it's a REQUEST, not a notification
+    end
+
 end
+

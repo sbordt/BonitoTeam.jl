@@ -908,18 +908,30 @@ end
 # "(no body — tool details not persisted)" race where an early expand hit
 # disk before `persist_tool_content!` finished writing the first snap.
 function tool_content_for_render(m::ToolMsg, chat_dir::AbstractString)
-    if m.chat !== nothing && haskey(m.chat.tool_content_cache, m.id)
-        return m.chat.tool_content_cache[m.id]
+    # `tool_content_cache` is a plain Dict shared across per-session views and
+    # written by the consumer task; a concurrent read during a rehash is a data
+    # race (T8). Guard the lookup under the chat's lock; the disk fallback runs
+    # off-lock (it's I/O and the key was absent under the lock).
+    if m.chat !== nothing
+        hit = lock(m.chat.lock) do
+            haskey(m.chat.tool_content_cache, m.id) ?
+                m.chat.tool_content_cache[m.id] : nothing
+        end
+        hit === nothing || return hit
     end
     return load_tool_content(chat_dir, m.id)
 end
 
 # Record the latest snap's content into the in-RAM cache. Empty content is
-# stored verbatim so the cache reflects the live snap state.
+# stored verbatim so the cache reflects the live snap state. Write under the
+# chat's lock so readers (`tool_content_for_render`) never see a half-rehashed
+# Dict (T8).
 function cache_tool_content!(chat::Union{ChatModel,Nothing}, tool_id::AbstractString,
                               content::AbstractVector)
     chat === nothing && return nothing
-    chat.tool_content_cache[String(tool_id)] = Vector{Any}(content)
+    lock(chat.lock) do
+        chat.tool_content_cache[String(tool_id)] = Vector{Any}(content)
+    end
     return nothing
 end
 
@@ -1115,7 +1127,7 @@ end
 # the message id (`show_remote_app!`). No content is read here.
 render_tool_body(state::ServerState, m::BonitoAppMsg, cwd::AbstractString,
     chat_dir::AbstractString=cwd; project_id::AbstractString="") =
-    wrap_for_detach(m.id, remote_app_placeholder(m.id, project_id,
+    wrap_for_detach(m.id, remote_app_placeholder(state, m.id, project_id,
                                                  isempty(m.app_id) ? m.id : m.app_id))
 
 function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
@@ -1453,6 +1465,44 @@ function process!(chat::ChatModel, m::AgentClientProtocol.ModeUpdate)
     return nothing
 end
 
+# User clicked a model (or any other config option) in the header pill.
+# Send the `session/set_config_option` RPC and OPTIMISTICALLY patch
+# session_meta so the pill reflects the choice immediately — the agent's
+# follow-up `config_option_update` notification is the source of truth and
+# will reconcile (or revert) the value if needed. The RPC is sent off-task
+# so a slow agent can't freeze the click handler; failures log + revert.
+function apply_config_pick!(model::ChatModel, cfg_id::AbstractString,
+                            value::AbstractString)
+    client = model.client[]
+    client === nothing && return nothing
+
+    # Optimistic patch: swap `current_value` on the matching ConfigOption.
+    s = shared(model)
+    prev = nothing
+    s.session_meta[] = Any[map(s.session_meta[]) do x
+        if x isa AgentClientProtocol.ConfigOption && x.id == cfg_id
+            prev = x.current_value
+            AgentClientProtocol.ConfigOption(x.id, x.name, x.description,
+                x.category, String(value), x.choices)
+        else
+            x
+        end
+    end...]
+
+    @async try
+        AgentClientProtocol.set_config_option!(client, cfg_id, value)
+    catch e
+        @warn "set_config_option failed; reverting" cfg_id value exception = e
+        prev === nothing && return
+        s.session_meta[] = Any[map(s.session_meta[]) do x
+            x isa AgentClientProtocol.ConfigOption && x.id == cfg_id ?
+                AgentClientProtocol.ConfigOption(x.id, x.name, x.description,
+                    x.category, prev, x.choices) : x
+        end...]
+    end
+    return nothing
+end
+
 to_message(chat::ChatModel, m::AgentClientProtocol.AgentMessage) = AgentMsg(chat, m.text)
 # Compact-summary "user" messages get their own centered kind. ACP doesn't carry
 # Claude Code's `isCompactSummary` flag, so we route on the verbatim opening.
@@ -1669,7 +1719,10 @@ function parse_bg_output_path(content)
         txt = try
             hasproperty(c, :text) ? String(getproperty(c, :text)) :
                 (c isa AbstractDict ? String(get(c, "text", "")) : "")
-        catch
+        catch e
+            # A `.text` field that isn't string-convertible (unexpected content
+            # shape) — treat as "no text" but don't swallow other errors (T20).
+            e isa Union{MethodError, ArgumentError, InexactError} || rethrow()
             ""
         end
         mm = match(r"written to:\s*(\S+)", txt)
@@ -1789,9 +1842,18 @@ function background_poll_loop(state::ServerState, model::ChatModel)
     # last time each id's output file grew (only consulted for the non-
     # Linux quiesce fallback). When a tool finalizes we drop its entry.
     last_grew = Dict{String,Float64}()
-    while true
+    # The loop's lifetime is the chat's: `close(::ChatModel)` closes
+    # `user_messages`, which both ends the `run_chat!` consumer and signals this
+    # poller to exit (T4). Before this guard the loop was `while true` with a
+    # catch-all, so a closed chat left an immortal 1 Hz poller holding a strong
+    # ref to the ChatModel forever.
+    while isopen(model.user_messages)
         try
-            for m in collect(model.msgs_store)
+            # Snapshot msgs_store ONCE per tick under `model.lock` — the single
+            # `run_chat!` consumer `push!`es to this Vector on another task, and a
+            # regrow mid-iteration is a data race (T8). We iterate the snapshot.
+            snapshot = lock(model.lock) do; copy(model.msgs_store); end
+            for m in snapshot
                 (m isa BashToolMsg && m.is_background && m.bg_running &&
                     !isempty(m.bg_output_path)) || continue
                 before = m.bg_offset
@@ -1812,7 +1874,7 @@ function background_poll_loop(state::ServerState, model::ChatModel)
             # on a previous tick or an orphan sweep cleared them).
             for id in collect(keys(last_grew))
                 any(x -> x isa BashToolMsg && x.id == id && x.bg_running,
-                    model.msgs_store) || delete!(last_grew, id)
+                    snapshot) || delete!(last_grew, id)
             end
         catch e
             @warn "background task poll loop tick failed" exception = e
@@ -1891,6 +1953,22 @@ function run_chat!(chat::ChatModel)
             @error "chat turn failed" exception = (e, catch_backtrace())
         end
     end
+    return nothing
+end
+
+# Tear a ChatModel's long-lived tasks down (T4). Closing `user_messages` ends
+# the `run_chat!` consumer (its `for … in chat.user_messages` loop exits on a
+# closed channel) AND signals `background_poll_loop` to exit (its
+# `while isopen(model.user_messages)` guard) — so the 1 Hz poller stops and
+# `start_background_poller!`'s `finally` drops the `BG_POLLERS` entry, releasing
+# the last strong ref to the ChatModel. We resolve to the shared parent so a
+# per-session view never half-closes the real model.
+#
+# Idempotent: closing an already-closed channel is a no-op (we guard `isopen`),
+# and `stop_session!` may run more than once for the same project.
+function Base.close(model::ChatModel)
+    s = shared(model)
+    isopen(s.user_messages) && close(s.user_messages)
     return nothing
 end
 
@@ -2477,12 +2555,51 @@ end
 
 # The model label ("Opus 4.7 with 1M context") is self-explanatory; the other
 # options need their name as a prefix to read well ("mode: Default").
-header_pill(o::AgentClientProtocol.ConfigOption) =
+#
+# `pick` is an Observable{Tuple{String,String}} ((configId, value)) the model
+# pill posts into on selection; nothing for the static (no-picker) rendering
+# path (e.g. unit tests of `header_meta_line` with a plain item list).
+function header_pill(o::AgentClientProtocol.ConfigOption,
+                     pick::Union{Observable,Nothing} = nothing)
+    if pick !== nothing && o.category == "model" && length(o.choices) > 1
+        return model_select_pill(o, pick)
+    end
     DOM.span(o.category == "model" ? AgentClientProtocol.pill_label(o) :
              "$(lowercase(o.name)): $(AgentClientProtocol.pill_label(o))";
         class = "bt-header-meta-item", title = pill_tooltip(o))
+end
 # Fallback so an unknown meta kind degrades to its string form, not an error.
-header_pill(x) = DOM.span(string(x); class = "bt-header-meta-item")
+header_pill(x, pick::Union{Observable,Nothing} = nothing) =
+    DOM.span(string(x); class = "bt-header-meta-item")
+
+# A native <select> wrapped to look like the meta-item pill. The agent's
+# config_option_update is the SOURCE OF TRUTH for the displayed value — we
+# rebuild the select on every session_meta change, so `selected` is whatever
+# the agent currently reports. `onchange` posts `(configId, value)` into
+# `pick`; the parent handler (registered ONCE in `chat_header`) translates
+# that into a `set_config_option!` RPC.
+function model_select_pill(o::AgentClientProtocol.ConfigOption, pick::Observable)
+    cfg_id = o.id
+    cur    = o.current_value
+    # Build each option separately so we can conditionally include the
+    # `selected` attribute — Bonito's DOM renders `selected = nothing` as a
+    # bare `selected` (boolean attribute is present, just empty), which then
+    # marks EVERY option as selected. Splatting kwargs lets us omit the key
+    # entirely on the non-current options.
+    function mkopt(c)
+        title = isnothing(c.description) ? c.name : c.description
+        kwargs = c.value == cur ?
+            (; value = c.value, title = title, selected = true) :
+            (; value = c.value, title = title)
+        DOM.option(c.name; kwargs...)
+    end
+    DOM.div(
+        DOM.select((mkopt(c) for c in o.choices)...;
+            class = "bt-header-meta-select",
+            onchange = js"event => $(pick).notify([$(cfg_id), event.target.value])"),
+        class = "bt-header-meta-item bt-header-meta-pick",
+        title = pill_tooltip(o))
+end
 
 # Display policy: which meta items make it into the header line. Of claude's
 # config options only the MODEL is shown — the agent reports mode/effort as
@@ -2495,13 +2612,13 @@ show_in_header(::Any) = true
 # The most informative item (the model) leads the line.
 meta_order(x) = x isa AgentClientProtocol.ConfigOption && x.category == "model" ? 0 : 1
 
-function header_meta_line(items)
+function header_meta_line(items, pick::Union{Observable,Nothing} = nothing)
     shown = sort(filter(show_in_header, collect(Any, items)); by = meta_order)
     isempty(shown) && return DOM.span()
     parts = Any[]
     for (i, x) in enumerate(shown)
         i > 1 && push!(parts, " · ")
-        push!(parts, header_pill(x))
+        push!(parts, header_pill(x, pick))
     end
     DOM.div(parts...; class = "bt-header-meta")
 end
@@ -2518,8 +2635,17 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
 
     # Session config (model / mode / effort …) as a plain-text second header
     # line; re-renders whenever the agent reports a change (bring-up,
-    # config_option_update).
-    meta_line = map(header_meta_line, model.session_meta)
+    # config_option_update). The model pill is a native `<select>` and posts
+    # `(configId, value)` into `config_pick` when the user chooses; the
+    # handler below sends `session/set_config_option` and optimistically
+    # patches `session_meta` so the new choice is reflected immediately
+    # (the agent's follow-up `config_option_update` reconciles).
+    config_pick = Observable(Tuple{String,String}(("", "")))
+    meta_line = map(items -> header_meta_line(items, config_pick), model.session_meta)
+    on(session, config_pick) do (cfg_id, value)
+        isempty(cfg_id) && return
+        apply_config_pick!(model, cfg_id, value)
+    end
 
     sync_status = Observable("")
     sync_button = DOM.button(map(s -> isempty(s) ? "Sync" : s, sync_status);
@@ -2551,15 +2677,23 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
             onclick=js"event => $(xsync_status).notify('__click__')")
         on(session, xsync_status) do s
             s == "__click__" || return
+            # Guard the lookup BEFORE flipping the label to "comparing…" (T18):
+            # an unguarded `state.projects[][project_id]` KeyErrors if the project
+            # was deleted, escaping before the @async whose catch resets the
+            # label — so the button wedged on "comparing…" forever.
+            cur = get(state.projects[], project_id, nothing)
+            if cur === nothing
+                safe_set!(xsync_status, "project gone")
+                return
+            end
             xsync_status[] = "comparing…"
-            cur = state.projects[][project_id]
             @async begin
                 try
                     cmp = compare_projects(state, cur, other)
                     sync_modal_state[] = (current = cur, other = other, comparison = cmp)
                     safe_set!(xsync_status, "")
                 catch e
-                    @warn "cross-worker compare failed" exception=e
+                    @warn "cross-worker compare failed" exception=(e, catch_backtrace())
                     safe_set!(xsync_status, "compare failed")
                 end
             end
@@ -2851,22 +2985,36 @@ handle_command!(model::ChatModel, ::Session, ::InitCommand) =
         "type" => "msgs.count", "n" => length(model.msgs_store)))
 
 function handle_command!(model::ChatModel, ::Session, cmd::MsgsRequestCommand)
-    store = model.msgs_store
-    n = length(store)
-    s = clamp(cmd.s, 0, n - 1)
-    e = clamp(cmd.e, 0, n - 1)
-    s > e && return nothing
-    batch = [msg_to_dict(store[i], model.chat_dir) for i in (s+1):(e+1)]
+    # Snapshot the requested slice under `model.lock` — the single `run_chat!`
+    # consumer `push!`es to `msgs_store` on another task, and reading it
+    # concurrently (Vector regrow) is the data race the lock exists for (T8).
+    # We render `msg_to_dict` OUTSIDE the lock (it can touch disk).
+    batch = lock(model.lock) do
+        store = model.msgs_store
+        n = length(store)
+        s = clamp(cmd.s, 0, n - 1)
+        e = clamp(cmd.e, 0, n - 1)
+        s > e && return nothing
+        (s, store[(s+1):(e+1)])
+    end
+    batch === nothing && return nothing
+    s, slice = batch
+    msgs = [msg_to_dict(m, model.chat_dir) for m in slice]
     chat_emit(model, Dict{String,Any}(
-        "type" => "msgs.range", "start" => s, "msgs" => batch))
+        "type" => "msgs.range", "start" => s, "msgs" => msgs))
     return nothing
 end
 
 function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderCommand)
     isempty(cmd.tool_id) && return nothing
-    idx = findfirst(m -> m isa ToolMsg && m.id == cmd.tool_id, model.msgs_store)
-    idx === nothing && return nothing
-    msg = model.msgs_store[idx]
+    # Find + grab the ToolMsg under `model.lock` (T8): `findfirst` over
+    # `msgs_store` races the consumer's `push!`. The msg object itself is then
+    # rendered off-lock below.
+    msg = lock(model.lock) do
+        idx = findfirst(m -> m isa ToolMsg && m.id == cmd.tool_id, model.msgs_store)
+        idx === nothing ? nothing : model.msgs_store[idx]
+    end
+    msg === nothing && return nothing
     # Run the render OFF the comm task. `render_tool_body` for a `bonito_app`
     # ToolMsg mounts a `RemoteAppPlaceholder` whose `jsrender` calls
     # `embed_remote_app` → `call_ctrl(eb, "delegate")`, which blocks up to 30 s
@@ -2914,7 +3062,11 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
             '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
     if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
 }""")
-        catch
+        catch fallback_e
+            # The fallback render itself failed — almost always the tab's session
+            # went away mid-render. Log instead of swallowing (T20); there's no
+            # further recovery (the slot is gone with the page).
+            @debug "tool render fallback failed (session likely gone)" tool_id = cmd.tool_id exception = fallback_e
         end
     end)
     return nothing
@@ -2922,10 +3074,14 @@ end
 
 function handle_command!(model::ChatModel, ::Session, cmd::ThoughtRenderCommand)
     isempty(cmd.thought_id) && return nothing
-    idx = findfirst(m -> m isa ThoughtMsg && m.id == cmd.thought_id, model.msgs_store)
-    idx === nothing && return nothing
-    html = sprint(show, MIME("text/html"),
-        Markdown.parse(model.msgs_store[idx].text))
+    # Read the matching thought's text under `model.lock` (T8) — the lookup +
+    # field read race the consumer's `push!`. Render markdown off-lock.
+    text = lock(model.lock) do
+        idx = findfirst(m -> m isa ThoughtMsg && m.id == cmd.thought_id, model.msgs_store)
+        idx === nothing ? nothing : model.msgs_store[idx].text
+    end
+    text === nothing && return nothing
+    html = sprint(show, MIME("text/html"), Markdown.parse(text))
     chat_emit(model, Dict{String,Any}("type" => "thought.body",
         "id" => cmd.thought_id, "html" => html))
     return nothing

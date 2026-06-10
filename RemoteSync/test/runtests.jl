@@ -377,3 +377,129 @@ end
         end
     end
 end
+
+# ── Stability / security regressions (R1, R3, R4, R5, R7) ───────────────────
+const RS = RemoteSync
+
+# Fake frame transports for WebSocketIO tests. Must be top-level (struct defs
+# can't live in a @testset's local scope).
+mutable struct FakeWS
+    sent   :: Vector{Vector{UInt8}}
+    closed :: Bool
+end
+RS.send_frame!(ws::FakeWS, bytes::AbstractVector{UInt8}) = (push!(ws.sent, Vector{UInt8}(bytes)); nothing)
+RS.recv_frame(::FakeWS) = nothing
+RS.is_closed(ws::FakeWS) = ws.closed
+RS.close_ws!(ws::FakeWS) = (ws.closed = true; nothing)
+
+mutable struct BlockingWS
+    gate :: Channel{Nothing}
+end
+RS.recv_frame(ws::BlockingWS) = (take!(ws.gate); UInt8[0x41])   # blocks until released
+RS.send_frame!(::BlockingWS, ::AbstractVector{UInt8}) = nothing
+RS.is_closed(::BlockingWS) = false
+RS.close_ws!(::BlockingWS) = nothing
+
+@testset "stability regressions" begin
+
+    # ── R1: path-traversal guard rejects escaping rels on both sides ─────────
+    @testset "R1 safe_rel rejects escaping/absolute paths" begin
+        root = mktempdir()
+        try
+            # Legitimate rels normalize and pass.
+            @test RS.safe_rel(root, "a/b.txt") == "a/b.txt"
+            @test RS.safe_rel(root, "a/../b.txt") == "b.txt"     # collapses, stays inside
+            @test RS.safe_rel(root, "./c.txt") == "c.txt"
+
+            # Escaping / absolute / empty are rejected (return nothing).
+            @test RS.safe_rel(root, "../escape") === nothing
+            @test RS.safe_rel(root, "../../etc/passwd") === nothing
+            @test RS.safe_rel(root, "a/../../escape") === nothing
+            @test RS.safe_rel(root, "/abs/path") === nothing
+            @test RS.safe_rel(root, "/etc/passwd") === nothing
+            @test RS.safe_rel(root, "") === nothing
+            @test RS.safe_rel(root, "..") === nothing
+        finally
+            rm(root; recursive = true, force = true)
+        end
+    end
+
+    # ── R1 (receiver): an unsafe manifest entry never lands outside root ─────
+    @testset "R1 build_plan drops unsafe manifest entries" begin
+        root = mktempdir()
+        try
+            manifest = RS.ManifestEntry[
+                RS.ManifestEntry("ok.txt", UInt64(3), 0.0),
+                RS.ManifestEntry("../evil.txt", UInt64(3), 0.0),
+                RS.ManifestEntry("/etc/evil", UInt64(3), 0.0),
+            ]
+            plan = RS.build_plan(root, manifest)
+            rels = Set(p.rel for p in plan)
+            @test "ok.txt" in rels
+            @test !("../evil.txt" in rels)
+            @test !("/etc/evil" in rels)
+            @test !any(p -> occursin("evil", p.rel), plan)
+        finally
+            rm(root; recursive = true, force = true)
+        end
+    end
+
+    # ── R3: oversized / malformed frame lengths are refused, not allocated ────
+    @testset "R3 frame size caps" begin
+        @test RS.MAX_FRAME_BYTES < typemax(UInt32)   # cap leaves room to exceed
+
+        # read_frame refuses a length prefix above the cap (a 4 GiB claim) and
+        # never tries to allocate it.
+        buf = IOBuffer()
+        write(buf, UInt8(RS.TAG_DELTA))
+        write(buf, htol(typemax(UInt32)))            # ~4 GiB announced length
+        seekstart(buf)
+        @test_throws ErrorException RS.read_frame(buf)
+
+        # A crafted manifest whose inner rel_len exceeds the frame is rejected
+        # rather than driving a giant allocation.
+        bad = IOBuffer()
+        write(bad, htol(UInt32(1)))             # 1 entry
+        write(bad, htol(UInt32(1_000_000)))     # rel_len far beyond remaining bytes
+        @test_throws Exception RS.decode_manifest(take!(bad))
+
+        # A crafted entry count larger than the frame is rejected up front.
+        bad2 = IOBuffer()
+        write(bad2, htol(UInt32(1_000_000)))    # claims a million entries, 4 bytes total
+        @test_throws Exception RS.decode_manifest(take!(bad2))
+    end
+
+    # ── R3: a valid round-trip still works (cap doesn't break normal frames) ──
+    @testset "R3 normal manifest round-trips" begin
+        m = RS.ManifestEntry[RS.ManifestEntry("a/b.txt", UInt64(10), 1.5)]
+        decoded = RS.decode_manifest(RS.encode_manifest(m))
+        @test length(decoded) == 1
+        @test decoded[1].rel == "a/b.txt"
+        @test decoded[1].size == UInt64(10)
+    end
+
+    # ── R4: WebSocketIO close flushes, closes the ws, and warns on failure ────
+    # A tiny fake frame transport lets us assert close behaviour without HTTP.
+    @testset "R4 WebSocketIO.close closes the underlying transport" begin
+        ws = FakeWS(Vector{UInt8}[], false)
+        io = RS.WebSocketIO(ws)
+        write(io, UInt8[1, 2, 3])
+        close(io)
+        @test ws.closed                       # underlying ws actually closed (R4)
+        @test !isempty(ws.sent)               # buffered bytes were flushed first
+        @test ws.sent[end] == UInt8[1, 2, 3]
+    end
+
+    # ── R5: a second concurrent reader is detected and refused ───────────────
+    @testset "R5 concurrent read is rejected" begin
+        ws = BlockingWS(Channel{Nothing}(0))
+        io = RS.WebSocketIO(ws)
+        # First reader parks inside recv_frame holding the read guard.
+        r1 = @async read(io, UInt8)
+        sleep(0.1)
+        # Second reader must hit the single-consumer guard immediately.
+        @test_throws ErrorException read(io, UInt8)
+        put!(ws.gate, nothing)                # release the first reader
+        @test fetch(r1) == 0x41
+    end
+end

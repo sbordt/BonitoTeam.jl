@@ -25,10 +25,19 @@ const ACTION_FULL   = 0x01   # receiver has nothing — send literal contents
 const ACTION_PATCH  = 0x02   # receiver sent a signature, send a delta against it
 const ACTION_DELETE = 0x03   # receiver should delete this file
 
+# Hard cap on a single frame's payload (R3). A hostile or garbled peer can put
+# any 32-bit length in the prefix; without a cap, `read(io, len)` would try to
+# allocate up to 4 GiB on the spot. 256 MiB comfortably exceeds our largest
+# real frame (a 1 MiB file chunk, or a manifest/plan for a big tree) while
+# making a length-prefix DoS impossible. Sub-lengths inside a payload
+# (manifest/plan rel-lengths, signature lengths) are equally untrusted, so the
+# decoders validate each against the bytes actually remaining.
+const MAX_FRAME_BYTES = 256 * 1024 * 1024
+
 # ── Low-level frame IO ─────────────────────────────────────────────────────
 function write_frame(io::IO, tag::UInt8, payload::AbstractVector{UInt8})
-    length(payload) > typemax(UInt32) &&
-        error("RemoteSync: frame payload too large ($(length(payload)) bytes)")
+    length(payload) > MAX_FRAME_BYTES &&
+        error("RemoteSync: frame payload too large ($(length(payload)) bytes > $(MAX_FRAME_BYTES) cap)")
     write(io, tag)
     write(io, htol(UInt32(length(payload))))
     isempty(payload) || write(io, payload)
@@ -38,14 +47,29 @@ end
 
 write_frame(io::IO, tag::UInt8) = write_frame(io, tag, UInt8[])
 
-# Returns (tag, payload). Throws EOFError on clean EOF mid-frame.
+# Returns (tag, payload). Throws EOFError on clean EOF mid-frame, or an error if
+# the peer announces a payload larger than `MAX_FRAME_BYTES` (R3) — we refuse to
+# allocate it.
 function read_frame(io::IO)
     tag = read(io, UInt8)
-    len = ltoh(read(io, UInt32))
-    payload = len == 0 ? UInt8[] : read(io, Int(len))
-    length(payload) == Int(len) ||
+    len = Int(ltoh(read(io, UInt32)))
+    len > MAX_FRAME_BYTES &&
+        error("RemoteSync: peer announced oversized frame ($(len) bytes > $(MAX_FRAME_BYTES) cap)")
+    payload = len == 0 ? UInt8[] : read(io, len)
+    length(payload) == len ||
         throw(EOFError())
     return (tag, payload)
+end
+
+# Read a wire-supplied sub-length and reject it if it exceeds the bytes left in
+# `io` (an IOBuffer over a single frame's payload). Stops a crafted inner length
+# from driving a huge `read(io, n)` allocation inside the decoders (R3).
+function read_sublen(io::IOBuffer)
+    n = Int(ltoh(read(io, UInt32)))
+    n < 0 && error("RemoteSync: negative sub-length")
+    n > bytesavailable(io) &&
+        error("RemoteSync: sub-length $(n) exceeds remaining frame bytes $(bytesavailable(io))")
+    return n
 end
 
 # ── Manifest encoding ──────────────────────────────────────────────────────
@@ -72,11 +96,16 @@ end
 
 function decode_manifest(payload::AbstractVector{UInt8})
     io = IOBuffer(payload)
-    n = ltoh(read(io, UInt32))
+    n = Int(ltoh(read(io, UInt32)))
+    # The entry count is attacker-controlled; each entry consumes >= 4 bytes, so
+    # a count larger than the remaining bytes can't be real. Refuse before
+    # `Vector{}(undef, n)` over-allocates (R3).
+    n > bytesavailable(io) &&
+        error("RemoteSync: manifest entry count $(n) exceeds frame bytes")
     out = Vector{ManifestEntry}(undef, n)
     for i in 1:n
-        rel_len = ltoh(read(io, UInt32))
-        rel     = String(read(io, Int(rel_len)))
+        rel_len = read_sublen(io)
+        rel     = String(read(io, rel_len))
         size    = ltoh(read(io, UInt64))
         mtime   = reinterpret(Float64, ltoh(read(io, UInt64)))
         out[i]  = ManifestEntry(rel, size, mtime)
@@ -110,14 +139,16 @@ end
 
 function decode_plan(payload::AbstractVector{UInt8})
     io = IOBuffer(payload)
-    n = ltoh(read(io, UInt32))
+    n = Int(ltoh(read(io, UInt32)))
+    n > bytesavailable(io) &&
+        error("RemoteSync: plan entry count $(n) exceeds frame bytes")
     out = Vector{PlanEntry}(undef, n)
     for i in 1:n
-        rel_len = ltoh(read(io, UInt32))
-        rel     = String(read(io, Int(rel_len)))
+        rel_len = read_sublen(io)
+        rel     = String(read(io, rel_len))
         action  = read(io, UInt8)
-        sig_len = ltoh(read(io, UInt32))
-        sig     = sig_len == 0 ? UInt8[] : read(io, Int(sig_len))
+        sig_len = read_sublen(io)
+        sig     = sig_len == 0 ? UInt8[] : read(io, sig_len)
         out[i]  = PlanEntry(rel, action, sig)
     end
     return out
@@ -137,8 +168,8 @@ end
 
 function decode_delta_frame(payload::AbstractVector{UInt8})
     io = IOBuffer(payload)
-    rel_len = ltoh(read(io, UInt32))
-    rel     = String(read(io, Int(rel_len)))
+    rel_len = read_sublen(io)
+    rel     = String(read(io, rel_len))
     delta   = read(io)
     return (rel, delta)
 end

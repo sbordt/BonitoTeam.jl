@@ -130,12 +130,17 @@ function main()
     isempty(cmd) && error("lowbox: no command after `--`")
 
     # Label each whitelist dir Low so the low-integrity child can write it.
+    # If labelling fails we MUST abort (R2): otherwise the child launches into a
+    # silently mislabeled sandbox where the whitelist isn't actually writable,
+    # and the failure surfaces much later as an opaque permission error deep in
+    # the user's program instead of here at the boundary.
     for d in grants
         try
             run(pipeline(`icacls $d /setintegritylevel "(OI)(CI)L"`;
                          stdout = devnull, stderr = devnull))
         catch e
-            @warn "lowbox: failed to label $d as Low integrity" exception=e
+            error("lowbox: failed to label $d as Low integrity (the sandbox " *
+                  "whitelist would not be writable); aborting launch: $e")
         end
     end
 

@@ -56,6 +56,22 @@ end
 
 session_file(chat_dir::AbstractString) = joinpath(String(chat_dir), "chat.md")
 
+# Per-chat.md write lock (T13). chat.md is touched by two kinds of writer that
+# must not interleave: append-only writers (`append_user`/`finalize_agent`/…)
+# and the header read-modify-write (`update_session_id!`). Without a lock the
+# RMW reads the whole file, then rewrites it — an append landing in that window
+# is silently lost, and a crash mid-rewrite truncates the history. We serialize
+# all chat.md writes for a given path through one lock, keyed by the absolute
+# path so per-chat views (which each build their own ChatSession) still share it.
+const CHAT_FILE_LOCKS = Dict{String,ReentrantLock}()
+const CHAT_FILE_LOCKS_GUARD = ReentrantLock()
+function chat_file_lock(path::AbstractString)
+    p = abspath(String(path))
+    lock(CHAT_FILE_LOCKS_GUARD) do
+        get!(() -> ReentrantLock(), CHAT_FILE_LOCKS, p)
+    end
+end
+
 # ── ACP wire-frame log ──────────────────────────────────────────────────────
 # Raw ACP JSON-RPC traffic (both directions), one envelope per line:
 #   {"ts": "2026-06-05T12:34:56.789Z", "dir": "in"|"out", "msg": <frame>}
@@ -158,31 +174,59 @@ function parse_session_meta(path::String, cwd::String)::Union{ChatSession,Nothin
     return nothing
 end
 
+# Atomic whole-file write of chat.md: serialize to a unique sibling temp then
+# rename, so a crash mid-write can never truncate the chat history (T13). The
+# caller holds `chat_file_lock(path)`.
+function atomic_write_text(f, path::AbstractString)
+    dir = dirname(String(path))
+    mkpath(dir)
+    tmp = tempname(dir; cleanup = false)
+    try
+        open(tmp, "w") do io
+            f(io)
+        end
+        mv(tmp, String(path); force = true)
+    catch
+        try
+            rm(tmp; force = true)
+        catch cleanup_err
+            @debug "atomic_write_text: could not remove temp file" tmp exception = cleanup_err
+        end
+        rethrow()
+    end
+end
+
 function write_session_header(session::ChatSession)
-    open(session.path, "w") do io
-        println(io, "+++")
-        println(io, "session_id = $(repr(session.session_id))")
-        println(io, "cwd = $(repr(session.cwd))")
-        println(io, "created = $(repr(string(session.created)))")
-        println(io, "+++")
-        println(io)
+    lock(chat_file_lock(session.path)) do
+        atomic_write_text(session.path) do io
+            println(io, "+++")
+            println(io, "session_id = $(repr(session.session_id))")
+            println(io, "cwd = $(repr(session.cwd))")
+            println(io, "created = $(repr(string(session.created)))")
+            println(io, "+++")
+            println(io)
+        end
     end
 end
 
 function update_session_id!(session::ChatSession, new_id::String)
-    # Rewrite only the header, preserving the rest of the file
     path = session.path
-    content = isfile(path) ? read(path, String) : "\n"
-    # Strip existing +++ block
-    body = replace(content, r"^\+\+\+.*?\+\+\+\n"s => ""; count=1)
-    new_session = ChatSession(new_id, session.cwd, session.created, path)
-    open(path, "w") do io
-        println(io, "+++")
-        println(io, "session_id = $(repr(new_session.session_id))")
-        println(io, "cwd = $(repr(new_session.cwd))")
-        println(io, "created = $(repr(string(new_session.created)))")
-        println(io, "+++")
-        print(io, body)
+    # The read-modify-write runs under the per-file lock so an `append_*` can't
+    # land between the read and the rewrite (lost append), and the write is
+    # atomic (tmp + mv) so a crash can't truncate the file (T13).
+    lock(chat_file_lock(path)) do
+        content = isfile(path) ? read(path, String) : "\n"
+        # Strip existing +++ block
+        body = replace(content, r"^\+\+\+.*?\+\+\+\n"s => ""; count=1)
+        new_session = ChatSession(new_id, session.cwd, session.created, path)
+        atomic_write_text(path) do io
+            println(io, "+++")
+            println(io, "session_id = $(repr(new_session.session_id))")
+            println(io, "cwd = $(repr(new_session.cwd))")
+            println(io, "created = $(repr(string(new_session.created)))")
+            println(io, "+++")
+            print(io, body)
+        end
     end
 end
 
@@ -237,24 +281,31 @@ function first_user_prompt(chat_dir::AbstractString)::Union{String,Nothing}
 end
 
 # Append messages
+# All `append_*` writers take the per-file lock (T13) so an append can't
+# interleave with `update_session_id!`'s read-modify-write (which would drop the
+# append) and concurrent appenders from different tasks stay whole.
 function append_user(session::ChatSession, msg::UserMsg)
-    open(session.path, "a") do io
-        println(io, "!!! user \"$(now(UTC))\"")
-        for line in split(msg.text, '\n')
-            println(io, "    ", line)
+    lock(chat_file_lock(session.path)) do
+        open(session.path, "a") do io
+            println(io, "!!! user \"$(now(UTC))\"")
+            for line in split(msg.text, '\n')
+                println(io, "    ", line)
+            end
+            println(io)
         end
-        println(io)
     end
 end
 
 function finalize_agent(session::ChatSession, msg::AgentMsg)
     isempty(msg.text) && return
-    open(session.path, "a") do io
-        println(io, "!!! assistant \"$(now(UTC))\"")
-        for line in split(msg.text, '\n')
-            println(io, "    ", line)
+    lock(chat_file_lock(session.path)) do
+        open(session.path, "a") do io
+            println(io, "!!! assistant \"$(now(UTC))\"")
+            for line in split(msg.text, '\n')
+                println(io, "    ", line)
+            end
+            println(io)
         end
-        println(io)
     end
 end
 
@@ -264,42 +315,48 @@ end
 # replay edge cases) are skipped to keep chat.md clean.
 function append_thought(session::ChatSession, msg::ThoughtMsg)
     isempty(strip(msg.text)) && return
-    open(session.path, "a") do io
-        println(io, "!!! thought \"$(msg.id)\"")
-        for line in split(msg.text, '\n')
-            println(io, "    ", line)
+    lock(chat_file_lock(session.path)) do
+        open(session.path, "a") do io
+            println(io, "!!! thought \"$(msg.id)\"")
+            for line in split(msg.text, '\n')
+                println(io, "    ", line)
+            end
+            println(io)
         end
-        println(io)
     end
 end
 
 function append_tool(session::ChatSession, msg::ToolMsg)
-    open(session.path, "a") do io
-        # 4th field: the resolved filter key (`tool_key`) — persisting it makes
-        # the typed variants (Bash/Task/MCP…) reload with stable per-tool
-        # filter identities even though reload lands as `GenericToolMsg`.
-        meta = "$(msg.kind) · $(msg.status) · $(msg.id) · $(tool_key(msg))"
-        println(io, "!!! tool \"$meta\"")
-        println(io, "    `$(msg.title)`")
-        # Brief summary on the collapsed header; full ACP body lives in
-        # the chat-storage `tools/<id>.json` (see update_tool_file!).
-        if !isempty(msg.summary)
-            println(io, "")
-            println(io, "    $(msg.summary)")
+    lock(chat_file_lock(session.path)) do
+        open(session.path, "a") do io
+            # 4th field: the resolved filter key (`tool_key`) — persisting it makes
+            # the typed variants (Bash/Task/MCP…) reload with stable per-tool
+            # filter identities even though reload lands as `GenericToolMsg`.
+            meta = "$(msg.kind) · $(msg.status) · $(msg.id) · $(tool_key(msg))"
+            println(io, "!!! tool \"$meta\"")
+            println(io, "    `$(msg.title)`")
+            # Brief summary on the collapsed header; full ACP body lives in
+            # the chat-storage `tools/<id>.json` (see update_tool_file!).
+            if !isempty(msg.summary)
+                println(io, "")
+                println(io, "    $(msg.summary)")
+            end
+            println(io)
         end
-        println(io)
     end
 end
 
 function append_plan(session::ChatSession, msg::TodoListMsg)
-    open(session.path, "a") do io
-        println(io, "!!! plan")
-        # Write as plain lines (not markdown list) so admonition_text can round-trip them
-        for e in msg.entries
-            mark = e.status == "completed" ? "x" : " "
-            println(io, "    [$mark] $(e.content)")
+    lock(chat_file_lock(session.path)) do
+        open(session.path, "a") do io
+            println(io, "!!! plan")
+            # Write as plain lines (not markdown list) so admonition_text can round-trip them
+            for e in msg.entries
+                mark = e.status == "completed" ? "x" : " "
+                println(io, "    [$mark] $(e.content)")
+            end
+            println(io)
         end
-        println(io)
     end
 end
 
@@ -307,12 +364,14 @@ end
 # have to re-classify by matching the verbatim Claude Code prefix every time.
 function append_summary(session::ChatSession, msg::SummaryMsg)
     isempty(strip(msg.text)) && return
-    open(session.path, "a") do io
-        println(io, "!!! summary \"$(now(UTC))\"")
-        for line in split(msg.text, '\n')
-            println(io, "    ", line)
+    lock(chat_file_lock(session.path)) do
+        open(session.path, "a") do io
+            println(io, "!!! summary \"$(now(UTC))\"")
+            for line in split(msg.text, '\n')
+                println(io, "    ", line)
+            end
+            println(io)
         end
-        println(io)
     end
 end
 

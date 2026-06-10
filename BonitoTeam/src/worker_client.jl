@@ -28,9 +28,14 @@ using HTTP, HTTP.WebSockets, JSON, AgentClientProtocol, RemoteSync
 # Send a JSON command to a worker over its control WS. Throws if the worker
 # isn't currently connected.
 function send_command(state::ServerState, worker_name::String, payload::AbstractDict)
-    haskey(state.worker_control_ws, worker_name) ||
-        error("Worker '$worker_name' is not connected")
-    WebSockets.send(state.worker_control_ws[worker_name], JSON.json(payload))
+    # Snapshot the socket under the lock (T14): `haskey` then index unlocked
+    # raced `teardown_worker_control!`/`remove_worker!` deleting the entry — a
+    # raw KeyError in the middle of a UI handler. One locked lookup decides.
+    ws = lock(state.lock) do
+        get(state.worker_control_ws, worker_name, nothing)
+    end
+    ws === nothing && error("Worker '$worker_name' is not connected")
+    WebSockets.send(ws, JSON.json(payload))
     return nothing
 end
 
@@ -76,13 +81,29 @@ function register_rpc!(state::ServerState)
     return (rid, ch)
 end
 
+# Drop a pending-RPC registration if it's still present (T10). `take_pending!`
+# already evicts on timeout/success, but if `send_command` (or the command
+# dict-build) throws between `register_rpc!` and `take_pending!`, the entry
+# would leak — the RPC wrappers run this in a `finally` to cover that gap.
+# No-op once the key is gone (the normal success path already removed it).
+function unregister_rpc!(state::ServerState, key::AbstractString)
+    lock(state.lock) do
+        haskey(state.pending_rpcs, String(key)) && delete!(state.pending_rpcs, String(key))
+    end
+    return nothing
+end
+
 # Take from a pending-RPC channel with a bounded wait. If `timeout` seconds
 # elapse without the worker replying, evict the entry (so a late reply gets
 # "unknown id") and surface a clear error to the caller.
 function take_pending!(state::ServerState, ch::Channel, key::String,
                        timeout::Real, op_name::AbstractString)
-    Base.errormonitor(@async begin
-        sleep(timeout)
+    # Fire the timeout from a `Timer` rather than an `@async sleep(timeout)`
+    # task (T15): the old design left one sleeping task alive for the FULL
+    # timeout (15–120 s, and the 1 Hz bg poller calls this every tick) even when
+    # the reply landed in milliseconds. The timer is `close`d the instant the
+    # take returns, so a fast reply doesn't strand anything.
+    timer = Timer(timeout) do _
         # Atomic "take if present" so we don't race a concurrent
         # deliver_rpc_response! popping the same key.
         had = lock(state.lock) do
@@ -94,19 +115,25 @@ function take_pending!(state::ServerState, ch::Channel, key::String,
             end
         end
         if had
-            # The channel may have been closed by a peer-cleanup
-            # between the `had` check above and this put!. That's
-            # exactly the race this whole timeout dance handles —
-            # not a real error.
+            # The channel may have been closed by a peer-cleanup between the
+            # `had` check above and this put!. That's exactly the race this
+            # whole timeout dance handles — not a real error.
             try
                 put!(ch, nothing)
             catch e
                 e isa InvalidStateException || rethrow()
             end
         end
-    end)
-    val = take!(ch)
+    end
+    val = try
+        take!(ch)
+    finally
+        close(timer)
+    end
     val === nothing && error("$op_name timed out after $(timeout)s — worker may be offline or stuck")
+    # M9/M13: the worker can report a definitive failure (e.g. open_session_failed)
+    # by delivering an Exception, so we fail fast instead of waiting out the timeout.
+    val isa Exception && throw(val)
     return val
 end
 
@@ -124,6 +151,14 @@ function deliver_rpc_response!(state::ServerState, rid::AbstractString, value)
     catch e
         e isa InvalidStateException || rethrow()
     end
+    return
+end
+
+# Fail a pending RPC: deliver an Exception so `take_pending!` rethrows it (M9).
+# Used when the worker reports a definitive failure for a registered operation
+# (e.g. `open_session_failed`) instead of dialing back.
+function deliver_rpc_error!(state::ServerState, rid::AbstractString, message::AbstractString)
+    deliver_rpc_response!(state, rid, ErrorException(message))
     return
 end
 
@@ -243,6 +278,13 @@ function handle_worker_control(state::ServerState, ws)
                     deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                 elseif t == "tail_file_response"
                     deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                elseif t == "open_session_failed"
+                    # M9/M13: worker couldn't spawn/dial the ACP session; fail the
+                    # pending open_session (keyed by `sid`) now instead of waiting
+                    # out the 30s timeout in transport.jl.
+                    sid = String(get(cmd, "sid", ""))
+                    deliver_rpc_error!(state, sid,
+                        String(get(cmd, "error", "worker failed to open ACP session")))
                 end
             catch e
                 @warn "Worker control frame error" exception=e
@@ -450,14 +492,36 @@ function handle_handoff_ws(state::ServerState, ws, id_field::AbstractString;
         send_ws_error(ws, Dict("ok"=>false, "error"=>"missing $id_field"))
         return
     end
-    haskey(state.pending_rpcs, id) || begin
+    # Atomic take-if-present under `state.lock` (T3). `haskey` then `pop!`
+    # unlocked raced the timeout task in `take_pending!` (which deletes the same
+    # key under the lock): the bare `pop!` could KeyError mid-handshake, or two
+    # paths could both think they own the channel. One locked pop decides the
+    # winner.
+    ch = lock(state.lock) do
+        haskey(state.pending_rpcs, id) ? pop!(state.pending_rpcs, id) : nothing
+    end
+    if ch === nothing
         send_ws_error(ws, Dict("ok"=>false,
                                "error"=>"unknown or expired $id_field"))
         return
     end
-    ch = pop!(state.pending_rpcs, id)
+    # Ack first (the worker waits for `{ok:true}` before it starts streaming),
+    # then hand the live WS to the waiting orchestrator. The caller may have
+    # already given up (closed the channel) between our pop and this put! — same
+    # race `take_pending!` handles. If nobody consumed the WS, close it so we
+    # don't leak a socket + this handler task parked in the sleep loop forever.
     WebSockets.send(ws, JSON.json(Dict("ok" => true)))
-    put!(ch, ws)
+    delivered = try
+        put!(ch, ws)
+        true
+    catch e
+        e isa InvalidStateException || rethrow()
+        false
+    end
+    if !delivered
+        close_ws_safe(ws)
+        return
+    end
 
     while !WebSockets.isclosed(ws)
         sleep(1)
@@ -495,16 +559,22 @@ function sync_dir_to_worker!(state::ServerState, worker_name::String,
 
     sync_id, ch = register_rpc!(state)
 
-    notify_progress(on_progress, :phase, (msg = "Connecting to worker…",))
-    send_command(state, worker_name, Dict(
-        "type"      => "open_transfer",
-        "sync_id"   => sync_id,
-        "direction" => "to_worker",
-        "dst_path"  => dst,
-    ))
-
-    ws = take_pending!(state, ch, sync_id, handoff_timeout,
+    # try/finally so a throw in `send_command` (worker hung up between the
+    # haskey check and the send) doesn't leak the pending registration (T10).
+    # On the success path the handoff already popped the key, so this is a no-op.
+    ws = try
+        notify_progress(on_progress, :phase, (msg = "Connecting to worker…",))
+        send_command(state, worker_name, Dict(
+            "type"      => "open_transfer",
+            "sync_id"   => sync_id,
+            "direction" => "to_worker",
+            "dst_path"  => dst,
+        ))
+        take_pending!(state, ch, sync_id, handoff_timeout,
                       "sync to '$worker_name'")
+    finally
+        unregister_rpc!(state, sync_id)
+    end
     try
         notify_progress(on_progress, :phase, (msg = "Streaming via librsync…",))
         wsio = RemoteSync.WebSocketIO(ws)
@@ -532,16 +602,20 @@ function sync_dir_from_worker!(state::ServerState, worker_name::String,
 
     sync_id, ch = register_rpc!(state)
 
-    notify_progress(on_progress, :phase, (msg = "Connecting to worker…",))
-    send_command(state, worker_name, Dict(
-        "type"      => "open_transfer",
-        "sync_id"   => sync_id,
-        "direction" => "from_worker",
-        "src_path"  => src,
-    ))
-
-    ws = take_pending!(state, ch, sync_id, handoff_timeout,
+    # try/finally to avoid leaking the pending registration on a send failure (T10).
+    ws = try
+        notify_progress(on_progress, :phase, (msg = "Connecting to worker…",))
+        send_command(state, worker_name, Dict(
+            "type"      => "open_transfer",
+            "sync_id"   => sync_id,
+            "direction" => "from_worker",
+            "src_path"  => src,
+        ))
+        take_pending!(state, ch, sync_id, handoff_timeout,
                       "sync from '$worker_name'")
+    finally
+        unregister_rpc!(state, sync_id)
+    end
     try
         notify_progress(on_progress, :phase, (msg = "Streaming via librsync…",))
         wsio = RemoteSync.WebSocketIO(ws)
@@ -575,13 +649,16 @@ function list_worker_dir(state::ServerState, worker_name::String, path::Abstract
         error("Worker '$worker_name' is not connected")
 
     rid, ch = register_rpc!(state)
-    send_command(state, worker_name, Dict(
-        "type"       => "list_dir",
-        "request_id" => rid,
-        "path"       => String(path),
-    ))
-
-    resp = take_pending!(state, ch, rid, timeout, "list_dir on '$worker_name'")
+    resp = try
+        send_command(state, worker_name, Dict(
+            "type"       => "list_dir",
+            "request_id" => rid,
+            "path"       => String(path),
+        ))
+        take_pending!(state, ch, rid, timeout, "list_dir on '$worker_name'")
+    finally
+        unregister_rpc!(state, rid)   # T10: no leak on send failure
+    end
     resp isa AbstractDict || error("list_dir on '$worker_name': unexpected response shape")
     haskey(resp, "error") && error("list_dir on '$worker_name': $(resp["error"])")
     return (path = String(resp["path"]),
@@ -613,12 +690,16 @@ function inspect_worker_path(state::ServerState, worker_name::String,
     haskey(state.worker_control_ws, worker_name) ||
         error("Worker '$worker_name' is not connected")
     rid, ch = register_rpc!(state)
-    send_command(state, worker_name, Dict(
-        "type"       => "inspect_path",
-        "request_id" => rid,
-        "path"       => String(path),
-    ))
-    resp = take_pending!(state, ch, rid, timeout, "inspect_path on '$worker_name'")
+    resp = try
+        send_command(state, worker_name, Dict(
+            "type"       => "inspect_path",
+            "request_id" => rid,
+            "path"       => String(path),
+        ))
+        take_pending!(state, ch, rid, timeout, "inspect_path on '$worker_name'")
+    finally
+        unregister_rpc!(state, rid)   # T10
+    end
     resp isa AbstractDict || error("inspect_path: unexpected response shape")
     haskey(resp, "error") && error("inspect_path on '$worker_name': $(resp["error"])")
     summary = get(resp, "summary", nothing)
@@ -636,10 +717,14 @@ function tail_worker_file(state::ServerState, worker_id::AbstractString,
     haskey(state.worker_control_ws, worker_id) ||
         error("Worker '$worker_id' is not connected")
     rid, ch = register_rpc!(state)
-    send_command(state, worker_id, Dict(
-        "type" => "tail_file", "request_id" => rid,
-        "path" => String(path), "offset" => offset, "max_bytes" => max_bytes))
-    resp = take_pending!(state, ch, rid, timeout, "tail_file on '$worker_id'")
+    resp = try
+        send_command(state, worker_id, Dict(
+            "type" => "tail_file", "request_id" => rid,
+            "path" => String(path), "offset" => offset, "max_bytes" => max_bytes))
+        take_pending!(state, ch, rid, timeout, "tail_file on '$worker_id'")
+    finally
+        unregister_rpc!(state, rid)   # T10
+    end
     resp isa AbstractDict || error("tail_file: unexpected response shape")
     haskey(resp, "error") && error("tail_file on '$worker_id': $(resp["error"])")
     return (exists     = Bool(get(resp, "exists", false)),
@@ -671,8 +756,12 @@ end
 # definitively-missing paths, and never an in-use (locked) project. Returns the
 # number pruned. Runs the inspect round-trips serially — fine off the hot path.
 function prune_missing_projects!(state::ServerState, worker_id::AbstractString)
-    candidates = [(id, p.worker_path) for (id, p) in collect(state.projects[])
-                  if p.worker_id == worker_id && p.locked_by === nothing]
+    # Snapshot candidates under the lock (T14) so we don't iterate
+    # `state.projects[]` while a locked writer rehashes it.
+    candidates = lock(state.lock) do
+        [(id, p.worker_path) for (id, p) in state.projects[]
+         if p.worker_id == worker_id && p.locked_by === nothing]
+    end
     dead = String[]
     for (id, wp) in candidates
         worker_path_missing(state, worker_id, wp) && push!(dead, id)
@@ -779,8 +868,12 @@ function scan_worker_sessions(state::ServerState, worker_name::String;
     haskey(state.worker_control_ws, worker_name) ||
         error("Worker '$worker_name' is not connected")
     rid, ch = register_rpc!(state)
-    send_command(state, worker_name, Dict("type" => "scan_sessions", "request_id" => rid))
-    resp = take_pending!(state, ch, rid, timeout, "scan_sessions on '$worker_name'")
+    resp = try
+        send_command(state, worker_name, Dict("type" => "scan_sessions", "request_id" => rid))
+        take_pending!(state, ch, rid, timeout, "scan_sessions on '$worker_name'")
+    finally
+        unregister_rpc!(state, rid)   # T10
+    end
     return resp isa AbstractVector ? resp : Dict{String,Any}[]
 end
 
@@ -891,9 +984,12 @@ function clone_repo_on_worker(state::ServerState, worker_name::String,
         "dst_path"   => String(dst_path),
     )
     pr_number === nothing || (payload["pr_number"] = Int(pr_number))
-    send_command(state, worker_name, payload)
-
-    resp = take_pending!(state, ch, rid, timeout, "clone_repo on '$worker_name'")
+    resp = try
+        send_command(state, worker_name, payload)
+        take_pending!(state, ch, rid, timeout, "clone_repo on '$worker_name'")
+    finally
+        unregister_rpc!(state, rid)   # T10
+    end
     resp isa AbstractDict || error("clone_repo '$url' on '$worker_name': unexpected response")
     haskey(resp, "error") &&
         error("clone_repo '$url' on '$worker_name': $(resp["error"])")
@@ -923,15 +1019,18 @@ function fetch_file_from_worker(state::ServerState, worker_name::String,
 
     sync_id, ch = register_rpc!(state)
 
-    send_command(state, worker_name, Dict(
-        "type"      => "open_transfer",
-        "sync_id"   => sync_id,
-        "direction" => "file_from_worker",
-        "src_path"  => String(src_path),
-    ))
-
-    ws = take_pending!(state, ch, sync_id, handoff_timeout,
+    ws = try
+        send_command(state, worker_name, Dict(
+            "type"      => "open_transfer",
+            "sync_id"   => sync_id,
+            "direction" => "file_from_worker",
+            "src_path"  => String(src_path),
+        ))
+        take_pending!(state, ch, sync_id, handoff_timeout,
                       "fetch_file from '$worker_name'")
+    finally
+        unregister_rpc!(state, sync_id)   # T10
+    end
     try
         wsio = RemoteSync.WebSocketIO(ws)
         RemoteSync.receive_file(String(dst_path), wsio; on_progress)
@@ -966,15 +1065,18 @@ function send_file_to_worker!(state::ServerState, worker_name::String,
 
     sync_id, ch = register_rpc!(state)
 
-    send_command(state, worker_name, Dict(
-        "type"      => "open_transfer",
-        "sync_id"   => sync_id,
-        "direction" => "file_to_worker",
-        "dst_path"  => String(dst_path),
-    ))
-
-    ws = take_pending!(state, ch, sync_id, handoff_timeout,
+    ws = try
+        send_command(state, worker_name, Dict(
+            "type"      => "open_transfer",
+            "sync_id"   => sync_id,
+            "direction" => "file_to_worker",
+            "dst_path"  => String(dst_path),
+        ))
+        take_pending!(state, ch, sync_id, handoff_timeout,
                       "send_file to '$worker_name'")
+    finally
+        unregister_rpc!(state, sync_id)   # T10
+    end
     try
         wsio = RemoteSync.WebSocketIO(ws)
         RemoteSync.send_file(String(src_path), wsio; on_progress)

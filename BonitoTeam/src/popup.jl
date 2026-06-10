@@ -48,7 +48,13 @@ function save_popup_state(chat_dir::AbstractString;
         mv(tmp, f; force=true)
     catch e
         @debug "save_popup_state: write failed" path=f exception=e
-        try; rm(tmp; force=true); catch; end
+        # Best-effort temp cleanup; a failure to remove a stray temp file is
+        # itself only worth a debug line, never a silent swallow (T20).
+        try
+            rm(tmp; force=true)
+        catch rm_e
+            @debug "save_popup_state: temp cleanup failed" path=tmp exception=rm_e
+        end
     end
     return nothing
 end
@@ -130,8 +136,12 @@ function install_popup!(session::Bonito.Session,
     # current_view → chat_dir → load saved state.
     on(current_view) do pid
         isempty(pid) && return
-        haskey(state.chat_models, pid) || return
-        chat_dir = String(state.chat_models[pid].chat_dir)
+        # `get` not `haskey`+index (T19): the model can be evicted (chat closed,
+        # worker dropped) between the check and the index, KeyError-ing out of the
+        # notify chain. A nil model just means "no popup state to load".
+        model = get(state.chat_models, pid, nothing)
+        model === nothing && return
+        chat_dir = String(model.chat_dir)
         st = load_popup_state(chat_dir)
         st === nothing && return
         loading[] = true
@@ -153,8 +163,10 @@ function install_popup!(session::Bonito.Session,
         loading[] && return
         pid = current_view[]
         isempty(pid) && return
-        haskey(state.chat_models, pid) || return
-        chat_dir = String(state.chat_models[pid].chat_dir)
+        # `get` not `haskey`+index (T19) — same eviction race as the loader above.
+        model = get(state.chat_models, pid, nothing)
+        model === nothing && return
+        chat_dir = String(model.chat_dir)
         save_popup_state(chat_dir;
             x = x[], y = y[], width = width[], height = height[],
             location = location[], chat_width = chat_width[])

@@ -46,6 +46,13 @@ send(t::SubprocessTransport, line::AbstractString) =
 
 recv(t::SubprocessTransport) = readline(t.proc.out; keep = false)
 
+# True once the transport can yield no more frames: stdout hit EOF or the agent
+# exited. Lets `reader_loop` tell a real EOF from a stray blank line (A4) — a
+# `recv` returning "" is ambiguous on its own.
+transport_eof(t::SubprocessTransport) = eof(t.proc.out) || !process_running(t.proc)
+# Default for channel/test transports: rely on the `recv == ""` convention.
+transport_eof(::Transport) = false
+
 # Idempotent + total: safe to call on a already-torn-down process.
 # Closing stdin signals EOF to the agent so it exits cleanly; if it's
 # still alive after that, we kill it. `isopen` / `process_running`
@@ -209,14 +216,79 @@ function dispatcher_loop(conn::Connection)
     finally
         # Teardown: close any in-flight turn stream so its parse loop ends,
         # then unblock every pending RPC (including the turn's response) with
-        # ConnectionClosed so `prompt!` surfaces a dead session.
-        conn.active_updates === nothing || close(conn.active_updates)
-        conn.active_updates = nothing
-        conn.active_id = nothing
-        for (_, ch) in conn.pending
-            put!(ch, ConnectionClosed())
+        # ConnectionClosed so `prompt!` surfaces a dead session. All of this
+        # runs under `conn.lock` and flips `conn.closed` so a `send_request`
+        # racing teardown either registers before us (and gets failed below) or
+        # sees `closed` and throws — it can never park on a channel nobody will
+        # ever feed (A1/A2).
+        lock(conn.lock) do
+            conn.closed = true
+            conn.active_updates === nothing || close(conn.active_updates)
+            conn.active_updates = nothing
+            conn.active_id = nothing
+            for (_, ch) in conn.pending
+                put!(ch, ConnectionClosed())
+            end
+            empty!(conn.pending)
         end
-        empty!(conn.pending)
+    end
+end
+
+# Register a pending RPC under the lock, refusing once the dispatcher has torn
+# down (A1/A2). The channel must be created by the caller so the registration +
+# the wire send below stay a tight critical section; the actual send happens
+# outside the lock so a slow transport write can't serialize against the
+# dispatcher's response delivery.
+function register_pending!(conn::Connection, id::Int, ch::Channel)
+    lock(conn.lock) do
+        conn.closed && throw(ConnectionClosed("connection torn down"))
+        conn.pending[id] = ch
+    end
+    return nothing
+end
+
+# Same, but also claims the single streaming-turn slot. Errors if a turn is
+# already active (A8: a second concurrent turn would orphan the first
+# consumer) or if the connection is closed.
+function register_turn!(conn::Connection, id::Int,
+                        response::Channel, updates::Channel)
+    lock(conn.lock) do
+        conn.closed && throw(ConnectionClosed("connection torn down"))
+        conn.active_updates === nothing ||
+            error("ACP: a prompt turn is already in flight; cancel or await it first")
+        conn.pending[id]    = response
+        conn.active_updates = updates
+        conn.active_id      = id
+    end
+    return nothing
+end
+
+# Deliver one streamed update WITHOUT ever blocking the dispatcher (A7). If the
+# consumer abandoned its channel, a plain `put!` into a full 256-slot buffer
+# would wedge the single dispatcher task forever (it could never reach the
+# turn's `cancelled`/`end_turn` response sitting behind the backlog). Only the
+# latest snapshot matters to a live UI, so on a full buffer we drop the oldest
+# queued update and enqueue the new one. A closed channel (consumer gone) is a
+# no-op.
+function deliver_update!(ch::Channel{SessionUpdate}, update::SessionUpdate)
+    while true
+        lock(ch)
+        try
+            isopen(ch) || return nothing            # consumer closed it
+            if Base.n_avail(ch) < ch.sz_max
+                put!(ch, update)
+                return nothing
+            end
+        finally
+            unlock(ch)
+        end
+        # Buffer full: drop the oldest so we never block the dispatcher.
+        try
+            take!(ch)
+        catch e
+            e isa InvalidStateException && return nothing
+            rethrow()
+        end
     end
 end
 
@@ -239,7 +311,7 @@ function send_request(conn::Connection, method::String, params)::Any
         id
     end
     ch = Channel{Any}(1)
-    conn.pending[id] = ch
+    register_pending!(conn, id, ch)
     send_raw(conn, Dict("jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params))
     result = take!(ch)
     result isa Exception && throw(result)
@@ -248,6 +320,43 @@ end
 
 function send_notification(conn::Connection, method::String, params)
     send_raw(conn, Dict("jsonrpc" => "2.0", "method" => method, "params" => params))
+end
+
+# Like `send_request`, but gives up after `timeout` seconds (A3). Used by setup
+# RPCs (`initialize`, `session/new`) so a wedged agent that never replies can't
+# hang `Client()` forever. On timeout we deregister the pending entry under the
+# lock (so the dispatcher won't later `put!` into an abandoned channel) and
+# raise `ConnectionClosed`; the caller closes the connection and the agent is
+# reaped.
+function send_request(conn::Connection, method::String, params, timeout::Real)::Any
+    id = lock(conn.lock) do
+        i = conn.next_id; conn.next_id += 1; i
+    end
+    ch = Channel{Any}(1)
+    register_pending!(conn, id, ch)
+    send_raw(conn, Dict("jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params))
+
+    # A one-shot timer closes `ch` if no response lands in time. The timer
+    # callback is the ONLY thing that closes `ch` on the timeout path, so a
+    # closed-on-take means "timed out". `close(timer)` after we get a result
+    # cancels a still-pending timer cleanly (no callback runs).
+    timer = Timer(_ -> (isopen(ch) && close(ch)), timeout)
+    result = try
+        take!(ch)
+    catch e
+        # Channel closed with nothing delivered: timed out (or torn down).
+        if e isa InvalidStateException
+            lock(conn.lock) do
+                delete!(conn.pending, id)
+            end
+            throw(ConnectionClosed("request `$method` timed out after $(timeout)s"))
+        end
+        rethrow()
+    finally
+        close(timer)
+    end
+    result isa Exception && throw(result)
+    return result
 end
 
 # Begin a request that streams `session/update` notifications back while it runs.
@@ -269,9 +378,7 @@ function request_updates(conn::Connection, method::String, params)
     end
     response = Channel{Any}(1)
     updates  = Channel{SessionUpdate}(BUF)
-    conn.pending[id]     = response
-    conn.active_updates  = updates
-    conn.active_id       = id
+    register_turn!(conn, id, response, updates)
     send_raw(conn, Dict("jsonrpc" => "2.0", "id" => id,
                         "method" => method, "params" => params))
     return updates, response
@@ -301,14 +408,24 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
         # stream behind it on the dispatcher.
         id = msg["id"]
         params = get(msg, "params", nothing)
-        @async begin
+        # errormonitor so a failure to even send the reply (transport gone) is
+        # logged instead of vanishing into a dead bare task — otherwise the
+        # agent waits forever for a response that never comes (A5).
+        Base.errormonitor(@async begin
             try
                 result = on_request(conn.handler, method, params)
                 send_response(conn, id, result)
             catch e
-                send_error_response(conn, id, -32603, string(e))
+                # Handler threw: report the error back so the agent unblocks.
+                # If even THAT send fails (transport dead), log loudly rather
+                # than swallow.
+                try
+                    send_error_response(conn, id, -32603, string(e))
+                catch e2
+                    @warn "ACP: failed to send error response to agent" id exception=(e2, catch_backtrace())
+                end
             end
-        end
+        end)
 
     elseif method !== nothing
         if method == "session/update"
@@ -329,8 +446,10 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
             # render any more of this turn anyway (the consumer fast-discards),
             # so dropping here keeps the dispatcher free to reach the response
             # immediately, regardless of downstream speed.
-            ch = conn.active_updates
-            (ch === nothing || (@atomic conn.cancelling)) || put!(ch, update)
+            ch = lock(() -> conn.active_updates, conn.lock)
+            if ch !== nothing && !(@atomic conn.cancelling)
+                deliver_update!(ch, update)
+            end
         end
         # Other notifications silently ignored.
 
@@ -343,20 +462,31 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
         # The active prompt's response ends the turn: close its update stream
         # (its parse loop drains the buffer, then exits). The response itself
         # still flows to the pending channel below so `prompt!` can read the
-        # stopReason / surface an rpc error.
-        if id == conn.active_id
-            conn.active_updates === nothing || close(conn.active_updates)
-            conn.active_updates = nothing
-            conn.active_id = nothing
+        # stopReason / surface an rpc error. Both the active-turn slot and the
+        # pending table are read/mutated under `conn.lock` (A1) — caller tasks
+        # register concurrently, so an unlocked get/delete here could miss an
+        # entry mid-insert and hang the caller forever.
+        ch = lock(conn.lock) do
+            if id == conn.active_id
+                conn.active_updates === nothing || close(conn.active_updates)
+                conn.active_updates = nothing
+                conn.active_id = nothing
+            end
+            c = get(conn.pending, id, nothing)
+            c === nothing || delete!(conn.pending, id)
+            c
         end
-        ch = get(conn.pending, id, nothing)
         if ch !== nothing
-            delete!(conn.pending, id)
             if haskey(msg, "error")
                 put!(ch, ErrorException(get(msg["error"], "message", "rpc error")))
             else
                 put!(ch, get(msg, "result", nothing))
             end
+        else
+            # No pending entry: a duplicate response, a reply after teardown, or
+            # an id we never sent. Correlation failures are otherwise invisible
+            # (A6).
+            @warn "ACP: response for unknown request id" id maxlog=10
         end
     end
 end
@@ -365,7 +495,14 @@ function reader_loop(conn::Connection)
     try
         while !conn.closed
             line = recv(conn.transport)
-            isempty(line) && break
+            if isempty(line)
+                # A genuinely empty line is ambiguous: real EOF, or a stray
+                # blank line the agent emitted between frames. Only tear the
+                # connection down on a real EOF; otherwise skip and keep reading
+                # (A4) so one blank line can't kill a live session.
+                transport_eof(conn.transport) && break
+                continue
+            end
             local msg
             try
                 msg = JSON.parse(line)
@@ -384,6 +521,11 @@ function reader_loop(conn::Connection)
             @warn "ACP reader failed" exception=e
         end
     finally
+        # The agent may have closed stdout but kept running (or the loop is
+        # exiting for any other reason): close the transport so the subprocess
+        # is actually reaped instead of leaking (A4). Idempotent with
+        # `close(conn)`.
+        close(conn.transport)
         # Closing the inbox lets the dispatcher's `for msg in inbox`
         # finish draining any in-flight messages, then its `finally`
         # cleans up pending RPCs with ConnectionClosed.

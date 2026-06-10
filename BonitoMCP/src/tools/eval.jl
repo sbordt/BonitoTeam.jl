@@ -88,10 +88,11 @@ end
 function julia_continue_handler(args::AbstractDict)
     env_path  = get(args, "env_path", nothing)
     user_to   = get(args, "timeout",  nothing)
-    julia_cmd = get(args, "julia_cmd", nothing)
 
+    # Pure lookup — never get_or_create! (which would kill+replace the session
+    # holding the in-flight eval; M5). `julia_cmd` is intentionally ignored here.
     s = try
-        get_or_create!(manager(), env_path; julia_cmd)
+        lookup_session(manager(), env_path)
     catch e
         return Dict{String,Any}(
             "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],
@@ -118,10 +119,11 @@ end
 
 function julia_interrupt_handler(args::AbstractDict)
     env_path  = get(args, "env_path", nothing)
-    julia_cmd = get(args, "julia_cmd", nothing)
 
+    # Pure lookup — never get_or_create! (M5). Interrupting requires the EXISTING
+    # session that owns the in-flight eval, not a freshly created replacement.
     s = try
-        get_or_create!(manager(), env_path; julia_cmd)
+        lookup_session(manager(), env_path)
     catch e
         return Dict{String,Any}(
             "content" => [Dict("type" => "text", "text" => sprint(showerror, e))],

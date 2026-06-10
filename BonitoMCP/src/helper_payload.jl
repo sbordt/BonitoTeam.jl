@@ -11,6 +11,15 @@ using Base64
 const DEFAULT_MAX_RESPONSE_BYTES = 10_000
 const LARGE_CONTAINER_THRESHOLD  = 100      # array / dict elements
 
+# On-disk cap for rich-output files (PNG/SVG/HTML written by try_save_rich).
+# This is SEPARATE from `max_bytes` (the per-block RESPONSE cap, 10KB default):
+# the rendered bytes go to a FILE on the worker, never into the MCP response —
+# only the path + mime + size do. Gating the file on the tiny response cap meant
+# essentially every real Makie/Plots PNG (50-500KB) silently degraded to text
+# (M14). 50MB is generous enough for any normal figure while still refusing a
+# pathological multi-hundred-MB render.
+const RICH_FILE_CAP_BYTES = 50 * 1024 * 1024
+
 # Stack frames we strip from error backtraces so the user-visible trace ends
 # at the actual call site (not REPL / include_string / Malt internals).
 const BACKTRACE_NOISE_FRAMES = (
@@ -57,14 +66,17 @@ end
 # matrices) and write the first match to disk. Returns a `shown: <relpath>
 # (<mime>, <size>)` text block that the chat-side render_tool_body
 # detects and previews inline. nothing if no rich MIME was renderable.
+# `max_bytes` is accepted for call-site compatibility but the file-size gate uses
+# the generous RICH_FILE_CAP_BYTES — the bytes go to disk, not the response (M14).
 function try_save_rich(val, out_dir::AbstractString, max_bytes::Int)
     val === nothing && return nothing
     mkpath(out_dir)
     base = string(time_ns(), base = 16) * "-" * string(rand(UInt32), base = 16)
+    cap = RICH_FILE_CAP_BYTES
 
     if showable_safe(MIME"image/png"(), val)
         png = sprint_mime(val, MIME"image/png"())
-        if !isempty(png) && length(png) <= max_bytes
+        if !isempty(png) && length(png) <= cap
             return write_show_file(out_dir, base, ".png", "image/png", png, val)
         end
     end
@@ -72,7 +84,7 @@ function try_save_rich(val, out_dir::AbstractString, max_bytes::Int)
     if looks_like_image(val)
         try
             png = value_to_png(val)
-            if length(png) <= max_bytes
+            if length(png) <= cap
                 return write_show_file(out_dir, base, ".png", "image/png", png, val)
             end
         catch
@@ -81,14 +93,14 @@ function try_save_rich(val, out_dir::AbstractString, max_bytes::Int)
 
     if showable_safe(MIME"image/svg+xml"(), val)
         svg = sprint_mime(val, MIME"image/svg+xml"())
-        if !isempty(svg) && length(svg) <= max_bytes
+        if !isempty(svg) && length(svg) <= cap
             return write_show_file(out_dir, base, ".svg", "image/svg+xml", svg, val)
         end
     end
 
     if showable_safe(MIME"text/html"(), val)
         html = sprint_mime(val, MIME"text/html"())
-        if !isempty(html) && length(html) <= max_bytes
+        if !isempty(html) && length(html) <= cap
             return write_show_file(out_dir, base, ".html", "text/html", html, val)
         end
     end

@@ -88,6 +88,10 @@ include("test_history_sync.jl")
 
 include("test_summary_msg.jl")
 
+# Stability regressions (T1–T22): duplicate-session funnel, JSON-corruption
+# locking, chat-teardown leak, lock coverage. Pure Julia — no Electron/worker.
+include("test_stability.jl")
+
 include("test_sidebar_open_chats.jl")
 
 include("test_queued_messages.jl")

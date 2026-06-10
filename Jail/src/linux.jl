@@ -73,7 +73,22 @@ function _build_bwrap(exe, whitelist, readonly, cfg::JailConfig)
     append!(a, ["--tmpfs", "/tmp"])
 
     for d in whitelist
-        append!(a, ["--bind", d, d])        # read-write
+        # A whitelist dir that doesn't exist yet must NOT abort the whole launch
+        # (R6): `--bind` errors hard if the source is missing. Create it (the
+        # whitelist is read-write, so the caller intends to use it) and bind it;
+        # if creation fails (e.g. a parent we can't write), fall back to
+        # `--bind-try` so bwrap skips it gracefully instead of dying.
+        if isdir(d)
+            append!(a, ["--bind", d, d])        # read-write
+        else
+            made = try
+                mkpath(d); true
+            catch e
+                @warn "Jail: could not create whitelist dir; binding best-effort" dir=d exception=e
+                false
+            end
+            append!(a, [made ? "--bind" : "--bind-try", d, d])
+        end
     end
     for d in readonly
         append!(a, ["--ro-bind-try", d, d]) # read-only

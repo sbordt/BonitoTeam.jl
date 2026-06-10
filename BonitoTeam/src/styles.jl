@@ -149,6 +149,41 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-header-meta-item",
         "cursor" => "default"),
 
+    # Model picker — a native <select> styled as the meta-item pill. We strip
+    # the native chrome (no border / no system background / no arrow gap) so it
+    # reads as a clickable text label; only on hover does the box-shadow ring +
+    # the down-arrow hint that it's interactive. `currentColor` keeps the
+    # arrow matching the muted meta-text color.
+    CSS(".bt-header-meta-pick",
+        "padding" => "0",                 # the <select> brings its own
+        "cursor" => "pointer",
+        "border-radius" => "3px",
+        "transition" => "background 80ms ease, box-shadow 80ms ease"),
+    CSS(".bt-header-meta-pick:hover",
+        "background" => "var(--bt-surface-soft, rgba(127,127,127,0.08))",
+        "box-shadow" => "0 0 0 1px var(--bt-border, rgba(127,127,127,0.25))"),
+    CSS(".bt-header-meta-select",
+        "appearance" => "none",
+        "-webkit-appearance" => "none",
+        "-moz-appearance" => "none",
+        "background" => "transparent",
+        "border" => "0",
+        "outline" => "0",
+        "color" => "inherit",
+        "font" => "inherit",
+        "padding" => "1px 14px 1px 4px",
+        "cursor" => "pointer",
+        # Tiny down-arrow rendered as an inline SVG background so the pill
+        # doesn't depend on a font-glyph being available.
+        "background-image" => "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'><path fill='currentColor' d='M0 0l5 6 5-6z'/></svg>\")",
+        "background-repeat" => "no-repeat",
+        "background-position" => "right 3px center",
+        "background-size" => "7px 5px"),
+    CSS(".bt-header-meta-select:focus-visible",
+        "outline" => "1px solid var(--bt-accent, #3b82f6)",
+        "outline-offset" => "1px",
+        "border-radius" => "3px"),
+
     # ── Status dot (online/offline/streaming) ────────────────────────────────
     CSS(".bt-dot",
         "display" => "inline-block",

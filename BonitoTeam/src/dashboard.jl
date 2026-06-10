@@ -237,9 +237,15 @@ on success or `:stale` on failure.
 function sync_project_to_server!(state::ServerState, p::ProjectInfo; on_progress = nothing)
     haskey(state.workers[], p.worker_id) ||
         error("Worker '$(p.worker_id)' is not connected")
-    p.backup_status === :syncing &&
-        error("Project '$(p.name)' is already syncing")
-    p.backup_status = :syncing
+    # Atomic test-and-set of `backup_status` under the lock (T7). The unlocked
+    # "is it :syncing? → set :syncing" had a window where two receivers both
+    # passed the check and both started writing the same server directory. One
+    # locked transition makes the loser error out cleanly.
+    lock(state.lock) do
+        p.backup_status === :syncing &&
+            error("Project '$(p.name)' is already syncing")
+        p.backup_status = :syncing
+    end
     safe_notify!(state.projects)
     try
         sync_dir_from_worker!(state, p.worker_id, p.worker_path, p.server_path;
@@ -285,7 +291,74 @@ function ensure_project_session!(state::ServerState, p::ProjectInfo;
     if !isempty(target_worker) && String(target_worker) != p.worker_id
         return start!(state, p, target_worker; progress = progress)
     end
-    haskey(state.chat_models, p.id) && return state.chat_models[p.id]
+    # Funnel concurrent bring-ups for the SAME project through ONE in-flight
+    # task (T1). Without this, two tabs opening the same project both pass the
+    # unlocked `haskey(state.chat_models, p.id)` check (the cache write happens
+    # seconds later, at the end of `start_chat_client!`), spawn two
+    # claude-agent-acp processes on the worker, and the second ChatModel
+    # overwrites the first — orphaning a live agent + its stream task.
+    #
+    # Same pattern as RESTART_INFLIGHT: under `state.lock` we either find a live
+    # bring-up task to await, find the finished cache entry, or insert OUR task
+    # as the in-flight placeholder before releasing the lock. The check, the
+    # cache lookup, and the task insertion are one atomic step.
+    local task::Task
+    own = lock(state.lock) do
+        haskey(state.chat_models, p.id) && return (state.chat_models[p.id]::ChatModel, false)
+        existing = get(SESSION_INFLIGHT, p.id, nothing)
+        if existing !== nothing
+            return (existing, false)
+        end
+        t = @task bring_up_project_session!(state, p; progress = progress)
+        SESSION_INFLIGHT[p.id] = t
+        task = t
+        return (t, true)
+    end
+    if own[2]
+        # We own the bring-up: schedule the task, ensure the inflight entry is
+        # cleared on completion (success OR failure) before we surface the
+        # result, so a failed bring-up doesn't wedge later callers.
+        schedule(task)
+        try
+            return fetch_bring_up(task)
+        finally
+            lock(state.lock) do
+                get(SESSION_INFLIGHT, p.id, nothing) === task &&
+                    delete!(SESSION_INFLIGHT, p.id)
+            end
+        end
+    else
+        # Someone else owns it (or it's already cached).
+        winner = own[1]
+        winner isa Task && return fetch_bring_up(winner)
+        return winner
+    end
+end
+
+# `fetch` on a failed task wraps the cause in a `TaskFailedException`; callers
+# (e.g. the loading view's `sprint(showerror, e)`) expect the ORIGINAL error
+# `ensure_project_session!` used to throw directly, so unwrap it.
+function fetch_bring_up(t::Task)
+    try
+        return fetch(t)
+    catch e
+        e isa TaskFailedException && throw(t.result)
+        rethrow()
+    end
+end
+
+# project_id → in-flight `ensure_project_session!` bring-up task. Guarded by
+# `state.lock` (the same lock that guards `chat_models`), so the "is it cached /
+# is a bring-up in flight / start one" decision is atomic. Keyed by the stable
+# project id (a String) rather than the ProjectInfo so two per-session views of
+# the same project funnel together. Entry lifetime is one bring-up.
+const SESSION_INFLIGHT = Dict{String,Task}()
+
+# The actual bring-up, run inside the single in-flight task funnelled by
+# `ensure_project_session!`. Never call this directly from concurrent callers —
+# go through `ensure_project_session!` so duplicates collapse.
+function bring_up_project_session!(state::ServerState, p::ProjectInfo;
+                                   progress = nothing)
     haskey(state.workers[], p.worker_id) ||
         error("Worker '$(p.worker_id)' is not connected")
     w = state.workers[][p.worker_id]
@@ -353,6 +426,12 @@ function stop_session!(state::ServerState, p::ProjectInfo)
         m
     end
     # close is idempotent + total now; a real error here is worth surfacing.
+    # `close(model)` (T4) closes `user_messages`, ending the `run_chat!` consumer
+    # AND the 1 Hz background poller — without it both leak forever, keeping the
+    # ChatModel alive via the `BG_POLLERS` IdDict. Close the model BEFORE the
+    # transport so the consumer's `for … in user_messages` exits cleanly rather
+    # than erroring on a torn-down client mid-turn.
+    model === nothing || close(model)
     model === nothing || close(model.transport)
     model === nothing || notify_chats!(state)   # drop from the active-chats sidebar
     release_project!(state, p)
@@ -1917,9 +1996,13 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         haskey(state.workers[], target) || return
         is_busy_idle(busy[]) || return   # don't pile up moves
         target_w = state.workers[][target]
+        # Set the busy guard SYNCHRONOUSLY, before spawning (T16). Doing it
+        # inside the @async let a double-click pass the `is_busy_idle` check
+        # twice (busy was still idle until the first task ran) and start two
+        # concurrent project moves. The other long-ops set it synchronously too.
+        busy_start!(busy, "Opening $(p.name) on $(target_w.name)")
         @async begin
             try
-                busy_start!(busy, "Opening $(p.name) on $(target_w.name)")
                 cb = (stage, info) -> busy_event!(busy, stage, info)
                 start!(state, p, target; progress = cb)
                 safe_set!(error_obs, "")
@@ -2067,6 +2150,11 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     function do_import(w_name::String, path::String;
                         name::Union{Nothing,String} = nothing,
                         resume_session_id::Union{Nothing,String} = nothing)
+        # In-flight guard (T16): a double-click (or two import affordances firing
+        # at once) had no guard here and would run two concurrent imports of the
+        # same folder. Bail synchronously if a long-op is already running; the
+        # synchronous `busy_start!` just below then latches this one.
+        is_busy_idle(busy[]) || return nothing
         proj_name = name !== nothing ? name :
             let n = replace(basename(rstrip(path, '/')), r"[^a-zA-Z0-9_\-]" => "_")
                 isempty(n) ? "project" : n
@@ -2332,69 +2420,94 @@ end
 # `compare_projects`. The user picks a direction; `on_apply(src, dst)` runs the
 # directional overwrite via `sync_across_workers!`. Reuses the `bt-collision-*`
 # CSS that already ships in DashboardStyles.
+# One opened-modal instance. Rendered via `jsrender` so its three button
+# handlers register on the PER-RENDER sub-session (T22), not the long-lived
+# parent — `map(session, sync_modal_state)` frees that sub-session when the
+# modal closes / reopens, so handlers + the retained `comparison` don't pile up.
+struct SyncModalContent
+    state            :: ServerState
+    sync_modal_state :: Observable
+    on_apply         :: Function
+    c                :: Any   # (current, other, comparison) NamedTuple
+end
+
 function render_sync_modal(session::Bonito.Session,
                             state::ServerState,
                             sync_modal_state::Observable,
                             on_apply::Function)
-    worker_label(id) = haskey(state.workers[], id) ? state.workers[][id].name : id
     map(session, sync_modal_state) do c
         c === nothing && return DOM.div()
-        cur_label   = worker_label(c.current.worker_id)
-        other_label = worker_label(c.other.worker_id)
+        # Return a renderable: its jsrender runs in this map iteration's
+        # sub-session, so the button handlers it registers are freed when this
+        # value is superseded (modal closed or reopened) — fixing the handler
+        # accumulation (T22).
+        SyncModalContent(state, sync_modal_state, on_apply, c)
+    end
+end
 
-        cur_side = sync_side_panel(
-            "$(cur_label) (this chat)", c.current.worker_path,
-            c.comparison.a,
-            c.comparison.a_source === :worker ? "live" : "server mirror")
-        other_side = sync_side_panel(
-            other_label, c.other.worker_path,
-            c.comparison.b,
-            c.comparison.b_source === :worker ? "live" : "server mirror")
+function Bonito.jsrender(session::Bonito.Session, m::SyncModalContent)
+    state            = m.state
+    sync_modal_state = m.sync_modal_state
+    on_apply         = m.on_apply
+    c                = m.c
+    worker_label(id) = haskey(state.workers[], id) ? state.workers[][id].name : id
+    cur_label   = worker_label(c.current.worker_id)
+    other_label = worker_label(c.other.worker_id)
 
-        # Highlight whichever side was edited more recently.
-        cur_mt   = Float64(c.comparison.a["latest_mtime"])
-        other_mt = Float64(c.comparison.b["latest_mtime"])
-        newer = cur_mt > other_mt ? :current : (other_mt > cur_mt ? :other : :tie)
-        if newer === :current
-            cur_side = DOM.div(cur_side; class = "bt-collision-newer")
-        elseif newer === :other
-            other_side = DOM.div(other_side; class = "bt-collision-newer")
-        end
+    cur_side = sync_side_panel(
+        "$(cur_label) (this chat)", c.current.worker_path,
+        c.comparison.a,
+        c.comparison.a_source === :worker ? "live" : "server mirror")
+    other_side = sync_side_panel(
+        other_label, c.other.worker_path,
+        c.comparison.b,
+        c.comparison.b_source === :worker ? "live" : "server mirror")
 
-        push_btn = Bonito.Button("Use $cur_label → overwrite $other_label";
-            style = nothing, class = "bt-btn bt-btn-primary",
-            title = "Copy $(cur_label)'s files onto $other_label, overwriting it")
-        pull_btn = Bonito.Button("Use $other_label → overwrite $cur_label";
-            style = nothing, class = "bt-btn bt-btn-secondary",
-            title = "Copy $(other_label)'s files onto $cur_label, overwriting it")
-        cancel_btn = Bonito.Button("Cancel"; style = nothing,
-            class = "bt-btn bt-btn-ghost")
-        on(session, push_btn.value) do clicked
-            clicked || return
-            on_apply(c.current, c.other)
-        end
-        on(session, pull_btn.value) do clicked
-            clicked || return
-            on_apply(c.other, c.current)
-        end
-        on(session, cancel_btn.value) do clicked
-            clicked || return
-            sync_modal_state[] = nothing
-        end
+    # Highlight whichever side was edited more recently.
+    cur_mt   = Float64(c.comparison.a["latest_mtime"])
+    other_mt = Float64(c.comparison.b["latest_mtime"])
+    newer = cur_mt > other_mt ? :current : (other_mt > cur_mt ? :other : :tie)
+    if newer === :current
+        cur_side = DOM.div(cur_side; class = "bt-collision-newer")
+    elseif newer === :other
+        other_side = DOM.div(other_side; class = "bt-collision-newer")
+    end
 
+    push_btn = Bonito.Button("Use $cur_label → overwrite $other_label";
+        style = nothing, class = "bt-btn bt-btn-primary",
+        title = "Copy $(cur_label)'s files onto $other_label, overwriting it")
+    pull_btn = Bonito.Button("Use $other_label → overwrite $cur_label";
+        style = nothing, class = "bt-btn bt-btn-secondary",
+        title = "Copy $(other_label)'s files onto $cur_label, overwriting it")
+    cancel_btn = Bonito.Button("Cancel"; style = nothing,
+        class = "bt-btn bt-btn-ghost")
+    # Register on THIS render's session (freed when the modal closes/reopens).
+    on(session, push_btn.value) do clicked
+        clicked || return
+        on_apply(c.current, c.other)
+    end
+    on(session, pull_btn.value) do clicked
+        clicked || return
+        on_apply(c.other, c.current)
+    end
+    on(session, cancel_btn.value) do clicked
+        clicked || return
+        sync_modal_state[] = nothing
+    end
+
+    node = DOM.div(
         DOM.div(
             DOM.div(
-                DOM.div(
-                    DOM.h3("Sync '$(c.current.name)' across workers"),
-                    DOM.div("This project exists on both $cur_label and $other_label. " *
-                            "Pick which side's files to keep — the other side is overwritten.";
-                            class = "bt-collision-sub")),
-                DOM.div(cur_side, other_side; class = "bt-collision-sides"),
-                DOM.div(cancel_btn, pull_btn, push_btn;
-                        class = "bt-collision-actions");
-                class = "bt-collision-card");
-            class = "bt-collision-overlay")
-    end
+                DOM.h3("Sync '$(c.current.name)' across workers"),
+                DOM.div("This project exists on both $cur_label and $other_label. " *
+                        "Pick which side's files to keep — the other side is overwritten.";
+                        class = "bt-collision-sub")),
+            DOM.div(cur_side, other_side; class = "bt-collision-sides"),
+            DOM.div(cancel_btn, pull_btn, push_btn;
+                    class = "bt-collision-actions");
+            class = "bt-collision-card");
+        class = "bt-collision-overlay")
+    return Bonito.jsrender(session, node)
 end
 
 # One column of the side-by-side compare. Top line is the headline decision

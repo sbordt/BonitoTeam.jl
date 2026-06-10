@@ -8,7 +8,7 @@ include("connection.jl")
 include("messages.jl")
 include("client.jl")
 
-export Client, MCPServer, ImageAttachment, prompt!, cancel!
+export Client, MCPServer, ImageAttachment, prompt!, cancel!, set_config_option!
 export Transport, SubprocessTransport
 export Handler, DiscardHandler
 export ConnectionClosed

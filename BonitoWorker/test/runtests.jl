@@ -262,6 +262,10 @@ end
 
 end  # BonitoWorker
 
+# Stability regressions (M1 clone_repo data-loss guard, M8/M12/M13). Pure unit
+# tests — no subprocess, no network.
+include("test_stability.jl")
+
 # Real-agent integration test — separate file because it boots a subprocess
 # and stands up an HTTP+WS server. Skipped automatically when
 # claude-agent-acp isn't on PATH (so unit-only environments stay green).

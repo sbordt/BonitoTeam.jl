@@ -102,6 +102,7 @@ const HEADLESS_WEBGL_ARGS = String[
     # Software WebGL via ANGLE+SwiftShader. NB this Electron rejects the old
     # `--use-gl=swiftshader` (resolves to gl=none); it wants the ANGLE form:
     "--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
+    "--in-process-gpu",  # keep GL in-process so a GPU-process crash can't lose the WebGL context (headless SwiftShader "Context lost")
     "--ignore-gpu-blocklist",
 ]
 

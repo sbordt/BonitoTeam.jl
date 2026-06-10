@@ -1,7 +1,7 @@
 # Regression tests for the BonitoWorker stability findings (M1, M8, M12, M13).
 # No network, no claude-agent-acp, no real git: we exercise the pure pieces that
 # were extracted for exactly this (clone_repo_response with an injected clone
-# stub, the watchdog idle predicate, report_open_session_failed framing).
+# stub, the removed idle watchdog, report_open_session_failed framing).
 
 using Test
 using BonitoWorker
@@ -91,26 +91,13 @@ end
     @test BW.kill_proc!(proc) === nothing       # idempotent second call
 end
 
-# ── M12: control-WS idle watchdog fires only after the timeout ─────────────────
-@testset "M12: watchdog idle math" begin
-    # The watchdog declares the socket dead when (now - last_frame) exceeds the
-    # idle timeout. We assert the constants are sane and the comparison holds.
-    @test BW.CONTROL_WS_IDLE_TIMEOUT > BW.CONTROL_WS_WATCHDOG_TICK
-    # Fresh frame → not idle.
-    @test (time() - time()) <= BW.CONTROL_WS_IDLE_TIMEOUT
-    # An ancient last_frame → idle (would trigger a close).
-    ancient = time() - (BW.CONTROL_WS_IDLE_TIMEOUT + 10)
-    @test (time() - ancient) > BW.CONTROL_WS_IDLE_TIMEOUT
-
-    # The watchdog exits promptly when `done` is set, without ever closing.
-    closed = Ref(false)
-    fakews = (; )           # never touched because done flips first
-    last_frame = Ref(time())
-    done = Ref(false)
-    t = @async BW.control_ws_watchdog(fakews, last_frame, done)
-    done[] = true
-    @test timedwait(() -> istaskdone(t), 10.0) === :ok
-    @test closed[] == false
+# ── M12: NO idle watchdog ──────────────────────────────────────────────────────
+# The control-WS idle watchdog was removed: the server doesn't ping, so an idle
+# (healthy) connection has no inbound frames and the watchdog killed it. Assert
+# the heuristic is gone so it can't be reintroduced without a real heartbeat.
+@testset "M12: no idle-kill watchdog on the control WS" begin
+    @test !isdefined(BW, :control_ws_watchdog)
+    @test !isdefined(BW, :CONTROL_WS_IDLE_TIMEOUT)
 end
 
 # ── M13: open_session failures are reported to the server, not swallowed ───────

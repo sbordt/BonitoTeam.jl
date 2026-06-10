@@ -640,31 +640,15 @@ function connect_and_serve(; server_url::String,
     end
 end
 
-# How long the control WS may go with NO inbound frame before we declare it
-# dead. The server pings well inside this window, so silence past it means a
-# half-open TCP (laptop suspend, NAT/VPN drop) where no RST ever arrives — the
-# `for frame in ws` loop would otherwise block forever and the reconnect loop in
-# `connect_and_serve` would be unreachable (M12). 3 missed ping cycles.
-const CONTROL_WS_IDLE_TIMEOUT = 90.0
-const CONTROL_WS_WATCHDOG_TICK = 5.0
-
-# Watchdog: closes `ws` (breaking the read loop → reconnect) if no frame has
-# arrived for CONTROL_WS_IDLE_TIMEOUT. `last_frame` is a Ref updated by the read
-# loop on every frame; `done` is set when the session ends so the watchdog exits.
-function control_ws_watchdog(ws, last_frame::Ref{Float64}, done::Ref{Bool})
-    while !done[]
-        sleep(CONTROL_WS_WATCHDOG_TICK)
-        done[] && return
-        if time() - last_frame[] > CONTROL_WS_IDLE_TIMEOUT
-            @warn "BonitoWorker: control WS idle > $(CONTROL_WS_IDLE_TIMEOUT)s (half-open?) — forcing reconnect"
-            try close(ws) catch e
-                @warn "BonitoWorker: watchdog close failed" exception=e
-            end
-            return
-        end
-    end
-    return
-end
+# NOTE: there is deliberately NO idle/heartbeat watchdog here. An earlier
+# version closed the control WS after N seconds without an inbound frame to
+# guard against a half-open TCP (laptop suspend / NAT drop with no RST). That
+# was wrong: the server does NOT send periodic pings, so a perfectly healthy
+# but idle control connection receives no frames and the watchdog would kill
+# it — and in dev mode `run_control_session` runs without a reconnect loop, so
+# the worker never came back. A correct half-open guard needs either TCP
+# keepalive on the socket or a real bidirectional server→worker ping; until
+# one exists we let the connection sit idle (the common, healthy case).
 
 # Control WS lifecycle
 function run_control_session(; server_url, secret, worker_id, name, mcp_command,
@@ -693,15 +677,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
         end
         @info "BonitoWorker: registered with server" name=name
 
-        # Last-frame watchdog: a half-open control WS (no RST) would hang the
-        # read loop forever, never reaching the reconnect loop. The watchdog
-        # closes the WS on prolonged silence so the loop exits and we redial.
-        last_frame = Ref(time())
-        done = Ref(false)
-        Base.errormonitor(Threads.@spawn control_ws_watchdog(ws, last_frame, done))
-        try
         for frame in ws
-            last_frame[] = time()
             cmd = JSON.parse(String(frame))
             t = get(cmd, "type", "")
             if t == "open_session"
@@ -723,9 +699,6 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             else
                 @warn "BonitoWorker: unknown control frame" type=t
             end
-        end
-        finally
-            done[] = true               # let the watchdog exit promptly
         end
         @info "BonitoWorker: control WS closed by server"
     end

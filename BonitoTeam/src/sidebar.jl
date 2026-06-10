@@ -195,8 +195,8 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # touched it before — `title` backfilled or `resume_session_id` set
     # (both persist in projects.json, so the list survives a server OR
     # worker restart). The per-entry LED encodes liveness:
-    #   green pulse — agent turn in flight (busy_active true)
-    #   yellow      — worker online, idle (live ChatModel OR resumable)
+    #   green pulse — agent turn in flight (busy_active true) = "working"
+    #   green       — worker online, idle (live ChatModel OR resumable)
     #   red         — worker offline / missing
     # Re-renders on structural change (`chat_signal` for chat add/remove,
     # `state.projects` for project add/remove, `state.workers` for worker
@@ -382,11 +382,14 @@ const SidebarStyles = Bonito.Styles(
         "box-shadow" => "0 0 0 2px var(--bt-surface)",
         "transition" => "background 120ms"),
     CSS(".bt-side-led[data-status=\"offline\"]",
-        "background" => "#dc2626"),    # red
+        "background" => "var(--bt-status-offline)"),    # red — worker down
+    # online = ACP/worker up, idle. Solid green (NOT yellow): an open/online
+    # chat is a healthy steady state, not a warning.
     CSS(".bt-side-led[data-status=\"online\"]",
-        "background" => "#f59e0b"),    # yellow
+        "background" => "var(--bt-status-online)"),     # green (solid)
+    # active = an agent turn is in flight. Same green, but pulsing = "working".
     CSS(".bt-side-led[data-status=\"active\"]",
-        "background" => "#16a34a",     # green
+        "background" => "var(--bt-status-active)",      # green
         "animation" => "bt-side-led-pulse 1.1s ease-in-out infinite"),
     CSS("@keyframes bt-side-led-pulse",
         CSS("0%",   "box-shadow" => "0 0 0 2px var(--bt-surface), 0 0 0 0 rgba(22,163,74,0.55)"),

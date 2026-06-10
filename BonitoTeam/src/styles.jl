@@ -17,7 +17,26 @@ const ChatStyles = Bonito.Styles(
         "--bt-shadow-sm"     => "0 1px 2px rgba(15,23,42,0.05)",
         "--bt-shadow-md"     => "0 4px 12px rgba(15,23,42,0.08)",
         "--bt-radius"        => "8px",
-        "--bt-radius-sm"     => "6px"),
+        "--bt-radius-sm"     => "6px",
+        # ── Spacing scale (4px base) — use instead of ad-hoc px so padding/gap
+        #    stay consistent across sidebar / dashboard / chat.
+        "--bt-space-1"       => "4px",
+        "--bt-space-2"       => "8px",
+        "--bt-space-3"       => "12px",
+        "--bt-space-4"       => "16px",
+        "--bt-space-5"       => "24px",
+        "--bt-space-6"       => "32px",
+        # ── Type scale.
+        "--bt-text-xs"       => "11px",
+        "--bt-text-sm"       => "13px",
+        "--bt-text-md"       => "14px",
+        "--bt-text-lg"       => "16px",
+        # ── Status colors — ONE source of truth for every liveness indicator
+        #    (sidebar LED, in-chat dot, dashboard dot). Online = idle-healthy,
+        #    active = a turn is in flight (pulses), offline = worker down.
+        "--bt-status-online"  => "#16a34a",
+        "--bt-status-active"  => "#16a34a",
+        "--bt-status-offline" => "#dc2626"),
 
     # ── Reset ────────────────────────────────────────────────────────────────
     CSS("html, body",
@@ -185,14 +204,17 @@ const ChatStyles = Bonito.Styles(
         "border-radius" => "3px"),
 
     # ── Status dot (online/offline/streaming) ────────────────────────────────
+    # Shared liveness dot (chat header, dashboard). Same status palette as the
+    # sidebar LED. `vertical-align: middle` keeps it centered against the title
+    # text it sits next to (it used to ride high / look detached in the header).
     CSS(".bt-dot",
         "display" => "inline-block",
         "width" => "8px", "height" => "8px",
-        "border-radius" => "50%", "flex-shrink" => "0"),
+        "border-radius" => "50%", "flex-shrink" => "0",
+        "vertical-align" => "middle"),
     CSS(".bt-dot-online",
-        "background" => "var(--bt-success)",
-        "box-shadow" => "0 0 0 3px rgba(16,185,129,0.18)"),
-    CSS(".bt-dot-offline", "background" => "var(--bt-text-faint)"),
+        "background" => "var(--bt-status-online)"),
+    CSS(".bt-dot-offline", "background" => "var(--bt-status-offline)"),
 
     # (The old `.bt-banner-error` / `.bt-banner-detail` session-ended
     # banner has been removed: the permanent header restart button is
@@ -578,6 +600,12 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-tool-body",
         "padding" => "0 12px 10px",
         "border-top" => "1px solid var(--bt-border)"),
+    # A collapsed tool keeps an EMPTY `.bt-tool-body` placeholder (the body is
+    # only rendered into it on expand). Without this it still drew its border-top
+    # + bottom padding — a stray ~11px box under every collapsed tool header.
+    # Zero it out until it actually has content.
+    CSS(".bt-tool-body:empty",
+        "padding" => "0", "border-top" => "none"),
     CSS(".bt-tool-empty",
         "padding" => "8px 0",
         "color" => "var(--bt-text-faint)",

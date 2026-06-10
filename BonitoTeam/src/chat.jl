@@ -764,6 +764,9 @@ function monaco_readonly(text::AbstractString, lang::AbstractString)
         scrollBeyondLastLine=false,
         lineNumbers="off",
         minimap=Dict(:enabled => false),
+        # Force light Monaco. BonitoBook's "default" theme follows the host OS
+        # `prefers-color-scheme` (dark here), which clashed with the light app.
+        theme=Observable("vs"),
         js_init_func=MONACO_RESIZE_INIT,
     )
 end
@@ -948,6 +951,7 @@ function render_diff_block(d::DiffContent; max_height::Int = EDIT_BODY_EXPANDED_
         BonitoBook.DiffEditor(something(d.old_text, ""), d.new_text;
             language=detect_language(d.path),
             renderSideBySide=false,
+            theme=Observable("vs"),   # light, matching the app (see monaco_readonly)
             max_height=max_height);
         class="bt-diff-block")
 end

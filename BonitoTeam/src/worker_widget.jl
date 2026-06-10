@@ -299,6 +299,17 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
         get(d, wid, Dict{String,Any}[])
     end
 
+    # Session ids that are ALREADY imported as a project on this worker (a
+    # project whose `resume_session_id` matches). Such a session is now an open
+    # chat — we drop it from the discover list below so its row disappears once
+    # resumed, instead of lingering with a stale optimistic "Resuming…" label.
+    # Session-scoped (`map(session, …)`) so the listener deregisters with the
+    # browser session rather than leaking onto the long-lived `state.projects`.
+    imported_sids = map(session, c.state.projects) do projects
+        Set(String(p.resume_session_id) for p in values(projects)
+            if p.resume_session_id !== nothing && p.worker_id == wid)
+    end
+
     display_name_obs = map(c.state.workers) do workers
         w = get(workers, wid, nothing)
         w === nothing ? wid : w.name
@@ -354,7 +365,7 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
         get!(session_rows, sr.row_key, sr)
     end
 
-    groups_obs = map(results_obs) do results
+    groups_obs = map(results_obs, imported_sids) do results, imported
         by_path  = Dict{String, Vector{Any}}()
         latest_by_path = Dict{String, Float64}()
         for r in results
@@ -364,6 +375,9 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
             # subagents (e.g. older Claude Code versions that didn't persist the
             # parent jsonl) drops out of the list entirely.
             String(get(r, "kind", "session")) == "subagent" && continue
+            # Already imported (resumed into an open chat) → drop from discover.
+            sid = String(get(r, "session_id", ""))
+            (!isempty(sid) && sid in imported) && continue
             p = String(get(r, "path", ""))
             push!(get!(by_path, p, Any[]), r)
             ts = get(r, "last_used", 0.0)

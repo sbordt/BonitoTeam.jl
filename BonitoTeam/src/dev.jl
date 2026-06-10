@@ -58,7 +58,9 @@ end
 """
 function dev_server(; port::Union{Int,Nothing}             = nothing,
                       name::Union{String,Nothing}          = nothing,
-                      auto_open::Bool                      = false)
+                      auto_open::Bool                      = false,
+                      agent_bin::Union{String,Nothing}     = nothing,
+                      agent_env::Dict{String,String}       = Dict{String,String}())
     # port=0 lets the kernel pick a free ephemeral port; Bonito.Server
     # writes the real port back to srv.port after start.
     chosen_port = port === nothing ? 0 : port
@@ -86,6 +88,19 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     # attempt) rather than `connect_and_serve` (auto-reconnect loop)
     # because reconnecting against a torn-down server prints a noisy
     # error every retry_delay seconds during shutdown.
+    # Spawn the worker control loop in-process. errormonitor surfaces
+    # any crash on stderr so dev workflows don't silently lose the
+    # worker connection. We use `run_control_session` (one connect
+    # attempt) rather than `connect_and_serve` (auto-reconnect loop)
+    # because reconnecting against a torn-down server prints a noisy
+    # error every retry_delay seconds during shutdown.
+    #
+    # When the caller wants a deterministic test agent (mock_claude_agent_acp
+    # or anything else speaking ACP over stdio), they pass `agent_bin` +
+    # `agent_env` and we forward them to the worker so EVERY chat the
+    # worker hosts spawns that binary instead of the real claude-agent-acp.
+    resolved_agent_bin = agent_bin === nothing ? BonitoWorker.find_agent_bin() :
+                          String(agent_bin)
     worker_task = Base.errormonitor(@async try
         BonitoWorker.run_control_session(;
             server_url    = server_url,
@@ -95,7 +110,8 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
             mcp_command   = BonitoWorker.julia_bin(),
             mcp_arguments = BonitoWorker.mcp_args(),
             projects_root = worker_root,
-            agent_bin     = BonitoWorker.find_agent_bin())
+            agent_bin     = resolved_agent_bin,
+            agent_env     = agent_env)
     catch e
         e isa InterruptException && return
         # WebSocket-closed-by-server is the normal shutdown path; don't

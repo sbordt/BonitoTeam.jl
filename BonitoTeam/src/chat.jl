@@ -88,6 +88,15 @@ mutable struct ChatModel
     # points back to it for any `copy(model, session)` view so writes to the
     # broadcast observables reach every tab via the parent→child bridges.
     parent::Union{ChatModel,Nothing}
+
+    # In-RAM cache of every live tool's most-recent content. `render_tool_body`
+    # reads here first, falls back to `tools/<id>.json` on disk only if absent
+    # (history reload after a server restart; the cache only holds tools whose
+    # updates we processed in this server's lifetime). Eliminates the
+    # "no body — tool details not persisted" race where an early expand hit
+    # the disk before `persist_tool_content!` had skipped-or-flushed an empty
+    # initial snap. Shared across per-session views (same `Dict` reference).
+    tool_content_cache::Dict{String, Vector}
 end
 
 function ChatModel(state::ServerState, cwd::AbstractString;
@@ -100,6 +109,13 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     actual_transport = transport === nothing ?
                        LocalTransport(cwd; mcp_servers=collect(AgentClientProtocol.MCPServer, mcp_servers)) :
                        transport
+    busy_active = Observable(false)
+    # Wire busy_active → sidebar status LED: a prompt going in-flight (or
+    # finishing) flips chat_status, which the sidebar wants to know about
+    # immediately, not on the next chat_signal edge. The listener is
+    # anchored to `busy_active` itself (lives as long as the ChatModel
+    # does, GCed with it), so there's no leak.
+    on(busy_active) do _; notify_chats!(state); end
     return ChatModel(
         ReentrantLock(),
         state, String(cwd), String(project_id),
@@ -113,10 +129,11 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(Dict{String,Any}()),
         Observable(true),
         Observable(""),
-        Observable(false),          # busy_active
+        busy_active,
         Observable(Any[]),          # session_meta
         Ref{Union{Task,Nothing}}(nothing),   # consumer_task
         nothing,                    # parent: this is the shared instance itself
+        Dict{String,Vector}(),      # tool_content_cache
     )
 end
 
@@ -141,6 +158,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.session_meta),
             m.consumer_task,           # shared → only the parent runs the loop
             m,    # parent → the shared instance we copied from
+            m.tool_content_cache,      # shared Dict; per-tab views see same RAM cache
         )
     end
 end
@@ -624,13 +642,14 @@ function augment_header!(d::Dict, m::BonitoAppMsg, chat_dir::AbstractString)
     return d
 end
 
-# `kind == "edit"` preview + `bt_show` auto-expand are shared across the generic
-# tool variants and depend on persisted on-disk content, so they live here once.
+# `bt_show` auto-expand is shared across the generic tool variants and depends
+# on persisted on-disk content, so it lives here once. Edit-tool previews used
+# to be HTML strings emitted here too, but that "all `-` then all `+`" view
+# was misleading and divergent from the body's Monaco diff. Edit tools now
+# auto-mount a single compact Monaco DiffEditor as their body (see
+# `auto_expand_body` for the eager-mount, and `render_diff_block` for the
+# capped height); no separate HTML preview.
 function augment_generic_header!(d::Dict, chat_dir::AbstractString)
-    if d["kind"] == "edit" && !isempty(chat_dir)
-        prev = render_edit_preview(chat_dir, d["id"])
-        prev === nothing || (d["preview"] = prev)
-    end
     if !isempty(chat_dir)
         content = load_tool_content(chat_dir, d["id"])
         # bt_show references auto-expand the pill; inline image content
@@ -686,58 +705,18 @@ function todolist_summary(entries)
     return "$done/$(length(entries)) done"
 end
 
-# ── Edit preview ──────────────────────────────────────────────────────────────
-# Tiny inline diff shown above the lazy-loaded body so the user can skim
-# the change without expanding. Renders the FIRST diff hunk's removed +
-# added lines, capped at EDIT_PREVIEW_MAX_LINES. Multi-edit tools show a
-# "+ N more files" footnote when there's more than one DiffContent.
-const EDIT_PREVIEW_MAX_LINES = 8
-
-# Minimal HTML escape — same shape as the JS escapeHTML so the snippet
-# can be innerHTML'd directly without parse mismatches.
-preview_escape(s) = replace(String(s),
-    '&' => "&amp;", '<' => "&lt;", '>' => "&gt;", '"' => "&quot;")
-
-function render_edit_preview(chat_dir::AbstractString, tool_id::AbstractString)
-    content = load_tool_content(String(chat_dir), String(tool_id))
-    isempty(content) && return nothing
-    diffs = [c for c in content if c isa DiffContent]
-    isempty(diffs) && return nothing
-
-    d = first(diffs)
-    old_lines = d.old_text === nothing ? String[] : split(String(d.old_text), '\n')
-    new_lines = split(String(d.new_text), '\n')
-
-    rows = String[]
-    push!(rows, """<div class="bt-edit-preview-path">$(preview_escape(d.path))</div>""")
-
-    # Trailing newline in old/new produces a phantom empty last element from
-    # `split`; pop it so the preview doesn't show an awkward "- " or "+ "
-    # blank row at the end of each side.
-    trim_trailing_blank!(xs) =
-        (!isempty(xs) && isempty(last(xs))) ? (pop!(xs); xs) : xs
-    trim_trailing_blank!(old_lines)
-    trim_trailing_blank!(new_lines)
-
-    n_used = 0
-    for line in old_lines
-        n_used >= EDIT_PREVIEW_MAX_LINES && break
-        push!(rows, """<div class="bt-edit-preview-line bt-edit-preview-del">- $(preview_escape(line))</div>""")
-        n_used += 1
-    end
-    for line in new_lines
-        n_used >= EDIT_PREVIEW_MAX_LINES && break
-        push!(rows, """<div class="bt-edit-preview-line bt-edit-preview-add">+ $(preview_escape(line))</div>""")
-        n_used += 1
-    end
-
-    if length(diffs) > 1
-        extra = length(diffs) - 1
-        push!(rows, """<div class="bt-edit-preview-more">+ $extra more file$(extra == 1 ? "" : "s") in this edit</div>""")
-    end
-
-    return join(rows)
-end
+# ── Edit-tool body sizing ────────────────────────────────────────────────────
+# Edit-tool bodies render as a Monaco `DiffEditor` (see `render_diff_block`).
+# To keep multi-edit tool calls from flooding the chat with full-height
+# editors, the body is initially rendered with `max_height = EDIT_BODY_COMPACT_PX`.
+# The expand toggle re-renders with `max_height = EDIT_BODY_EXPANDED_PX` (or
+# in the future, swaps the value through the editor's `max_height`
+# Observable so the same Monaco instance resizes without re-mounting). This
+# replaces the prior HTML-string "all − then all +" preview that lived above
+# the body — that view was wrong (it dumped old then new instead of
+# interleaving real hunks) and divergent from the body's Monaco render.
+const EDIT_BODY_COMPACT_PX  = 240
+const EDIT_BODY_EXPANDED_PX = 2000
 
 # Tool-body rendering (Bonito DOM tree, includes BonitoBook MonacoEditor /
 # DiffEditor instances). Called only when the user clicks expand; output is
@@ -915,15 +894,49 @@ function load_tool_content(chat_dir::AbstractString, tool_id::AbstractString)
     return Any[parse_tool_content_item(c) for c in raw if c isa AbstractDict]
 end
 
-# A single DiffContent rendered as path-header + inline DiffEditor. Used by
-# both the dedicated 'edit' path (where multiple diffs are stacked) and the
-# default fallback (where a diff appears in a mixed content array).
-function render_diff_block(d::DiffContent)
+# Two-tier content lookup for `render_tool_body`. RAM first: the chat's
+# `tool_content_cache` carries the most recent snap content for every live
+# tool, populated by `process_update!` for each snap (including empty initial
+# ones). Disk fallback covers history reload after a server restart, where
+# the cache is empty but `tools/<id>.json` still has the persisted state.
+#
+# The cache is authoritative for live tools — if a tool is in the cache with
+# empty content, that genuinely means "the agent has not yet delivered any
+# content for this tool", NOT "look on disk for a stale copy". The disk read
+# only fires when the tool was never seen live by this server process
+# (history reload from chat.md). Critically: this removes the
+# "(no body — tool details not persisted)" race where an early expand hit
+# disk before `persist_tool_content!` finished writing the first snap.
+function tool_content_for_render(m::ToolMsg, chat_dir::AbstractString)
+    if m.chat !== nothing && haskey(m.chat.tool_content_cache, m.id)
+        return m.chat.tool_content_cache[m.id]
+    end
+    return load_tool_content(chat_dir, m.id)
+end
+
+# Record the latest snap's content into the in-RAM cache. Empty content is
+# stored verbatim so the cache reflects the live snap state.
+function cache_tool_content!(chat::Union{ChatModel,Nothing}, tool_id::AbstractString,
+                              content::AbstractVector)
+    chat === nothing && return nothing
+    chat.tool_content_cache[String(tool_id)] = Vector{Any}(content)
+    return nothing
+end
+
+# A single DiffContent rendered as path-header + inline Monaco DiffEditor.
+# `max_height` caps Monaco's content-based auto-sizing — pass a small value
+# (`EDIT_BODY_COMPACT_PX`) for the collapsed body, a large one
+# (`EDIT_BODY_EXPANDED_PX`) for the expanded body. The JS `MonacoDiffEditor`
+# also exposes `setMaxHeight` on the container so the Collapsable can flip
+# between the two without re-mounting Monaco (kept here as a fallback for
+# the rare path where the body IS remounted, e.g. tool-update churn).
+function render_diff_block(d::DiffContent; max_height::Int = EDIT_BODY_EXPANDED_PX)
     DOM.div(
         DOM.div(d.path; class="bt-diff-header"),
         BonitoBook.DiffEditor(something(d.old_text, ""), d.new_text;
             language=detect_language(d.path),
-            renderSideBySide=false);
+            renderSideBySide=false,
+            max_height=max_height);
         class="bt-diff-block")
 end
 
@@ -1108,10 +1121,13 @@ render_tool_body(state::ServerState, m::BonitoAppMsg, cwd::AbstractString,
 function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     chat_dir::AbstractString=cwd;
     project_id::AbstractString="")
-    content = load_tool_content(chat_dir, m.id)
+    content = tool_content_for_render(m, chat_dir)
+    # Live tool whose content hasn't arrived yet (user expanded mid-stream
+    # before any snap with content reached us). Render a quiet placeholder
+    # instead of the alarming "details not persisted" message — the next
+    # tool_update will trigger a fresh render with real content.
     isempty(content) &&
-        return DOM.div("(no body — tool details not persisted for this entry)",
-            class="bt-tool-empty")
+        return DOM.div("(loading…)"; class = "bt-tool-empty bt-tool-loading")
 
     # bt_show output: ANY text block starts with "shown: " (the bt_julia_eval
     # wrapper prepends a `\`\`\`julia` code-echo block before the formatter's
@@ -1133,11 +1149,20 @@ function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
 
     if m.kind == "edit"
         # Render every diff (multi-edit calls used to silently drop all but
-        # the first). Stack with file-path headers between each.
+        # the first). Stack with file-path headers between each. Each
+        # Monaco editor caps at `EDIT_BODY_COMPACT_PX` initially; the JS
+        # Collapsable's edit-mode swaps to `EDIT_BODY_EXPANDED_PX` in
+        # place by calling `setMaxHeight` on the editor's container,
+        # without re-mounting. The body is also auto-expanded on the
+        # first snap that carries a `DiffContent` (see `auto_expand_body`)
+        # so the user sees the compact diff under the header without a
+        # click.
         diffs = [c for c in content if c isa DiffContent]
         if !isempty(diffs)
-            return DOM.div((render_diff_block(d) for d in diffs)...;
-                class=length(diffs) > 1 ? "bt-multi-diff" : "")
+            return DOM.div(
+                (render_diff_block(d; max_height = EDIT_BODY_COMPACT_PX) for d in diffs)...;
+                class = length(diffs) > 1 ? "bt-multi-diff bt-edit-tool-body" : "bt-edit-tool-body",
+                dataEditTool = "1")
         end
     end
 
@@ -1375,11 +1400,23 @@ process!(chat::ChatModel, m::AgentClientProtocol.Message) =
 # actually arrives — empty redacted thoughts leave no trace in the store, while
 # an agent that DOES expose plaintext still renders one.
 function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
-    chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => true))
+    chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => true, "count" => 0))
     text = m.text
+    # Liveness counter for long thinks. The reasoning plaintext is redacted, so
+    # we have nothing to render — but each streamed (empty) chunk still ticks the
+    # channel, so the running chunk count is the only real-time proof that the
+    # model is still churning. Shipped next to the "reasoning…" indicator.
+    n = 0
+    c = chat.client[]
     try
         for delta in m.updates
             text *= delta
+            n += 1
+            # Mirror AgentMsg.append!: once stop is pressed, quit shipping per-
+            # chunk wire events (the one thing that keeps the turn "busy" after a
+            # cancel). The final active=false below still fires from the finally.
+            (c !== nothing && (@atomic c.conn.cancelling)) ||
+                chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => true, "count" => n))
         end
     finally
         # MUST fire even if the update iteration threw (session died mid-
@@ -1496,7 +1533,7 @@ end
 function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
     try
         persist_tool_content!(b.chat.chat_dir, m)
-        ship_edit_preview!(b)
+        cache_tool_content!(b.chat, m.id, m.content)
         for snap in m.updates
             prev_status = b.status
             b.status = snap.status
@@ -1506,24 +1543,21 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             prev_status in ("completed", "failed") || !(b.status in ("completed", "failed")) ||
                 (b.finished_at = time())
             persist_tool_content!(b.chat.chat_dir, snap)
+            cache_tool_content!(b.chat, snap.id, snap.content)
             # Per-type extraction from THIS snap (e.g. BonitoAppMsg pulls the
             # worker-registered `shown_app: <id>` out of the result content).
-            # Runs BEFORE we decide expand — so the BonitoApp's auto_expand
-            # gate sees the freshly-captured app_id and emits expand=true on
-            # the SAME tool_update that carries the result. A separate
-            # process_update! override on BonitoAppMsg used to do this but
-            # consumed the snap from `m.updates`, so the generic loop never
-            # saw the result snap and never emitted any expand event.
             update_from_snap!(b, snap)
             pretty_title, _ = pretty_tool_title(b.title)
             d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
                 "status" => b.status, "title" => pretty_title, "summary" => b.summary)
             b.finished_at === nothing || (d["finished_at"] = b.finished_at)
-            # Auto-expand the body: a live Bonito app once we've captured its
-            # app_id, or a `bt_show` tool once content carries a `shown:` ref.
-            # `auto_expand_body` dispatches on the type + current state — no
-            # content sniffing inline.
-            (auto_expand_body(b) || has_show_reference(snap.content)) &&
+            # Auto-expand the body: live Bonito app once we've captured its
+            # app_id, `bt_show` tool once content carries a `shown:` ref, or
+            # an edit tool once its first DiffContent has landed (so the
+            # compact Monaco preview shows up under the header without a
+            # click). `auto_expand_body` dispatches on the type + content
+            # presence — no content sniffing inline here.
+            (auto_expand_body(b, snap.content) || has_show_reference(snap.content)) &&
                 (d["expand"] = true)
             # Displayable media (bt_show mime, or inline image content from
             # e.g. Read on a PNG) — the client's Native Images mode keys on
@@ -1531,7 +1565,6 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             mime = tool_media_mime(snap.content)
             mime === nothing || (d["show_mime"] = mime)
             chat_emit(b.chat, d)
-            ship_edit_preview!(b)
         end
     finally
         close(b)        # total: finalizes the bubble even if the loop body threw
@@ -1539,11 +1572,22 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
     return nothing
 end
 
-# Does this tool's body auto-open on render? A live Bonito app once we've
-# captured its worker-registered id (otherwise the body would try to render
-# with the tool_id as app_id and the worker KeyErrors on the missing route).
-auto_expand_body(::ToolMsg) = false
-auto_expand_body(m::BonitoAppMsg) = !isempty(m.app_id)
+# Does this tool's body auto-open on render? Three signals:
+#   • BonitoAppMsg with a captured app_id — the worker route exists now, so
+#     the embed can mount (without an app_id the body would try to delegate
+#     with the tool_id as the app id and the worker KeyErrors).
+#   • Edit tool whose snap content has a `DiffContent` — the body IS the
+#     diff preview now (compact Monaco editor under the header); the user
+#     should see it without an extra click. The auxiliary `snap_content`
+#     parameter lets the generic loop pass the SAME snap content it's
+#     about to ship, so we don't re-load from cache/disk.
+#   • Everything else stays click-to-expand.
+auto_expand_body(::ToolMsg, snap_content) = false
+auto_expand_body(m::BonitoAppMsg, snap_content) = !isempty(m.app_id)
+auto_expand_body(m::GenericToolMsg, snap_content) =
+    m.kind == "edit" && any(c -> c isa DiffContent, snap_content)
+# Two-arg fallback for tests / call sites that don't have the snap yet.
+auto_expand_body(b::ToolMsg) = auto_expand_body(b, Any[])
 
 # Per-snap state mutation, run inside the generic loop BEFORE the expand/emit
 # decisions so freshly-captured state (e.g. BonitoAppMsg's app_id from the
@@ -1775,18 +1819,6 @@ function background_poll_loop(state::ServerState, model::ChatModel)
         end
         sleep(1.0)
     end
-end
-
-# Edit tools show an inline diff preview on the collapsed header. The diff is
-# only on disk AFTER the persist above, but `wire_new` (which builds the header)
-# already fired — so we ship the preview as a follow-up `tool_update`. No-op for
-# non-edit tools, so the bt_show / generic tool flow is untouched.
-function ship_edit_preview!(b::ToolMsg)
-    b.kind == "edit" || return nothing
-    prev = render_edit_preview(b.chat.chat_dir, b.id)
-    prev === nothing && return nothing
-    chat_emit(b.chat, Dict{String,Any}("type" => "tool_update", "id" => b.id, "preview" => prev))
-    return nothing
 end
 
 # Todos are one-shot snapshots — nothing to stream, just finalize (persist).
@@ -2136,20 +2168,37 @@ end
 # kept here so the server side doesn't depend on the deployed worker's
 # version of those helpers (older workers pre-date them).
 #
-# Generic strategy: strip ANY leading `<tag>…</tag>` block (closer matches
-# opener via backreference); after that, if the remainder still starts with a
-# bare `<tag>` opener it's system commentary (e.g. `<ide_opened_file>The user
-# opened …` with no closing tag) and contains no user prose, so we skip it.
-const TITLE_LEADING_TAG_BLOCK  = r"\A\s*<\s*([A-Za-z][\w-]*)\s*>.*?<\s*/\s*\1\s*>"is
-const TITLE_LEADING_TAG_OPENER = r"\A\s*<\s*[A-Za-z][\w-]*\s*>"
+# Generic strategy: peel any leading wrapper — three shapes:
+#   1. `<tag …attrs?…>body</tag>` paired block (closer backref'd to opener)
+#   2. `<tag …attrs?…/>` self-closing (no body)
+#   3. `<tag …attrs?…>` bare opener at start of remainder ⇒ system commentary
+#      with no following user prose ⇒ skip the message
+#
+# Attributes inside the opener (`<command-args foo="bar">`) are tolerated
+# via the `[^>]*` arm — without it the regex bailed at the first space and
+# the whole tag leaked into the title.
+const TITLE_LEADING_TAG_BLOCK = r"\A\s*<\s*([A-Za-z][\w-]*)(?:\s+[^>]*)?\s*>.*?<\s*/\s*\1\s*>"is
+const TITLE_LEADING_TAG_SELF  = r"\A\s*<\s*[A-Za-z][\w-]*(?:\s+[^>]*)?\s*/\s*>"is
+const TITLE_LEADING_TAG_OPENER= r"\A\s*<\s*[A-Za-z][\w-]*(?:\s+[^>]*)?\s*>"is
 
 function meaningful_title(raw::AbstractString)
     s = String(raw)
-    while occursin(TITLE_LEADING_TAG_BLOCK, s)
-        s = replace(s, TITLE_LEADING_TAG_BLOCK => ""; count = 1)
+    # Peel paired blocks and self-closing tags from the front. A single loop
+    # iteration handles either shape; alternate-pattern peeling lets the
+    # caller's intermixed wrappers (e.g. `<command-args/><system-reminder>x</system-reminder>real`)
+    # collapse to the user prose in one pass.
+    while true
+        m = match(TITLE_LEADING_TAG_BLOCK, s)
+        if m === nothing
+            m = match(TITLE_LEADING_TAG_SELF, s)
+        end
+        m === nothing && break
+        s = s[nextind(s, lastindex(m.match)):end]
     end
     s = strip(s)
     isempty(s) && return nothing
+    # A bare opener still up front means the message is system commentary
+    # (`<ide_opened_file>The user opened …` with no closer; not user prose).
     occursin(TITLE_LEADING_TAG_OPENER, s) && return nothing
     startswith(s, "Caveat: The messages below were generated by the user") && return nothing
     # Collapse whitespace runs, then truncate to a sidebar-friendly length.
@@ -3057,7 +3106,7 @@ function Bonito.jsrender(session::Session, shared_model::ChatModel)
         DOM.div("Waiting for your next instruction"; class="bt-waiting"),
         # Transient "reasoning…" indicator (toggled by the `thinking` comm
         # event in bonitoteam.js). Hidden until an agent thought is in flight.
-        DOM.div("💭 reasoning…"; class="bt-thinking"),
+        DOM.div("💭 reasoning…", DOM.span(class="bt-thinking-count"); class="bt-thinking"),
         # Overscroll tail: empty space the user can scroll into below the
         # last message (~30% of the pane; JS sizes it from clientHeight).
         DOM.div(class="bt-messages-tail");

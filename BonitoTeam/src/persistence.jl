@@ -186,6 +186,56 @@ function update_session_id!(session::ChatSession, new_id::String)
     end
 end
 
+"""
+    first_user_prompt(chat_dir) -> Union{String,Nothing}
+
+Scan `chat.md` for the FIRST `!!! user "..."` admonition and return its body,
+dedented. Returns `nothing` if the file doesn't exist, has no user message
+yet, or the body is empty. Used by the Rescan sweep to re-derive project
+titles from the original prompt instead of the once-saved (possibly stale)
+`p.title` — relevant when an older `meaningful_title` had a bug and the
+truncated/leaked title is now pinned on disk.
+"""
+function first_user_prompt(chat_dir::AbstractString)::Union{String,Nothing}
+    path = session_file(chat_dir)
+    isfile(path) || return nothing
+    lines  = split(read(path, String), '\n')
+    n      = length(lines)
+    header = r"^!!! (\w+)(?:\s+\"(.*)\")?\s*$"
+
+    i = 1
+    # Skip the +++ front-matter so a `+++ … title = "x" … +++` block doesn't
+    # accidentally match the admonition regex on something like a stray !!!.
+    if i <= n && strip(lines[i]) == "+++"
+        i += 1
+        while i <= n && strip(lines[i]) != "+++"
+            i += 1
+        end
+        i <= n && (i += 1)
+    end
+
+    while i <= n
+        h = match(header, lines[i])
+        if h === nothing
+            i += 1
+            continue
+        end
+        category = h.captures[1]
+        i += 1
+        body_lines = String[]
+        while i <= n && match(header, lines[i]) === nothing
+            ln = lines[i]
+            push!(body_lines, startswith(ln, "    ") ? chop(ln; head = 4, tail = 0) : ln)
+            i += 1
+        end
+        if category == "user"
+            body = strip(join(body_lines, '\n'))
+            return isempty(body) ? nothing : String(body)
+        end
+    end
+    return nothing
+end
+
 # Append messages
 function append_user(session::ChatSession, msg::UserMsg)
     open(session.path, "a") do io

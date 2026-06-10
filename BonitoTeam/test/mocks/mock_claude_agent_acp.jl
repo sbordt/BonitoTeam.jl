@@ -35,12 +35,18 @@
 # Stdin EOF → exit(0). The `LocalTransport` close(); `kill` cycle relies on
 # this: closing stdin makes us drop out of the dispatcher loop cleanly.
 
-using JSON
+using JSON, Sockets
 
 const SCENARIO  = String(get(ENV, "BT_MOCK_ACP_SCENARIO", "normal"))
 const N_CHUNKS  = parse(Int, String(get(ENV, "BT_MOCK_ACP_CHUNKS",  "3")))
 const SESSION   = String(get(ENV, "BT_MOCK_ACP_SESSION", "s"))
 const CHUNK_MS  = parse(Int, String(get(ENV, "BT_MOCK_ACP_CHUNK_MS", "0")))
+# Dispatcher mode (scenario = "dispatcher"): connect back to a TCP socket
+# in the parent test process. Per `session/prompt` we send a single JSON
+# object {"prompt": "..."} and the dispatcher streams back a list of
+# events terminated by a line {"type":"end"} which carries the optional
+# stopReason. Each event maps to one ACP frame.
+const DISPATCHER_ADDR = String(get(ENV, "BT_MOCK_ACP_DISPATCHER", ""))
 
 # Flushing line writer: the real claude-agent-acp emits each frame as one
 # line + flush; mirror it so the reader-loop in `ACP.Connection` sees
@@ -213,10 +219,164 @@ function handle_prompt(prompt_id, scenario::AbstractString)
             agent_chunk("loop$i ")
             pause()
         end
+    elseif scenario == "dispatcher"
+        # Ask the parent test process what to emit for this prompt. The
+        # dispatcher TCP server in TestServer translates the user's
+        # `agent::Function` into a stream of typed events; we map each
+        # event to one ACP frame. This is the path real e2e tests take
+        # to swap claude-agent-acp with a test-process responder while
+        # keeping the entire LocalTransport spawn/wire path real.
+        run_dispatcher_prompt(prompt_id)
     else
         error("unknown BT_MOCK_ACP_SCENARIO: $(scenario)")
     end
 end
+
+# Dispatcher mode plumbing ─────────────────────────────────────────────────
+# Open one TCP connection on startup; reuse for every prompt. The
+# dispatcher protocol is line-delimited JSON in both directions:
+#
+#   client → server: {"prompt": "<text>"}              (one line per prompt)
+#   server → client: stream of {"type":"text|edit|bash|thought|end", ...}
+#                    until the server sends `{"type":"end", ...}`.
+#
+# The `end` event optionally carries `stopReason` (default "end_turn") which
+# we forward as the `session/prompt` response.
+const DISPATCHER_SOCK = Ref{Union{Nothing, Sockets.TCPSocket}}(nothing)
+
+function ensure_dispatcher!()
+    DISPATCHER_SOCK[] === nothing || isopen(DISPATCHER_SOCK[]) || (DISPATCHER_SOCK[] = nothing)
+    DISPATCHER_SOCK[] === nothing || return DISPATCHER_SOCK[]
+    isempty(DISPATCHER_ADDR) &&
+        error("scenario=dispatcher requires BT_MOCK_ACP_DISPATCHER=host:port")
+    host, port_str = rsplit(DISPATCHER_ADDR, ":"; limit = 2)
+    DISPATCHER_SOCK[] = Sockets.connect(host, parse(Int, port_str))
+    return DISPATCHER_SOCK[]
+end
+
+function run_dispatcher_prompt(prompt_id)
+    sock = ensure_dispatcher!()
+    # Pull the user's prompt text out of the original message — the
+    # dispatcher loop already parsed it, but we don't have it here. The
+    # test process keys its agent fn on whatever the user typed; carry
+    # the last seen prompt text in this Ref. Set by the dispatcher loop.
+    prompt_text = LAST_PROMPT[]
+    println(sock, JSON.json(Dict("prompt" => prompt_text)))
+    flush(sock)
+
+    stop_reason = "end_turn"
+    next_tool_id = 1
+    while !eof(sock)
+        line = try readline(sock) catch; break end
+        isempty(line) && continue
+        ev = try JSON.parse(line) catch; continue end
+        et = String(get(ev, "type", ""))
+        if et == "text"
+            agent_chunk(String(ev["text"]))
+        elseif et == "thought"
+            thought_chunk(String(ev["text"]))
+        elseif et == "edit"
+            # Edit tool with one DiffContent. The chat side keys off
+            # `kind == "edit"` to route to the Monaco DiffEditor body.
+            tid = String(get(ev, "id", "edit-$(next_tool_id)")); next_tool_id += 1
+            path = String(get(ev, "path", "/unknown"))
+            old_text = String(get(ev, "old", ""))
+            new_text = String(get(ev, "new", ""))
+            # `tool_call` for the bubble header + a `tool_call_update` that
+            # ships the diff content and flips status to completed. Mirrors
+            # what real claude-agent-acp emits.
+            upd("tool_call", Dict{String,Any}(
+                "toolCallId" => tid, "kind" => "edit",
+                "title"  => "Edit $(basename(path))",
+                "status" => "in_progress",
+                "_meta"  => Dict("claudeCode" => Dict("toolName" => "Edit"))))
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid, "status" => "completed",
+                "content" => [Dict{String,Any}(
+                    "type" => "diff", "path" => path,
+                    "oldText" => old_text, "newText" => new_text)]))
+        elseif et == "bash"
+            tid = String(get(ev, "id", "bash-$(next_tool_id)")); next_tool_id += 1
+            upd("tool_call", Dict{String,Any}(
+                "toolCallId" => tid, "kind" => "execute",
+                "title" => "Bash", "status" => "in_progress",
+                "_meta" => Dict("claudeCode" => Dict("toolName" => "Bash")),
+                "rawInput" => Dict("command" => String(get(ev, "command", "")))))
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid, "status" => "completed",
+                "content" => [Dict{String,Any}(
+                    "type" => "content",
+                    "content" => Dict("type" => "text",
+                                       "text" => String(get(ev, "output", ""))))]))
+        elseif et == "bt_show_app_result"
+            # MCP-style tool call: the toolName `mcp__btworker__bt_show_app`
+            # is what the ACP parser splits to `(server="btworker",
+            # tool_name="bt_show_app")` — which is what the chat's
+            # `is_bonito_app(::MCPCall)` checks to route this to the
+            # BonitoAppMsg lifecycle. Without the `mcp__` prefix the call
+            # would land as GenericTool and never auto-mount.
+            tid = String(ev["tool_id"])
+            code = String(ev["code"])
+            env_label = ev["env_path"] === nothing ? "<temp>" : String(ev["env_path"])
+            raw_input = Dict{String,Any}("code" => code)
+            ev["env_path"] === nothing || (raw_input["env_path"] = String(ev["env_path"]))
+            upd("tool_call", Dict{String,Any}(
+                "toolCallId" => tid, "kind" => "other",
+                "title"  => "bt_show_app ($(env_label))",
+                "status" => "in_progress",
+                "_meta"  => Dict("claudeCode" => Dict(
+                    "toolName"  => "mcp__btworker__bt_show_app",
+                    "toolInput" => raw_input)),
+                "rawInput" => raw_input))
+            packed = Any[]
+            for c in get(ev, "content", Any[])
+                push!(packed, Dict{String,Any}("type" => "content", "content" => c))
+            end
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid,
+                "status" => Bool(get(ev, "is_error", false)) ? "failed" : "completed",
+                "content" => packed))
+        elseif et == "bt_eval_result"
+            # MCP returned its content blocks; wrap each in ACP's `type:"content"`
+            # envelope (TextContent/ImageContent expect that shape). The chat
+            # keys off `_meta.claudeCode.toolName == "mcp__btworker__bt_julia_eval"`
+            # for the bt_julia_eval-specific rendering path; matches production.
+            tid = String(ev["tool_id"])
+            code = String(ev["code"])
+            env_label = ev["env_path"] === nothing ? "<temp>" : String(ev["env_path"])
+            raw_input = Dict{String,Any}("code" => code)
+            ev["env_path"] === nothing || (raw_input["env_path"] = String(ev["env_path"]))
+            upd("tool_call", Dict{String,Any}(
+                "toolCallId" => tid, "kind" => "execute",
+                "title"  => "bt_julia_eval ($(env_label))",
+                "status" => "in_progress",
+                "_meta"  => Dict("claudeCode" => Dict(
+                    "toolName"  => "mcp__btworker__bt_julia_eval",
+                    "toolInput" => raw_input)),
+                "rawInput" => raw_input))
+            # Pack MCP content into the ACP `type:"content"` envelope.
+            packed = Any[]
+            for c in get(ev, "content", Any[])
+                push!(packed, Dict{String,Any}("type" => "content", "content" => c))
+            end
+            upd("tool_call_update", Dict{String,Any}(
+                "toolCallId" => tid,
+                "status" => Bool(get(ev, "is_error", false)) ? "failed" : "completed",
+                "content" => packed))
+        elseif et == "end"
+            stop_reason = String(get(ev, "stopReason", "end_turn"))
+            break
+        end
+        # Unknown event types: silently skip. Lets the dispatcher add
+        # new event types without churning the binary in lockstep.
+    end
+    resp(prompt_id, Dict("stopReason" => stop_reason))
+end
+
+# Most-recent prompt text — used by the dispatcher handler to know what
+# message the test process should respond to. Written by the dispatcher
+# loop on each `session/prompt`.
+const LAST_PROMPT = Ref{String}("")
 
 # Dispatcher: read JSON-RPC frames from stdin, route by `method`. Returns
 # when stdin EOFs (parent closed our stdin → time to die).
@@ -238,6 +398,13 @@ function dispatch_loop()
             resp(id, Dict("sessionId" => SESSION))
         elseif method == "session/prompt" && id !== nothing
             cancelled[] = false
+            # Capture the user's prompt text for dispatcher mode. claude's
+            # session/prompt carries `params.prompt` as a Vector of content
+            # blocks; we concat the text bits. Other scenarios ignore this.
+            params = get(msg, "params", Dict())
+            prompt_blocks = get(params, "prompt", Any[])
+            LAST_PROMPT[] = join(String(get(b, "text", "")) for b in prompt_blocks
+                                  if isa(b, AbstractDict) && get(b, "type", "") == "text")
             try
                 handle_prompt(id, SCENARIO)
             catch e

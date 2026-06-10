@@ -20,20 +20,34 @@
 //   • the first expand of a lazy section shows a "loading…" placeholder and
 //     fires `onExpand` once; the owner fills the body (via dom_in_js or a comm
 //     reply) and `fill()` marks it loaded so a re-expand doesn't refetch
-//   • `fetchEachExpand` (tools) refetches on every expand and `discardOnCollapse`
-//     empties the body on collapse (frees the mounted Monaco editors)
+//   • `fetchEachExpand` (most tools) refetches on every expand and
+//     `discardOnCollapse` empties the body on collapse (frees the mounted
+//     Monaco editors)
+//   • `editMode` (edit tools): the body stays mounted ALWAYS — collapse just
+//     shrinks Monaco's `max_height` via its own `setMaxHeight` API; expand
+//     grows it. No re-fetch, no display:none. The eager body mount itself is
+//     triggered from `createNode` so the user sees the compact diff under the
+//     header immediately. Implies !fetchEachExpand && !discardOnCollapse.
 export class Collapsable {
     constructor(headerEl, bodyEl, opts = {}) {
         this.header  = headerEl;
         this.body    = bodyEl;
         this.toggle  = opts.toggleEl || null;
         this.native  = opts.native || false;          // hosted in <details>/<summary>
-        this.fetchEachExpand   = opts.fetchEachExpand || false;
-        this.discardOnCollapse = opts.discardOnCollapse || false;
+        this.editMode = opts.editMode || false;
+        this.compactHeight  = opts.compactHeight  || 240;
+        this.expandedHeight = opts.expandedHeight || 2000;
+        this.fetchEachExpand   = this.editMode ? false : (opts.fetchEachExpand || false);
+        this.discardOnCollapse = this.editMode ? false : (opts.discardOnCollapse || false);
         this.onExpand = opts.onExpand || null;
         this.lazy     = !!this.onExpand;
         this.loaded   = !this.lazy;                    // eager bodies start loaded
-        this.expanded = false;
+
+        // Edit tools start in COMPACT visual state (Monaco capped to 240px)
+        // but the body element is rendered/visible from the start. The
+        // initial `setMaxHeight` lookup is deferred to the first toggle
+        // (Monaco may not have finished its async init when createNode runs).
+        this.expanded = this.editMode ? false : false;
 
         if (this.native) {
             this.details = headerEl.closest('details') || bodyEl.closest('details');
@@ -56,17 +70,38 @@ export class Collapsable {
         if (!this.native) {
             this.header.dataset.expanded = expanded ? 'true' : 'false';
             if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
-            this.body.style.display = expanded ? '' : 'none';
+            if (this.editMode) {
+                // Body stays visible; size via Monaco's own API so the
+                // resize is animated by Monaco itself instead of CSS clip.
+                this.body.style.display = '';
+                this._applyEditHeight(expanded ? this.expandedHeight : this.compactHeight);
+            } else {
+                this.body.style.display = expanded ? '' : 'none';
+            }
         }
-        if (expanded) {
+        if (expanded && !this.editMode) {
             if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
                 this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
                 this.onExpand && this.onExpand();
             }
-        } else if (this.discardOnCollapse) {
+        } else if (!expanded && this.discardOnCollapse) {
             this.body.innerHTML = '';
             this.loaded = false;
         }
+    }
+
+    // Look up the Monaco DiffEditor inside our body and resize via its API.
+    // Querying every toggle handles both "Monaco wasn't ready on first
+    // construction" (the body has the .monaco-diff-editor-div but no
+    // __btMonacoDiff yet) and multi-diff bodies (just resize the first; the
+    // sibling diffs are sized by the same body wrapper). No-op if the
+    // editor finished tearing down or never mounted.
+    _applyEditHeight(h) {
+        const divs = this.body.querySelectorAll('.monaco-diff-editor-div');
+        divs.forEach(div => {
+            const monaco = div.__btMonacoDiff;
+            if (monaco && typeof monaco.setMaxHeight === 'function') monaco.setMaxHeight(h);
+        });
     }
 
     // Owner finished loading the lazy body: set its html + mark loaded so a
@@ -190,6 +225,9 @@ class BonitoChat {
         // thought, then removed. Most thoughts are redacted (empty) so this is
         // usually all the user sees of the model's thinking.
         this.thinkingEl   = container.querySelector('.bt-thinking');
+        // Live chunk counter rendered next to the reasoning indicator — ticks
+        // per streamed (redacted) thought chunk so a long think visibly moves.
+        this.thinkingCountEl = container.querySelector('.bt-thinking-count');
         // Overscroll tail: empty space below the last message the user can
         // scroll into (~30% of the pane; sized in the container RO).
         this.tailEl       = container.querySelector('.bt-messages-tail');
@@ -617,7 +655,7 @@ class BonitoChat {
                 if (this.followMode) this._queueScrollToBottom();
                 return;
             case 'agent_final':  return this.onAgentFinal(msg);
-            case 'thinking':     return this.onThinking(msg.active);
+            case 'thinking':     return this.onThinking(msg);
             case 'thought_final':return this.onThoughtFinal(msg);
             case 'thought.body': return this.onThoughtBody(msg);
             case 'tool_update':  return this.onToolUpdate(msg);
@@ -1002,6 +1040,15 @@ class BonitoChat {
             delete node.dataset.btAutoExpand;
             node.collapsable?.setExpanded(true);
         }
+        // Deferred eager-mount for edit tools (Monaco body without flipping
+        // the Collapsable to expanded). Same scrollbar-drag guard as above.
+        if (node.dataset && node.dataset.btAutoMount && !this._scrollbarDrag) {
+            delete node.dataset.btAutoMount;
+            if (node.collapsable && !node.collapsable.loaded) {
+                node.collapsable.loaded = true;
+                this.comm.notify({type: 'tool.render', id: node.dataset.msgId});
+            }
+        }
     }
 
     // ── New messages + streaming ──────────────────────────────────────────
@@ -1109,8 +1156,13 @@ class BonitoChat {
 
     // Transient "reasoning…" indicator toggled by Julia for the lifetime of an
     // agent thought (redacted thoughts have no body, so this is the only trace).
-    onThinking(active) {
+    onThinking(msg) {
+        const active = msg.active;
         if (this.thinkingEl) this.thinkingEl.classList.toggle('bt-thinking-active', !!active);
+        // Show the running chunk count while active; clear it on teardown so the
+        // next think starts fresh. count 0 (initial activation) shows no number.
+        if (this.thinkingCountEl)
+            this.thinkingCountEl.textContent = (active && msg.count) ? String(msg.count) : '';
         if (active && this.followMode) this._queueScrollToBottom();
     }
 
@@ -1168,19 +1220,6 @@ class BonitoChat {
             const s = node.querySelector('.bt-tool-summary');
             if (s) s.textContent = msg.summary;
         }
-        // Edit tools ship their inline diff preview as a follow-up update (the
-        // header was emitted before the diff was on disk). Insert it right after
-        // the header, matching the initial toolHTML layout.
-        if (msg.preview != null) {
-            let prev = node.querySelector('.bt-edit-preview');
-            if (!prev) {
-                prev = document.createElement('div');
-                prev.className = 'bt-edit-preview';
-                const header = node.querySelector('.bt-tool-header');
-                if (header) header.insertAdjacentElement('afterend', prev);
-            }
-            prev.innerHTML = msg.preview;
-        }
         // bt_show: the completion update is when we learn it's a "show me
         // this" tool (and its mime). Native-media mode takes precedence:
         // chrome off + body mounted; otherwise auto-expand the pill
@@ -1190,8 +1229,26 @@ class BonitoChat {
         if (this._wantsNative(node)) {
             this._applyNative(node);
         } else if (msg.expand && node.collapsable) {
-            if (node.isConnected) node.collapsable.setExpanded(true);
-            else node.dataset.btAutoExpand = '1';
+            if (node.collapsable.editMode) {
+                // Edit tools: msg.expand from the server means "the first
+                // DiffContent landed — eager-mount the compact Monaco
+                // preview, but DON'T flip Collapsable.expanded (we stay in
+                // compact size). A click on the header is what expands
+                // Monaco; this auto-mount just makes the diff visible
+                // without requiring a click.
+                if (node.isConnected) {
+                    if (!node.collapsable.loaded) {
+                        node.collapsable.loaded = true;
+                        this.comm.notify({type: 'tool.render', id: msg.id});
+                    }
+                } else {
+                    node.dataset.btAutoMount = '1';
+                }
+            } else if (node.isConnected) {
+                node.collapsable.setExpanded(true);
+            } else {
+                node.dataset.btAutoExpand = '1';
+            }
         }
         // A background bash/Task only learns it's a taskbar item when its launch
         // result arrives (rawInput doesn't carry run_in_background), so the server
@@ -1391,11 +1448,17 @@ class BonitoChat {
                 // Click-header host; the body is re-rendered (Monaco etc.) on
                 // every expand via tool.render → dom_in_js, and discarded on
                 // collapse so the editors are freed.
+                // Edit tools render their compact Monaco diff under the
+                // header eagerly (no click required). The Collapsable's
+                // editMode keeps the body mounted across collapse — toggle
+                // just calls Monaco.setMaxHeight to swap compact↔full.
+                const isEdit = msg.kind === 'edit';
                 div.collapsable = new Collapsable(
                     div.querySelector('.bt-tool-header'),
                     div.querySelector('.bt-tool-body'),
                     { toggleEl: div.querySelector('.bt-tool-toggle'),
-                      fetchEachExpand: true, discardOnCollapse: true,
+                      editMode: isEdit,
+                      fetchEachExpand: !isEdit, discardOnCollapse: !isEdit,
                       onExpand: () => this.comm.notify({type: 'tool.render', id}) });
                 // Detach (bonito_app only): pop the embed into the floating
                 // window. Lives on the ⤢ header button — the conventional "open

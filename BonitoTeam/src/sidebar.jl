@@ -64,10 +64,19 @@ end
 function sidebar_entry(label::AbstractString, icon::Bonito.Node,
                         target_value::AbstractString, title::AbstractString;
                         active::Bool = false, closeable::Bool = false,
-                        extra_class::AbstractString = "")
+                        extra_class::AbstractString = "",
+                        status::Union{Symbol,Nothing} = nothing)
     # The icon now carries the worker initials (project_icon does the
     # styling); the title span only needs the chat title text.
     kids = Any[icon, DOM.span(label; class = "bt-side-name")]
+    # Status LED (green pulse / yellow / red). Rendered as a small absolutely
+    # positioned dot anchored to the icon — `data-status` lets the CSS
+    # pick the colour + animation. The 1Hz `recompute_status_dom!` JS
+    # updates this attr in place so the LED reactivity doesn't require a
+    # body re-render. Home entry has no LED (status === nothing).
+    status === nothing || push!(kids, DOM.span(""; class = "bt-side-led",
+                                                title = string(status),
+                                                dataStatus = string(status)))
     # A ✕ to close (stop) an active chat. Plain markup — the delegated
     # handler on the aside reads `.bt-side-close` and routes to close_trigger
     # rather than current_view, so no per-entry Observable is interpolated
@@ -85,36 +94,45 @@ function sidebar_entry(label::AbstractString, icon::Bonito.Node,
 end
 
 """
-    sidebar_resumable_projects(projects, discovered, open_set) -> Vector{ProjectInfo}
+    open_chat_projects(state) -> Vector{ProjectInfo}
 
-Projects whose Claude Code session is currently running on the worker (per the
-cached discover scan) but which aren't already open as a live ChatModel. These
-are what should re-fill the sidebar after a server restart — the agent process
-is still alive on the worker, the user just needs to click it to resume the
-session via `session/load`.
-
-Match rule: `discovered[project.worker_id]` has a record with
-`path == project.worker_path` and `running == true`. We don't require the
-record's `session_id` to match `project.resume_session_id` — any running
-session at that path makes the project resumable (resume_session_id is the
-hint the bring-up uses; matching at the path is enough to surface the entry).
+The single "Open chats" list shown in the sidebar. A project counts as
+"open" iff the user has interacted with it at least once — i.e. it has
+either a backfilled `title` (set on the first user message) or a
+`resume_session_id` (imported from claude-agent-acp). This is the
+persistent definition: surviving a server OR worker restart, because both
+markers live on disk in `projects.json` and are restored on boot. We don't
+gate on `chat_models` (in-memory only) or on the `discovered.json` scan
+cache (stale by definition between rescans).
 """
-function sidebar_resumable_projects(projects::AbstractDict{<:AbstractString,ProjectInfo},
-                                     discovered::AbstractDict,
-                                     open_set::AbstractSet{<:AbstractString})
+function open_chat_projects(projects::AbstractDict{<:AbstractString,ProjectInfo})
     out = ProjectInfo[]
-    for (pid, p) in projects
-        pid in open_set && continue
-        scans = get(discovered, p.worker_id, nothing)
-        scans === nothing && continue
-        for r in scans
-            haskey(r, "error") && continue
-            String(get(r, "path", "")) == p.worker_path && get(r, "running", false) === true || continue
-            push!(out, p)
-            break
-        end
+    for (_, p) in projects
+        (p.title !== nothing || p.resume_session_id !== nothing) || continue
+        push!(out, p)
     end
     return out
+end
+
+"""
+    chat_status(state, p) -> Symbol
+
+One of `:active`, `:online`, `:offline` — the sidebar LED state.
+
+  * `:offline`  — worker entry is missing OR its status isn't `:online`.
+                  Nothing the agent can do until the worker reconnects.
+  * `:online`   — worker is up but no agent turn is in flight. Covers both
+                  "ChatModel exists, sitting idle" and "no ChatModel yet,
+                  needs a session/load resume on click".
+  * `:active`   — ChatModel exists AND `busy_active` is true (a prompt is
+                  in flight: claude is thinking or streaming).
+"""
+function chat_status(state::ServerState, p::ProjectInfo)
+    w = get(state.workers[], p.worker_id, nothing)
+    (w === nothing || w.status !== :online) && return :offline
+    m = lock(state.lock) do; get(state.chat_models, p.id, nothing); end
+    m === nothing && return :online
+    return m.busy_active[] ? :active : :online
 end
 
 const HOME_ICON = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "icons", "home.svg"))
@@ -167,29 +185,22 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         current_view[] == pid && (current_view[] = "")
     end
 
-    # The left strip is now an ACTIVE-CHATS switcher: one entry per running
-    # ChatModel (`state.chat_models`), not per registered project. It also
-    # picks up "resumable" projects — ones whose Claude Code session is
-    # currently running on the worker (per the cached discover scan) but
-    # which the server hasn't brought up yet (e.g. fresh after a server
-    # restart). Those render dimmer and clicking them does the normal
-    # current_view = pid path, which `ensure_project_session!` turns into a
-    # `session/load` resume. Re-renders on `chat_signal` (a chat opened/
-    # closed), `discovered` (a worker rescan), or project/worker changes.
-    body = map(state.chat_signal, state.projects, state.workers, state.discovered) do _, projects, workers, discovered
+    # ONE unified "Open chats" list. A project is "open" iff the user has
+    # touched it before — `title` backfilled or `resume_session_id` set
+    # (both persist in projects.json, so the list survives a server OR
+    # worker restart). The per-entry LED encodes liveness:
+    #   green pulse — agent turn in flight (busy_active true)
+    #   yellow      — worker online, idle (live ChatModel OR resumable)
+    #   red         — worker offline / missing
+    # Re-renders on structural change (`chat_signal` for chat add/remove,
+    # `state.projects` for project add/remove, `state.workers` for worker
+    # online/offline transitions). The LED color is recomputed every second
+    # by `recompute_status_dom!` on the OUTER aside (below) so a busy_active
+    # flip mid-turn doesn't require a body re-render.
+    body = map(state.chat_signal, state.projects, state.workers) do _, projects, workers
         active_pid = current_view[]
-        open_ids = lock(state.lock) do
-            collect(keys(state.chat_models))
-        end
-        open_set = Set{String}(open_ids)
-        open_projs = ProjectInfo[projects[id] for id in open_ids if haskey(projects, id)]
+        open_projs = open_chat_projects(projects)
         sort!(open_projs; by = p -> lowercase(p.name))
-
-        # Resumable: projects with a `running == true` discover record matching
-        # (worker_id, worker_path), AND which aren't already open. Survives a
-        # server restart since `discovered` is loaded from disk on boot.
-        resumable_projs = sidebar_resumable_projects(projects, discovered, open_set)
-        sort!(resumable_projs; by = p -> lowercase(p.name))
 
         entries = Any[sidebar_entry("Home", home_icon, "", "Dashboard";
                                     active = active_pid == "")]
@@ -209,27 +220,14 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             t = wtag(p)
             b = base(p)
             label = base_counts[b] > 1 ? "$b · $(thread_tag(p))" : b
-            tooltip = "[$t] $label · folder: $(p.name)"
+            st = chat_status(state, p)
+            tooltip = "[$t] $label · folder: $(p.name) · $(st)"
             push!(entries,
                   sidebar_entry(label, project_icon(p, t), p.id, tooltip;
-                                active = active_pid == p.id, closeable = true))
+                                active = active_pid == p.id, closeable = true,
+                                status = st))
         end
-        if !isempty(resumable_projs)
-            push!(entries, DOM.div("Running on worker"; class = "bt-side-section"))
-            for p in resumable_projs
-                t = wtag(p)
-                b = base(p)
-                tooltip = "[$t] $b · folder: $(p.name) · resumable"
-                # Clicking pulls them up the normal way (current_view = pid),
-                # which `ensure_project_session!` resolves to a session/load resume.
-                push!(entries,
-                      sidebar_entry(b, project_icon(p, t), p.id, tooltip;
-                                    active = active_pid == p.id,
-                                    closeable = false,
-                                    extra_class = "bt-side-resumable"))
-            end
-        end
-        isempty(open_projs) && isempty(resumable_projs) && push!(entries,
+        isempty(open_projs) && push!(entries,
             DOM.div("No open chats yet — open one from the dashboard.";
                     class = "bt-side-empty"))
         DOM.div(entries...; class = "bt-side-list")
@@ -286,6 +284,44 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         try { localStorage.setItem('bt-last-pid', pid || ''); } catch (e) {}
     }""")
 
+    # ── Per-entry LED status updates (no body re-render, no polling) ────────
+    # `chat_status` is computed server-side and pushed as a `pid → status`
+    # map. The JS handler reads `.bt-side-led` elements by `data-project-id`
+    # and swaps the `data-status` attr in place. Pure attribute update —
+    # never touches Observable refcounts in the body subsession, so the
+    # GLOBAL_OBJECT_CACHE notes at the top still hold.
+    #
+    # Triggers: any state change that can flip a chat's status fires
+    # `chat_signal` server-side. `chat_models` additions/removals already
+    # call `notify_chats!`; the `ChatModel` constructor anchors an
+    # `on(busy_active) → notify_chats!` so a prompt going in-flight (or
+    # finishing) fans straight through to the sidebar without any polling.
+    status_obs = Observable(Dict{String,String}())
+    function recompute_status!()
+        new = Dict{String,String}()
+        for (pid, p) in state.projects[]
+            (p.title !== nothing || p.resume_session_id !== nothing) || continue
+            new[pid] = string(chat_status(state, p))
+        end
+        status_obs[] = new
+    end
+    recompute_status!()
+    on(session, state.chat_signal) do _; recompute_status!(); end
+    on(session, state.workers)     do _; recompute_status!(); end
+    on(session, state.projects)    do _; recompute_status!(); end
+
+    Bonito.onjs(session, status_obs, js"""(map) => {
+        document.querySelectorAll('.bt-sidebar .bt-side-led').forEach(el => {
+            const pid = el.closest('.bt-side-item')?.dataset.projectId;
+            if (!pid) return;
+            const st = map[pid] || 'offline';
+            if (el.dataset.status !== st) {
+                el.dataset.status = st;
+                el.title = st;
+            }
+        });
+    }""")
+
     return aside
 end
 
@@ -320,20 +356,30 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-active",
         "border-left-color" => "var(--bt-accent)",
         "background" => "var(--bt-surface-2)"),
-    # Subheader for the "Running on worker" group. Dim, uppercase, small —
-    # reads as a section label, not an item.
-    CSS(".bt-side-section",
-        "padding" => "10px 12px 4px",
-        "font-size" => "10.5px", "font-weight" => "600",
-        "letter-spacing" => "0.08em", "text-transform" => "uppercase",
-        "color" => "var(--bt-text-faint)"),
-    # A resumable entry is dimmer (the agent process is alive but the server
-    # hasn't brought up its ChatModel yet — clicking does the resume).
-    CSS(".bt-side-resumable",
-        "opacity" => "0.78"),
-    CSS(".bt-side-resumable .bt-side-name",
-        "color" => "var(--bt-text-muted)",
-        "font-style" => "italic"),
+    # Per-entry status LED: a 7px dot tucked into the icon's top-right.
+    # `data-status` picks one of three states. Active blinks; the other
+    # two are flat. Position is relative to the entry so the LED follows
+    # the icon when the entry wraps over two lines on a narrow column.
+    CSS(".bt-side-item", "position" => "relative"),
+    CSS(".bt-side-led",
+        "position" => "absolute",
+        "top" => "6px", "left" => "32px",
+        "width" => "7px", "height" => "7px",
+        "border-radius" => "50%",
+        "background" => "var(--bt-text-faint)",
+        "box-shadow" => "0 0 0 2px var(--bt-surface)",
+        "transition" => "background 120ms"),
+    CSS(".bt-side-led[data-status=\"offline\"]",
+        "background" => "#dc2626"),    # red
+    CSS(".bt-side-led[data-status=\"online\"]",
+        "background" => "#f59e0b"),    # yellow
+    CSS(".bt-side-led[data-status=\"active\"]",
+        "background" => "#16a34a",     # green
+        "animation" => "bt-side-led-pulse 1.1s ease-in-out infinite"),
+    CSS("@keyframes bt-side-led-pulse",
+        CSS("0%",   "box-shadow" => "0 0 0 2px var(--bt-surface), 0 0 0 0 rgba(22,163,74,0.55)"),
+        CSS("70%",  "box-shadow" => "0 0 0 2px var(--bt-surface), 0 0 0 6px rgba(22,163,74,0)"),
+        CSS("100%", "box-shadow" => "0 0 0 2px var(--bt-surface), 0 0 0 0 rgba(22,163,74,0)")),
     CSS(".bt-proj-icon",
         "border-radius" => "8px",
         "color" => "#fff", "font-weight" => "600",

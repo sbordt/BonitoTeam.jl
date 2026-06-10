@@ -642,7 +642,8 @@ end
 
 # Control WS lifecycle
 function run_control_session(; server_url, secret, worker_id, name, mcp_command,
-                               mcp_arguments, projects_root, agent_bin)
+                               mcp_arguments, projects_root, agent_bin,
+                               agent_env::Dict{String,String} = Dict{String,String}())
     control_url = ws_url(server_url, "/worker-ws")
     @info "BonitoWorker: connecting to control WS" control_url worker_id name
     WebSockets.open(control_url) do ws
@@ -670,7 +671,7 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
             cmd = JSON.parse(String(frame))
             t = get(cmd, "type", "")
             if t == "open_session"
-                @async handle_open_session(server_url, secret, agent_bin, cmd)
+                @async handle_open_session(server_url, secret, agent_bin, cmd; agent_env)
             elseif t == "open_transfer"
                 @async handle_open_transfer(server_url, secret, cmd)
             elseif t == "list_dir"
@@ -695,10 +696,16 @@ end
 
 # Per-session WS handler
 function handle_open_session(server_url::String, secret::String, agent_bin::String,
-                              cmd::AbstractDict)
+                              cmd::AbstractDict;
+                              agent_env::Dict{String,String} = Dict{String,String}())
     sid           = String(get(cmd, "sid", ""))
     cwd           = String(get(cmd, "cwd", pwd()))
-    env_overrides = Dict{String,String}(get(cmd, "env", Dict{String,String}()))
+    # `cmd.env` is per-session overrides from the open_session command.
+    # `agent_env` is worker-wide config (e.g. `dev_server(agent=...)`
+    # threading dispatcher coords to every chat). Merge with per-session
+    # winning over worker-wide, both winning over inherited.
+    env_overrides = merge(Dict{String,String}(agent_env),
+                          Dict{String,String}(get(cmd, "env", Dict{String,String}())))
     isempty(sid) && (@error "open_session missing sid"; return)
 
     isdir(cwd) || try mkpath(cwd) catch end

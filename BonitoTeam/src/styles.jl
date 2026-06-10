@@ -620,50 +620,15 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "12px", "line-height" => "1.5",
         "margin" => "0"),
 
-    # ── Edit-tool inline preview ─────────────────────────────────────────────
-    # Server-rendered diff snippet between the tool header and the lazy body.
-    # Capped at ~100px (~7-8 lines) with a fade gradient at the bottom so
-    # there's a visual hint that "more lives in the expanded body".
-    CSS(".bt-edit-preview",
-        "max-height" => "100px",
-        "overflow"   => "hidden",
-        "position"   => "relative",
-        "padding"    => "6px 12px 8px",
-        # border-box so the 100px cap is the actual rendered height — keeps
-        # the lightweight contract honest no matter what padding lands here.
-        "box-sizing" => "border-box",
+    # ── Edit-tool body container ─────────────────────────────────────────────
+    # The body IS the diff preview now — a single (or multi-) Monaco
+    # DiffEditor. Size is driven by Monaco's own height API
+    # (`MonacoDiffEditor.setMaxHeight`), not by an outer CSS clip. The
+    # container just gives it room and a subtle top border so it visually
+    # belongs to its header.
+    CSS(".bt-edit-tool-body",
         "border-top" => "1px solid var(--bt-border)",
-        "background" => "var(--bt-surface-2)",
-        "font-family" => "ui-monospace, monospace",
-        "font-size"  => "11.5px",
-        "line-height" => "1.4"),
-    # Bottom fade so the truncation is intentional-looking rather than
-    # an awkward hard cut.
-    CSS(".bt-edit-preview::after",
-        "content" => "''",
-        "position" => "absolute",
-        "left" => "0", "right" => "0", "bottom" => "0",
-        "height" => "20px",
-        "background" => "linear-gradient(to bottom, rgba(248,250,252,0), var(--bt-surface-2))",
-        "pointer-events" => "none"),
-    CSS(".bt-edit-preview-path",
-        "color" => "var(--bt-text-muted)",
-        "font-weight" => "600",
-        "padding-bottom" => "2px"),
-    CSS(".bt-edit-preview-line",
-        "white-space" => "pre",
-        "overflow" => "hidden",
-        "text-overflow" => "ellipsis"),
-    CSS(".bt-edit-preview-del",
-        "color" => "#b91c1c",
-        "background" => "rgba(239,68,68,0.06)"),
-    CSS(".bt-edit-preview-add",
-        "color" => "#047857",
-        "background" => "rgba(16,185,129,0.08)"),
-    CSS(".bt-edit-preview-more",
-        "color" => "var(--bt-text-faint)",
-        "font-style" => "italic",
-        "padding-top" => "2px"),
+        "background" => "var(--bt-surface)"),
 
     # ── Diff blocks (multi-edit) ─────────────────────────────────────────────
     # Single-diff body just shows the editor; multi-edit bodies stack diffs
@@ -871,6 +836,14 @@ const ChatStyles = Bonito.Styles(
         "transition" => "height 150ms ease, padding 150ms ease"),
     CSS(".bt-thinking.bt-thinking-active",
         "height" => "22px", "padding" => "2px 0"),
+    # Running chunk count tacked onto the reasoning indicator. Tabular figures
+    # so the width doesn't jitter as the number climbs; empty until the first
+    # chunk lands (no leading gap when there's nothing to show).
+    CSS(".bt-thinking-count",
+        "margin-left" => "6px", "font-style" => "normal",
+        "font-variant-numeric" => "tabular-nums",
+        "color" => "var(--bt-text-faint)"),
+    CSS(".bt-thinking-count:empty", "margin-left" => "0"),
     CSS(".bt-collapsable-loading",
         "color" => "var(--bt-text-faint)",
         "font-style" => "italic", "font-size" => "12px",

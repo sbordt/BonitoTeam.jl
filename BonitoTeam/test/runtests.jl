@@ -88,7 +88,7 @@ include("test_history_sync.jl")
 
 include("test_summary_msg.jl")
 
-include("test_sidebar_resumable.jl")
+include("test_sidebar_open_chats.jl")
 
 include("test_queued_messages.jl")
 

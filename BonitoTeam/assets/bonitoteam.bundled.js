@@ -8,12 +8,15 @@ class Collapsable {
         this.body = bodyEl;
         this.toggle = opts.toggleEl || null;
         this.native = opts.native || false;
-        this.fetchEachExpand = opts.fetchEachExpand || false;
-        this.discardOnCollapse = opts.discardOnCollapse || false;
+        this.editMode = opts.editMode || false;
+        this.compactHeight = opts.compactHeight || 240;
+        this.expandedHeight = opts.expandedHeight || 2000;
+        this.fetchEachExpand = this.editMode ? false : opts.fetchEachExpand || false;
+        this.discardOnCollapse = this.editMode ? false : opts.discardOnCollapse || false;
         this.onExpand = opts.onExpand || null;
         this.lazy = !!this.onExpand;
         this.loaded = !this.lazy;
-        this.expanded = false;
+        this.expanded = this.editMode ? false : false;
         if (this.native) {
             this.details = headerEl.closest('details') || bodyEl.closest('details');
             this.details && this.details.addEventListener('toggle', ()=>this.applyExpanded(this.details.open));
@@ -35,17 +38,29 @@ class Collapsable {
         if (!this.native) {
             this.header.dataset.expanded = expanded ? 'true' : 'false';
             if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
-            this.body.style.display = expanded ? '' : 'none';
+            if (this.editMode) {
+                this.body.style.display = '';
+                this._applyEditHeight(expanded ? this.expandedHeight : this.compactHeight);
+            } else {
+                this.body.style.display = expanded ? '' : 'none';
+            }
         }
-        if (expanded) {
+        if (expanded && !this.editMode) {
             if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
                 this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
                 this.onExpand && this.onExpand();
             }
-        } else if (this.discardOnCollapse) {
+        } else if (!expanded && this.discardOnCollapse) {
             this.body.innerHTML = '';
             this.loaded = false;
         }
+    }
+    _applyEditHeight(h) {
+        const divs = this.body.querySelectorAll('.monaco-diff-editor-div');
+        divs.forEach((div)=>{
+            const monaco = div.__btMonacoDiff;
+            if (monaco && typeof monaco.setMaxHeight === 'function') monaco.setMaxHeight(h);
+        });
     }
     fill(html) {
         if (html != null) this.body.innerHTML = html;
@@ -120,6 +135,7 @@ class BonitoChat {
         this.busyEl = container.querySelector('.bt-busy');
         this.waitingEl = container.querySelector('.bt-waiting');
         this.thinkingEl = container.querySelector('.bt-thinking');
+        this.thinkingCountEl = container.querySelector('.bt-thinking-count');
         this.tailEl = container.querySelector('.bt-messages-tail');
         this._sizeTail();
         this.measureEl = document.createElement('div');
@@ -445,7 +461,7 @@ class BonitoChat {
             case 'agent_final':
                 return this.onAgentFinal(msg);
             case 'thinking':
-                return this.onThinking(msg.active);
+                return this.onThinking(msg);
             case 'thought_final':
                 return this.onThoughtFinal(msg);
             case 'thought.body':
@@ -737,6 +753,16 @@ class BonitoChat {
             delete node.dataset.btAutoExpand;
             node.collapsable?.setExpanded(true);
         }
+        if (node.dataset && node.dataset.btAutoMount && !this._scrollbarDrag) {
+            delete node.dataset.btAutoMount;
+            if (node.collapsable && !node.collapsable.loaded) {
+                node.collapsable.loaded = true;
+                this.comm.notify({
+                    type: 'tool.render',
+                    id: node.dataset.msgId
+                });
+            }
+        }
     }
     appendNewMessage(msg) {
         const idx = this.totalCount - 1;
@@ -792,8 +818,10 @@ class BonitoChat {
         const node = this.nodeById.get(msg.id);
         node && node.collapsable && node.collapsable.fill(msg.html);
     }
-    onThinking(active) {
+    onThinking(msg) {
+        const active = msg.active;
         if (this.thinkingEl) this.thinkingEl.classList.toggle('bt-thinking-active', !!active);
+        if (this.thinkingCountEl) this.thinkingCountEl.textContent = active && msg.count ? String(msg.count) : '';
         if (active && this.followMode) this._queueScrollToBottom();
     }
     onSessionReset() {
@@ -828,22 +856,27 @@ class BonitoChat {
             const s = node.querySelector('.bt-tool-summary');
             if (s) s.textContent = msg.summary;
         }
-        if (msg.preview != null) {
-            let prev = node.querySelector('.bt-edit-preview');
-            if (!prev) {
-                prev = document.createElement('div');
-                prev.className = 'bt-edit-preview';
-                const header = node.querySelector('.bt-tool-header');
-                if (header) header.insertAdjacentElement('afterend', prev);
-            }
-            prev.innerHTML = msg.preview;
-        }
         if (msg.show_mime) node.dataset.showMime = msg.show_mime;
         if (this._wantsNative(node)) {
             this._applyNative(node);
         } else if (msg.expand && node.collapsable) {
-            if (node.isConnected) node.collapsable.setExpanded(true);
-            else node.dataset.btAutoExpand = '1';
+            if (node.collapsable.editMode) {
+                if (node.isConnected) {
+                    if (!node.collapsable.loaded) {
+                        node.collapsable.loaded = true;
+                        this.comm.notify({
+                            type: 'tool.render',
+                            id: msg.id
+                        });
+                    }
+                } else {
+                    node.dataset.btAutoMount = '1';
+                }
+            } else if (node.isConnected) {
+                node.collapsable.setExpanded(true);
+            } else {
+                node.dataset.btAutoExpand = '1';
+            }
         }
         if (msg.taskbar) node.dataset.toolTaskbar = '1';
         this._refreshTaskbar();
@@ -976,10 +1009,12 @@ class BonitoChat {
                     const liveTool = !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
                     if (liveTool) div.classList.add('bt-tool-live');
                     const id = msg.id;
+                    const isEdit = msg.kind === 'edit';
                     div.collapsable = new Collapsable(div.querySelector('.bt-tool-header'), div.querySelector('.bt-tool-body'), {
                         toggleEl: div.querySelector('.bt-tool-toggle'),
-                        fetchEachExpand: true,
-                        discardOnCollapse: true,
+                        editMode: isEdit,
+                        fetchEachExpand: !isEdit,
+                        discardOnCollapse: !isEdit,
                         onExpand: ()=>this.comm.notify({
                                 type: 'tool.render',
                                 id

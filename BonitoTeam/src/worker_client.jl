@@ -807,7 +807,65 @@ function scan_and_store!(state::ServerState, worker_id::AbstractString)
         save_discovered!(state)
     end
     safe_notify!(state.discovered)
+    # Opportunistic title-repair sweep: re-derive titles for this worker's
+    # projects whose saved title leaks an injected wrapper (a pre-fix
+    # `meaningful_title` would let `<ide_selection>…` or `<command-args
+    # foo="bar">…` through). Bounded to projects on THIS worker so a Rescan
+    # click doesn't churn unrelated state. See `refresh_broken_titles!`.
+    refresh_broken_titles!(state, wid)
     return norm
+end
+
+# A title is "broken" if the current `meaningful_title` would change it —
+# either reject it outright (wrapper-only blob ⇒ `nothing`) or return a
+# different cleaned string (wrapper + prose where the wrapper part leaked
+# through the older regex). Clean titles round-trip to themselves and the
+# sweep ignores them.
+title_is_broken(t::Nothing) = false
+function title_is_broken(t::AbstractString)
+    s = String(t)
+    cleaned = meaningful_title(s)
+    return cleaned === nothing || String(cleaned) != s
+end
+
+"""
+    refresh_broken_titles!(state, worker_id) -> Int
+
+Re-derive `p.title` for every project on `worker_id` whose saved title would
+change under the current `meaningful_title` (wrapper leakage from an older
+filter). For each broken title we try the original prompt from `chat.md`
+first — that's almost always the best source. If chat.md is missing or its
+first prompt also reduces to nothing, we fall back to the cleaned version
+of the saved title; that's still better than leaving the leak.
+
+Returns the number of titles touched. Idempotent — running it twice on the
+same state is a no-op the second time.
+"""
+function refresh_broken_titles!(state::ServerState, worker_id::AbstractString)
+    wid = String(worker_id)
+    fixed = 0
+    lock(state.lock) do
+        for (pid, p) in state.projects[]
+            p.worker_id == wid || continue
+            title_is_broken(p.title) || continue
+            # Prefer the original prompt — re-running the filter against the
+            # raw first user message recovers any prose the old truncation
+            # dropped on the floor.
+            chat_dir = chat_storage_dir(state, pid, p.server_path)
+            raw = first_user_prompt(chat_dir)
+            new_title = raw === nothing ? nothing : meaningful_title(raw)
+            # Fall back to cleaning the saved title in place — strictly an
+            # improvement over the leaked form even when chat.md isn't
+            # available (cwd moved, project imported, …).
+            new_title === nothing && (new_title = meaningful_title(String(p.title)))
+            p.title = new_title === nothing ? nothing : String(new_title)
+            fixed += 1
+        end
+        fixed > 0 && save_projects!(state)
+    end
+    fixed > 0 && (@info "refresh_broken_titles!: repaired $(fixed) project title(s)" worker_id=wid;
+                   safe_notify!(state.projects))
+    return fixed
 end
 
 """

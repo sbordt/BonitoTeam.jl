@@ -42,6 +42,11 @@ end"""
 function fake_agent_project!(h, n::Int; name::AbstractString = "churn", code::AbstractString = APPCODE)
     wid = first(keys(h.state.workers[]))
     p = BT.create_project_from_worker!(h.state, wid, ROOT; name = name, start_session = false)
+    # The sidebar only lists projects with a title or resume_session_id
+    # (open_chat_projects), so without this the project has no .bt-proj-icon and
+    # the test can't click into the chat — the chat never opens, no tools/canvas
+    # render. Give it a title so it shows up.
+    p.title = name
     for (k, v) in BT.eval_dialback_env(h.state, p.id); ENV[k] = v; end
     # In production this is set by the BonitoWorker daemon from its install
     # URL. Tests bypass that daemon (spawn BonitoMCP directly), so we plug it
@@ -67,6 +72,7 @@ function fake_agent_project!(h, n::Int; name::AbstractString = "churn", code::Ab
         BT.send!(model, BT.BonitoAppMsg(tid, "bonito_app", "bt_show_app", "completed",
                                         "", time(), time(), "btworker", String(appid), nothing))
     end
+    BT.notify_chats!(h.state)   # re-render the sidebar so the project's icon appears
     return p, model
 end
 
@@ -76,8 +82,10 @@ end
 function nav_target_project!(h; name::AbstractString = "beta")
     wid = first(keys(h.state.workers[]))
     pB = BT.create_project_from_worker!(h.state, wid, mktempdir(); name = name, start_session = false)
+    pB.title = name   # so it shows in the sidebar (open_chat_projects needs a title)
     h.state.chat_models[pB.id] = BT.ChatModel(h.state, pB.server_path; project_id = pB.id,
                                               transport = BT.MockTransport((o, i) -> nothing))
+    BT.notify_chats!(h.state)
     return pB
 end
 

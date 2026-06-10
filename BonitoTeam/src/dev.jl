@@ -101,33 +101,45 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
     # worker hosts spawns that binary instead of the real claude-agent-acp.
     resolved_agent_bin = agent_bin === nothing ? BonitoWorker.find_agent_bin() :
                           String(agent_bin)
-    worker_task = Base.errormonitor(@async try
-        BonitoWorker.run_control_session(;
-            server_url    = server_url,
-            secret        = secret,
-            worker_id     = worker_id,
-            name          = actual_name,
-            mcp_command   = BonitoWorker.julia_bin(),
-            mcp_arguments = BonitoWorker.mcp_args(),
-            projects_root = worker_root,
-            agent_bin     = resolved_agent_bin,
-            agent_env     = agent_env)
-    catch e
-        e isa InterruptException && return
-        # WebSocket-closed-by-server is the normal shutdown path; don't
-        # log it as an error.
-        msg = sprint(showerror, e)
-        if occursin("WebSocketError", msg) || occursin("EOFError", msg) ||
-           occursin("IOError", msg)
-            @debug "dev worker control WS closed" exception=e
-        else
-            @warn "dev worker control session ended unexpectedly" exception=e
+    # Shared shutdown flag — created here so the worker loop can gate on it and
+    # `close(handle)` (below) can flip it. A transient control-WS drop or a
+    # server restart should auto-recover in dev too (matching a deployed
+    # worker's `connect_and_serve`); we only stop reconnecting once the dev
+    # server is shutting down, so teardown stays quiet (no retry-spam).
+    closed = Threads.Atomic{Bool}(false)
+    worker_task = Base.errormonitor(@async begin
+        while !closed[]
+            try
+                BonitoWorker.run_control_session(;
+                    server_url    = server_url,
+                    secret        = secret,
+                    worker_id     = worker_id,
+                    name          = actual_name,
+                    mcp_command   = BonitoWorker.julia_bin(),
+                    mcp_arguments = BonitoWorker.mcp_args(),
+                    projects_root = worker_root,
+                    agent_bin     = resolved_agent_bin,
+                    agent_env     = agent_env)
+                # Clean return = server closed the WS. If we're not shutting
+                # down, that was a transient drop — loop and redial.
+            catch e
+                e isa InterruptException && break
+                closed[] && break
+                msg = sprint(showerror, e)
+                if occursin("WebSocketError", msg) || occursin("EOFError", msg) ||
+                   occursin("IOError", msg)
+                    @debug "dev worker control WS dropped; reconnecting" exception=e
+                else
+                    @warn "dev worker control session ended; reconnecting" exception=e
+                end
+            end
+            closed[] && break
+            sleep(1.0)   # brief backoff before redial
         end
     end)
 
     handle = DevHandle(server_url, secret, state, worker_task,
-                       state_dir, working_dir, worker_root,
-                       Threads.Atomic{Bool}(false))
+                       state_dir, working_dir, worker_root, closed)
 
     # Best-effort cleanup if the Julia process exits without explicit close.
     Base.atexit(() -> close(handle))

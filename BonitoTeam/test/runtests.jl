@@ -127,8 +127,11 @@ include(joinpath(@__DIR__, "..", "..", "BonitoMCP", "test", "test_remote_proxy.j
 # a worker that can dial back, so it's opt-in.
 if get(ENV, "BT_RUN_E2E", "") == "1"
     include("test_real_e2e.jl")
+    # discover → Resume → chat: a resumable worker session opens a chat and its
+    # discover row disappears (no stuck "Resuming…"). Needs worker + Electron.
+    include("test_resume_discover_e2e.jl")
 else
-    @info "runtests: skipping test_real_e2e.jl (set BT_RUN_E2E=1 to run the live worker-dial-back e2e)"
+    @info "runtests: skipping test_real_e2e.jl + test_resume_discover_e2e.jl (set BT_RUN_E2E=1 to run the live worker-dial-back e2e)"
 end
 
 # Real-browser fake-agent churn test: WGLMakie apps + open/collapse in Electron —

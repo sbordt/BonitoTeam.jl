@@ -85,9 +85,12 @@ end
 # (appE, win, R) where R(js) runs JS in the renderer and returns the value.
 function open_browser(h; width = 1300, height = 850, logp = nothing)
     EC   = Bonito.HTTPServer.current_electron()
-    args = logp === nothing ? String[] :
-           String["--enable-logging", "--log-file=$logp", "--v=0"]
-    appE = EC.Application(; additional_electron_args = args, sandbox = false)
+    args = logp === nothing ? String["--no-sandbox"] :
+           String["--no-sandbox", "--enable-logging", "--log-file=$logp", "--v=0"]
+    # `--no-sandbox` replaces the old `sandbox=false` kwarg (ElectronCall's
+    # Application no longer accepts it) — Electron's sandbox can't start as root
+    # / in containers, which is where these e2e tests run.
+    appE = EC.Application(; additional_electron_args = args)
     win  = EC.Window(appE, EC.URI(h.url); options = Dict("show" => false, "width" => width, "height" => height))
     return appE, win, (c -> EC.run(win, c))
 end

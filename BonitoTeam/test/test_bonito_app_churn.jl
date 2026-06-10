@@ -33,7 +33,7 @@ else
         @test count(m -> m isa BT.ToolMsg, model.msgs_store) == 3
 
         logp = tempname() * ".log"
-        appE = EC.Application(; additional_electron_args = String["--enable-logging", "--log-file=$logp", "--v=0"], sandbox = false)
+        appE = EC.Application(; additional_electron_args = String["--no-sandbox", "--enable-logging", "--log-file=$logp", "--v=0"])
         win  = EC.Window(appE, EC.URI(h.url); options = Dict("show" => false, "width" => 1300, "height" => 850))
         R(c) = EC.run(win, c)
         sleep(8)
@@ -72,7 +72,7 @@ end
         @test haskey(BT.EVAL_WORKERS, pA.id)
 
         logp = tempname() * ".log"
-        appE = EC.Application(; additional_electron_args = String["--enable-logging", "--log-file=$logp", "--v=0"], sandbox = false)
+        appE = EC.Application(; additional_electron_args = String["--no-sandbox", "--enable-logging", "--log-file=$logp", "--v=0"])
         win  = EC.Window(appE, EC.URI(h.url); options = Dict("show" => false, "width" => 1300, "height" => 850))
         R(c) = EC.run(win, c)
         sleep(8)
@@ -120,7 +120,7 @@ end
         pA, _ = fake_agent_project!(h, 1; name = "interact", code = INTERACTIVE_CODE)
         @test haskey(BT.EVAL_WORKERS, pA.id)
 
-        appE = EC.Application(; additional_electron_args = String[], sandbox = false)
+        appE = EC.Application(; additional_electron_args = String["--no-sandbox"])
         win  = EC.Window(appE, EC.URI(h.url); options = Dict("show" => false, "width" => 1100, "height" => 700))
         R(c) = EC.run(win, c)
         sleep(8)

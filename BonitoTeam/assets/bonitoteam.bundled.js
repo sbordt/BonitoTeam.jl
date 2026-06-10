@@ -99,6 +99,10 @@ class BonitoChat {
         this.EST_HEIGHT = 80;
         this.OVERSCAN = 8;
         this.initialLoad = false;
+        const wantKeepalive = typeof window !== 'undefined' && Number.isFinite(window.BT_APP_KEEPALIVE) ? window.BT_APP_KEEPALIVE : 6;
+        this.APP_KEEPALIVE = Math.min(10, Math.max(0, wantKeepalive));
+        this.parked = new Set();
+        this.appLru = [];
         this.ITEM_GAP = parseFloat(getComputedStyle(container).rowGap) || 0;
         this.followMode = true;
         this.unreadCount = 0;
@@ -730,18 +734,105 @@ class BonitoChat {
             ...this.rendered
         ]){
             if (idx < s || idx > e) {
-                this.cache.get(idx)?.remove();
-                this.rendered.delete(idx);
+                const node = this.cache.get(idx);
+                if (node && node.dataset && node.dataset.btApp && !node.dataset.btSpilled) {
+                    if (!this.parked.has(idx)) {
+                        node.style.display = 'none';
+                        this.parked.add(idx);
+                        this.touchApp(idx);
+                    }
+                } else {
+                    node?.remove();
+                    this.rendered.delete(idx);
+                    this.parked.delete(idx);
+                }
             }
         }
         for(let i = s; i <= e; i++){
-            if (this.cache.has(i) && !this.rendered.has(i)) {
+            if (this.parked.has(i)) {
+                const node = this.cache.get(i);
+                if (node) node.style.display = '';
+                this.parked.delete(i);
+                this.touchApp(i);
+            } else if (this.cache.has(i) && !this.rendered.has(i)) {
                 this.insertSorted(i, this.cache.get(i));
                 this.rendered.add(i);
+                if (this.cache.get(i)?.dataset?.btApp) this.touchApp(i);
             }
         }
+        this.enforceAppLru();
         this.spacerTop.style.height = this.cumHeight(0, s) + 'px';
         this.spacerBottom.style.height = this.cumHeight(e + 1, this.totalCount) + 'px';
+    }
+    touchApp(idx) {
+        const i = this.appLru.indexOf(idx);
+        if (i !== -1) this.appLru.splice(i, 1);
+        this.appLru.push(idx);
+    }
+    enforceAppLru() {
+        if (this.parked.size <= this.APP_KEEPALIVE) return;
+        for (const idx of [
+            ...this.appLru
+        ]){
+            if (this.parked.size <= this.APP_KEEPALIVE) break;
+            if (!this.parked.has(idx)) continue;
+            this.spillApp(idx, this.cache.get(idx));
+        }
+    }
+    spillApp(idx, node) {
+        if (!node) {
+            this.parked.delete(idx);
+            return;
+        }
+        const slot = node.querySelector('.bt-slot') || node.querySelector('.bt-tool-body');
+        const canvas = node.querySelector('canvas');
+        let dataUrl = null;
+        if (canvas) {
+            try {
+                dataUrl = canvas.toDataURL('image/png');
+            } catch (_) {}
+        }
+        if (slot) {
+            slot.innerHTML = '';
+            const wrap = document.createElement('div');
+            wrap.className = 'bt-app-snapshot';
+            wrap.style.cssText = 'position:relative;display:inline-block;max-width:100%';
+            if (dataUrl) {
+                const img = document.createElement('img');
+                img.src = dataUrl;
+                img.alt = 'app snapshot';
+                img.style.cssText = 'max-width:100%;display:block;border-radius:6px;filter:saturate(.85) brightness(.97)';
+                wrap.appendChild(img);
+            }
+            const btn = document.createElement('button');
+            btn.className = 'bt-app-reload';
+            btn.type = 'button';
+            btn.textContent = dataUrl ? '⟳ Reload live app' : '⟳ Load live app';
+            btn.style.cssText = 'position:absolute;top:8px;right:8px;padding:4px 10px;' + 'border-radius:6px;border:1px solid #cbd5e1;background:rgba(255,255,255,.9);' + 'cursor:pointer;font:500 12px/1 ui-sans-serif,system-ui';
+            btn.addEventListener('click', (e)=>{
+                e.stopPropagation();
+                this.reloadApp(node);
+            });
+            wrap.appendChild(btn);
+            slot.appendChild(wrap);
+        }
+        node.dataset.btSpilled = '1';
+        node.style.display = '';
+        node.remove();
+        this.rendered.delete(idx);
+        this.parked.delete(idx);
+        const li = this.appLru.indexOf(idx);
+        if (li !== -1) this.appLru.splice(li, 1);
+    }
+    reloadApp(node) {
+        delete node.dataset.btSpilled;
+        const id = node.dataset.msgId;
+        const body = node.querySelector('.bt-tool-body');
+        if (body) body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+        if (id) this.comm.notify({
+            type: 'tool.render',
+            id
+        });
     }
     insertSorted(idx, node) {
         const sorted = [
@@ -1002,6 +1093,7 @@ class BonitoChat {
                 {
                     div.className = 'bt-tool-msg';
                     div.innerHTML = this.toolHTML(msg);
+                    if (msg.kind === 'bonito_app') div.dataset.btApp = '1';
                     if (msg.id) div.dataset.msgId = msg.id;
                     if (msg.started_at != null) div.dataset.toolStarted = String(msg.started_at);
                     if (msg.finished_at != null) div.dataset.toolFinished = String(msg.finished_at);
@@ -1512,6 +1604,7 @@ function arrayBufferToBase64(buf) {
     return btoa(binary);
 }
 const CHAT_INSTANCES = new Set();
+if (typeof window !== 'undefined') window.__btChats = CHAT_INSTANCES;
 window._btToolSlot = (id)=>{
     const direct = document.querySelector(`.bt-tool-body[data-tool-id="${CSS.escape(id)}"]`);
     if (direct) return direct;

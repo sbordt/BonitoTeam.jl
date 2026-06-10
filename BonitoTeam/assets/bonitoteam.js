@@ -142,6 +142,30 @@ class BonitoChat {
         this.EST_HEIGHT    = 80;
         this.OVERSCAN      = 8;
         this.initialLoad   = false;
+
+        // ── Live-app keep-alive LRU ──────────────────────────────────────
+        // App embeds (msg.kind === 'bonito_app', marked data-bt-app) host a
+        // live Bonito sub-session + WGLMakie WebGL context. Plain removal on
+        // scroll-off closes the sub-session and disposes the context, so the
+        // app comes back dead. Instead we PARK such nodes in place via
+        // `display:none`: the node never leaves its parent, so Bonito's
+        // delete-observer never fires (session stays open) and the canvas
+        // stays under document.body (WGLMakie keeps the context); on-demand
+        // rendering means a hidden app costs ~0. `parked` holds the idxs that
+        // are display:none-parked (still in `rendered` so insertSorted/spacer
+        // math is unchanged). The browser hard-caps live WebGL contexts (~16,
+        // varies) and DESTROYS the oldest beyond that, so we keep at most
+        // APP_KEEPALIVE parked alive and clamp it well under that ceiling;
+        // the LRU-oldest beyond it spills to a snapshot+reload (Stage 2).
+        // Clamp hard: the browser destroys the oldest WebGL context past its
+        // ceiling (~16, varies), so keep this well under it. An optional
+        // window.BT_APP_KEEPALIVE override (set before connect) is clamped too —
+        // asking for 100 silently gives 10, never the danger zone.
+        const wantKeepalive = (typeof window !== 'undefined' && Number.isFinite(window.BT_APP_KEEPALIVE))
+            ? window.BT_APP_KEEPALIVE : 6;
+        this.APP_KEEPALIVE = Math.min(10, Math.max(0, wantKeepalive));
+        this.parked = new Set();   // idx → parked (display:none, alive, off-screen)
+        this.appLru = [];          // app idxs, least-recently-visible first
         // The .bt-messages flex column separates children with a row gap.
         // The virtual height math must count it per item or the virtual
         // geometry drifts ~gap px per message from the real scrollHeight —
@@ -1005,16 +1029,40 @@ class BonitoChat {
         if (s > e) return;
         for (const idx of [...this.rendered]) {
             if (idx < s || idx > e) {
-                this.cache.get(idx)?.remove();
-                this.rendered.delete(idx);
+                const node = this.cache.get(idx);
+                // Live app embeds: PARK in place (display:none) to keep the
+                // sub-session + WebGL context alive, rather than removing
+                // (which closes the session and disposes the canvas → it comes
+                // back dead). The node stays in `rendered`, so insertSorted's
+                // ordering and the spacer math are unchanged (a display:none
+                // node is 0px). Spilled nodes (Stage 2) are plain again.
+                if (node && node.dataset && node.dataset.btApp && !node.dataset.btSpilled) {
+                    if (!this.parked.has(idx)) {
+                        node.style.display = 'none';
+                        this.parked.add(idx);
+                        this.touchApp(idx);   // just left the viewport
+                    }
+                } else {
+                    node?.remove();
+                    this.rendered.delete(idx);
+                    this.parked.delete(idx);
+                }
             }
         }
         for (let i = s; i <= e; i++) {
-            if (this.cache.has(i) && !this.rendered.has(i)) {
+            if (this.parked.has(i)) {
+                // Re-entering the viewport: un-hide the kept-alive app.
+                const node = this.cache.get(i);
+                if (node) node.style.display = '';
+                this.parked.delete(i);
+                this.touchApp(i);
+            } else if (this.cache.has(i) && !this.rendered.has(i)) {
                 this.insertSorted(i, this.cache.get(i));
                 this.rendered.add(i);
+                if (this.cache.get(i)?.dataset?.btApp) this.touchApp(i);
             }
         }
+        this.enforceAppLru();
         this.spacerTop.style.height    = this.cumHeight(0, s) + 'px';
         this.spacerBottom.style.height = this.cumHeight(e + 1, this.totalCount) + 'px';
         // NOTE: no drag-time scrollHeight freeze here. An earlier freeze
@@ -1024,6 +1072,87 @@ class BonitoChat {
         // track left". The real fix is upstream: prefetched nodes are
         // measured off-screen (`_measureNodes`), so heights are real
         // everywhere and drags see a stable scrollHeight to begin with.
+    }
+
+    // Mark an app idx as most-recently-relevant in the keep-alive LRU
+    // (called when it enters the viewport or just left it).
+    touchApp(idx) {
+        const i = this.appLru.indexOf(idx);
+        if (i !== -1) this.appLru.splice(i, 1);
+        this.appLru.push(idx);
+    }
+
+    // Keep at most APP_KEEPALIVE parked (off-screen, alive) app sub-sessions,
+    // evicting the least-recently-visible parked ones. Visible apps are never
+    // evicted. The evicted node is SPILLED: its last frame is snapshotted to a
+    // static <img> + Reload button (which tears down the live sub-session and
+    // frees the WebGL context). The browser hard-caps live contexts (~16) and
+    // destroys the oldest beyond that, so this keeps us deterministically below
+    // the ceiling — our snapshot fires first, instead of the browser blanking a
+    // canvas out from under us.
+    enforceAppLru() {
+        if (this.parked.size <= this.APP_KEEPALIVE) return;
+        for (const idx of [...this.appLru]) {
+            if (this.parked.size <= this.APP_KEEPALIVE) break;
+            if (!this.parked.has(idx)) continue;   // only parked nodes are evictable
+            this.spillApp(idx, this.cache.get(idx));
+        }
+    }
+
+    // Freeze a parked app to a snapshot + Reload button and tear down its live
+    // embed. The node stays in `cache` showing the snapshot; on scroll-back it
+    // behaves like any normal node (no WebGL context), and Reload re-mounts a
+    // fresh sub-session via the standard tool.render path.
+    spillApp(idx, node) {
+        if (!node) { this.parked.delete(idx); return; }
+        const slot = node.querySelector('.bt-slot') || node.querySelector('.bt-tool-body');
+        const canvas = node.querySelector('canvas');
+        let dataUrl = null;
+        // preserveDrawingBuffer is on, so toDataURL returns the last rendered
+        // frame even though the node is parked (display:none).
+        if (canvas) { try { dataUrl = canvas.toDataURL('image/png'); } catch (_) {} }
+        if (slot) {
+            // Emptying the slot removes the sub-session root → Bonito closes the
+            // sub-session and WGLMakie disposes the WebGL context.
+            slot.innerHTML = '';
+            const wrap = document.createElement('div');
+            wrap.className = 'bt-app-snapshot';
+            wrap.style.cssText = 'position:relative;display:inline-block;max-width:100%';
+            if (dataUrl) {
+                const img = document.createElement('img');
+                img.src = dataUrl;
+                img.alt = 'app snapshot';
+                img.style.cssText = 'max-width:100%;display:block;border-radius:6px;filter:saturate(.85) brightness(.97)';
+                wrap.appendChild(img);
+            }
+            const btn = document.createElement('button');
+            btn.className = 'bt-app-reload';
+            btn.type = 'button';
+            btn.textContent = dataUrl ? '⟳ Reload live app' : '⟳ Load live app';
+            btn.style.cssText = 'position:absolute;top:8px;right:8px;padding:4px 10px;' +
+                'border-radius:6px;border:1px solid #cbd5e1;background:rgba(255,255,255,.9);' +
+                'cursor:pointer;font:500 12px/1 ui-sans-serif,system-ui';
+            btn.addEventListener('click', (e) => { e.stopPropagation(); this.reloadApp(node); });
+            wrap.appendChild(btn);
+            slot.appendChild(wrap);
+        }
+        node.dataset.btSpilled = '1';
+        node.style.display = '';   // a spilled node is a plain <img>, render it normally
+        node.remove();             // off-screen → leaves the DOM like any normal node
+        this.rendered.delete(idx);
+        this.parked.delete(idx);
+        const li = this.appLru.indexOf(idx);
+        if (li !== -1) this.appLru.splice(li, 1);
+    }
+
+    // Re-mount a spilled app: drop the snapshot, re-render the BonitoAppMsg body
+    // (fresh worker sub-session) through the existing tool.render path.
+    reloadApp(node) {
+        delete node.dataset.btSpilled;
+        const id = node.dataset.msgId;
+        const body = node.querySelector('.bt-tool-body');
+        if (body) body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+        if (id) this.comm.notify({ type: 'tool.render', id });
     }
 
     insertSorted(idx, node) {
@@ -1429,6 +1558,9 @@ class BonitoChat {
             case 'tool': {
                 div.className = 'bt-tool-msg';
                 div.innerHTML = this.toolHTML(msg);
+                // Live Bonito/WGLMakie embeds get kept alive (display:none) on
+                // scroll-off instead of removed — see the keep-alive LRU.
+                if (msg.kind === 'bonito_app') div.dataset.btApp = '1';
                 // Live state + start time live on the message node itself so
                 // the 1s ticker can find them by selector. Status `pending` /
                 // `in_progress` count as live until a terminal update flips
@@ -2233,6 +2365,9 @@ function arrayBufferToBase64(buf) {
 // Without it, a reply racing an eviction was silently dropped and the body
 // stayed on "loading…".
 const CHAT_INSTANCES = new Set();
+// Debug/test introspection: e.g. `[...window.__btChats][0].APP_KEEPALIVE` /
+// `.parked.size`. Read-only convenience; not used by product code.
+if (typeof window !== 'undefined') window.__btChats = CHAT_INSTANCES;
 window._btToolSlot = (id) => {
     const direct = document.querySelector(
         `.bt-tool-body[data-tool-id="${CSS.escape(id)}"]`);

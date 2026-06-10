@@ -84,6 +84,11 @@ end  # BonitoTeam paths
     include("test_worker_state.jl")
 end
 
+# dev_server runs the worker as a real separate-process install (config.json +
+# spawn_worker) and cleans it up on close. Spawns a worker subprocess (no
+# Electron / agent needed), so it's in the default suite.
+include("test_dev_server_worker.jl")
+
 include("test_history_sync.jl")
 
 include("test_summary_msg.jl")

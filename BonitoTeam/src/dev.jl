@@ -18,12 +18,13 @@ using Random
 mutable struct DevHandle
     url         :: String
     secret      :: String
-    state       :: ServerState
-    worker_task :: Task
-    state_dir   :: String
-    working_dir :: String
-    worker_root :: String
-    closed      :: Threads.Atomic{Bool}
+    state         :: ServerState
+    worker_proc   :: Union{Base.Process,Nothing}  # the worker runs as a SEPARATE process (see dev_server)
+    state_dir     :: String
+    working_dir   :: String
+    worker_root   :: String
+    worker_config :: String                       # throwaway BonitoWorker config dir (removed on close)
+    closed        :: Threads.Atomic{Bool}
 end
 
 """
@@ -82,64 +83,29 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
                     working_dir   = working_dir)
     server_url = "http://127.0.0.1:$(state.srv.port)"
 
-    # Spawn the worker control loop in-process. errormonitor surfaces
-    # any crash on stderr so dev workflows don't silently lose the
-    # worker connection. We use `run_control_session` (one connect
-    # attempt) rather than `connect_and_serve` (auto-reconnect loop)
-    # because reconnecting against a torn-down server prints a noisy
-    # error every retry_delay seconds during shutdown.
-    # Spawn the worker control loop in-process. errormonitor surfaces
-    # any crash on stderr so dev workflows don't silently lose the
-    # worker connection. We use `run_control_session` (one connect
-    # attempt) rather than `connect_and_serve` (auto-reconnect loop)
-    # because reconnecting against a torn-down server prints a noisy
-    # error every retry_delay seconds during shutdown.
-    #
-    # When the caller wants a deterministic test agent (mock_claude_agent_acp
-    # or anything else speaking ACP over stdio), they pass `agent_bin` +
-    # `agent_env` and we forward them to the worker so EVERY chat the
-    # worker hosts spawns that binary instead of the real claude-agent-acp.
+    # Stand the worker up exactly like a real install: write the SAME
+    # `config.json` and launch the SAME detached `BonitoWorker.start()` process
+    # via `spawn_worker`. The ONLY differences from a production install are
+    # (1) it's localhost and (2) the config lives in a throwaway dir, so we
+    # don't collide with a real install on this machine and can delete it on
+    # cleanup — we deliberately do NOT touch the systemd service. The detached
+    # worker inherits this process's env, so the config-dir override + the test
+    # agent (CLAUDE_AGENT_ACP + agent_env) reach it and the BonitoMCP it spawns.
     resolved_agent_bin = agent_bin === nothing ? BonitoWorker.find_agent_bin() :
                           String(agent_bin)
-    # Shared shutdown flag — created here so the worker loop can gate on it and
-    # `close(handle)` (below) can flip it. A transient control-WS drop or a
-    # server restart should auto-recover in dev too (matching a deployed
-    # worker's `connect_and_serve`); we only stop reconnecting once the dev
-    # server is shutting down, so teardown stays quiet (no retry-spam).
-    closed = Threads.Atomic{Bool}(false)
-    worker_task = Base.errormonitor(@async begin
-        while !closed[]
-            try
-                BonitoWorker.run_control_session(;
-                    server_url    = server_url,
-                    secret        = secret,
-                    worker_id     = worker_id,
-                    name          = actual_name,
-                    mcp_command   = BonitoWorker.julia_bin(),
-                    mcp_arguments = BonitoWorker.mcp_args(),
-                    projects_root = worker_root,
-                    agent_bin     = resolved_agent_bin,
-                    agent_env     = agent_env)
-                # Clean return = server closed the WS. If we're not shutting
-                # down, that was a transient drop — loop and redial.
-            catch e
-                e isa InterruptException && break
-                closed[] && break
-                msg = sprint(showerror, e)
-                if occursin("WebSocketError", msg) || occursin("EOFError", msg) ||
-                   occursin("IOError", msg)
-                    @debug "dev worker control WS dropped; reconnecting" exception=e
-                else
-                    @warn "dev worker control session ended; reconnecting" exception=e
-                end
-            end
-            closed[] && break
-            sleep(1.0)   # brief backoff before redial
-        end
-    end)
+    worker_config = mktempdir(; prefix = "bonitoteam-dev-wcfg-")
+    ENV["BONITOTEAM_CONFIG_DIR"] = worker_config
+    write(joinpath(worker_config, "worker_id"), worker_id)   # pin the ephemeral dev id
+    resolved_agent_bin === nothing || (ENV["CLAUDE_AGENT_ACP"] = resolved_agent_bin)
+    for (k, v) in agent_env; ENV[k] = v; end
+    BonitoWorker.write_config!(; server_url = server_url, secret = secret,
+                                projects_root = worker_root, name = actual_name)
+    worker_proc, _ = BonitoWorker.spawn_worker()
 
-    handle = DevHandle(server_url, secret, state, worker_task,
-                       state_dir, working_dir, worker_root, closed)
+    # `closed` guards close() idempotency (the worker lifecycle is the process).
+    closed = Threads.Atomic{Bool}(false)
+    handle = DevHandle(server_url, secret, state, worker_proc,
+                       state_dir, working_dir, worker_root, worker_config, closed)
 
     # Best-effort cleanup if the Julia process exits without explicit close.
     Base.atexit(() -> close(handle))
@@ -172,6 +138,41 @@ function dev_server(f::Function; kwargs...)
     end
 end
 
+# Stop a detached worker process: SIGTERM, wait out a grace window, then SIGKILL
+# if it's still alive. Returns once the process is gone (or we've given up). The
+# `kill` calls can throw `IOError` if the process died between our check and the
+# signal — that's the outcome we want, so it's tolerated; anything else surfaces.
+# grace_s is short by design: a *connected* worker is parked in a libuv socket
+# read and won't act on a queued SIGTERM before we'd give up anyway, so a long
+# grace just delays every close. An idle/reconnecting worker exits on SIGTERM in
+# ~0.2s and returns early, well under this window.
+function stop_worker_proc!(proc::Base.Process; grace_s::Real = 1.5)
+    process_exited(proc) && return
+    try
+        kill(proc)                       # SIGTERM
+    catch e
+        e isa Base.IOError || rethrow()
+    end
+    deadline = grace_s / 0.05
+    for _ in 1:ceil(Int, deadline)
+        process_exited(proc) && return
+        sleep(0.05)
+    end
+    @warn "dev_server: worker ignored SIGTERM within grace window; sending SIGKILL" grace_s
+    try
+        kill(proc, Base.SIGKILL)
+    catch e
+        e isa Base.IOError || rethrow()
+    end
+    for _ in 1:40
+        process_exited(proc) && return
+        sleep(0.05)
+    end
+    process_exited(proc) ||
+        @warn "dev_server: worker still alive after SIGKILL" pid=getpid(proc)
+    return
+end
+
 # Idempotent close: stops the server, lets the worker WS drop, removes
 # every tempdir we allocated. Safe to call multiple times — only the
 # first call does anything.
@@ -181,32 +182,47 @@ function Base.close(h::DevHandle)
     prev = Threads.atomic_cas!(h.closed, false, true)
     prev && return h
     @info "dev_server: shutting down" url=h.url
-    # Bonito.Server.close blocks waiting for accept loops + WS handlers
-    # to drain, which can take a few seconds when a worker is still
-    # connected. Run it in a task so we can move on without it
-    # holding cleanup hostage in interactive use. Failures from inside
-    # the server's drain (Bonito has a known surface that occasionally
-    # throws on background route handlers) are surfaced via
-    # `errormonitor` rather than swallowed — they go to stderr, the
-    # main cleanup proceeds.
+    # Kill the worker subprocess FIRST: its WS then drops so the server's drain
+    # below isn't waiting on a live worker, and its connect_and_serve loop stops
+    # retrying against the closing server (no shutdown retry-spam).
+    #
+    # SIGTERM → grace → SIGKILL. A worker blocked in the WS `receive()` (a libuv
+    # socket read) processes a queued SIGTERM only sluggishly, so a bare
+    # `kill(proc)` can leave it alive for many seconds. SIGKILL can't be delayed
+    # or blocked, so escalate once the grace window lapses — exactly what
+    # systemd's TimeoutStopSec does for the production service.
+    if h.worker_proc !== nothing
+        stop_worker_proc!(h.worker_proc)
+    end
+    # Drop the env we set so this process is left as we found it (the detached
+    # worker already inherited it at spawn; this just prevents leakage into
+    # later dev_server / test runs in the same Julia session).
+    for k in ("BONITOTEAM_CONFIG_DIR", "CLAUDE_AGENT_ACP")
+        haskey(ENV, k) && delete!(ENV, k)
+    end
+    # Bonito.Server.close blocks waiting for accept loops + WS handlers to
+    # drain. Run it in a task so a slow/throwing drain doesn't hold cleanup
+    # hostage; failures (Bonito occasionally throws in background route
+    # handlers) go to stderr via errormonitor. The accept-listener's ephemeral
+    # port is reclaimed by the OS on exit either way.
+    #
+    # We WAIT for this to finish before removing the tempdirs below: killing the
+    # worker makes its control socket drop, and the server's teardown handler
+    # then persists `discovered.json` into `state_dir`. If we rm'd before that
+    # write landed, the dir would reappear holding that one file. The drain
+    # completes in well under a second normally; the generous bound only guards
+    # a genuinely wedged handler (logged, then we rm anyway).
     close_task = Base.errormonitor(@async close(h.state.srv))
-    # Give the server a budget to close cleanly; if it doesn't make it,
-    # cleanup proceeds anyway. The server's accept-listener is bound to
-    # an ephemeral port that the OS reclaims on Julia exit either way.
-    for _ in 1:40
+    for _ in 1:200
         istaskdone(close_task) && break
         sleep(0.05)
     end
-    # Worker task should have dropped when its WS got the server's
-    # close; brief window so any final writes flush before we rm.
-    for _ in 1:20
-        istaskdone(h.worker_task) && break
-        sleep(0.05)
-    end
+    istaskdone(close_task) ||
+        @warn "dev_server: server close did not finish in time; removing tempdirs anyway"
     # `force = true` already makes "doesn't exist" a no-op, so the only
     # remaining failure modes are permission / filesystem errors — those
     # we DO want surfaced rather than silently dropping the tempdir.
-    for d in (h.state_dir, h.working_dir, h.worker_root)
+    for d in (h.state_dir, h.working_dir, h.worker_root, h.worker_config)
         try
             rm(d; recursive = true, force = true)
         catch e

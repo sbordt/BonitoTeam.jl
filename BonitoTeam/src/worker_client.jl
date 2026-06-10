@@ -261,34 +261,49 @@ function handle_worker_control(state::ServerState, ws)
         # Process inbound frames from the worker. Every typed reply maps
         # back to a pending RPC by request_id; deliver_rpc_response! is a
         # no-op if the id is unknown (caller already timed out).
-        for frame in ws
-            try
-                cmd = JSON.parse(String(frame))
-                t   = get(cmd, "type", "")
-                rid = String(get(cmd, "request_id", ""))
-                if t == "list_dir_response"
-                    deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                elseif t == "scan_sessions_result"
-                    sessions = [Dict{String,Any}(s)
-                                for s in get(cmd, "sessions", Any[])]
-                    deliver_rpc_response!(state, rid, sessions)
-                elseif t == "clone_repo_response"
-                    deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                elseif t == "inspect_path_response"
-                    deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                elseif t == "tail_file_response"
-                    deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
-                elseif t == "open_session_failed"
-                    # M9/M13: worker couldn't spawn/dial the ACP session; fail the
-                    # pending open_session (keyed by `sid`) now instead of waiting
-                    # out the 30s timeout in transport.jl.
-                    sid = String(get(cmd, "sid", ""))
-                    deliver_rpc_error!(state, sid,
-                        String(get(cmd, "error", "worker failed to open ACP session")))
+        #
+        # The `for frame in ws` iteration calls `receive(ws)` under the hood,
+        # which THROWS (EOFError / IOError / WebSocketError) when the socket
+        # drops abruptly — a worker kill, crash, or any ungraceful disconnect,
+        # i.e. the common case. That throw escapes the per-frame try below (it
+        # happens in the iterator, not the body), so without this guard every
+        # worker disconnect dumps a stacktrace to the server console. Swallow
+        # the benign close errors; the `finally` runs teardown either way.
+        try
+            for frame in ws
+                try
+                    cmd = JSON.parse(String(frame))
+                    t   = get(cmd, "type", "")
+                    rid = String(get(cmd, "request_id", ""))
+                    if t == "list_dir_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "scan_sessions_result"
+                        sessions = [Dict{String,Any}(s)
+                                    for s in get(cmd, "sessions", Any[])]
+                        deliver_rpc_response!(state, rid, sessions)
+                    elseif t == "clone_repo_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "inspect_path_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "tail_file_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "open_session_failed"
+                        # M9/M13: worker couldn't spawn/dial the ACP session; fail the
+                        # pending open_session (keyed by `sid`) now instead of waiting
+                        # out the 30s timeout in transport.jl.
+                        sid = String(get(cmd, "sid", ""))
+                        deliver_rpc_error!(state, sid,
+                            String(get(cmd, "error", "worker failed to open ACP session")))
+                    end
+                catch e
+                    @warn "Worker control frame error" exception=e
                 end
-            catch e
-                @warn "Worker control frame error" exception=e
             end
+        catch e
+            # Benign socket drop (worker killed/crashed/disconnected) — the
+            # iterator raises these on EOF. A real error still surfaces.
+            is_stale_session_error(e) ||
+                @warn "Worker control loop ended" worker_id=worker_id exception=(e, catch_backtrace())
         end
     finally
         teardown_worker_control!(state, worker_id, ws)

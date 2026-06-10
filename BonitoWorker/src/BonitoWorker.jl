@@ -15,7 +15,17 @@ using Scratch: @get_scratch!
 # a writable, cross-platform location without poking at `XDG_DATA_HOME` /
 # `HOME` / `%APPDATA%` ourselves. Holds the stable `worker_id`, the install
 # `config.json`, and the detached worker's `worker.log`.
-config_dir() = @get_scratch!("config")
+#
+# `BONITOTEAM_CONFIG_DIR` overrides it — used by `dev_server` to run a real
+# install + worker against a throwaway dir (isolated from a machine's real
+# install, and removable on cleanup). The spawned worker inherits the env var,
+# so it reads the same dir.
+function config_dir()
+    override = get(ENV, "BONITOTEAM_CONFIG_DIR", "")
+    isempty(override) && return @get_scratch!("config")
+    mkpath(override)
+    return override
+end
 
 # Stable per-install identity for this worker. Generated once and persisted so
 # the server can recognise the same physical install across hostname/IP
@@ -457,6 +467,26 @@ function apply_run_mode!(mode::Symbol; projects_root::AbstractString = pwd(),
 end
 
 # ── Install / start ────────────────────────────────────────────────────────────
+
+# Write the worker's `config.json` (read back by `start()`). Shared by `install!`
+# and `dev_server`, so the two stay in lock-step. `name` defaults to the derived
+# per-install label; callers can override it.
+function write_config!(; server_url::AbstractString,
+                          secret::AbstractString,
+                          projects_root::AbstractString = pwd(),
+                          name::AbstractString = default_worker_name(load_or_generate_worker_id()))
+    config = Dict(
+        "server_url"    => String(server_url),
+        "secret"        => String(secret),
+        "name"          => String(name),
+        "projects_root" => abspath(projects_root),
+    )
+    cfg = config_path()
+    write(cfg, JSON.json(config))
+    @info "BonitoWorker: wrote config" path=cfg server_url projects_root=config["projects_root"]
+    return cfg
+end
+
 """
     BonitoWorker.install!(; server_url, secret, projects_root = pwd(), run_mode = :prompt)
 
@@ -479,16 +509,7 @@ function install!(; server_url::String,
                     # code is actually loaded — otherwise the user only sees
                     # the new package version after a manual kill.
                     code_changed::Bool = true)
-    worker_id = load_or_generate_worker_id()
-    config = Dict(
-        "server_url"    => server_url,
-        "secret"        => secret,
-        "name"          => default_worker_name(worker_id),
-        "projects_root" => abspath(projects_root),
-    )
-    cfg = config_path()
-    write(cfg, JSON.json(config))
-    @info "BonitoWorker: wrote config" path=cfg server_url projects_root=config["projects_root"]
+    cfg = write_config!(; server_url, secret, projects_root)
 
     mode = run_mode == :prompt ? choose_run_mode() : run_mode
     result = apply_run_mode!(mode; projects_root = abspath(projects_root),

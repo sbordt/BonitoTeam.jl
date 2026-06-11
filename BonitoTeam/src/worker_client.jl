@@ -287,6 +287,8 @@ function handle_worker_control(state::ServerState, ws)
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "tail_file_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "kill_file_writers_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "open_session_failed"
                         # M9/M13: worker couldn't spawn/dial the ACP session; fail the
                         # pending open_session (keyed by `sid`) now instead of waiting
@@ -558,16 +560,20 @@ end
 # multi-GB transfers.
 
 """
-    sync_dir_to_worker!(worker_name, src, dst; on_progress=nothing)
+    sync_dir_to_worker!(worker_name, src, dst; on_progress=nothing, quick_check=true)
 
 Send the contents of server-side `src` to worker-side `dst` via librsync.
 Resumable: subsequent calls compute deltas against the worker's existing
-files, so unchanged content isn't retransmitted.
+files, so unchanged content isn't retransmitted. `quick_check=false` makes
+the worker delta-check files even when size+mtime match (rsync --checksum
+semantics) — required for directional overwrites where the destination may
+hold different content with identical metadata.
 """
 function sync_dir_to_worker!(state::ServerState, worker_name::String,
                               src::String, dst::String;
                               handoff_timeout::Real = 30.0,
-                              on_progress = nothing)
+                              on_progress = nothing,
+                              quick_check::Bool = true)
     isdir(src) || error("Source path is not a directory: $src")
     haskey(state.worker_control_ws, worker_name) ||
         error("Worker '$worker_name' is not connected")
@@ -580,10 +586,11 @@ function sync_dir_to_worker!(state::ServerState, worker_name::String,
     ws = try
         notify_progress(on_progress, :phase, (msg = "Connecting to worker…",))
         send_command(state, worker_name, Dict(
-            "type"      => "open_transfer",
-            "sync_id"   => sync_id,
-            "direction" => "to_worker",
-            "dst_path"  => dst,
+            "type"        => "open_transfer",
+            "sync_id"     => sync_id,
+            "direction"   => "to_worker",
+            "dst_path"    => dst,
+            "quick_check" => quick_check,
         ))
         take_pending!(state, ch, sync_id, handoff_timeout,
                       "sync to '$worker_name'")
@@ -602,15 +609,17 @@ function sync_dir_to_worker!(state::ServerState, worker_name::String,
 end
 
 """
-    sync_dir_from_worker!(worker_name, src, dst; on_progress=nothing)
+    sync_dir_from_worker!(worker_name, src, dst; on_progress=nothing, quick_check=true)
 
 Inverse: receive worker-side `src` into server-side `dst` via librsync.
-Resumable in the same way as `sync_dir_to_worker!`.
+Resumable in the same way as `sync_dir_to_worker!`; `quick_check=false`
+forces delta-checking files whose size+mtime already match locally.
 """
 function sync_dir_from_worker!(state::ServerState, worker_name::String,
                                 src::String, dst::String;
                                 handoff_timeout::Real = 30.0,
-                                on_progress = nothing)
+                                on_progress = nothing,
+                                quick_check::Bool = true)
     haskey(state.worker_control_ws, worker_name) ||
         error("Worker '$worker_name' is not connected")
     mkpath(dst)
@@ -634,7 +643,8 @@ function sync_dir_from_worker!(state::ServerState, worker_name::String,
     try
         notify_progress(on_progress, :phase, (msg = "Streaming via librsync…",))
         wsio = RemoteSync.WebSocketIO(ws)
-        RemoteSync.receive_directory(dst, wsio; on_progress = on_progress)
+        RemoteSync.receive_directory(dst, wsio; on_progress = on_progress,
+                                     quick_check = quick_check)
         notify_progress(on_progress, :phase, (msg = "Done",))
     finally
         close_ws_safe(ws)
@@ -750,6 +760,29 @@ function tail_worker_file(state::ServerState, worker_id::AbstractString,
             mtime      = Float64(get(resp, "mtime", 0.0)))
 end
 
+# SIGTERM every process holding `path` open on the worker — the direct stop
+# for a background shell (the SDK gives no ACP kill primitive, but the shell
+# keeps its `>> output` redirect open until it exits). Returns the killed
+# pids; `supported=false` on a non-Linux worker. Best-effort: errors are
+# returned, not thrown, so the caller can still finalize the UI.
+function kill_worker_file_writers(state::ServerState, worker_id::AbstractString,
+                                   path::AbstractString; timeout::Real = 10.0)
+    haskey(state.worker_control_ws, worker_id) ||
+        error("Worker '$worker_id' is not connected")
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_id, Dict(
+            "type" => "kill_file_writers", "request_id" => rid, "path" => String(path)))
+        take_pending!(state, ch, rid, timeout, "kill_file_writers on '$worker_id'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("kill_file_writers: unexpected response shape")
+    haskey(resp, "error") && error("kill_file_writers on '$worker_id': $(resp["error"])")
+    return (killed    = Int.(get(resp, "killed", Int[])),
+            supported = Bool(get(resp, "supported", false)))
+end
+
 # Is a project's `worker_path` DEFINITIVELY gone on a connected worker? True only
 # when the worker explicitly reports the path isn't a directory; a timeout /
 # disconnect / any other error is UNCERTAIN → false. We never prune on doubt —
@@ -855,15 +888,18 @@ function sync_across_workers!(state::ServerState, src::ProjectInfo, dst::Project
     haskey(state.workers[], dst.worker_id) ||
         error("Target worker '$(dst.worker_id)' is not connected")
 
+    # quick_check=false on both legs: this is a user-confirmed directional
+    # overwrite, so files whose size+mtime happen to match must still be
+    # delta-checked — otherwise divergent same-size edits silently survive.
     notify_progress(on_progress, :phase, (msg = "Pulling '$(src.name)' from source worker…",))
     sync_dir_from_worker!(state, src.worker_id, src.worker_path, src.server_path;
-                          on_progress = on_progress)
+                          on_progress = on_progress, quick_check = false)
     src.backup_status = :synced
     src.last_sync_at  = now(UTC)
 
     notify_progress(on_progress, :phase, (msg = "Pushing onto target worker…",))
     sync_dir_to_worker!(state, dst.worker_id, src.server_path, dst.worker_path;
-                        on_progress = on_progress)
+                        on_progress = on_progress, quick_check = false)
     # dst's worker tree now matches src; dst's own server mirror is out of date.
     dst.backup_status = :stale
     save_projects!(state)

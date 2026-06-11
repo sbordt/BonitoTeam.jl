@@ -369,6 +369,93 @@ function teardown_eval_bridge!(state::ServerState, project_id::AbstractString)
     return nothing
 end
 
+# ── MCP-process control channel (/mcp-ws) ───────────────────────────────────
+# The BonitoMCP stdio server (NOT its Malt eval worker) dials this back so the
+# chat can interrupt an in-flight bt_julia_eval per tool — without cancelling
+# the whole agent turn. Distinct from /eval-ws on purpose: the eval worker
+# runs user code and can be too busy to service a control frame; the MCP
+# process never runs user code and owns the reliable `Malt.interrupt` lever.
+#
+# Wire (JSON per WS message):
+#   server → mcp:  {"op": "interrupt_eval", "request_id", "env_path"?}
+#   mcp → server:  {"type": "interrupt_result", "request_id", "interrupted": n}
+# Replies route through the same `pending_rpcs` machinery as worker RPCs.
+const MCP_CTRL = Dict{String,Any}()    # project_id => live ctrl WS
+
+mcp_ctrl_for(state::ServerState, project_id::AbstractString) =
+    lock(state.lock) do
+        get(MCP_CTRL, String(project_id), nothing)
+    end
+
+function handle_mcp_ctrl_ws(state::ServerState, ws)
+    line = try; String(HTTP.WebSockets.receive(ws)); catch; return; end
+    parts = split(strip(line), ' '; limit = 2)
+    if length(parts) != 2 || parts[1] != state.worker_secret
+        @warn "mcp ctrl dial-back: bad handshake"
+        return
+    end
+    project_id = String(parts[2])
+    lock(state.lock) do
+        MCP_CTRL[project_id] = ws
+    end
+    @info "MCP control channel connected" project_id
+    try
+        for msg in ws
+            # Per-frame guard — one malformed reply must not drop the channel.
+            try
+                d = JSON.parse(String(msg))
+                rid = get(d, "request_id", nothing)
+                rid isa AbstractString && !isempty(rid) &&
+                    deliver_rpc_response!(state, String(rid), Dict{String,Any}(d))
+            catch e
+                @warn "mcp ctrl frame error" exception = e
+            end
+        end
+    catch e
+        is_stale_session_error(e) ||
+            @warn "mcp ctrl loop ended" project_id exception = (e, catch_backtrace())
+    finally
+        # Identity-guarded eviction: a reconnect may have swapped a fresh WS
+        # in before this stale handler's finally ran.
+        lock(state.lock) do
+            get(MCP_CTRL, project_id, nothing) === ws && delete!(MCP_CTRL, project_id)
+        end
+        @info "MCP control channel closed" project_id
+    end
+    return
+end
+
+"""
+    interrupt_project_eval!(state, project_id; env_path=nothing, timeout=15.0) -> Int
+
+SIGINT the in-flight `bt_julia_eval` of `project_id`'s MCP server — the
+chat-side half of the per-tool ⊗ stop button. `env_path` scopes the
+interrupt to one eval session; `nothing` interrupts every in-flight eval of
+that chat's MCP process (it serves exactly one chat, so that's safe).
+Returns how many evals were interrupted. Throws when the project has no
+live control channel (agent not started, or a worker install that predates
+the feature).
+"""
+function interrupt_project_eval!(state::ServerState, project_id::AbstractString;
+                                 env_path::Union{AbstractString,Nothing} = nothing,
+                                 timeout::Real = 15.0)
+    ws = mcp_ctrl_for(state, project_id)
+    ws === nothing && error(
+        "no MCP control channel for this chat — the agent's MCP server " *
+        "hasn't dialed back (not started yet, or an old worker install)")
+    rid, ch = register_rpc!(state)
+    resp = try
+        payload = Dict{String,Any}("op" => "interrupt_eval", "request_id" => rid)
+        env_path === nothing || (payload["env_path"] = String(env_path))
+        HTTP.WebSockets.send(ws, JSON.json(payload))
+        take_pending!(state, ch, rid, timeout, "interrupt_eval")
+    finally
+        unregister_rpc!(state, rid)   # T10: no leak on send failure
+    end
+    resp isa AbstractDict || error("interrupt_eval: unexpected response shape")
+    return Int(get(resp, "interrupted", 0))
+end
+
 # Env the server injects into the BonitoMCP MCP server so its eval worker can
 # dial `/eval-ws` back. The dial-back URL itself is NOT set here — the
 # BonitoWorker daemon supplies `BONITOTEAM_SERVER_URL` (the URL it dialed in

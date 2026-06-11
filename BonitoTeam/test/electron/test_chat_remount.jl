@@ -10,6 +10,8 @@
 # documents the bug until we fix it.
 isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
+using BonitoTeam
+
 state = TH.make_state(; n_workers = 1, n_projects = 1)
 
 scripted = [(0.05, TH.agent_chunk_update("first response"))]
@@ -59,17 +61,37 @@ try
     n_agent_before = TH.dom_count(ctx, ".bt-agent-msg")
 
     TH.section("Navigate Home") do
+        # Chat panes are KEPT ALIVE on navigation (display:none, see
+        # unified_main's pane cache) — so .bt-app stays in the DOM. What
+        # must change is visibility: dashboard shown, chat pane hidden.
         TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[0].click()""")
-        record("dashboard mounts",
-               @TH.test_true TH.wait_for(ctx,
-                   "document.querySelector('.bt-app') === null"; timeout = 3.0))
+        record("dashboard becomes visible",
+               @TH.test_true TH.wait_for(ctx, """
+                   (() => {
+                       const dash = document.querySelector('.bt-view-dash');
+                       return dash !== null && dash.style.display !== 'none';
+                   })()
+               """; timeout = 3.0))
+        record("chat pane hidden (kept alive)",
+               @TH.test_true TH.eval_js(ctx, """
+                   (() => {
+                       const panes = document.querySelectorAll('.bt-view-chats .bt-chatpane');
+                       return Array.from(panes).every(p => p.style.display === 'none');
+                   })()
+               """))
     end
 
     TH.section("Navigate back to project — history should still be there") do
         TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[$p1_idx].click()""")
-        record("chat re-mounts",
-               @TH.test_true TH.wait_for(ctx,
-                   "document.querySelector('.bt-app') !== null"; timeout = 3.0))
+        record("chat pane visible again",
+               @TH.test_true TH.wait_for(ctx, """
+                   (() => {
+                       const app = document.querySelector('.bt-app');
+                       if (!app) return false;
+                       const pane = app.closest('.bt-chatpane');
+                       return pane === null || pane.style.display !== 'none';
+                   })()
+               """; timeout = 3.0))
         # Give the JS-side BonitoChat a moment to do its initial range fetch.
         sleep(0.5)
 

@@ -7,6 +7,13 @@ using Test
 using BonitoWorker
 const BW = BonitoWorker
 
+# A WebSocket stand-in that drops sends — handle_* helpers write their JSON
+# response to the WS, which the unit tests don't need to read. Reach the
+# exact `send` the worker calls (`HTTP.WebSockets.send`) through the module
+# so HTTP needn't be a direct test dep.
+struct NullWS end
+BonitoWorker.WebSockets.send(::NullWS, ::Any) = nothing
+
 @testset "BonitoWorker" begin
 
 # ── which_executable ──────────────────────────────────────────────────────────
@@ -258,6 +265,35 @@ end
     # silently downgrade an existing one.
     @test BW.decide_run_mode(nothing, true)  == :service
     @test BW.decide_run_mode(nothing, false) == :background
+end
+
+# ── file_writer_pids / kill_file_writers (background-shell stop) ────────────
+# The direct stop for a background bash: the shell holds its `>> output`
+# redirect open until it exits, so the file's writers ARE the shell. Linux
+# only (/proc scan); other OSes report no holders (the caller still
+# finalizes the UI).
+@testset "file_writer_pids + kill" begin
+    if Sys.islinux()
+        mktempdir() do dir
+            path = joinpath(dir, "held.output")
+            write(path, "seed\n")
+            # A child shell that holds `path` open (append) and sleeps.
+            proc = run(pipeline(`bash -c "exec sleep 30"`; stdout = path, append = true);
+                       wait = false)
+            # Give it a moment to open the fd.
+            sleep(0.5)
+            pids = BW.file_writer_pids(path)
+            @test getpid(proc) in pids
+            @test !(getpid() in pids)        # never our own process
+
+            BW.handle_kill_file_writers(NullWS(), Dict("request_id" => "r",
+                                                       "path" => path))
+            @test timedwait(() -> !process_running(proc), 5.0) === :ok
+            @test isempty(BW.file_writer_pids(path))
+        end
+    else
+        @test isempty(BW.file_writer_pids(tempname()))
+    end
 end
 
 end  # BonitoWorker

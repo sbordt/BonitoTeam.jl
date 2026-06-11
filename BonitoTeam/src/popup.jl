@@ -5,9 +5,12 @@
 # state stays alive across moves. The popup geometry is persisted per chat to
 # `chat_dir/popup_state.json`, so it survives a server reboot.
 #
-# JS controller: `window._btPopup.detach(toolId)` / `.restore()`. The bubble's
-# Detach button is plain DOM with `onclick → window._btPopup.detach('<id>')`,
-# decoupling the button from the per-session Observable wiring.
+# The JS half is `PopupController` (assets/popup.js): one instance per window,
+# constructed with its DOM nodes + observables — every inbound action
+# (detach / restore / dock / undock / reveal-file-pane / chat navigation)
+# arrives through an Observable on the `PlotPane` handle (plotpane.jl).
+
+const PopupLib = Bonito.ES6Module(joinpath(@__DIR__, "..", "assets", "popup.js"))
 
 # ── Per-chat persisted geometry ──────────────────────────────────────────────
 
@@ -82,9 +85,10 @@ popup window (Detach button) and back (popup close → restore-to-slot).
 function wrap_for_detach(tool_id::AbstractString, body)
     tid = String(tool_id)
     # Detach now lives on the ⤢ button in the tool header (rendered for
-    # bonito_app tools by bonitoteam.js, calling window._btPopup.detach). Here we
-    # only keep the slot/embed structure the controller moves between surfaces,
-    # plus a placeholder that takes over the inline spot while it's detached.
+    # bonito_app tools by bonitoteam.js; routed comm → DetachAppCommand →
+    # `pane.detach_app`). Here we only keep the slot/embed structure the
+    # controller moves between surfaces, plus a placeholder that takes over
+    # the inline spot while it's detached.
     placeholder = DOM.span("In floating window — close it to bring this back";
                           class = "bt-detach-placeholder")
     DOM.div(
@@ -99,23 +103,23 @@ end
 
 """
     install_popup!(session, state, current_view) ->
-        (FloatingWindow, plotpane_dom, onload_js::Bonito.JSCode)
+        (FloatingWindow, plotpane_dom, onload_js::Bonito.JSCode, pane::PlotPane)
 
-Build the chat-global popup + plotpane surfaces and the `window._btPopup`
-controller JS, with per-chat persistence (geometry **and** last-used location:
-"floating" vs "docked") to `state.chat_models[pid].chat_dir/popup_state.json`.
+Build the chat-global popup + plotpane surfaces, with per-chat persistence
+(geometry **and** last-used location: "floating" vs "docked") to
+`state.chat_models[pid].chat_dir/popup_state.json`.
 
-The controller exposes:
-  - `_btPopup.detach(toolId)` — open the bubble's app at whichever surface the
-    chat last left it in (floating popup, or the docked plotpane).
-  - `_btPopup.restore()` — send the current embed back to its bubble; both
-    surfaces hide.
-  - `_btPopup.dock()` / `.undock()` — toggle the current embed between the
-    floating popup and the plotpane.
+The returned `PlotPane` is the Julia-side handle: pass it down to the chat
+views (ChatPaneRef sets it on each per-session ChatModel) so chat code can
+`open_file!(pane, model, path)` and route detach/restore requests. The
+`onload_js` constructs the `PopupController` (assets/popup.js) once the
+shell is mounted; the controller subscribes to the pane's observables —
+nothing here ever talks to a window-global.
+
 Plus an unobtrusive **drag-to-dock**: drag the popup's title bar over the
 plotpane drop zone and release → docks. (No special drop handler on the
-widget; the JS listens to pointer events at the document level, runs in
-parallel with FloatingWindow's own drag logic.)
+widget; the controller listens to pointer events at the document level,
+runs in parallel with FloatingWindow's own drag logic.)
 """
 function install_popup!(session::Bonito.Session,
                          state::ServerState,
@@ -130,6 +134,40 @@ function install_popup!(session::Bonito.Session,
     close_t   = Observable(false)
     chat_width = Observable(0)                    # per-chat chat-column width (0 ⇒ CSS default)
     title     = Observable("Detached app")
+
+    pane = PlotPane()
+    # ── Tab-state folding ────────────────────────────────────────────────
+    # Every UI event funnels into ONE atomic `tabs` update (items + active
+    # change together — see plotpane.jl).
+    on(session, pane.tab_click) do id
+        isempty(id) && return
+        pane.tabs[] = activate_tab(pane.tabs[], id)
+    end
+    on(session, pane.tab_close) do id
+        isempty(id) && return
+        if id == APP_TAB_ID
+            # The app tab closes by restoring the embed to its bubble; the
+            # controller then reports `app_docked("")`, which drops the tab.
+            pane.restore_app[] = true
+        else
+            delete!(pane.editors, id)
+            pane.tabs[] = remove_tab(pane.tabs[], id)
+        end
+    end
+    # The JS controller reports app-embed docking; fold it in as a tab.
+    on(session, pane.app_docked) do tid
+        st = pane.tabs[]
+        if isempty(tid)
+            any(t -> t.id == APP_TAB_ID, st.items) &&
+                (pane.tabs[] = remove_tab(st, APP_TAB_ID))
+        else
+            pane.tabs[] = upsert_tab(st,
+                PaneTab(APP_TAB_ID, "App · " * tid[1:min(8, end)], :app))
+        end
+    end
+    # JS-safe derivation the controller subscribes to: the active tab id
+    # drives content visibility + the pane column's own visibility.
+    active_tab = map(st -> st.active, session, pane.tabs)
 
     loading = Ref(false)
 
@@ -185,36 +223,58 @@ function install_popup!(session::Bonito.Session,
         else            main.style.removeProperty('--bt-chat-width');
     }""")
 
-    # Navigation drives the per-chat surface swap: `setChat` parks the previous
-    # chat's detached embed back into its (kept-alive) bubble, hides both
-    # surfaces, then re-detaches the new chat's app at its remembered location.
-    # This is what makes the floating-window / plotpane state resident per chat
-    # (home → both surfaces simply hide, since "" has no detached app). It runs
-    # in the parent session that owns the `window._btPopup` controller, so
-    # interpolating `current_view` here is safe (never a KeyedList child).
-    # x/y/width/height are deliberately left to the geometry loader above, so a
-    # returning chat lands its popup exactly where it was dragged.
-    Bonito.onjs(session, current_view,
-        js"(pid) => window._btPopup && window._btPopup.setChat(pid)")
+    # Navigation (`current_view`) drives the per-chat surface swap inside the
+    # controller (`setChat` subscription): it parks the previous chat's
+    # detached embed back into its kept-alive bubble, then re-detaches the
+    # new chat's app at its remembered location. x/y/width/height are
+    # deliberately left to the geometry loader above, so a returning chat
+    # lands its popup exactly where it was dragged.
 
-    # Two mount slots, one per surface. The controller moves the embed
-    # `bt-embed-<tool_id>` between them.
+    # Mounts. The floating window keeps its single slot; the plotpane mount
+    # is TABBED: the app host (where the controller moves `bt-embed-<id>`
+    # subtrees) and one kept-alive wrapper per open file editor (KeyedList —
+    # switching tabs preserves Monaco state). The controller toggles
+    # `[data-tab-id]` visibility from the `active_tab` observable.
     popup_mount = DOM.div(""; id = "bt-popup-mount", class = "bt-popup-mount")
-    plotpane_mount = DOM.div(""; id = "bt-plotpane-mount", class = "bt-plotpane-mount")
+    app_host = DOM.div(""; id = "bt-plotpane-app",
+        class = "bt-pp-tabcontent", dataTabId = APP_TAB_ID)
+    file_items = map(session, pane.tabs) do st
+        PaneTabContent[PaneTabContent(t.id, pane.editors[t.id])
+                       for t in st.items
+                       if t.kind === :file && haskey(pane.editors, t.id)]
+    end
+    plotpane_mount = DOM.div(
+        app_host,
+        Bonito.KeyedList(file_items; key = c -> c.id);
+        id = "bt-plotpane-mount", class = "bt-plotpane-mount")
 
     fw = FloatingWindow(popup_mount;
         title = title, x = x, y = y, width = width, height = height,
         visible = visible, close_trigger = close_t)
 
-    # Plotpane column: a stable shell + header (undock + close) + the mount.
-    # The whole column is hidden (CSS width:0) when `plotpane_visible` is false.
-    pp_title = map(t -> t, title)
+    # Plotpane column: a stable shell + a VSCode-style tab bar (+ undock /
+    # close chrome) + the mount. The whole column is hidden (CSS width:0)
+    # when `plotpane_visible` is false. The tab bar is a small bounded
+    # region — whole-bar re-render per tabs update is fine (AGENTS.md §5);
+    # per-render click handlers live in the map's sub-session and are freed
+    # on the next render.
+    tab_bar = map(session, pane.tabs) do st
+        DOM.div(
+            (DOM.div(
+                DOM.span(t.label; class = "bt-pp-tab-label"),
+                DOM.span("×"; class = "bt-pp-tab-close", title = "Close",
+                    onclick = js"event => { event.stopPropagation(); $(pane.tab_close).notify($(t.id)); }");
+                class = t.id == st.active ? "bt-pp-tab bt-pp-tab-active" : "bt-pp-tab",
+                onclick = js"event => $(pane.tab_click).notify($(t.id))")
+             for t in st.items)...;
+            class = "bt-pp-tabs")
+    end
     undock_btn = DOM.span("⤡";
         class = "bt-pp-btn", title = "Pop out to floating window",
-        onclick = js"event => { event.stopPropagation(); window._btPopup && window._btPopup.undock(); }")
+        onclick = js"event => { event.stopPropagation(); $(pane.undock_app).notify(true); }")
     pp_close_btn = DOM.span("×";
-        class = "bt-pp-btn", title = "Close",
-        onclick = js"event => { event.stopPropagation(); window._btPopup && window._btPopup.restore(); }")
+        class = "bt-pp-btn", title = "Close pane",
+        onclick = js"event => { event.stopPropagation(); $(pane.restore_app).notify(true); }")
     # The resize handle is the first child so it sits at the left edge of the
     # column (the column is `position: relative` so the absolute handle anchors
     # to the pane, not the page). Drag wiring in `controller_js`.
@@ -223,7 +283,7 @@ function install_popup!(session::Bonito.Session,
     plotpane = DOM.div(
         pp_resize,
         DOM.div(
-            DOM.span(pp_title; class = "bt-pp-title"),
+            tab_bar,
             DOM.div(undock_btn, pp_close_btn; class = "bt-pp-controls");
             class = "bt-pp-header"),
         plotpane_mount;
@@ -234,202 +294,37 @@ function install_popup!(session::Bonito.Session,
         class = "bt-plotpane")
 
     # Close (×) on the floating window: send embed back to its bubble.
-    on(close_t) do v
+    on(session, close_t) do v
         v || return
         close_t[] = false
-        try
-            Bonito.evaljs(session, js"""window._btPopup && window._btPopup.restore && window._btPopup.restore();""")
-        catch e
-            @debug "popup close: evaljs failed" exception = e
-        end
+        pane.restore_app[] = true
     end
 
+    # Construct the PopupController (assets/popup.js) once the shell is in
+    # the DOM. Everything it touches is handed over here — its own DOM nodes
+    # and the observables it subscribes to. No window globals.
     controller_js = js"""
-    (root) => {
-        const visObs   = $(visible);
-        const ppvObs   = $(plotpane_v);
-        const locObs   = $(location);
-        const titleObs = $(title);
-
-        const showFor = (location) => {
-            if (location === 'docked') {
-                ppvObs.notify(true);  visObs.notify(false);
-            } else {
-                visObs.notify(true);  ppvObs.notify(false);
-            }
-        };
-
-        // Imperative class swap for the plotpane column (Bonito doesn't bind
-        // `class = Observable` live the way it bridges `style.display`).
-        const applyPlotpaneVis = () => {
-            const z = document.getElementById('bt-plotpane-dropzone');
-            if (z) z.classList.toggle('bt-plotpane-visible', ppvObs.value);
-        };
-        ppvObs.on(applyPlotpaneVis);
-        applyPlotpaneVis();
-
-        // ── Divider: resizes the CHAT column ─────────────────────────────────
-        // The plotpane (flex:1) fills whatever the chat leaves, so the handle on
-        // its left edge sizes `--bt-chat-width` on `.bt-main`. Drag right → wider
-        // chat (narrower pane); drag left → narrower chat. Clamped to the chat's
-        // readable range, always leaving at least PANE_MIN for the pane.
-        const CHAT_MIN = 480, CHAT_MAX = 1400, PANE_MIN = 320;
-        const chatWidthObs = $(chat_width);   // per-chat divider width (persisted)
-        const pp = document.getElementById('bt-plotpane-dropzone');
-        const main = document.querySelector('.bt-main');
-        const handle = pp ? pp.querySelector('.bt-pp-resize') : null;
-        if (main && handle) {
-            let startX = 0, startW = 0, stageW = 0;
-            const clampW = (w) => Math.max(CHAT_MIN,
-                Math.min(Math.min(CHAT_MAX, stageW - PANE_MIN), w));
-            const onMove = (e) => {
-                main.style.setProperty('--bt-chat-width',
-                    clampW(startW + (e.clientX - startX)) + 'px');
-            };
-            const onUp = () => {
-                window.removeEventListener('pointermove', onMove);
-                window.removeEventListener('pointerup',   onUp);
-                pp && pp.classList.remove('bt-pp-resizing');
-                const finalW = Math.round(main.getBoundingClientRect().width);
-                if (finalW >= CHAT_MIN) chatWidthObs.notify(finalW);   // → Julia saver
-            };
-            handle.addEventListener('pointerdown', (e) => {
-                e.preventDefault();
-                const stage = document.querySelector('.bt-stage');
-                stageW = stage ? stage.clientWidth : window.innerWidth;
-                startX = e.clientX;
-                startW = main.getBoundingClientRect().width;
-                pp && pp.classList.add('bt-pp-resizing');
-                window.addEventListener('pointermove', onMove);
-                window.addEventListener('pointerup',   onUp);
-            });
-            // Double-click = reset to the default chat width.
-            handle.addEventListener('dblclick', (e) => {
-                e.preventDefault();
-                main.style.removeProperty('--bt-chat-width');
-                chatWidthObs.notify(0);
-            });
-        }
-
-        // Per-chat detached state. Each chat (pid) independently remembers which
-        // of its bubble embeds is detached and where (floating | docked). The
-        // surfaces (floating window + plotpane) are SHARED chrome — only the
-        // active chat's embed is ever in them; the others are parked back in
-        // their own (kept-alive) bubbles. That's what makes detach/dock state
-        // "resident per chat": navigating swaps which embed occupies the surface.
-        window._btPopup = {
-            activePid: '',
-            byPid: {},                     // pid -> { toolId, location }
-            current() { return this.byPid[this.activePid] || null; },
-            _toSurface(toolId, location) {
-                const embed = document.getElementById('bt-embed-' + toolId);
-                const mount = document.getElementById(
-                    location === 'docked' ? 'bt-plotpane-mount' : 'bt-popup-mount');
-                if (!embed || !mount) return false;
-                Bonito.move_dom_node(embed, mount, null);
-                const slot = document.getElementById('bt-slot-' + toolId);
-                if (slot) slot.setAttribute('data-detached', '1');
-                return true;
-            },
-            _toBubble(toolId) {
-                const embed = document.getElementById('bt-embed-' + toolId);
-                const slot  = document.getElementById('bt-slot-'  + toolId);
-                if (embed && slot) {
-                    Bonito.move_dom_node(embed, slot, null);
-                    slot.removeAttribute('data-detached');
-                }
-            },
-            // Open the active chat's bubble embed at its last-used surface. If a
-            // different app in THIS chat was detached, send it back first.
-            detach(toolId) {
-                const pid = this.activePid, prev = this.byPid[pid];
-                if (prev && prev.toolId !== toolId) this._toBubble(prev.toolId);
-                const location = (prev && prev.location) || locObs.value || 'floating';
-                if (!this._toSurface(toolId, location)) {
-                    console.warn('[btPopup] detach: no embed for', toolId); return;
-                }
-                this.byPid[pid] = { toolId, location };
-                locObs.notify(location);
-                titleObs.notify('App · ' + toolId.slice(0, 8));
-                showFor(location);
-            },
-            // Send the active chat's embed back to its bubble; hide both surfaces.
-            restore() {
-                const rec = this.current();
-                if (rec) { this._toBubble(rec.toolId); delete this.byPid[this.activePid]; }
-                visObs.notify(false);
-                ppvObs.notify(false);
-            },
-            // floating → docked.
-            dock() {
-                const rec = this.current(); if (!rec) return;
-                if (!this._toSurface(rec.toolId, 'docked')) return;
-                rec.location = 'docked'; locObs.notify('docked'); showFor('docked');
-            },
-            // docked → floating.
-            undock() {
-                const rec = this.current(); if (!rec) return;
-                if (!this._toSurface(rec.toolId, 'floating')) return;
-                rec.location = 'floating'; locObs.notify('floating'); showFor('floating');
-            },
-            // Navigation hook (driven by current_view). Park the previous chat's
-            // detached embed back into its kept-alive bubble and hide the
-            // surfaces, then re-detach the new chat's app if it had one — so each
-            // chat's floating/docked app reappears exactly where it was left.
-            setChat(pid) {
-                pid = pid || '';
-                if (pid === this.activePid) return;
-                const old = this.byPid[this.activePid];
-                if (old) this._toBubble(old.toolId);
-                visObs.notify(false);
-                ppvObs.notify(false);
-                this.activePid = pid;
-                const rec = this.byPid[pid];
-                if (rec && this._toSurface(rec.toolId, rec.location)) {
-                    locObs.notify(rec.location);
-                    titleObs.notify('App · ' + rec.toolId.slice(0, 8));
-                    showFor(rec.location);
-                }
-            },
-        };
-
-        // Drag-to-dock. Dragging the floating window's title bar over the whole
-        // area to the RIGHT of the chat (the region the plotpane fills) docks it.
-        // The ENTIRE drop region highlights — not a thin strip. A fixed-position
-        // overlay marks it (pointer-events:none so it never interferes with the
-        // FloatingWindow's own drag, which runs in parallel on its own listeners).
-        document.addEventListener('pointerdown', (ev) => {
-            const tb = ev.target.closest('.bn-fw-title');
-            if (!tb || ev.target.closest('.bn-fw-controls')) return;
-            if (!window._btPopup.current()) return;     // nothing detached → no-op
-            const main  = document.querySelector('.bt-main');
-            const stage = document.querySelector('.bt-stage');
-            if (!main || !stage) return;
-            const mr = main.getBoundingClientRect(), sr = stage.getBoundingClientRect();
-            const left = mr.right, right = sr.right;
-            if (right - left < 40) return;              // no room to dock into
-            const ov = document.createElement('div');
-            ov.className = 'bt-drop-overlay';
-            ov.style.left = left + 'px';  ov.style.top = sr.top + 'px';
-            ov.style.width = (right - left) + 'px';  ov.style.height = sr.height + 'px';
-            document.body.appendChild(ov);
-            const inZone = (e2) => e2.clientX >= left && e2.clientX <= right &&
-                                   e2.clientY >= sr.top && e2.clientY <= sr.bottom;
-            const onMove = (e2) => ov.classList.toggle('bt-drop-active', inZone(e2));
-            const onUp = (e2) => {
-                document.removeEventListener('pointermove', onMove);
-                document.removeEventListener('pointerup',   onUp);
-                const over = inZone(e2);
-                ov.remove();
-                if (over) window._btPopup.dock();
-            };
-            document.addEventListener('pointermove', onMove);
-            document.addEventListener('pointerup',   onUp);
-        });
-    }
+    (root) => $(PopupLib).then(mod => new mod.PopupController({
+        popupMount:    $(popup_mount),
+        paneMount:     $(plotpane_mount),
+        appHost:       $(app_host),
+        dropzone:      $(plotpane),
+        vis:           $(visible),
+        ppv:           $(plotpane_v),
+        loc:           $(location),
+        title:         $(title),
+        chatWidth:     $(chat_width),
+        currentView:   $(current_view),
+        activeTab:     $(active_tab),
+        detachApp:     $(pane.detach_app),
+        restoreApp:    $(pane.restore_app),
+        dockApp:       $(pane.dock_app),
+        undockApp:     $(pane.undock_app),
+        appDocked:     $(pane.app_docked),
+    }))
     """
 
-    return (fw, plotpane, controller_js)
+    return (fw, plotpane, controller_js, pane)
 end
 
 const PopupStyles = Bonito.Styles(
@@ -498,10 +393,40 @@ const PopupStyles = Bonito.Styles(
         "flex-shrink" => "0",
         "font" => "13px/1.2 system-ui, -apple-system, sans-serif",
         "color" => "var(--bt-text)"),
-    Bonito.CSS(".bt-pp-title",
+    # VSCode-style tab bar: one tab per open file + the docked app.
+    Bonito.CSS(".bt-pp-tabs",
         "flex" => "1 1 auto", "min-width" => "0",
-        "overflow" => "hidden", "text-overflow" => "ellipsis",
-        "white-space" => "nowrap", "font-weight" => "600"),
+        "display" => "flex", "align-items" => "stretch",
+        "gap" => "2px", "overflow-x" => "auto"),
+    Bonito.CSS(".bt-pp-tab",
+        "display" => "flex", "align-items" => "center", "gap" => "6px",
+        "padding" => "4px 8px",
+        "font" => "12px/1.2 system-ui, -apple-system, sans-serif",
+        "color" => "var(--bt-text-muted)",
+        "border-radius" => "6px 6px 0 0",
+        "border" => "1px solid transparent",
+        "border-bottom" => "none",
+        "cursor" => "pointer",
+        "white-space" => "nowrap",
+        "user-select" => "none"),
+    Bonito.CSS(".bt-pp-tab:hover",
+        "background" => "var(--bt-surface-2)"),
+    Bonito.CSS(".bt-pp-tab-active",
+        "background" => "var(--bt-surface)",
+        "border-color" => "var(--bt-border)",
+        "color" => "var(--bt-text)",
+        "font-weight" => "600"),
+    Bonito.CSS(".bt-pp-tab-close",
+        "color" => "var(--bt-text-faint)",
+        "padding" => "0 2px",
+        "border-radius" => "4px"),
+    Bonito.CSS(".bt-pp-tab-close:hover",
+        "color" => "var(--bt-error)",
+        "background" => "var(--bt-surface-2)"),
+    Bonito.CSS(".bt-pp-tabcontent",
+        "height" => "100%", "min-height" => "0",
+        "display" => "flex", "flex-direction" => "column",
+        "overflow" => "auto"),
     Bonito.CSS(".bt-pp-controls",
         "display" => "flex", "gap" => "2px", "flex-shrink" => "0"),
     Bonito.CSS(".bt-pp-btn",

@@ -79,7 +79,14 @@ function serve(; host::String        = "0.0.0.0",
 
     # online_url uses the post-start srv.port — handles port=0 → ephemeral
     # AND EADDRINUSE → port+1 retry without us tracking the actual port.
-    base_url = something(public_url, Bonito.online_url(srv, ""))
+    # An EMPTY public_url counts as unset too (the CLI entry point passes ""
+    # when --public-url was omitted; `something("", …)` would have kept the
+    # empty string and templated install scripts with a blank SERVER_URL).
+    base_url = (public_url === nothing || isempty(public_url)) ?
+        Bonito.online_url(srv, "") : public_url
+    # The dashboard's install snippet renders the SAME url the install routes
+    # are templated with — never a "<your-server>" placeholder.
+    state.base_url[] = rstrip(base_url, '/')
     add_install_routes!(srv, base_url, worker_secret)
     add_acp_log_routes!(srv, state)
     add_worker_ws_routes!(srv, state)
@@ -433,4 +440,8 @@ function add_worker_ws_routes!(srv::Bonito.Server, state::ServerState)
     # Eval workers (BonitoMCP) dial here to be driven for interactive app proxying.
     Bonito.HTTPServer.websocket_route!(srv, "/eval-ws" => (_ctx, ws) ->
         handle_eval_ws(state, ws))
+    # The BonitoMCP stdio process itself dials here — the control channel the
+    # per-tool eval interrupt rides on (see remote_app.jl `MCP_CTRL`).
+    Bonito.HTTPServer.websocket_route!(srv, "/mcp-ws" => (_ctx, ws) ->
+        handle_mcp_ctrl_ws(state, ws))
 end

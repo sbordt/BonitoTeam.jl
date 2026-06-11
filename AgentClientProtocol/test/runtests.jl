@@ -102,13 +102,55 @@ next_out(t::MockTransport) = JSON.parse(take!(t.outbox))
     end
 
     # ── A8: a second concurrent turn errors instead of orphaning the first ───
-    @testset "A8 overlapping turn errors" begin
+    # ── Concurrent turns: the handoff contract ────────────────────────────────
+    # claude-agent-acp supports a second `session/prompt` while one runs
+    # (steering; also the only release for a turn the SDK holds open for a
+    # background shell). Updates must route to the OLDEST unresolved prompt;
+    # a prompt's response closes ITS stream and updates flow to the next.
+    @testset "concurrent turns route updates oldest-first, handoff on response" begin
+        upd(text) = put!(t.inbox, JSON.json(Dict(
+            "jsonrpc" => "2.0", "method" => "session/update",
+            "params" => Dict("sessionId" => "s", "update" => Dict(
+                "sessionUpdate" => "agent_message_chunk",
+                "content" => Dict("type" => "text", "text" => text))))))
+        drain_text(ch) = begin
+            texts = String[]
+            for u in ch
+                u isa ACP.AgentMessageChunk && u.content isa ACP.TextContent &&
+                    push!(texts, u.content.text)
+            end
+            texts
+        end
+
         t = MockTransport()
         conn = ACP.Connection(t)
         u1, r1 = ACP.request_updates(conn, "session/prompt", Dict())
-        _ = next_out(t)
-        @test_throws ErrorException ACP.request_updates(conn, "session/prompt", Dict())
+        id1 = next_out(t)["id"]
+        u2, r2 = ACP.request_updates(conn, "session/prompt", Dict())   # mid-turn: allowed
+        id2 = next_out(t)["id"]
+
+        upd("for-turn-1")                       # both turns open → oldest (1)
+        push_response!(t, id1, Dict("stopReason" => "end_turn"))   # handoff
+        upd("for-turn-2")                       # turn 1 gone → routes to 2
+        push_response!(t, id2, Dict("stopReason" => "end_turn"))
+
+        @test drain_text(u1) == ["for-turn-1"]  # u1 closed by id1's response
+        @test take!(r1)["stopReason"] == "end_turn"
+        @test drain_text(u2) == ["for-turn-2"]
+        @test take!(r2)["stopReason"] == "end_turn"
+        @test isempty(conn.active_turns)
         close(conn)
+    end
+
+    @testset "teardown closes every in-flight turn" begin
+        t = MockTransport()
+        conn = ACP.Connection(t)
+        u1, r1 = ACP.request_updates(conn, "session/prompt", Dict())
+        u2, r2 = ACP.request_updates(conn, "session/prompt", Dict())
+        close(conn)
+        @test timedwait(() -> !isopen(u1) && !isopen(u2), 5.0) === :ok
+        @test take!(r1) isa ACP.ConnectionClosed
+        @test take!(r2) isa ACP.ConnectionClosed
     end
 
     # ── A7: drop-oldest delivery never blocks the dispatcher ─────────────────

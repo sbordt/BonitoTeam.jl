@@ -131,10 +131,45 @@ tool_content_to_dict(c::ImageContent) = Dict{String,Any}(
 function persist_tool_content!(chat_dir::AbstractString, tc::AgentClientProtocol.ToolCall)
     isempty(tc.content) && return nothing
     path = tool_file(chat_dir, tc.id)
+    d = Dict{String,Any}("content" => [tool_content_to_dict(c) for c in tc.content])
+    # The call's arguments (for the variants that keep them): claude's
+    # Read/Edit/Write carry the real `file_path` here — the ✎ editor
+    # affordance needs it after a history reload, where the ToolMsg's
+    # in-RAM raw_input is gone.
+    ri = raw_input_of(tc)
+    ri === nothing || isempty(ri) || (d["rawInput"] = ri)
     open(path, "w") do io
-        JSON.print(io, Dict("content" => [tool_content_to_dict(c) for c in tc.content]))
+        JSON.print(io, d)
     end
     return nothing
+end
+
+raw_input_of(::AgentClientProtocol.ToolCall)      = nothing
+raw_input_of(tc::AgentClientProtocol.GenericTool) = tc.raw_input
+raw_input_of(tc::AgentClientProtocol.MCPCall)     = tc.raw_input
+# BashCall extracts its typed fields at parse time and drops the dict —
+# reconstruct the bits history reload needs (the description drives the
+# pill title; the command feeds the tooltip).
+raw_input_of(tc::AgentClientProtocol.BashCall) = Dict{String,Any}(
+    "command" => tc.command,
+    "run_in_background" => tc.run_in_background,
+    (tc.description === nothing ? () : ("description" => tc.description,))...)
+
+# The arguments recorded with the tool snapshot, for consumers running
+# after a history reload (the ToolMsg's in-RAM fields are gone).
+function stored_raw_input(chat_dir::AbstractString, tool_id::AbstractString)
+    params = load_tool_file(String(chat_dir), String(tool_id))
+    params === nothing && return nothing
+    ri = get(params, "rawInput", nothing)
+    return ri isa AbstractDict ? ri : nothing
+end
+
+# Path argument from the stored snapshot (rawInput.file_path / path / …) —
+# feeds the path-link derivation after a history reload.
+function stored_path_hint(chat_dir::AbstractString, tool_id::AbstractString)
+    ri = stored_raw_input(chat_dir, tool_id)
+    ri === nothing && return nothing
+    return mcp_path_hint(ri)
 end
 
 function load_tool_file(chat_dir::AbstractString, tool_id::AbstractString)::Union{AbstractDict,Nothing}

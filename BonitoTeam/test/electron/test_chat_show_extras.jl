@@ -78,7 +78,8 @@ try
     end
 
     TH.section("video/mp4 preview → <video> element") do
-        TH.eval_js(ctx, "(() => { document.querySelectorAll('.bt-tool-msg').forEach(m => { if (m.querySelector('.bt-tool-body[data-tool-id=\"video-1\"]')) m.querySelector('.bt-tool-header').click(); }); })()")
+        # NO click: bt_show results auto-expand (the completion update ships
+        # `expand`), so a manual header click would TOGGLE the open body shut.
         record("video element appears in the body",
                @TH.test_true TH.wait_for(ctx, """
                    (() => {
@@ -102,7 +103,8 @@ try
     end
 
     TH.section("text/html falls through — no iframe, no inline render") do
-        TH.eval_js(ctx, "(() => { document.querySelectorAll('.bt-tool-msg').forEach(m => { if (m.querySelector('.bt-tool-body[data-tool-id=\"html-1\"]')) m.querySelector('.bt-tool-header').click(); }); })()")
+        # NO click: bt_show results auto-expand (the completion update ships
+        # `expand`), so a manual header click would TOGGLE the open body shut.
         # Wait for the body to render *something* (loading spinner gone).
         @assert TH.wait_for(ctx, """
             (() => {
@@ -129,7 +131,8 @@ try
     end
 
     TH.section("Missing-file → spinner then clean error placeholder") do
-        TH.eval_js(ctx, "(() => { document.querySelectorAll('.bt-tool-msg').forEach(m => { if (m.querySelector('.bt-tool-body[data-tool-id=\"missing-1\"]')) m.querySelector('.bt-tool-header').click(); }); })()")
+        # NO click: bt_show results auto-expand (the completion update ships
+        # `expand`), so a manual header click would TOGGLE the open body shut.
         # Spinner (Bonito RippleSpinner → .lds-ripple) shows while the @async
         # fetch is in flight; if the fetch fails fast, the error placeholder is
         # already there instead — either proves the async render path ran.

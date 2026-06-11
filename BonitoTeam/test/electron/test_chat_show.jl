@@ -81,11 +81,10 @@ try
     end
 
     TH.section("PNG preview — synchronous render from cwd mirror") do
-        # Expand the first tool body (show-1).
-        TH.eval_js(ctx, """
-            const headers = document.querySelectorAll('.bt-tool-header');
-            if (headers.length >= 1) headers[0].click();
-        """)
+        # NO click: a bt_show result auto-expands (the completion update
+        # ships `expand`/`show_mime`, and Native Images mode mounts the
+        # body on its own). A manual header click would TOGGLE the
+        # already-open body closed and discard it.
         record("img element appears in tool body",
                @TH.test_true TH.wait_for(ctx, """
                    (() => {
@@ -108,9 +107,7 @@ try
     end
 
     TH.section("Text preview — Monaco read-only inside tool body") do
-        # Expand the second tool body (show-2). One-liner avoids whatever
-        # multi-line eval quirk made the previous attempt throw.
-        TH.eval_js(ctx, "(() => { const h = document.querySelectorAll('.bt-tool-header'); if (h.length >= 2) h[1].click(); })()")
+        # NO click — same auto-expand contract as the PNG case above.
         # Monaco renders inside .monaco-editor — wait for that to mount.
         record("monaco editor appears",
                @TH.test_true TH.wait_for(ctx, """

@@ -1,25 +1,56 @@
-# ACP error paths in send_prompt_async!:
+# ACP error paths in run_turn!:
 #
-#   - Errors whose message contains "connection closed", "EOFError" or
-#     "BrokenPipe" → flip session_alive=false. The permanent header
-#     restart button gains `bt-header-restart-dead` and pulses red; its
-#     title attribute carries the underlying error. (No separate banner
-#     any more — the button IS the failure indicator.)
-#   - Any other error → push an inline `[error: ...]` AgentMsg bubble so
-#     the user sees the failure in line with the conversation.
+#   - The TRANSPORT dying mid-turn (subprocess EOF, socket drop — surfaced
+#     as a typed `ConnectionClosed`/`EOFError`/`IOError`, see
+#     `is_session_dead_error`) → flip session_alive=false. The permanent
+#     header restart button gains `bt-header-restart-dead` and pulses red;
+#     its title attribute carries the underlying error. (No separate
+#     banner any more — the button IS the failure indicator.)
+#   - A JSON-RPC ERROR REPLY to the prompt (the agent is alive and
+#     answered!) → push an inline `[error: ...]` AgentMsg bubble so the
+#     user sees the failure in line with the conversation.
 #
 # Both paths must also fire `busy_end` in the finally block.
 isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
+using BonitoTeam, JSON
+
 results = Pair{String,Bool}[]
 record(name, ok) = push!(results, name => ok)
 
-# --- Sub-test 1: transport-died error → banner ---------------------------------
+# --- Sub-test 1: transport dies mid-turn → dead restart button -----------------
+# A responder that answers the setup RPCs, then KILLS the transport the
+# moment the prompt arrives — the typed teardown path (`ConnectionClosed`),
+# not an error reply. (`mock_transport(prompt_error=…)` replies with a
+# JSON-RPC error, which is the agent-still-alive branch tested below.)
+function dying_on_setup(outgoing::Channel{String}, incoming::Channel{String})
+    Base.errormonitor(@async try
+        for line in outgoing
+            msg = JSON.parse(line)
+            method = get(msg, "method", "")
+            id     = get(msg, "id", nothing)
+            if method == "initialize" && id !== nothing
+                put!(incoming, JSON.json(Dict("jsonrpc" => "2.0", "id" => id,
+                                              "result" => Dict())))
+            elseif method == "session/new" && id !== nothing
+                put!(incoming, JSON.json(Dict("jsonrpc" => "2.0", "id" => id,
+                                              "result" => Dict("sessionId" => "mock-sess-1"))))
+            elseif method == "session/prompt"
+                close(incoming)        # the "agent process died" moment
+                break
+            end
+        end
+    catch e
+        e isa InvalidStateException || @warn "dying responder failed" exception = e
+    end)
+    return nothing
+end
+
 state1 = TH.make_state(; n_workers = 1, n_projects = 1)
 let proj = state1.projects[]["p-1"]
     model = BonitoTeam.ChatModel(state1, proj.server_path;
         project_id     = proj.id,
-        transport = TH.mock_transport(; prompt_error = "connection closed by peer"))
+        transport = BonitoTeam.MockTransport(dying_on_setup))
     BonitoTeam.start_chat_client!(model)
 end
 ctx1 = TH.open_window(state1)
@@ -27,7 +58,7 @@ ctx1 = TH.open_window(state1)
 try
     p1 = TH.eval_js(ctx1, """(() => { const items = document.querySelectorAll('.bt-side-item .bt-side-name'); for (let i=0; i<items.length; i++) if (items[i].innerText.split(' · ')[0]==='Project1') return i; return -1; })()""")
     TH.eval_js(ctx1, """document.querySelectorAll('.bt-side-item')[$p1].click()""")
-    @assert TH.wait_for(ctx1, "document.querySelector('.bt-text-input') !== null") "no chat"
+    @assert TH.wait_for(ctx1, "document.querySelector('.bt-text-input') !== null"; timeout = 15.0) "no chat"
 
     TH.section("Transport-died error → session-ended banner") do
         record("restart button is healthy before send",
@@ -83,7 +114,7 @@ ctx2 = TH.open_window(state2)
 try
     p1 = TH.eval_js(ctx2, """(() => { const items = document.querySelectorAll('.bt-side-item .bt-side-name'); for (let i=0; i<items.length; i++) if (items[i].innerText.split(' · ')[0]==='Project1') return i; return -1; })()""")
     TH.eval_js(ctx2, """document.querySelectorAll('.bt-side-item')[$p1].click()""")
-    @assert TH.wait_for(ctx2, "document.querySelector('.bt-text-input') !== null") "no chat"
+    @assert TH.wait_for(ctx2, "document.querySelector('.bt-text-input') !== null"; timeout = 15.0) "no chat"
 
     TH.section("Arbitrary error → inline [error: ...] bubble") do
         TH.type_into(ctx2, ".bt-text-input", "go")

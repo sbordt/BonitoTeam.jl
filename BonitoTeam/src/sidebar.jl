@@ -38,19 +38,49 @@ function project_color(id::AbstractString)
     return "hsl($(hue), 60%, 48%)"
 end
 
-# Renders one icon. The colour stays seeded by `p.id` (visually identifies
-# the project across surfaces); the *contents* default to the worker's
-# initials (`[DT]`-style — Desktop/HP Laptop/…) so the user reads from a
-# glance which machine hosts the chat. Pass `worker_tag = ""` to fall back
-# to the folder initials (used when a worker isn't connected). `size_px`
-# lets the sidebar reuse this at 32 px and the project_card at e.g. 24 px.
+"""
+    identicon_svg(id) → String
+
+A GitHub-style 5×5 identicon as an inline SVG string, deterministically
+seeded by `id`. The left half of the grid comes from the id's hash bits and
+is mirrored, so every icon is symmetric (symmetric shapes read as "a thing"
+rather than noise). Pattern cells are a darker shade of the same hue as
+`project_color(id)`, so the icon stays one coherent tile that the worker
+initials remain legible on. Single-quoted attributes so the result embeds
+directly into a CSS `url("data:image/svg+xml;utf8,…")` (the same trick the
+model-picker arrow uses in styles.jl).
+"""
+function identicon_svg(id::AbstractString)
+    h   = hash(id)
+    hue = abs(h % 360)
+    cells = IOBuffer()
+    for row in 0:4, col in 0:2
+        ((h >> (row * 3 + col)) & 1) == 1 || continue
+        for c in (col == 2 ? (2,) : (col, 4 - col))
+            print(cells, "<rect x='", c * 2, "' y='", row * 2, "' width='2' height='2'/>")
+        end
+    end
+    return string(
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'>",
+        "<rect width='10' height='10' fill='hsl(", hue, ", 60%, 48%)'/>",
+        "<g fill='hsl(", hue, ", 65%, 38%)'>", String(take!(cells)), "</g></svg>")
+end
+
+# Renders one icon: an identicon tile seeded by `p.id` (the pattern + hue
+# make each chat recognisable at a glance) with the worker's initials on
+# top (`[DT]`-style — Desktop/HP Laptop/…) so the user also reads which
+# machine hosts the chat. Pass `worker_tag = ""` to fall back to the folder
+# initials (used when a worker isn't connected). `size_px` lets the sidebar
+# reuse this at 32 px and the project_card at e.g. 24 px.
 function project_icon(p::ProjectInfo, worker_tag::AbstractString = "";
                        size_px::Int = 32)
     label = isempty(worker_tag) ? project_initials(p.name) : String(worker_tag)
     tip   = isempty(worker_tag) ? p.name : "$(worker_tag) · $(p.name)"
     DOM.div(label;
         class = "bt-proj-icon",
-        style = string("background:", project_color(p.id), ";",
+        style = string("background-image:url(\"data:image/svg+xml;utf8,",
+                       identicon_svg(p.id), "\");",
+                       "background-size:cover;",
                        "width:$(size_px)px;height:$(size_px)px;",
                        "line-height:$(size_px)px;font-size:$(round(Int, size_px*0.42))px"),
         title = tip)
@@ -94,22 +124,45 @@ function sidebar_entry(label::AbstractString, icon::Bonito.Node,
 end
 
 """
-    open_chat_projects(state) -> Vector{ProjectInfo}
+    open_chat_projects(projects) -> Vector{ProjectInfo}
 
-The single "Open chats" list shown in the sidebar. A project counts as
+The persistent half of the sidebar's "Open chats" list. A project counts as
 "open" iff the user has interacted with it at least once — i.e. it has
 either a backfilled `title` (set on the first user message) or a
 `resume_session_id` (imported from claude-agent-acp). This is the
 persistent definition: surviving a server OR worker restart, because both
-markers live on disk in `projects.json` and are restored on boot. We don't
-gate on `chat_models` (in-memory only) or on the `discovered.json` scan
-cache (stale by definition between rescans).
+markers live on disk in `projects.json` and are restored on boot. The
+`discovered.json` scan cache is deliberately NOT consulted (stale by
+definition between rescans).
 """
 function open_chat_projects(projects::AbstractDict{<:AbstractString,ProjectInfo})
     out = ProjectInfo[]
     for (_, p) in projects
         (p.title !== nothing || p.resume_session_id !== nothing) || continue
         push!(out, p)
+    end
+    return out
+end
+
+"""
+    open_chat_projects(state, projects) -> Vector{ProjectInfo}
+
+What the sidebar actually renders: the persisted-interacted projects PLUS
+every project with a LIVE `ChatModel`. A running chat deserves a sidebar
+entry from the moment it's brought up — before its first message backfills
+a title, a fresh thread was otherwise reachable only through the dashboard.
+"""
+function open_chat_projects(state::ServerState,
+                            projects::AbstractDict{<:AbstractString,ProjectInfo})
+    out  = open_chat_projects(projects)
+    have = Set(p.id for p in out)
+    live = lock(state.lock) do
+        collect(keys(state.chat_models))
+    end
+    for id in live
+        id in have && continue
+        p = get(projects, id, nothing)
+        p === nothing || push!(out, p)
     end
     return out
 end
@@ -136,6 +189,16 @@ function chat_status(state::ServerState, p::ProjectInfo)
 end
 
 const HOME_ICON = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "icons", "home.svg"))
+
+# Per-PROCESS boot id scoping the sidebar's localStorage last-route memory:
+# a route saved by one server process must not navigate a fresh one. Lazy
+# (Ref filled on first use) — a `const x = uuid4()` would be baked into the
+# precompile image and shared by every process.
+const SERVER_BOOT_ID = Ref("")
+function server_boot_id()
+    isempty(SERVER_BOOT_ID[]) && (SERVER_BOOT_ID[] = string(uuid4())[1:8])
+    return SERVER_BOOT_ID[]
+end
 
 """
     project_sidebar(session, state, current_view) → DOM
@@ -205,7 +268,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # flip mid-turn doesn't require a body re-render.
     body = map(state.chat_signal, state.projects, state.workers) do _, projects, workers
         active_pid = current_view[]
-        open_projs = open_chat_projects(projects)
+        open_projs = open_chat_projects(state, projects)
         sort!(open_projs; by = p -> lowercase(p.name))
 
         entries = Any[sidebar_entry("Home", home_icon, "", "Dashboard";
@@ -239,7 +302,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         DOM.div(entries...; class = "bt-side-list")
     end
 
-    aside = DOM.aside(body; class = "bt-sidebar")
+    aside = DOM.aside(body; class = "bt-sidebar", dataBootId = server_boot_id())
 
     # Delegated click handler: one listener on the aside. A click on a
     # `.bt-side-close` ✕ routes to `close_trigger`; anything else on a
@@ -254,8 +317,15 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # chat instead of getting bounced to home. We only restore IF the entry
     # for that pid exists (worker still has the project) — otherwise fall
     # back to home so a deleted project doesn't strand the user on an empty view.
+    #
+    # The saved value is SCOPED to this server boot ("<boot>|<pid>"): a value
+    # written by a previous server process must not navigate a fresh one (its
+    # chats need a fresh bring-up anyway, and on a shared origin — test runs,
+    # dev servers reusing a port — the stale pid could coincidentally match an
+    # unrelated project of the same name).
     Bonito.onload(session, aside, js"""(el) => {
         const LAST_PID_KEY = 'bt-last-pid';
+        const boot = el.dataset.bootId || '';
         el.addEventListener('click', e => {
             const close = e.target.closest('.bt-side-close');
             if (close) {
@@ -268,26 +338,33 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             if (item) $(current_view).notify(item.dataset.projectId || '');
         });
         // Restore last route on fresh sessions (when soft_close didn't catch us).
-        const saved = localStorage.getItem(LAST_PID_KEY);
-        if (saved) {
+        const saved = localStorage.getItem(LAST_PID_KEY) || '';
+        const sep = saved.indexOf('|');
+        if (sep > 0 && saved.slice(0, sep) === boot) {
+            const pid = saved.slice(sep + 1);
             // Only restore if that sidebar entry exists right now — projects can
             // be deleted while you're away, and we don't want to navigate to a
             // dangling pid (the loading view would show an error).
-            const entry = el.querySelector('.bt-side-item[data-project-id="' + saved.replace(/"/g, '') + '"]');
-            if (entry) $(current_view).notify(saved);
+            const entry = el.querySelector('.bt-side-item[data-project-id="' + pid.replace(/"/g, '') + '"]');
+            if (entry) $(current_view).notify(pid);
         }
     }""")
 
     # Active-highlight swap: when current_view changes, find every
     # sidebar item, toggle .bt-side-active based on data-project-id
     # match. No DOM replacement, no subsession recycling. Also persists the
-    # current pid to localStorage so a hard reconnect (past soft_close window
-    # OR a fresh tab) can restore it via the onload above.
+    # current pid to localStorage (boot-scoped, see above) so a hard
+    # reconnect (past soft_close window OR a fresh tab) can restore it via
+    # the onload above.
     Bonito.onjs(session, current_view, js"""(pid) => {
         document.querySelectorAll('.bt-sidebar .bt-side-item').forEach(el => {
             el.classList.toggle('bt-side-active', el.dataset.projectId === pid);
         });
-        try { localStorage.setItem('bt-last-pid', pid || ''); } catch (e) {}
+        try {
+            const aside = document.querySelector('.bt-sidebar');
+            const boot = aside ? (aside.dataset.bootId || '') : '';
+            localStorage.setItem('bt-last-pid', boot + '|' + (pid || ''));
+        } catch (e) {}
     }""")
 
     # ── Per-entry LED status updates (no body re-render, no polling) ────────
@@ -307,9 +384,12 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         # Snapshot (pid, project) pairs under the lock (T17) so we don't iterate
         # `state.projects[]` across the `chat_status` call (which can yield) while
         # a writer rehashes the dict. `chat_status` then runs on the snapshot.
+        # Same membership as the rendered list (`open_chat_projects(state, …)`):
+        # persisted-interacted OR carrying a live ChatModel.
         pairs = lock(state.lock) do
             [(pid, p) for (pid, p) in state.projects[]
-             if p.title !== nothing || p.resume_session_id !== nothing]
+             if p.title !== nothing || p.resume_session_id !== nothing ||
+                haskey(state.chat_models, pid)]
         end
         new = Dict{String,String}()
         for (pid, p) in pairs
@@ -368,18 +448,19 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-active",
         "border-left-color" => "var(--bt-accent)",
         "background" => "var(--bt-surface-2)"),
-    # Per-entry status LED: a 7px dot tucked into the icon's top-right.
-    # `data-status` picks one of three states. Active blinks; the other
-    # two are flat. Position is relative to the entry so the LED follows
-    # the icon when the entry wraps over two lines on a narrow column.
+    # Per-entry status LED: a 6px dot nestled into the icon's bottom-right
+    # corner. No outline ring — the dot sits ON the colored tile, where any
+    # of the three status colors reads cleanly against it. `data-status`
+    # picks the state; active pulses softly, the other two are flat.
+    # Position is relative to the entry so the LED follows the icon when
+    # the entry wraps over two lines on a narrow column.
     CSS(".bt-side-item", "position" => "relative"),
     CSS(".bt-side-led",
         "position" => "absolute",
-        "top" => "6px", "left" => "32px",
-        "width" => "7px", "height" => "7px",
+        "top" => "30px", "left" => "33px",
+        "width" => "6px", "height" => "6px",
         "border-radius" => "50%",
         "background" => "var(--bt-text-faint)",
-        "box-shadow" => "0 0 0 2px var(--bt-surface)",
         "transition" => "background 120ms"),
     CSS(".bt-side-led[data-status=\"offline\"]",
         "background" => "var(--bt-status-offline)"),    # red — worker down
@@ -392,15 +473,18 @@ const SidebarStyles = Bonito.Styles(
         "background" => "var(--bt-status-active)",      # green
         "animation" => "bt-side-led-pulse 1.1s ease-in-out infinite"),
     CSS("@keyframes bt-side-led-pulse",
-        CSS("0%",   "box-shadow" => "0 0 0 2px var(--bt-surface), 0 0 0 0 rgba(22,163,74,0.55)"),
-        CSS("70%",  "box-shadow" => "0 0 0 2px var(--bt-surface), 0 0 0 6px rgba(22,163,74,0)"),
-        CSS("100%", "box-shadow" => "0 0 0 2px var(--bt-surface), 0 0 0 0 rgba(22,163,74,0)")),
+        CSS("0%",   "box-shadow" => "0 0 0 0 rgba(22,163,74,0.55)"),
+        CSS("70%",  "box-shadow" => "0 0 0 5px rgba(22,163,74,0)"),
+        CSS("100%", "box-shadow" => "0 0 0 0 rgba(22,163,74,0)")),
     CSS(".bt-proj-icon",
         "border-radius" => "8px",
         "color" => "#fff", "font-weight" => "600",
         "text-align" => "center",
         "flex-shrink" => "0",
         "user-select" => "none",
+        # Initials sit on the identicon pattern — a soft shadow keeps them
+        # legible over both the light and dark pattern cells.
+        "text-shadow" => "0 1px 2px rgba(15,23,42,0.45)",
         "font-family" => "'Inter', system-ui, sans-serif",
         # Flex-center the contents so the home <img> sits perfectly in the
         # middle. For initials we still use line-height (set inline by
@@ -506,6 +590,8 @@ const UnifiedShellStyles = Bonito.Styles(
     CSS(".bt-stage",
         "flex" => "1 1 auto", "min-width" => "0",
         "display" => "flex", "flex-direction" => "row",
+        # Positioning context for the narrow-viewport plotpane overlay.
+        "position" => "relative",
         "overflow" => "hidden"),
     # The chat / dashboard column. `flex: 0 1 max` + `margin: 0 auto` ⇒ it caps at
     # `--bt-main-max` and sits centered in the free space when the plotpane is
@@ -540,6 +626,24 @@ const UnifiedShellStyles = Bonito.Styles(
     CSS("@media (max-width: 640px)",
         CSS(":root", "--bt-main-min" => "0px"),
         CSS(".bt-main", "min-width" => "0")),
+
+    # Narrow viewports with the PLOTPANE OPEN: a side-by-side split would
+    # force chat-min + pane-min past the stage and clip the messages. Below
+    # the breakpoint the pane becomes a full-stage OVERLAY instead — the
+    # chat keeps its full width underneath; × / tab-close brings it back.
+    # The divider is meaningless in overlay mode.
+    CSS("@media (max-width: 1100px)",
+        CSS(".bt-plotpane.bt-plotpane-visible",
+            "position" => "absolute", "inset" => "0",
+            "z-index" => "30",
+            "width" => "100%",
+            "border-left" => "none",
+            "box-shadow" => "var(--bt-shadow-lg, 0 8px 32px rgba(0,0,0,0.25))"),
+        CSS(".bt-stage:has(.bt-plotpane.bt-plotpane-visible) .bt-main",
+            "flex" => "0 1 var(--bt-main-max)",
+            "margin" => "0 auto"),
+        CSS(".bt-plotpane-visible .bt-pp-resize",
+            "display" => "none")),
 
     # ── Keep-alive view stack ────────────────────────────────────────────────
     # The dashboard and every opened chat are all mounted at once and stacked on
@@ -777,8 +881,12 @@ const KEEP_ALIVE_CAP = 6
 # collapse state — is preserved across navigation. That preservation IS the
 # "resident per-chat state" requirement: switching chats just hides/shows panes.
 struct ChatPaneRef
-    state :: ServerState
-    pid   :: String
+    state    :: ServerState
+    pid      :: String
+    # The window's plotpane handle, passed down from unified_app via
+    # unified_main. ChatPaneRef is where the per-session ChatModel view is
+    # created, so this is where the window-scoped pane attaches to it.
+    plotpane :: Union{Nothing,PlotPane}
 end
 
 # Render one kept-alive chat pane. The pane is absolutely positioned to fill the
@@ -788,9 +896,17 @@ function Bonito.jsrender(session::Bonito.Session, r::ChatPaneRef)
     model = get(r.state.chat_models, r.pid, nothing)
     # The flex sizing is load-bearing: the chat shell (.bt-app) is height:100%,
     # so the wrapper must be a flex column that fills, or the chat collapses.
-    inner = model === nothing ? DOM.div() :
-        DOM.div(model; style = Styles("flex" => "1 1 auto", "min-height" => "0",
-                                      "display" => "flex", "flex-direction" => "column"))
+    inner = if model === nothing
+        DOM.div()
+    else
+        # Make the per-session view HERE (rather than letting
+        # jsrender(::ChatModel) do it) so the window's plotpane can ride
+        # along — chat command handlers reach it as `model.plotpane`.
+        view = copy(model, session)
+        view.plotpane = r.plotpane
+        DOM.div(view; style = Styles("flex" => "1 1 auto", "min-height" => "0",
+                                     "display" => "flex", "flex-direction" => "column"))
+    end
     pane = DOM.div(inner; class = "bt-chatpane", dataPanePid = r.pid)
     # Self-initialize visibility on mount: a pane the KeyedList adds while its
     # chat is ALREADY the active view must reveal itself (the nav handler ran
@@ -817,7 +933,8 @@ end
 # the `null.bonitoKeyedList` flood — the dashboard's KeyedLists are never torn
 # down mid-update because the dashboard is never unmounted.
 function unified_main(session::Bonito.Session, state::ServerState,
-                      current_view::Observable{String}, ls::LoadingState)
+                      current_view::Observable{String}, ls::LoadingState,
+                      pane::Union{Nothing,PlotPane} = nothing)
     # ── Dashboard pane: rendered ONCE, mounted forever ──────────────────────
     dash_pane = DOM.div(
         dashboard_dom(session, state; current_view = current_view);
@@ -830,7 +947,7 @@ function unified_main(session::Bonito.Session, state::ServerState,
     # drops out of the list ⇒ KeyedList detaches its pane.
     alive = Observable(String[])
     panes = Dict{String,ChatPaneRef}()
-    ref(pid) = get!(() -> ChatPaneRef(state, pid), panes, pid)
+    ref(pid) = get!(() -> ChatPaneRef(state, pid, pane), panes, pid)
     chatpanes_obs = map(alive) do pids
         ChatPaneRef[ref(pid) for pid in pids if haskey(state.chat_models, pid)]
     end
@@ -871,6 +988,16 @@ function unified_main(session::Bonito.Session, state::ServerState,
         keep = vcat(filter(!=(pid), cur), pid)
         length(keep) > KEEP_ALIVE_CAP && (keep = keep[(end - KEEP_ALIVE_CAP + 1):end])
         alive[] = keep
+    end
+    # Closing a chat (✕ → stop_session!) evicts its ChatModel and fires
+    # chat_signal — prune the pane NOW so the dead chat's DOM (and its
+    # embeds) is dropped immediately, not at the next navigation. The
+    # `chatpanes_obs` filter would skip it on the next `alive` change
+    # anyway; this makes the change happen.
+    on(session, state.chat_signal) do _
+        cur = alive[]
+        keep = filter(pid -> haskey(state.chat_models, pid), cur)
+        length(keep) == length(cur) || (alive[] = keep)
     end
 
     container = DOM.div(dash_pane, chats_host, overlay_pane; class = "bt-main-views")
@@ -919,6 +1046,37 @@ function unified_main(session::Bonito.Session, state::ServerState,
     return container
 end
 
+# BonitoTeam logo family (see bonito-logos/README.md for the design notes).
+# The SVG doubles as the favicon — every evergreen browser accepts
+# `<link rel="icon" type="image/svg+xml">`; the 32px PNG is the fallback.
+const LOGO_SVG     = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "logo", "bonitoteam-light.svg"))
+const FAVICON_SVG  = LOGO_SVG
+const FAVICON_PNG  = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "logo", "bonitoteam-light-32.png"))
+
+# Bonito has no first-class favicon hook on App, so inject the <link> tags
+# into <head> on document load. The assets are served by the same hashed
+# asset machinery as everything else — resolved to URL STRINGS here because
+# a raw `Asset` has no msgpack mapping inside interpolated JS.
+function favicon_onload(session::Bonito.Session, node)
+    svg_url = Bonito.url(session, FAVICON_SVG)
+    png_url = Bonito.url(session, FAVICON_PNG)
+    Bonito.onload(session, node, js"""(el) => {
+        const ensure = (rel, type, href) => {
+            let link = document.querySelector(`link[rel="${rel}"]`);
+            if (!link) {
+                link = document.createElement('link');
+                link.rel = rel;
+                document.head.appendChild(link);
+            }
+            if (type) link.type = type;
+            link.href = href;
+        };
+        ensure('icon', 'image/svg+xml', $(svg_url));
+        ensure('apple-touch-icon', '', $(png_url));
+    }""")
+    return node
+end
+
 """
     unified_app(state) → Bonito.App
 
@@ -944,13 +1102,16 @@ function unified_app(state::ServerState)
             safe_notify!(current_view)
         end
         sidebar = project_sidebar(session, view, current_view)
-        main_panel = unified_main(session, view, current_view, ls)
         # Chat-global floating "show-app target" + right-side plotpane column.
         # `Detach` on any bt_show_app bubble moves the embed DOM into the
         # popup (or plotpane, if that was the last location); close → restore
         # to bubble. Drag the popup title bar over the plotpane → docks.
-        # Geometry + location persist per chat to disk.
-        popup, plotpane, popup_controller_js = install_popup!(session, view, current_view)
+        # Geometry + location persist per chat to disk. Built BEFORE
+        # unified_main so the PlotPane handle can be passed down to the chat
+        # panes (ChatPaneRef sets it on each per-session ChatModel view).
+        popup, plotpane, popup_controller_js, pane =
+            install_popup!(session, view, current_view)
+        main_panel = unified_main(session, view, current_view, ls, pane)
         # `.bt-stage` holds the centered chat column AND the plotpane side by side,
         # filling the whole viewport-minus-sidebar. The plotpane being a sibling of
         # `.bt-main` (not nested inside it) is what lets it grow into the right
@@ -975,11 +1136,14 @@ function unified_app(state::ServerState)
             stage,
             popup;
             class = "bt-shell")
-        # Install `window._btPopup` once the shell is in the DOM. The DOM nodes
-        # the controller queries (#bt-popup-mount inside the popup body, and
-        # per-tool #bt-slot-<id> / #bt-embed-<id> in the chat) are all
-        # descendants of the shell, so they're guaranteed present by onload.
+        # Construct the PopupController once the shell is in the DOM: its
+        # interpolated nodes (mounts, dropzone) and the per-tool
+        # #bt-slot-<id> / #bt-embed-<id> pairs it moves between surfaces are
+        # all descendants of the shell, so they're guaranteed present by
+        # onload.
         Bonito.onload(session, shell, popup_controller_js)
+        # Favicon (SVG + PNG fallback) — injected into <head> on load.
+        favicon_onload(session, shell)
         shell
     end
 end

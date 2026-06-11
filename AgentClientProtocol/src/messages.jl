@@ -266,8 +266,11 @@ GenericTool(id::AbstractString, kind::AbstractString, title::AbstractString,
 mutable struct TurnState
     current_message::Union{Message,Nothing}
     tools::Dict{String,ToolCall}
+    # Everything the current text message has received so far — used by
+    # `text!` to drop claude-agent-acp's handoff duplicate (see there).
+    acc::String
 end
-TurnState() = TurnState(nothing, Dict{String,ToolCall}())
+TurnState() = TurnState(nothing, Dict{String,ToolCall}(), "")
 
 # Closing the turn finishes the trailing message and any still-open tools.
 #
@@ -339,11 +342,39 @@ function parse_update!(out, st, u::ToolCallNotif)
     return nothing
 end
 
+# Late rawInput/name: claude-agent-acp STREAMS tool input, so the initial
+# `tool_call` frequently arrives with an empty (or partial) `rawInput`; the
+# complete arguments ride a later `tool_call_update`. Merge them into the
+# tracked call so snapshot consumers (BonitoTeam's code preview, timeout
+# badge, path hints, the taskbar's background flag) see the real arguments
+# instead of the empty stub. `GenericTool`/`MCPCall` keep the raw dict; the
+# typed variants re-extract the fields they pulled out at build time.
+merge_late_input!(::ToolCall, ::AbstractDict) = nothing
+merge_late_input!(tc::GenericTool, ri::AbstractDict) = (merge!(tc.raw_input, ri); nothing)
+merge_late_input!(tc::MCPCall,     ri::AbstractDict) = (merge!(tc.raw_input, ri); nothing)
+function merge_late_input!(tc::BashCall, ri::AbstractDict)
+    haskey(ri, "command") && (tc.command = String(ri["command"]))
+    haskey(ri, "run_in_background") &&
+        (tc.run_in_background = ri["run_in_background"] === true)
+    haskey(ri, "description") && (tc.description = _opt_str(ri["description"]))
+    return nothing
+end
+function merge_late_input!(tc::TaskCall, ri::AbstractDict)
+    haskey(ri, "description") && (tc.description = String(ri["description"]))
+    haskey(ri, "prompt")      && (tc.prompt      = String(ri["prompt"]))
+    haskey(ri, "run_in_background") &&
+        (tc.run_in_background = ri["run_in_background"] === true)
+    haskey(ri, "name") && (tc.task_name = _opt_str(ri["name"]))
+    return nothing
+end
+
 function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never touches the text bubble
     tc = get(st.tools, u.tool_call_id, nothing)
     tc === nothing && return nothing
     u.status !== nothing && (tc.status = u.status)
     u.title  !== nothing && (tc.title  = u.title)
+    u.raw_input === nothing || merge_late_input!(tc, u.raw_input)
+    u.tool_name === nothing || !(tc isa GenericTool) || (tc.name = u.tool_name)
     isempty(u.content) || (tc.content = Vector{ToolContent}(u.content))
     push_snapshot!(tc.updates, tc)
     is_terminal(tc.status) && (close(tc); delete!(st.tools, tc.id))
@@ -368,10 +399,19 @@ parse_update!(::Any, ::Any, ::SessionUpdate) = nothing   # UnknownUpdate: ignore
 function text!(out, st, ::Type{T}, text) where {T<:Message}
     text === nothing && return nothing               # non-text / empty replay thought
     if st.current_message isa T
+        # Steering-handoff duplicate (claude-agent-acp 0.44.0): text that
+        # streamed while the PREVIOUS prompt's loop was still active gets
+        # re-forwarded as one assembled block by the next prompt's loop (its
+        # stream-dedup sets are per-loop). Shape: a single chunk that equals
+        # EVERYTHING this message already received — drop it. (Observed live:
+        # chunks "", "HELLO", then a duplicate "HELLO".)
+        text == st.acc && !isempty(st.acc) && return nothing
         append!(st.current_message, text)
+        st.acc *= text
     else
         st.current_message === nothing || close(st.current_message)
         st.current_message = T(text)
+        st.acc = String(text)
         put!(out, st.current_message)                # delivered seeded with the first chunk
     end
     return nothing

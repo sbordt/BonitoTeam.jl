@@ -107,13 +107,22 @@ mutable struct Connection
     # (see `notify_frame`).
     on_frame::Union{Function,Nothing}
 
-    # The currently-active prompt turn. `prompt_updates` sets these; the
-    # dispatcher feeds `session/update` notifications into `active_updates`
-    # and closes it when the matching `session/prompt` response (id ==
-    # `active_id`) arrives. `nothing` between turns. Only one prompt is in
-    # flight per session, so a single slot suffices.
-    active_updates::Union{Channel{SessionUpdate},Nothing}
-    active_id::Union{Int,Nothing}
+    # The in-flight streaming turns, OLDEST FIRST. `prompt_updates` appends;
+    # the dispatcher feeds every `session/update` into the FIRST entry's
+    # channel and closes + removes an entry when its response arrives.
+    #
+    # More than one entry is a real, supported state: claude-agent-acp lets a
+    # second `session/prompt` be sent while one is running — the agent
+    # injects the new user message into the live turn (steering) and, when
+    # the SDK replays it, resolves the FIRST prompt with end_turn and hands
+    # the stream to the second (`pendingMessages`/`handedOff` upstream). This
+    # is also the ONLY way to get a turn back from the SDK's
+    # background-shell state: with a live background task the SDK never goes
+    # idle, so the active prompt never resolves on its own — the next prompt
+    # is what releases it. Oldest-first update routing matches the handoff
+    # contract: everything streamed before prompt N's response belongs to
+    # turn N.
+    active_turns::Vector{Pair{Int,Channel{SessionUpdate}}}
 
     # Single inbox for EVERY inbound frame (notifications, requests,
     # responses). `reader_loop` parses each WS line into a raw JSON-RPC
@@ -171,7 +180,7 @@ function Connection(transport::Transport, handler::Handler = DiscardHandler();
                       Dict{Int,Channel{Any}}(), 0,
                       handler,
                       on_frame,
-                      nothing, nothing,          # active_updates, active_id
+                      Pair{Int,Channel{SessionUpdate}}[],   # active_turns
                       Channel{Any}(1024),
                       ReentrantLock(), nothing, nothing, false,
                       false,                     # cancelling
@@ -223,9 +232,10 @@ function dispatcher_loop(conn::Connection)
         # ever feed (A1/A2).
         lock(conn.lock) do
             conn.closed = true
-            conn.active_updates === nothing || close(conn.active_updates)
-            conn.active_updates = nothing
-            conn.active_id = nothing
+            for (_, ch) in conn.active_turns
+                close(ch)
+            end
+            empty!(conn.active_turns)
             for (_, ch) in conn.pending
                 put!(ch, ConnectionClosed())
             end
@@ -247,18 +257,16 @@ function register_pending!(conn::Connection, id::Int, ch::Channel)
     return nothing
 end
 
-# Same, but also claims the single streaming-turn slot. Errors if a turn is
-# already active (A8: a second concurrent turn would orphan the first
-# consumer) or if the connection is closed.
+# Same, but also enrolls the request in the streaming-turn queue (oldest
+# first). Concurrent turns are deliberate — see the `active_turns` field doc:
+# a prompt sent while one runs is the agent's steering/handoff mechanism, and
+# the only way to free a turn the SDK holds open for a background shell.
 function register_turn!(conn::Connection, id::Int,
                         response::Channel, updates::Channel)
     lock(conn.lock) do
         conn.closed && throw(ConnectionClosed("connection torn down"))
-        conn.active_updates === nothing ||
-            error("ACP: a prompt turn is already in flight; cancel or await it first")
-        conn.pending[id]    = response
-        conn.active_updates = updates
-        conn.active_id      = id
+        conn.pending[id] = response
+        push!(conn.active_turns, id => updates)
     end
     return nothing
 end
@@ -368,8 +376,10 @@ end
 #   * `response` - a one-shot channel that receives the result (or a
 #                  ConnectionClosed on teardown), so the caller can detect a
 #                  dead session after draining `updates`.
-# Only one such request may be in flight per connection at a time — true here:
-# bring-up's `session/load` completes before the prompt consumer is started.
+# Concurrent streaming requests are supported (see `active_turns`): updates
+# route to the oldest unresolved one, matching claude-agent-acp's handoff
+# contract. (`session/load` still never overlaps a prompt in practice —
+# bring-up completes before the prompt consumer starts.)
 function request_updates(conn::Connection, method::String, params)
     @atomic conn.cancelling = false   # fresh turn renders normally
     @atomic conn.cancel_at  = 0.0     # fresh turn: no cancel recorded yet
@@ -433,20 +443,24 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
             # ACP wraps the actual update object under "update" key
             update_obj = get(params, "update", params)
             update = parse_session_update(update_obj)
-            # Belongs to the active request that streams (session/prompt or
-            # session/load); deliver to its stream. If none is active (the agent
-            # shouldn't stream otherwise), drop it.
+            # Belongs to the OLDEST in-flight streaming request (session/prompt
+            # or session/load): everything the agent streams before prompt N's
+            # response is turn N's content (the handoff contract — see
+            # `active_turns`). If none is active (the agent shouldn't stream
+            # otherwise), drop it.
             #
             # DROP the moment cancel is requested. This single dispatcher task
             # processes the inbox strictly in order, so if it BLOCKS here on
-            # `put!` into a backed-up `active_updates` (slow browser / heavy token
+            # `put!` into a backed-up updates channel (slow browser / heavy token
             # or tool-call stream), it can never reach the `cancelled` response
             # sitting behind the backlog — the turn would look wedged for as long
             # as the browser takes to drain. Once cancel is requested we don't
             # render any more of this turn anyway (the consumer fast-discards),
             # so dropping here keeps the dispatcher free to reach the response
             # immediately, regardless of downstream speed.
-            ch = lock(() -> conn.active_updates, conn.lock)
+            ch = lock(conn.lock) do
+                isempty(conn.active_turns) ? nothing : last(first(conn.active_turns))
+            end
             if ch !== nothing && !(@atomic conn.cancelling)
                 deliver_update!(ch, update)
             end
@@ -467,10 +481,10 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
         # register concurrently, so an unlocked get/delete here could miss an
         # entry mid-insert and hang the caller forever.
         ch = lock(conn.lock) do
-            if id == conn.active_id
-                conn.active_updates === nothing || close(conn.active_updates)
-                conn.active_updates = nothing
-                conn.active_id = nothing
+            i = findfirst(t -> first(t) == id, conn.active_turns)
+            if i !== nothing
+                close(last(conn.active_turns[i]))
+                deleteat!(conn.active_turns, i)
             end
             c = get(conn.pending, id, nothing)
             c === nothing || delete!(conn.pending, id)

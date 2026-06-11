@@ -88,9 +88,17 @@ try
         record("header marked expanded", @TH.test_eq expanded "true")
     end
 
-    TH.section("Tool body collapses on second click") do
-        TH.dom_click(ctx, ".bt-tool-header")
-        record("body cleared after collapse",
+    TH.section("Tool body collapses via the ▼ arrow only") do
+        # While EXPANDED, a click elsewhere on the dense header (near the
+        # small ⊗/⤢/» buttons) must NOT slam the body shut — only the
+        # disclosure arrow collapses (review item: accidental collapses).
+        TH.dom_click(ctx, ".bt-tool-summary")
+        sleep(0.2)
+        record("header click elsewhere does NOT collapse",
+               @TH.test_eq TH.eval_js(ctx,
+                   "document.querySelector('.bt-tool-header').dataset.expanded") "true")
+        TH.dom_click(ctx, ".bt-tool-toggle")
+        record("body cleared after arrow collapse",
                @TH.test_true TH.wait_for(ctx,
                    "document.querySelector('.bt-tool-body').innerHTML === ''"; timeout = 2.0))
         expanded = TH.eval_js(ctx, "document.querySelector('.bt-tool-header').dataset.expanded")

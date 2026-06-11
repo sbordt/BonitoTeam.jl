@@ -2,6 +2,8 @@
 # against the unified shell.
 isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
+using BonitoTeam
+
 state = TH.make_state(; n_workers = 1, n_projects = 2)
 
 # Seed a ChatModel for p-1 with the mock factory BEFORE opening the window so
@@ -24,9 +26,11 @@ try
         record("shell exists",       @TH.test_true TH.dom_exists(ctx, ".bt-shell"))
         record("sidebar exists",     @TH.test_true TH.dom_exists(ctx, ".bt-sidebar"))
         record("home icon present",  @TH.test_true TH.dom_exists(ctx, ".bt-side-home-icon"))
-        record("project icon count", @TH.test_eq   TH.dom_count(ctx, ".bt-proj-icon")  2)
-        # Two side items (1 home + 2 projects) under the visible nav.
-        record("side item count",    @TH.test_eq   TH.dom_count(ctx, ".bt-side-item")   3)
+        # The sidebar lists OPEN chats (persisted-interacted or live
+        # ChatModel), not every registered project: p-1 has a live model,
+        # p-2 is pristine → exactly ONE project icon + the Home entry.
+        record("project icon count", @TH.test_eq   TH.dom_count(ctx, ".bt-proj-icon")  1)
+        record("side item count",    @TH.test_eq   TH.dom_count(ctx, ".bt-side-item")   2)
     end
 
     TH.section("Sidebar geometry — desktop") do
@@ -72,7 +76,7 @@ try
         # project's id and mount the chat (we seeded the ChatModel up top).
         TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[$p1_idx].click()""")
         record("chat mounts on click",
-               @TH.test_true TH.wait_for(ctx, "document.querySelector('.bt-app') !== null"))
+               @TH.test_true TH.wait_for(ctx, "document.querySelector('.bt-app') !== null"; timeout = 15.0))
     end
 
     TH.section("Chat panel layout") do
@@ -83,16 +87,21 @@ try
         record("send button",     @TH.test_true TH.dom_exists(ctx, ".bt-send-btn"))
         record("stop button",     @TH.test_true TH.dom_exists(ctx, ".bt-stop-btn"))
 
-        # Geometry sanity: the input area sits at the bottom of the .bt-app.
-        # If the layout regressed (input floating mid-page), input.top would
-        # be ~half of app height; correct layout puts input.bottom ≈ app.bottom.
-        app   = TH.dom_rect(ctx, ".bt-app")
-        input = TH.dom_rect(ctx, ".bt-input-area")
-        gap   = app["bottom"] - input["bottom"]
+        # Geometry sanity: the composer block sits at the bottom of .bt-app.
+        # The bottom-most element is the per-type display toolbar
+        # (.bt-chat-toolbar, populated client-side; min-height 38px even when
+        # empty), with the input area directly above it. If the layout
+        # regressed (input floating mid-page), input.top would be ~half of
+        # app height.
+        app     = TH.dom_rect(ctx, ".bt-app")
+        input   = TH.dom_rect(ctx, ".bt-input-area")
+        toolbar = TH.dom_rect(ctx, ".bt-chat-toolbar")
         record("app fills .bt-main",
                @TH.test_true abs(TH.dom_rect(ctx, ".bt-main")["h"] - app["h"]) < 2)
-        record("input pinned at bottom (gap < 8px)",
-               @TH.test_true gap < 8)
+        record("toolbar pinned at bottom (gap < 8px)",
+               @TH.test_true app["bottom"] - toolbar["bottom"] < 8)
+        record("input sits directly above the toolbar",
+               @TH.test_true abs(toolbar["top"] - input["bottom"]) < 8)
 
         msgs = TH.dom_rect(ctx, ".bt-messages")
         record("messages occupies > 50% of app height",

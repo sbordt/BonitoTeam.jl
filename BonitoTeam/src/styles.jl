@@ -95,6 +95,31 @@ const ChatStyles = Bonito.Styles(
         "min-width" => "0", "overflow" => "hidden",
         "text-overflow" => "ellipsis", "white-space" => "nowrap",
         "flex" => "0 1 auto"),
+    # Inline-editable variant (an <input> over ProjectInfo.title). Reads as
+    # plain title text until clicked; hover/focus surface a soft field so the
+    # editability is discoverable. Same pattern as the worker-name edit on
+    # the dashboard cards. Needs an explicit flex-grow + cap: an input has no
+    # intrinsic text width, so without it the field collapses/overflows.
+    CSS("input.bt-header-title-edit",
+        "appearance" => "none",
+        "border" => "none",
+        "background" => "transparent",
+        "color" => "inherit",
+        "font" => "inherit",
+        "font-weight" => "600",
+        "outline" => "none",
+        "padding" => "2px 6px",
+        "margin" => "-2px -6px",
+        "border-radius" => "var(--bt-radius-sm)",
+        "flex" => "1 1 auto",
+        "max-width" => "420px",
+        "cursor" => "text",
+        "transition" => "background 80ms, box-shadow 80ms"),
+    CSS("input.bt-header-title-edit:hover",
+        "background" => "var(--bt-surface-2)"),
+    CSS("input.bt-header-title-edit:focus",
+        "background" => "var(--bt-surface-2)",
+        "box-shadow" => "inset 0 0 0 1px var(--bt-border-strong)"),
     CSS(".bt-header-cwd",
         "font-family" => "ui-monospace, monospace", "font-size" => "12px",
         "color" => "var(--bt-text-muted)", "font-weight" => "400",
@@ -107,13 +132,13 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "12px", "padding" => "4px 10px",
         "border-radius" => "6px",
         "cursor" => "pointer",
-        # Stable width: per-file progress labels can be long ("Sending
-        # 137/999: src/some/long/path/file.jl"); without a min-width the
-        # header reflows on every file. min-width pins the steady-state
-        # idle "Sync" label area, max-width caps so a wildly long path
-        # gets truncated rather than blowing out the header. tabular-nums
-        # keeps digit columns the same width so the counter doesn't dance.
-        "min-width" => "260px", "max-width" => "360px",
+        # Compact: the idle label is just "Sync". While a sync runs, the
+        # label switches to a short, COMPACTED progress string (the Julia
+        # side truncates it — see `compact_sync_label`); the full per-file
+        # message rides on the title attribute. max-width caps the syncing
+        # state so the header never reflows wildly; tabular-nums keeps
+        # digit columns stable so the counter doesn't dance.
+        "max-width" => "220px",
         "text-align" => "left",
         "white-space" => "nowrap",
         "overflow" => "hidden",
@@ -342,7 +367,6 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-thought-summary",
         "padding" => "8px 12px",
         "cursor" => "pointer",
-        "user-select" => "none",
         "list-style" => "none",
         "font-size" => "13px",
         "display" => "flex", "align-items" => "center", "gap" => "6px"),
@@ -411,47 +435,43 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-tool-detach:hover",
         "background" => "var(--bt-surface-2)",
         "color" => "var(--bt-accent)"),
-    # Full-chat-width toggle, vertically centered on the bubble's RIGHT edge.
-    # Hidden by default; revealed only while the tool body is expanded (the
-    # sibling rule below) — there's nothing to widen on a collapsed header.
+    # Full-chat-width toggle — a slim, quiet header button (same chrome as the
+    # ⤢ detach button), NOT an overlay floating over the body: an absolutely
+    # positioned button covered the actual app/diff content and looked bulky.
+    # Hidden by default; revealed only while the tool body is expanded —
+    # there's nothing to widen on a collapsed header.
     CSS(".bt-tool-fullwidth",
         "display" => "none",
-        "position" => "absolute", "right" => "4px", "top" => "50%",
-        "transform" => "translateY(-50%)",
-        "z-index" => "3",
-        "align-items" => "center", "justify-content" => "center",
-        "width" => "22px", "height" => "30px",
-        "background" => "var(--bt-surface-2)",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius-sm)",
+        "background" => "transparent",
+        "border" => "none",
+        "padding" => "2px 6px",
         "cursor" => "pointer",
-        "color" => "var(--bt-text-muted)",
+        "color" => "var(--bt-text-faint)",
         "font-size" => "13px", "line-height" => "1",
-        "opacity" => "0.55",
-        "transition" => "opacity 80ms, background 80ms, color 80ms"),
+        "border-radius" => "var(--bt-radius-sm)",
+        "flex-shrink" => "0",
+        "user-select" => "none",
+        "transition" => "background 80ms, color 80ms"),
     CSS(".bt-tool-fullwidth:hover",
-        "opacity" => "1", "background" => "var(--bt-surface)",
+        "background" => "var(--bt-surface-2)",
         "color" => "var(--bt-accent)"),
-    # Reveal the full-width toggle only while the body is expanded. `~` reaches
-    # the button (a later sibling of the header) once Collapsable flips
-    # `data-expanded="true"` on the header.
-    CSS(".bt-tool-header[data-expanded=\"true\"] ~ .bt-tool-fullwidth",
-        "display" => "flex"),
+    # Reveal the full-width toggle only while the body is expanded
+    # (Collapsable flips `data-expanded` on the header it lives in).
+    CSS(".bt-tool-header[data-expanded=\"true\"] .bt-tool-fullwidth",
+        "display" => "inline-flex"),
+    # NOTE: deliberately NO `user-select: none` here — every piece of text in
+    # the app should be selectable + copyable (file paths especially). The
+    # browser treats a drag-select as a drag (not a click), so the
+    # expand-on-click handler still fires only on real clicks.
     CSS(".bt-tool-header",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "padding" => "8px 12px",
         "cursor" => "pointer",
-        "user-select" => "none",
         "transition" => "background 80ms"),
-    # The title (and summary, and MCP server badge) carry the actual content
-    # the user wants to grab — Read shows the file path here, Edit the path,
-    # MCP tools their server name. Override the header's `user-select: none`
-    # so a drag-select copies the path. The icon / status badge / toggle
-    # stay non-selectable so click-to-expand isn't confused by stray drags.
-    # The browser treats a drag-select as a drag (not a click), so the
-    # expand-on-click handler still fires only on real clicks.
+    # The title / summary / server badge carry the actual content the user
+    # wants to grab — show a text cursor there so the affordance is obvious.
     CSS(".bt-tool-title, .bt-tool-summary, .bt-tool-server",
-        "user-select" => "text", "cursor" => "text"),
+        "cursor" => "text"),
     CSS(".bt-tool-header:hover",
         "background" => "var(--bt-surface-2)"),
     # The expand/collapse glyph (`▶` / `▼`) is swapped directly in JS
@@ -460,7 +480,17 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-tool-toggle",
         "color" => "var(--bt-text-faint)", "font-size" => "11px",
         "flex-shrink" => "0",
-        "width" => "10px"),
+        # The disclosure glyph is chrome, not content — keep it out of
+        # drag-selections (the header text itself IS selectable).
+        "user-select" => "none",
+        # While EXPANDED this glyph is the ONLY collapse control (see
+        # Collapsable's click handler) — give it a real hit area.
+        "padding" => "6px 8px",
+        "margin" => "-6px -2px -6px -8px",
+        "border-radius" => "var(--bt-radius-sm)"),
+    CSS(".bt-tool-header[data-expanded=\"true\"] .bt-tool-toggle:hover",
+        "background" => "var(--bt-surface-2)",
+        "color" => "var(--bt-accent)"),
     CSS(".bt-tool-kind",
         "font-size" => "13px", "flex-shrink" => "0"),
     # MCP server badge — dim pill before the tool name (e.g. "btworker").
@@ -538,23 +568,28 @@ const ChatStyles = Bonito.Styles(
     # No background or border on the container — each slot is a free-floating
     # capsule with its own surface, so multiple slots read as a stack rather
     # than a bordered widget.
+    # Positioning context shared by the messages area and the floating
+    # taskbar: the wrapper takes over the messages' flex role so the taskbar
+    # anchors below the (variable-height) header, over the messages.
+    CSS(".bt-messages-wrap",
+        "position" => "relative",
+        "flex" => "1 1 0", "min-height" => "0",
+        "display" => "flex", "flex-direction" => "column"),
     CSS(".bt-taskbar",
         "position" => "absolute",
         "top" => "8px", "left" => "8px",
         "z-index" => "6",
-        "display" => "flex", "flex-direction" => "column",
-        "gap" => "6px",
         "pointer-events" => "none",   # slots re-enable so we don't catch the messages scroll
-        "max-width" => "260px"),
-    CSS(".bt-taskbar:empty",
-        "display" => "none"),
-
-    # One slot per live tool/todo. Capsule shape, accent-tinted; click jumps
-    # back to the source bubble via scrollIntoView (set in bonitoteam.js).
+        "max-width" => "280px"),
+    CSS(".bt-taskbar-slots",
+        "display" => "flex", "flex-direction" => "column",
+        "gap" => "6px"),
+    # One slot per live tool. Capsule shape, accent-tinted; click jumps back
+    # to the source bubble (virtual-scroller index jump in bonitoteam.js).
     CSS(".bt-taskbar-slot",
         "pointer-events" => "auto",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
-        "padding" => "4px 10px",
+        "padding" => "4px 6px 4px 10px",
         "border-radius" => "999px",
         "background" => "var(--bt-surface)",
         "border" => "1px solid rgba(59,130,246,0.42)",
@@ -562,7 +597,6 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "11.5px",
         "color" => "var(--bt-text)",
         "cursor" => "pointer",
-        "user-select" => "none",
         "max-width" => "100%",
         "white-space" => "nowrap",
         "transition" => "background 80ms, transform 80ms"),
@@ -579,23 +613,185 @@ const ChatStyles = Bonito.Styles(
         "font-family" => "ui-monospace, monospace",
         "font-size" => "10.5px",
         "color" => "var(--bt-accent)"),
-    # Stop affordance — visible on slot-hover. A click sends `stop_tool`
-    # over comm; `StopToolCommand` translates that into a synthetic user
-    # message asking Claude to stop the bash/task. Honest UX: the slot
-    # keeps pulsing until the tool reports terminal status (we don't lie
-    # with a "Stopping…" state that the SDK can't guarantee).
-    CSS(".bt-taskbar-slot-stop",
-        "opacity" => "0",
+
+    # The live-todo panel: a left-aligned CARD, not a capsule — selector
+    # carries both classes so these rules outweigh the base slot rules
+    # regardless of order. Every item gets a ✓/▸/○ marker; finished entries
+    # crossed out, the active one accented.
+    CSS(".bt-taskbar-slot.bt-taskbar-todo",
+        "flex-direction" => "column",
+        "align-items" => "stretch",
+        "text-align" => "left",
+        "gap" => "4px",
+        "border-radius" => "10px",
+        "padding" => "7px 10px",
+        "min-width" => "210px",
+        "cursor" => "default"),
+    CSS(".bt-taskbar-slot.bt-taskbar-todo:hover",
+        "background" => "var(--bt-surface)",
+        "transform" => "none"),
+    CSS(".bt-taskbar-todo-head",
+        "display" => "flex", "align-items" => "center", "gap" => "6px",
+        "font-weight" => "600"),
+    CSS(".bt-taskbar-todo-item",
+        "font-size" => "11.5px",
+        "color" => "var(--bt-text-muted)",
+        "white-space" => "nowrap",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis"),
+    CSS(".bt-taskbar-todo-item::before",
+        "content" => "'○ '",
+        "display" => "inline-block",
+        "width" => "15px",
+        "color" => "var(--bt-text-faint)"),
+    CSS(".bt-taskbar-todo-item.bt-todo-active",
+        "color" => "var(--bt-text)",
+        "font-weight" => "600"),
+    CSS(".bt-taskbar-todo-item.bt-todo-active::before",
+        "content" => "'▸ '",
+        "color" => "var(--bt-accent)"),
+    CSS(".bt-taskbar-todo-item.bt-todo-done",
+        "text-decoration" => "line-through",
+        "opacity" => "0.55"),
+    CSS(".bt-taskbar-todo-item.bt-todo-done::before",
+        "content" => "'✓ '",
+        "color" => "var(--bt-success, #16a34a)"),
+
+    # Mini stop button — the composer stop button's little sibling, shared
+    # by taskbar slots and live tool pills: bordered circle, red rounded
+    # square drawn via ::before. ALWAYS visible (no hover reveal — a stop
+    # affordance you have to hunt for is not an affordance).
+    CSS(".bt-stop-mini",
+        "display" => "inline-flex",
+        "align-items" => "center", "justify-content" => "center",
+        "width" => "20px", "height" => "20px",
+        "box-sizing" => "border-box",
         "flex-shrink" => "0",
-        "color" => "var(--bt-text-faint)",
-        "border-radius" => "999px",
-        "padding" => "0 4px",
+        "padding" => "0",
+        "border-radius" => "50%",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border-strong)",
         "cursor" => "pointer",
-        "transition" => "opacity 80ms, color 80ms"),
-    CSS(".bt-taskbar-slot:hover .bt-taskbar-slot-stop",
-        "opacity" => "1"),
-    CSS(".bt-taskbar-slot-stop:hover",
-        "color" => "var(--bt-error)"),
+        "transition" => "background 120ms, border-color 120ms"),
+    CSS(".bt-stop-mini::before",
+        "content" => "''",
+        "width" => "8px", "height" => "8px",
+        "border-radius" => "2px",
+        "background" => "var(--bt-error)"),
+    CSS(".bt-stop-mini:hover",
+        "background" => "rgba(239,68,68,0.08)",
+        "border-color" => "var(--bt-error)"),
+
+    # ── Eval extras (bt_julia_eval family) ──────────────────────────────────
+    # Timeout badge: small mono hint next to the timer so the soft-checkpoint
+    # cadence is visible at a glance.
+    CSS(".bt-tool-timeout",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "10.5px",
+        "color" => "var(--bt-text-faint)",
+        "flex-shrink" => "0",
+        "white-space" => "nowrap"),
+    # Per-pill stop (shares .bt-stop-mini for the look). Hidden until the
+    # pill is live — stopping a finished tool is meaningless.
+    CSS(".bt-tool-stop",
+        "display" => "none",
+        "user-select" => "none"),
+    CSS(".bt-tool-msg.bt-tool-live .bt-tool-stop",
+        "display" => "inline-flex"),
+    # File-path links — tool titles with a file, diff headers, search hits,
+    # path-looking code spans in agent messages. Quiet dotted underline as
+    # the standing affordance; full link treatment on hover. One delegated
+    # listener in bonitoteam.js opens them in the plotpane editor.
+    CSS(".bt-path-link",
+        "cursor" => "pointer",
+        "text-decoration" => "underline dotted",
+        "text-decoration-color" => "var(--bt-text-faint)",
+        "text-underline-offset" => "3px"),
+    CSS(".bt-path-link:hover",
+        "color" => "var(--bt-accent)",
+        "text-decoration" => "underline",
+        "text-decoration-color" => "var(--bt-accent)"),
+
+    # ── Plotpane file editor ─────────────────────────────────────────────────
+    # Editable Monaco over a project file, mounted into #bt-plotpane-mount by
+    # `EditFileCommand`. Fills the pane; the header carries the path, a save
+    # status line, and the Save button.
+    CSS(".bt-file-editor",
+        "display" => "flex", "flex-direction" => "column",
+        "height" => "100%", "min-height" => "0"),
+    CSS(".bt-file-editor-header",
+        "display" => "flex", "align-items" => "center", "gap" => "10px",
+        "padding" => "6px 10px",
+        "border-bottom" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface-2)",
+        "flex-shrink" => "0"),
+    CSS(".bt-file-editor-path",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "11.5px",
+        "color" => "var(--bt-text-muted)",
+        "flex" => "1 1 auto", "min-width" => "0",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "white-space" => "nowrap",
+        # Path truncates from the LEFT so the filename (the part that
+        # matters) stays visible.
+        "direction" => "rtl", "text-align" => "left"),
+    CSS(".bt-file-editor-status",
+        "font-size" => "11px",
+        "color" => "var(--bt-text-faint)",
+        "flex-shrink" => "0",
+        "white-space" => "nowrap"),
+    CSS(".bt-file-editor-body",
+        "flex" => "1 1 auto", "min-height" => "0",
+        "overflow" => "hidden"),
+    # The Monaco wrapper chain must pass full height down to the editor div.
+    CSS(".bt-file-editor-body > div, .bt-file-editor-body .monaco-editor-div",
+        "height" => "100%", "min-height" => "0"),
+    # Live code preview: the code a running bt_julia_eval is executing,
+    # painted under the header BEFORE any result exists. Compact by default
+    # (capped height + bottom fade), the ⌄ toggle grows it — same
+    # small-preview → enlarge interaction as the diff view. Removed when the
+    # eval completes (the body's Monaco "Code" section takes over).
+    CSS(".bt-eval-preview",
+        "position" => "relative",
+        "border-top" => "1px solid var(--bt-border)",
+        "background" => "#0f172a",
+        "max-height" => "132px",
+        "overflow" => "hidden"),
+    CSS(".bt-eval-preview pre",
+        "margin" => "0",
+        "padding" => "8px 12px",
+        "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
+        "font-size" => "12px", "line-height" => "1.5",
+        "color" => "#e2e8f0",
+        "white-space" => "pre-wrap", "word-break" => "break-word"),
+    # Bottom fade hints that the preview is clipped; gone when enlarged.
+    CSS(".bt-eval-preview::after",
+        "content" => "\"\"",
+        "position" => "absolute",
+        "left" => "0", "right" => "0", "bottom" => "0",
+        "height" => "28px",
+        "pointer-events" => "none",
+        "background" => "linear-gradient(to bottom, rgba(15,23,42,0), rgba(15,23,42,0.92))"),
+    CSS(".bt-eval-preview.bt-eval-preview-full",
+        "max-height" => "600px",
+        "overflow-y" => "auto"),
+    CSS(".bt-eval-preview.bt-eval-preview-full::after",
+        "display" => "none"),
+    CSS(".bt-eval-preview-toggle",
+        "position" => "absolute",
+        "right" => "6px", "bottom" => "4px",
+        "z-index" => "2",
+        "background" => "rgba(255,255,255,0.08)",
+        "border" => "1px solid rgba(255,255,255,0.15)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "color" => "#e2e8f0",
+        "font-size" => "12px", "line-height" => "1",
+        "padding" => "2px 8px",
+        "cursor" => "pointer",
+        "user-select" => "none",
+        "transition" => "background 80ms"),
+    CSS(".bt-eval-preview-toggle:hover",
+        "background" => "rgba(255,255,255,0.18)"),
 
     CSS(".bt-tool-body",
         "padding" => "0 12px 10px",
@@ -643,7 +839,7 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-subsection-summary",
         "display" => "flex", "align-items" => "baseline", "gap" => "8px",
         "padding" => "6px 10px",
-        "cursor" => "pointer", "user-select" => "none",
+        "cursor" => "pointer",
         "list-style" => "none",
         "background" => "var(--bt-surface-2)"),
     CSS(".bt-subsection-summary::-webkit-details-marker", "display" => "none"),
@@ -856,6 +1052,12 @@ const ChatStyles = Bonito.Styles(
         "transition" => "height 150ms ease, padding 150ms ease"),
     CSS(".bt-busy.bt-busy-active",
         "height" => "28px", "padding" => "4px 0"),
+    # While a thought is streaming, the "reasoning…" line is the liveness
+    # indicator — showing the dots too is redundant. The suppress class is
+    # toggled from `onThinking` (bonitoteam.js); declared AFTER the active
+    # rule so the tie at equal specificity resolves to suppressed.
+    CSS(".bt-busy.bt-busy-suppressed",
+        "height" => "0", "padding" => "0"),
     CSS(".bt-busy-dot",
         "width" => "7px", "height" => "7px", "border-radius" => "50%",
         "background" => "var(--bt-accent)",
@@ -911,6 +1113,79 @@ const ChatStyles = Bonito.Styles(
         "color" => "var(--bt-text-faint)",
         "font-style" => "italic", "font-size" => "12px",
         "padding" => "4px 0"),
+
+    # ── Permission / question card ───────────────────────────────────────────
+    # Interactive card for `session/request_permission` (AskUserQuestion, plan
+    # approval, …): the question + one real button per option. Plain scroll
+    # content under the last message (see onPermission in bonitoteam.js).
+    CSS(".bt-permission-card",
+        "flex-shrink" => "0",
+        "align-self" => "flex-start",
+        "max-width" => "min(85%, 760px)",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-accent)",
+        "border-radius" => "var(--bt-radius)",
+        "padding" => "12px 14px",
+        "box-shadow" => "var(--bt-shadow-md)",
+        "display" => "flex", "flex-direction" => "column", "gap" => "10px"),
+    CSS(".bt-permission-question",
+        "font-size" => "14px", "line-height" => "1.5",
+        "font-weight" => "500",
+        "color" => "var(--bt-text)"),
+    CSS(".bt-permission-options",
+        "display" => "flex", "flex-wrap" => "wrap", "gap" => "8px"),
+    CSS(".bt-permission-btn",
+        "appearance" => "none",
+        "border" => "1px solid var(--bt-border-strong)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
+        "font-size" => "13px", "font-weight" => "500",
+        "padding" => "6px 14px",
+        "border-radius" => "999px",
+        "cursor" => "pointer",
+        "transition" => "background 80ms, border-color 80ms, color 80ms"),
+    CSS(".bt-permission-btn:hover",
+        "border-color" => "var(--bt-accent)",
+        "color" => "var(--bt-accent)",
+        "background" => "rgba(59,130,246,0.06)"),
+    CSS(".bt-permission-btn.bt-perm-allow:hover",
+        "border-color" => "var(--bt-success)", "color" => "#047857",
+        "background" => "rgba(16,185,129,0.08)"),
+    CSS(".bt-permission-btn.bt-perm-reject:hover",
+        "border-color" => "var(--bt-error)", "color" => "#b91c1c",
+        "background" => "rgba(239,68,68,0.08)"),
+    CSS(".bt-permission-btn:disabled",
+        "opacity" => "0.5", "cursor" => "default"),
+    CSS(".bt-permission-btn.bt-perm-chosen",
+        "opacity" => "1",
+        "border-color" => "var(--bt-accent)",
+        "background" => "rgba(59,130,246,0.12)",
+        "color" => "var(--bt-accent-hover)"),
+    # Question-form extras (AskUserQuestion): per-question label for
+    # multi-question forms, the free-text "Other" box, and the action row.
+    CSS(".bt-question-field-label",
+        "font-size" => "12.5px",
+        "color" => "var(--bt-text-muted)",
+        "margin-top" => "2px"),
+    CSS("input.bt-question-text",
+        "border" => "1px solid var(--bt-border-strong)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-bg)",
+        "color" => "var(--bt-text)",
+        "font" => "inherit", "font-size" => "13px",
+        "padding" => "7px 10px",
+        "outline" => "none",
+        "transition" => "border-color 120ms, box-shadow 120ms"),
+    CSS("input.bt-question-text:focus",
+        "border-color" => "var(--bt-accent)",
+        "box-shadow" => "0 0 0 3px rgba(59,130,246,0.18)"),
+    CSS(".bt-permission-actions",
+        "display" => "flex", "gap" => "8px",
+        "justify-content" => "flex-end",
+        "border-top" => "1px solid var(--bt-border)",
+        "padding-top" => "8px"),
+    CSS(".bt-question-skip",
+        "color" => "var(--bt-text-muted)"),
 
     # ── New-messages pill ────────────────────────────────────────────────────
     # Floats above the input area when followMode is off and new content
@@ -996,7 +1271,6 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-filter-toggle",
         "display" => "inline-flex", "align-items" => "center", "gap" => "5px",
         "cursor" => "pointer",
-        "user-select" => "none",
         "white-space" => "nowrap"),
     CSS(".bt-filter-toggle input",
         "cursor" => "pointer", "margin" => "0"),
@@ -1007,8 +1281,7 @@ const ChatStyles = Bonito.Styles(
     # per-tool key set is open, so no static rules.)
     CSS(".bt-filter-group-label",
         "margin-left" => "8px",
-        "font-weight" => "600",
-        "user-select" => "none"),
+        "font-weight" => "600"),
 
     # ── Native media display (bt_show + "Native Images" / "Native Videos") ──
     # The bt-tool-native class strips the pill chrome so the body's <img> or
@@ -1021,12 +1294,11 @@ const ChatStyles = Bonito.Styles(
         "box-shadow" => "none",
         "overflow" => "visible"),
     CSS(".bt-tool-native .bt-tool-header", "display" => "none"),
-    # The expanded-state reveal rule (`.bt-tool-header[data-expanded="true"]
-    # ~ .bt-tool-fullwidth`, 0,2,1) out-ranks a plain `.bt-tool-native
-    # .bt-tool-fullwidth` (0,2,0) — and native mode IS expanded. Match its
-    # shape with the native class prefixed so hiding wins.
+    # The full-width toggle lives inside the (hidden) header now, but keep an
+    # explicit hide that out-ranks the expanded-state reveal rule in case a
+    # future layout moves it back out of the header.
     CSS(".bt-tool-native .bt-tool-fullwidth, " *
-        ".bt-tool-native .bt-tool-header[data-expanded=\"true\"] ~ .bt-tool-fullwidth",
+        ".bt-tool-native .bt-tool-header[data-expanded=\"true\"] .bt-tool-fullwidth",
         "display" => "none"),
     CSS(".bt-tool-native .bt-tool-body",
         "border-top" => "none",
@@ -1164,6 +1436,7 @@ const ChatStyles = Bonito.Styles(
         "border-radius" => "50%",
         "border" => "2px solid var(--bt-border)",
         "border-top-color" => "var(--bt-accent)",
+        "will-change" => "transform",   # compositor-driven; survives main-thread jank
         "animation" => "bt-spin 0.7s linear infinite",
         "flex-shrink" => "0",
         "display" => "inline-block"),

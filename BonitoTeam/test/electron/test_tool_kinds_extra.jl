@@ -195,21 +195,21 @@ try
                """; timeout = 5.0))
     end
 
-    TH.section("Edit inline preview (single diff) — visible BEFORE expanding") do
-        # No click — assert the preview is already in the DOM right under the
-        # collapsed header.
-        record("preview present without expansion",
+    # NOTE: the old "HTML edit preview" (`.bt-edit-preview` — all `-` then all
+    # `+` lines, capped at 100px) was REMOVED from the product: an edit tool's
+    # body now eager-mounts a COMPACT Monaco DiffEditor without any click (see
+    # `auto_expand_body` / `EDIT_BODY_COMPACT_PX` in chat.jl). These sections
+    # assert that design.
+    TH.section("Edit compact diff (single) — auto-mounts BEFORE expanding") do
+        # No click — the Monaco diff editor mounts into the body on its own.
+        record("compact Monaco diff mounts without expansion",
                @TH.test_true TH.wait_for(ctx, """
                    (() => {
-                       const cards = document.querySelectorAll('.bt-tool-msg');
-                       for (const c of cards) {
-                           if (!c.querySelector('.bt-tool-body[data-tool-id="edit-prev-1"]')) continue;
-                           return c.querySelector('.bt-edit-preview') !== null;
-                       }
-                       return false;
+                       const slot = document.querySelector('.bt-tool-body[data-tool-id="edit-prev-1"]');
+                       return slot && slot.querySelector('.monaco-diff-editor-div') !== null;
                    })()
-               """; timeout = 5.0))
-        # Header still says collapsed.
+               """; timeout = 8.0))
+        # Header still reports collapsed — compact mode is NOT "expanded".
         expanded = TH.eval_js(ctx, """
             (() => {
                 const cards = document.querySelectorAll('.bt-tool-msg');
@@ -223,72 +223,112 @@ try
         """)
         record("body still collapsed", @TH.test_eq expanded "false")
 
-        # Path label, removed line, added line all present.
-        text = TH.eval_js(ctx, """
-            (() => {
-                const cards = document.querySelectorAll('.bt-tool-msg');
-                for (const c of cards) {
-                    if (!c.querySelector('.bt-tool-body[data-tool-id="edit-prev-1"]')) continue;
-                    const p = c.querySelector('.bt-edit-preview');
-                    return p ? p.innerText : null;
-                }
-                return null;
-            })()
-        """)
-        record("preview shows file path",
-               @TH.test_true (text isa AbstractString && occursin("src/a.py", text)))
-        record("preview shows removed line",
-               @TH.test_true (text isa AbstractString && occursin("- def hello():", text)))
-        record("preview shows added line",
-               @TH.test_true (text isa AbstractString && occursin("+ def hello(name):", text)))
+        # The file path shows in the diff header above the editor.
+        record("diff header shows file path",
+               @TH.test_true TH.wait_for(ctx, """
+                   (() => {
+                       const slot = document.querySelector('.bt-tool-body[data-tool-id="edit-prev-1"]');
+                       const hd = slot ? slot.querySelector('.bt-diff-header') : null;
+                       return hd && hd.innerText.indexOf('src/a.py') !== -1;
+                   })()
+               """; timeout = 5.0))
 
-        # Height capped — overflow hidden + max-height: 100px in CSS.
+        # Height capped — Monaco's compact max-height (240px + chrome slack).
         h = TH.eval_js(ctx, """
             (() => {
-                const cards = document.querySelectorAll('.bt-tool-msg');
-                for (const c of cards) {
-                    if (!c.querySelector('.bt-tool-body[data-tool-id="edit-prev-1"]')) continue;
-                    const p = c.querySelector('.bt-edit-preview');
-                    return p ? p.getBoundingClientRect().height : null;
-                }
-                return null;
+                const slot = document.querySelector('.bt-tool-body[data-tool-id="edit-prev-1"]');
+                const d = slot ? slot.querySelector('.monaco-diff-editor-div') : null;
+                return d ? d.getBoundingClientRect().height : null;
             })()
         """)
-        record("preview height ≤ 100px (lightweight)",
-               @TH.test_true (h !== nothing && h <= 101))
+        record("compact diff height ≤ 260px",
+               @TH.test_true (h !== nothing && h <= 260))
     end
 
-    TH.section("Edit preview: multi-edit shows 'N more files' footnote") do
-        text = TH.eval_js(ctx, """
-            (() => {
-                const cards = document.querySelectorAll('.bt-tool-msg');
-                for (const c of cards) {
-                    if (!c.querySelector('.bt-tool-body[data-tool-id="edit-multi-1"]')) continue;
-                    const p = c.querySelector('.bt-edit-preview');
-                    return p ? p.innerText : null;
-                }
-                return null;
-            })()
-        """)
-        record("multi-edit preview mentions '2 more files'",
-               @TH.test_true (text isa AbstractString && occursin("2 more file", text)))
+    TH.section("Edit compact diff: multi-edit renders every file") do
+        record("multi-edit body carries both diff blocks",
+               @TH.test_true TH.wait_for(ctx, """
+                   (() => {
+                       const slot = document.querySelector('.bt-tool-body[data-tool-id="edit-multi-1"]');
+                       return slot && slot.querySelectorAll('.bt-diff-block').length >= 2;
+                   })()
+               """; timeout = 8.0))
     end
 
-    TH.section("Non-edit tools do NOT get an inline preview") do
-        # Read, fetch, etc. — no .bt-edit-preview should be a sibling of those bodies.
-        n_extra_previews = TH.eval_js(ctx, """
+    TH.section("Non-edit tools do NOT auto-mount a diff body") do
+        n_extra = TH.eval_js(ctx, """
             (() => {
                 let n = 0;
                 document.querySelectorAll('.bt-tool-msg').forEach(c => {
                     const body = c.querySelector('.bt-tool-body');
                     const id   = body ? body.getAttribute('data-tool-id') : '';
                     if (!id || id.indexOf('edit') !== -1) return;
-                    if (c.querySelector('.bt-edit-preview')) n++;
+                    if (c.querySelector('.monaco-diff-editor-div')) n++;
                 });
                 return n;
             })()
         """)
-        record("no preview on non-edit tools", @TH.test_eq Int(n_extra_previews) 0)
+        record("no diff editor on non-edit tools", @TH.test_eq Int(n_extra) 0)
+    end
+
+    TH.section("path-link affordance generalizes across tool kinds") do
+        # Which tool TITLES become clickable path links? Read (path title),
+        # edit (DiffContent target) — yes. Move/think/fetch (no file the
+        # editor could open) — no.
+        title_link(id) = TH.eval_js(ctx, """
+            (() => {
+                const cards = document.querySelectorAll('.bt-tool-msg');
+                for (const c of cards) {
+                    if (!c.querySelector('.bt-tool-body[data-tool-id="$id"]')) continue;
+                    const t = c.querySelector('.bt-tool-title');
+                    return t ? t.classList.contains('bt-path-link') : null;
+                }
+                return null;
+            })()
+        """)
+        record("read tool title is a path link",  @TH.test_eq title_link("read-1") true)
+        record("edit tool title is a path link (via its diff target)",
+               @TH.test_eq title_link("edit-prev-1") true)
+        record("move tool title is plain",        @TH.test_eq title_link("mv-1") false)
+        record("think tool title is plain",       @TH.test_eq title_link("think-1") false)
+        record("fetch tool title is plain (URL ≠ file)",
+               @TH.test_eq title_link("fetch-1") false)
+        # The edit tool's compact diff carries a per-file path link too.
+        record("diff header is a path link with the file's path",
+               @TH.test_true TH.wait_for(ctx, """
+                   (() => {
+                       const slot = document.querySelector('.bt-tool-body[data-tool-id="edit-prev-1"]');
+                       const hd = slot && slot.querySelector('.bt-diff-header.bt-path-link');
+                       return hd !== null && hd !== undefined && hd.dataset.path === 'src/a.py';
+                   })()
+               """; timeout = 5.0))
+    end
+
+    TH.section("clicking the edit tool's title link opens the file editor") do
+        TH.eval_js(ctx, """
+            (() => {
+                const cards = document.querySelectorAll('.bt-tool-msg');
+                for (const c of cards) {
+                    if (!c.querySelector('.bt-tool-body[data-tool-id="edit-prev-1"]')) continue;
+                    const t = c.querySelector('.bt-tool-title.bt-path-link');
+                    if (t) t.click();
+                }
+            })()
+        """)
+        record("editable Monaco mounts in the plotpane",
+               @TH.test_true TH.wait_for(ctx, """
+                   (() => {
+                       const mount = document.getElementById('bt-plotpane-mount');
+                       return mount && mount.querySelector('.bt-file-editor .monaco-editor') !== null;
+                   })()
+               """; timeout = 8.0))
+        record("the file gets an ACTIVE pane tab carrying its name",
+               @TH.test_true TH.wait_for(ctx, """
+                   (() => {
+                       const t = document.querySelector('.bt-pp-tab-active .bt-pp-tab-label');
+                       return t && t.textContent.indexOf('a.py') !== -1;
+                   })()
+               """; timeout = 4.0))
     end
 
     TH.section("No JS errors") do

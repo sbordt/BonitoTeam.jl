@@ -178,6 +178,12 @@ mutable struct ServerState
     # re-scanning (refresh via the per-worker Rescan button). Saved to
     # `discovered.json`; mutated in place + `notify`d like `projects`.
     discovered :: Observable{Dict{String,Vector{Dict{String,Any}}}}
+
+    # The base URL workers (and the dashboard's install snippet) should use to
+    # reach this server. Set by `serve()` once the Bonito.Server is up —
+    # either the explicit `public_url` argument or `Bonito.online_url`. A Ref
+    # so per-session copies share the one value. "" until `serve()` fills it.
+    base_url :: Ref{String}
 end
 
 """
@@ -201,6 +207,7 @@ function ServerState(; state_dir::String,
         Dict{String,Any}(),                       # worker_control_ws
         Dict{String,Channel{Any}}(),              # pending_rpcs
         Observable(Dict{String,Vector{Dict{String,Any}}}()),  # discovered
+        Ref(""),                                  # base_url (set by serve())
     )
     load_workers!(s)
     load_projects!(s)
@@ -230,6 +237,7 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             s.worker_control_ws,
             s.pending_rpcs,
             map(identity, session, s.discovered),
+            s.base_url,
         )
     end
 end
@@ -237,6 +245,30 @@ end
 workers_file(s::ServerState)    = joinpath(s.state_dir, "workers.json")
 projects_file(s::ServerState)   = joinpath(s.state_dir, "projects.json")
 discovered_file(s::ServerState) = joinpath(s.state_dir, "discovered.json")
+agents_md_file(s::ServerState)  = joinpath(s.state_dir, "AGENTS.md")
+
+"""
+    global_agents_md(state) -> String
+
+The server-wide agent instructions (`<state_dir>/AGENTS.md`). Appended to the
+system prompt of EVERY agent session brought up through this server — across
+all workers and projects (see `session_meta_params` in transport.jl). ""
+when the file doesn't exist. Editable from the dashboard, or directly on
+disk (read per session bring-up, so edits apply to the next chat opened —
+no restart needed).
+"""
+function global_agents_md(s::ServerState)
+    f = agents_md_file(s)
+    isfile(f) || return ""
+    return String(strip(read(f, String)))
+end
+
+function set_global_agents_md!(s::ServerState, text::AbstractString)
+    f = agents_md_file(s)
+    mkpath(dirname(f))
+    write(f, String(text))
+    return nothing
+end
 
 """
     derive_initials(name) -> String

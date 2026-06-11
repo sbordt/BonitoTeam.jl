@@ -17,10 +17,13 @@ record(name, ok) = push!(results, name => ok)
 
 try
     TH.section("Workers section") do
-        # Two worker cards present.
+        # Two worker cards present. (The standalone dashboard "Projects"
+        # card list was REMOVED by design — projects live in the per-worker
+        # tree and the sidebar — so we only count worker cards + the static
+        # Agents block here.)
         n_cards = TH.dom_count(ctx, ".bt-card")
-        record("at least 2+2 cards (workers + projects)",
-               @TH.test_true (n_cards >= 4))
+        record("at least 2 worker cards",
+               @TH.test_true (n_cards >= 2))
         # Online worker shows the "+ Project" button (the folder→threads
         # browser is now always-visible below the card, not behind a Discover
         # toggle). Offline worker shows the "offline" pill.
@@ -52,58 +55,31 @@ try
         record("offline worker shows offline pill", @TH.test_true has_offline_pill)
     end
 
-    TH.section("Project cards") do
-        record("Project1 card present",
-               @TH.test_true TH.eval_js(ctx, """
-                   Array.from(document.querySelectorAll('.bt-card-name')).some(e => e.innerText === 'Project1')
-               """))
-        record("Project2 card present",
-               @TH.test_true TH.eval_js(ctx, """
-                   Array.from(document.querySelectorAll('.bt-card-name')).some(e => e.innerText === 'Project2')
-               """))
-        # "Open chat →" link present on each project card.
-        n_open_links = TH.eval_js(ctx, """
-            Array.from(document.querySelectorAll('.bt-link')).filter(e => e.innerText.indexOf('Open chat') !== -1).length
-        """)
-        record("two 'Open chat' links", @TH.test_eq n_open_links 2)
-        # Backup pill shows "not backed up" by default (we seeded with default
-        # :unsynced backup_status).
-        n_unsynced = TH.eval_js(ctx, """
-            Array.from(document.querySelectorAll('.bt-pill')).filter(e => e.innerText.indexOf('not backed up') !== -1).length
-        """)
-        record("two 'not backed up' pills", @TH.test_eq n_unsynced 2)
-    end
+    # (The old "Project cards" section tested the standalone dashboard
+    # project-card list — removed by design. Projects now surface in the
+    # sidebar; navigation through it is covered below.)
 
-    TH.section("Open chat → swaps to chat panel via current_view") do
-        # Click *Project1*'s Open chat link. Project1 is bound to w-1 (online)
-        # so the click hits the same-worker branch in the on(open_request)
-        # handler (view swap). Project2 is bound to w-2 (offline) — clicking
-        # its link would route through the cross-worker move path (added in
-        # commit 92c40c4) and fail with "Worker 'w-2' is not connected"
-        # instead of swapping views, which is not what this assertion is
-        # checking.
-        # IIFE-wrap: top-level `const` from `eval_js` lands in Electron's
-        # shared script scope, and the next `eval_js` that uses the same
-        # name (the Discover section's `const cards = …`) blows up with
-        # SyntaxError "Identifier 'cards' has already been declared".
-        TH.eval_js(ctx, """(() => {
-            const cards = Array.from(document.querySelectorAll('.bt-card'));
-            const card = cards.find(c => {
-                const n = c.querySelector('.bt-card-name');
-                return n && n.innerText === 'Project1';
-            });
-            const link = card && Array.from(card.querySelectorAll('.bt-link'))
-                                      .find(e => e.innerText.indexOf('Open chat') !== -1);
-            if (link) link.click();
-        })()""")
-        # No ChatModel was seeded, so we hit the placeholder branch ("Starting
-        # chat for ..."). That's still proof navigation worked.
-        record("dashboard hidden, chat placeholder shown",
+    TH.section("Sidebar entry → swaps to the chat view") do
+        # Mark Project1 as interacted so the open-chats sidebar lists it
+        # (pristine projects only show in the per-worker tree).
+        BonitoTeam.set_project_title!(state, "p-1", "Dashboard nav test")
+        record("Project1 appears in the sidebar",
                @TH.test_true TH.wait_for(ctx,
-                   "document.body.innerText.indexOf('Starting chat') !== -1"; timeout = 3.0))
+                   """document.querySelector('.bt-side-item[data-project-id="p-1"]') !== null""";
+                   timeout = 3.0))
+        TH.eval_js(ctx, """document.querySelector('.bt-side-item[data-project-id="p-1"]').click()""")
+        # No ChatModel was seeded, so we land on the bring-up view ("Opening
+        # … / Connecting …"). That's still proof navigation worked.
+        record("dashboard hidden, loading view shown",
+               @TH.test_true TH.wait_for(ctx, """
+                   (() => {
+                       const t = document.body.innerText;
+                       return t.indexOf('Opening') !== -1 || t.indexOf('Couldn\\'t open') !== -1;
+                   })()
+               """; timeout = 4.0))
         # Navigate back via Home for subsequent sections.
         TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[0].click()""")
-        @assert TH.wait_for(ctx, "document.body.innerText.indexOf('Project1') !== -1"; timeout = 3.0)
+        @assert TH.wait_for(ctx, "document.body.innerText.indexOf('Workers') !== -1 || document.body.innerText.indexOf('BonitoTeam') !== -1"; timeout = 3.0)
     end
 
     TH.section("+ Project button fires without errors") do

@@ -38,6 +38,8 @@ include("progress.jl")         # notify_progress / format_progress_string — sh
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
 include("transport.jl")        # ChatTransport + LocalTransport / WorkerTransport / MockTransport
 include("styles.jl")
+include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_popup!)
+include("taskbar.jl")          # TaskBar component (state-first pin-board)
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("remote_app.jl")       # embed_remote_app — interactive worker Bonito apps in the browser
 include("floating_window.jl")  # draggable/resizable position:fixed panel — used by popup.jl

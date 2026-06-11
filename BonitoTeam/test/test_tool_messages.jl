@@ -263,115 +263,184 @@ end
 
 # ── 4. TodoWrite absorption ───────────────────────────────────────────────
 
-@testset "TodoListMsg consolidation across calls" begin
-
-    @testset "first call creates a single bubble" begin
-        chat = make_chat()
-        BT.process!(chat, mktodo("tw1",
-            mkentries([("A", "pending"), ("B", "pending")])))
-        @test count(m -> m isa BT.TodoListMsg, chat.msgs_store) == 1
-        first_msg = chat.msgs_store[end]::BT.TodoListMsg
-        @test BT.is_live(first_msg) == true        # any pending entry → live
-        @test first_msg.finished_at === nothing     # NOT auto-stamped at create
+@testset "TodoListMsg lifecycle: taskbar pin while live, history on finalize" begin
+    # The REAL wire carries todos exclusively as `plan` SessionUpdates
+    # (verified on a live acp.jsonl); the TodoWrite tool_call channel is
+    # deliberately inert.
+    plan(entries) = ACP.Plan(entries)
+    pinned_todo(chat) = begin
+        items = chat.taskbar_items[]
+        idx = findfirst(t -> t.kind === :todo, items)
+        idx === nothing ? nothing : items[idx]
     end
 
-    @testset "second call ABSORBS into the existing bubble" begin
-        chat = make_chat()
-        BT.process!(chat, mktodo("tw1",
-            mkentries([("A", "pending"), ("B", "pending")])))
-        first_msg = chat.msgs_store[end]::BT.TodoListMsg
-        first_id = first_msg.id
-
-        BT.process!(chat, mktodo("tw2",
-            mkentries([("A", "completed"), ("B", "in_progress")])))
-
-        # Still ONE bubble, same identity, updated entries.
-        @test count(m -> m isa BT.TodoListMsg, chat.msgs_store) == 1
-        @test chat.msgs_store[end].id == first_id
-        @test [e.status for e in chat.msgs_store[end].entries] ==
-              ["completed", "in_progress"]
-        @test BT.is_live(chat.msgs_store[end]) == true
-    end
-
-    @testset "absorption stamps finished_at when entries become all-done" begin
+    @testset "TodoWrite tool_calls are inert (single-channel)" begin
         chat = make_chat()
         BT.process!(chat, mktodo("tw1", mkentries([("A", "pending")])))
-        @test chat.msgs_store[end].finished_at === nothing
-
-        BT.process!(chat, mktodo("tw2", mkentries([("A", "completed")])))
-
-        # One bubble; transitioned to done; finished_at stamped; is_live false.
-        @test count(m -> m isa BT.TodoListMsg, chat.msgs_store) == 1
-        @test chat.msgs_store[end].finished_at !== nothing
-        @test BT.is_live(chat.msgs_store[end]) == false
+        @test chat.live_todo[] === nothing
+        @test count(m -> m isa BT.TodoListMsg, chat.msgs_store) == 0
+        @test pinned_todo(chat) === nothing
     end
 
-    @testset "after all-done, the NEXT call starts a fresh bubble" begin
+    @testset "a live list pins to the taskbar — no chat message" begin
         chat = make_chat()
-        # Build a finished todo list.
-        BT.process!(chat, mktodo("tw1", mkentries([("A", "completed")])))
-        first_id = chat.msgs_store[end].id
-
-        # A brand new TodoWrite — different items — should spawn a separate
-        # bubble (NOT silently overwrite the just-finished list).
-        BT.process!(chat, mktodo("tw2",
-            mkentries([("X", "pending"), ("Y", "pending")])))
-
-        todos = filter(m -> m isa BT.TodoListMsg, chat.msgs_store)
-        @test length(todos) == 2
-        @test todos[1].id == first_id
-        @test todos[2].id != first_id
-        @test BT.is_live(todos[2]) == true
-        @test todos[2].finished_at === nothing
+        BT.process!(chat, plan(mkentries([("A", "pending"), ("B", "pending")])))
+        @test count(m -> m isa BT.TodoListMsg, chat.msgs_store) == 0
+        t = chat.live_todo[]
+        @test t isa BT.TodoListMsg && BT.is_live(t)
+        pin = pinned_todo(chat)
+        @test pin !== nothing
+        @test pin.entries == [("A", "pending"), ("B", "pending")]
     end
 
-    @testset "no premature finished_at on the initial close-persist" begin
-        # Regression for 5396e6c: `Base.close(::TodoListMsg)` used to stamp
-        # finished_at unconditionally, so the very first call's persist
-        # already marked the bubble done — and every later TodoWrite found
-        # `is_live=false` and spawned a parallel bubble. This guards against
-        # that shape coming back.
+    @testset "subsequent plans mutate the SAME live list + pin" begin
         chat = make_chat()
-        BT.process!(chat, mktodo("tw1", mkentries([("A", "in_progress")])))
-        m = chat.msgs_store[end]::BT.TodoListMsg
-        @test m.finished_at === nothing
-        @test BT.is_live(m) == true
+        BT.process!(chat, plan(mkentries([("A", "pending"), ("B", "pending")])))
+        first_id = chat.live_todo[].id
+
+        BT.process!(chat, plan(mkentries([("A", "completed"), ("B", "in_progress")])))
+
+        @test count(m -> m isa BT.TodoListMsg, chat.msgs_store) == 0
+        @test chat.live_todo[].id == first_id
+        pin = pinned_todo(chat)
+        @test pin.id == first_id
+        @test pin.entries == [("A", "completed"), ("B", "in_progress")]
     end
 
-    @testset "ACP Plan SessionUpdate routes the same absorption path" begin
-        # claude-agent-acp ALSO emits a separate `plan` SessionUpdate parallel
-        # to the `tool_call/TodoWrite`. Both should funnel into the same
-        # bubble — this is what `process!(chat, ::ACP.Plan)` is for.
+    @testset "all-done finalizes: pin drops, history bubble appears" begin
         chat = make_chat()
-        BT.process!(chat, mktodo("tw1", mkentries([("A", "pending")])))
-        first_id = chat.msgs_store[end].id
+        BT.process!(chat, plan(mkentries([("A", "pending")])))
+        live_id = chat.live_todo[].id
 
-        BT.process!(chat, ACP.Plan(mkentries([("A", "in_progress")])))
+        BT.process!(chat, plan(mkentries([("A", "completed")])))
 
+        @test chat.live_todo[] === nothing
+        @test pinned_todo(chat) === nothing
         todos = filter(m -> m isa BT.TodoListMsg, chat.msgs_store)
         @test length(todos) == 1
-        @test todos[1].id == first_id
-        @test todos[1].entries[1].status == "in_progress"
+        @test todos[1].id == live_id
+        @test todos[1].finished_at !== nothing
     end
+
+    @testset "redundant all-done re-send is DROPPED (no duplicate bubble)" begin
+        chat = make_chat()
+        BT.process!(chat, plan(mkentries([("A", "pending")])))
+        BT.process!(chat, plan(mkentries([("A", "completed")])))
+        @test count(m -> m isa BT.TodoListMsg, chat.msgs_store) == 1
+
+        # Claude re-sends the final state ("todos cleared") — must not
+        # create a second identical bubble.
+        BT.process!(chat, plan(mkentries([("A", "completed")])))
+        @test count(m -> m isa BT.TodoListMsg, chat.msgs_store) == 1
+        @test chat.live_todo[] === nothing
+    end
+
+    @testset "a DIFFERENT all-done list still lands once" begin
+        chat = make_chat()
+        BT.process!(chat, plan(mkentries([("A", "completed")])))
+        BT.process!(chat, plan(mkentries([("X", "completed")])))
+        @test count(m -> m isa BT.TodoListMsg, chat.msgs_store) == 2
+    end
+
+    @testset "zombie: finalize_todo! moves an unfinished list to history" begin
+        # run_turn!'s finally does exactly this for a list whose turn ended.
+        chat = make_chat()
+        BT.process!(chat, plan(mkentries([("A", "completed"), ("B", "pending")])))
+        t = chat.live_todo[]
+        BT.finalize_todo!(chat, t)
+
+        @test chat.live_todo[] === nothing
+        @test pinned_todo(chat) === nothing
+        todos = filter(m -> m isa BT.TodoListMsg, chat.msgs_store)
+        @test length(todos) == 1
+        @test [e.status for e in todos[1].entries] == ["completed", "pending"]
+    end
+end
+
+# ── Turn-scoped cancel ──────────────────────────────────────────────────────
+# A stop-click echoes the turn sequence it was AIMED at; a stale click
+# (buffered while its turn finished) must not cancel the next turn. Observed
+# live: three consecutive fresh prompts each murdered within one frame by
+# stop-clicks meant for earlier turns.
+@testset "CancelCommand is scoped to its turn" begin
+    using JSON: JSON
+
+    # Transport that records outgoing frames and answers the handshake.
+    function recording_transport(sent::Vector{String})
+        BT.MockTransport((outgoing, incoming) -> begin
+            Base.errormonitor(@async try
+                for line in outgoing
+                    push!(sent, line)
+                    msg = JSON.parse(line)
+                    id = get(msg, "id", nothing)
+                    m  = get(msg, "method", "")
+                    if m == "initialize"
+                        put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,"result"=>Dict())))
+                    elseif m == "session/new"
+                        put!(incoming, JSON.json(Dict("jsonrpc"=>"2.0","id"=>id,
+                                                      "result"=>Dict("sessionId"=>"s"))))
+                    end
+                end
+            catch e
+                e isa InvalidStateException || @warn "responder" e
+            end)
+            nothing
+        end)
+    end
+    cancels(sent) = count(l -> occursin("session/cancel", l), sent)
+
+    sent = String[]
+    state = BT.ServerState(; state_dir = mktempdir(),
+                              working_dir = mktempdir(), worker_secret = "x")
+    model = BT.ChatModel(state, mktempdir(); transport = recording_transport(sent))
+    BT.start_chat_client!(model)
+    @test timedwait(() -> model.client[] !== nothing, 5.0) === :ok
+
+    # Pretend turn 7 is running (cancel! itself no-ops without an active
+    # turn, so we only verify the seq gate in front of it).
+    model.turn_seq[] = 7
+
+    # Stale: aimed at turn 3 → dropped BEFORE reaching the client.
+    BT.handle_command!(model, nothing, BT.CancelCommand(3))
+    @test cancels(sent) == 0
+
+    # Unscoped (legacy) and current-turn cancels pass the gate; without an
+    # active prompt the ACP client then no-ops, so still nothing on the
+    # wire — the gate is what we are testing, the A8 idle-guard is already
+    # covered in the ACP suite.
+    BT.handle_command!(model, nothing, BT.CancelCommand(7))
+    BT.handle_command!(model, nothing, BT.CancelCommand())
+    @test cancels(sent) == 0
+
+    @test BT.parse_chat_command(Dict{String,Any}("type"=>"cancel","seq"=>5)) ==
+          BT.CancelCommand(5)
+    @test BT.parse_chat_command(Dict{String,Any}("type"=>"cancel")) ==
+          BT.CancelCommand(-1)
 end
 
 # ── 5. Stop-tool dispatch ─────────────────────────────────────────────────
 
 @testset "request_tool_stop! per-variant" begin
 
-    @testset "background BashToolMsg queues a synthetic user message" begin
+    # The stop button is a DIRECT action, never a chat message: claude-agent-acp
+    # completes the bg tool_call at launch and never sends a terminal update on
+    # its id, so we finalize the pill ourselves (and SIGTERM the shell when a
+    # worker is reachable — none here, so just finalize). No synthetic UserMsg.
+    @testset "background BashToolMsg → finalized directly, NO chat message" begin
         chat = make_chat()
         t = BT.BashToolMsg("b1", "execute", "sleep 100", "in_progress", "",
-                            time(), nothing, "sleep 100", true, "", 0, false, "", chat)
+                            time(), nothing, "sleep 100", true, "/tmp/x.output",
+                            0, true, "", chat)   # bg_running = true
         push!(chat.msgs_store, t)
+        BT.pin_task!(chat, BT.tool_taskbar_item(chat, t))
+        @test BT.is_pinned(chat, "b1")
 
         BT.handle_command!(chat, nothing, BT.StopToolCommand("b1"))
 
-        # A new UserMsg landed in the store referencing the tool id.
-        users = filter(m -> m isa BT.UserMsg, chat.msgs_store)
-        @test length(users) == 1
-        @test occursin("b1", users[1].text)
-        @test occursin("background bash", lowercase(users[1].text))
+        @test isempty(filter(m -> m isa BT.UserMsg, chat.msgs_store))  # no synthetic msg
+        @test !t.bg_running                       # finalized
+        @test t.status == "completed"
+        @test !BT.is_pinned(chat, "b1")           # pin dropped
     end
 
     @testset "non-background bash → silent no-op" begin
@@ -381,20 +450,18 @@ end
         push!(chat.msgs_store, t)
         BT.handle_command!(chat, nothing, BT.StopToolCommand("b2"))
         @test isempty(filter(m -> m isa BT.UserMsg, chat.msgs_store))
+        @test t.status == "in_progress"           # untouched
     end
 
-    @testset "background TaskToolMsg asks Claude to call TaskStop" begin
+    @testset "background TaskToolMsg → finalized directly, NO chat message" begin
         chat = make_chat()
         t = BT.TaskToolMsg("ta1", "other", "research", "in_progress", "",
                            time(), nothing, "research", true, "researcher", chat)
         push!(chat.msgs_store, t)
         BT.handle_command!(chat, nothing, BT.StopToolCommand("ta1"))
 
-        users = filter(m -> m isa BT.UserMsg, chat.msgs_store)
-        @test length(users) == 1
-        @test occursin("TaskStop", users[1].text)
-        @test occursin("ta1", users[1].text)
-        @test occursin("researcher", users[1].text)
+        @test isempty(filter(m -> m isa BT.UserMsg, chat.msgs_store))
+        @test !BT.is_live(t)                       # closed → terminal
     end
 
     @testset "generic / MCP tools → silent no-op" begin
@@ -410,6 +477,18 @@ end
         chat = make_chat()
         BT.handle_command!(chat, nothing, BT.StopToolCommand("nonexistent"))
         @test isempty(filter(m -> m isa BT.UserMsg, chat.msgs_store))
+    end
+
+    @testset "parse_bg_output_path strips trailing sentence punctuation" begin
+        # The launch banner ends "…/<id>.output. You will be notified" — the
+        # greedy \\S+ used to keep the period, yielding a path that never
+        # exists (so the pill could never finalize). Regression guard.
+        txt = "Command running in background with ID: x. " *
+              "Output is being written to: /tmp/t/abc.output. You will be notified"
+        @test BT.parse_bg_output_path([(text = txt,)]) == "/tmp/t/abc.output"
+        # Plain newline-terminated form is unaffected.
+        @test BT.parse_bg_output_path([(text = "written to: /tmp/t/x.output\nmore",)]) ==
+              "/tmp/t/x.output"
     end
 
     @testset "parse_chat_command extracts StopToolCommand" begin

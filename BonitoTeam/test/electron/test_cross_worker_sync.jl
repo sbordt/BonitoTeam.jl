@@ -85,8 +85,12 @@ function handle_xsync_transfer(mw::XSyncWorker, cmd::AbstractDict)
         get(ack, "ok", false) || error("server rejected transfer: $ack")
         wsio = RemoteSync.WebSocketIO(ws)
         if direction == "to_worker"
+            # Honor quick_check like the real BonitoWorker: the server sends
+            # quick_check=false for directional overwrites so same-size
+            # same-mtime divergent files are still delta-checked.
             dst = String(cmd["dst_path"]); mkpath(dst)
-            RemoteSync.receive_directory(dst, wsio)
+            qc  = get(cmd, "quick_check", true) === true
+            RemoteSync.receive_directory(dst, wsio; quick_check = qc)
         elseif direction == "from_worker"
             src = String(cmd["src_path"])
             isdir(src) || error("src_path is not a directory: $src")

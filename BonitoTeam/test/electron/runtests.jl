@@ -33,12 +33,15 @@ const FILES = [
     # Layout / nav
     "test_layout.jl",
     "test_mobile.jl",
+    "test_responsive_pane.jl",
     # Chat input + streaming + message variants
     "test_chat_input.jl",
     "test_chat_streaming.jl",
     "test_chat_messages.jl",
     "test_tool_variants.jl",
     "test_tool_kinds_extra.jl",
+    "test_streamed_tool_input.jl",
+    "test_todo_taskbar.jl",
     "test_markdown.jl",
     "test_virtual_scroll.jl",
     "test_chat_controls.jl",

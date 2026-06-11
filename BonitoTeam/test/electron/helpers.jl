@@ -7,6 +7,11 @@
 #   ...assertions via TH.eval_js / TH.dom_count / TH.wait_for...
 #   TH.shutdown(ctx)
 
+# Bring BonitoTeam into the INCLUDING module (Main) too — nearly every test
+# file references `BonitoTeam.…` directly, and relying on some earlier suite
+# file having imported it makes files fail when run standalone.
+using BonitoTeam
+
 module TestHelpers
 
 using Bonito, BonitoTeam, AgentClientProtocol, Dates, JSON
@@ -152,16 +157,24 @@ thought_chunk_update(text) = Dict(
 # `tool_call_update` name (kept for backwards compat with existing tests),
 # this produces the FIRST event for a given toolCallId. Use `tool_update`
 # below for the partial-update follow-ups.
-tool_call_update(; id="t1", kind="execute", title="ls", status="completed",
-                   content=[]) = Dict(
-    "sessionUpdate" => "tool_call",
-    "toolCallId" => id, "kind" => kind, "title" => title, "status" => status,
-    "content" => content)
+function tool_call_update(; id="t1", kind="execute", title="ls", status="completed",
+                            content=[], tool_name=nothing, raw_input=nothing)
+    d = Dict{String,Any}(
+        "sessionUpdate" => "tool_call",
+        "toolCallId" => id, "kind" => kind, "title" => title, "status" => status,
+        "content" => content)
+    tool_name === nothing ||
+        (d["_meta"] = Dict("claudeCode" => Dict("toolName" => tool_name)))
+    raw_input === nothing || (d["rawInput"] = raw_input)
+    return d
+end
 
 # Partial update for an already-emitted toolCallId — re-renders the header
-# in place. Pass only the fields you want to change.
+# in place. Pass only the fields you want to change. `tool_name`/`raw_input`
+# mirror real claude-agent-acp behavior: tool input STREAMS, so the
+# arguments usually ride one of these updates, not the initial tool_call.
 function tool_update(; id, kind=nothing, title=nothing, status=nothing,
-                       content=nothing)
+                       content=nothing, tool_name=nothing, raw_input=nothing)
     d = Dict{String,Any}(
         "sessionUpdate" => "tool_call_update",
         "toolCallId"    => id)
@@ -169,6 +182,9 @@ function tool_update(; id, kind=nothing, title=nothing, status=nothing,
     title   === nothing || (d["title"]   = title)
     status  === nothing || (d["status"]  = status)
     content === nothing || (d["content"] = content)
+    tool_name === nothing ||
+        (d["_meta"] = Dict("claudeCode" => Dict("toolName" => tool_name)))
+    raw_input === nothing || (d["rawInput"] = raw_input)
     return d
 end
 

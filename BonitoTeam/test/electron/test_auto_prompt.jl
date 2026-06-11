@@ -25,8 +25,13 @@ results = Pair{String,Bool}[]
 record(name, ok) = push!(results, name => ok)
 
 try
-    p1_idx = TH.eval_js(ctx, """(() => { const items = document.querySelectorAll('.bt-side-item .bt-side-name'); for (let i=0; i<items.length; i++) if (items[i].innerText.split(' · ')[0]==='Project1') return i; return -1; })()""")
-    TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[$p1_idx].click()""")
+    # Select the row by its stable data-project-id: the auto-prompt turn
+    # already ran, so the sidebar shows a meaningful title derived from
+    # the prompt, NOT the raw project name "Project1".
+    @assert TH.wait_for(ctx,
+        """document.querySelector('.bt-side-item[data-project-id="p-1"]') !== null""";
+        timeout = 5.0) "p-1 sidebar row missing"
+    TH.eval_js(ctx, """document.querySelector('.bt-side-item[data-project-id="p-1"]').click()""")
     @assert TH.wait_for(ctx, "document.querySelector('.bt-text-input') !== null") "no chat"
 
     TH.section("auto_prompt fires as the first user message") do

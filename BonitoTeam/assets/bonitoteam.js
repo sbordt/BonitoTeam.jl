@@ -55,7 +55,15 @@ export class Collapsable {
                 'toggle', () => this.applyExpanded(this.details.open));
         } else {
             headerEl.style.cursor = 'pointer';
-            headerEl.addEventListener('click', () => this.applyExpanded(!this.expanded));
+            headerEl.addEventListener('click', (e) => {
+                // Collapsed → the WHOLE header is the expand target (big,
+                // forgiving). Expanded → only the ▼ arrow collapses:
+                // the header is dense with small buttons (⊗ ⤢ »), and a
+                // near-miss on any of them used to slam the body shut.
+                if (this.expanded && this.toggle && e.target !== this.toggle &&
+                    !this.toggle.contains(e.target)) return;
+                this.applyExpanded(!this.expanded);
+            });
         }
     }
 
@@ -204,7 +212,8 @@ class BonitoChat {
         // per tool). Unchecking hides matching nodes (inline display:none)
         // AND zeroes their entries in the height math (effHeight), so
         // spacers/scroll mapping stay exact. Per-tab — rebuilt on remount.
-        this.toolbarEl   = container.parentElement.querySelector('.bt-chat-toolbar');
+        this.toolbarEl   = (container.closest('.bt-app') || container.parentElement)
+            .querySelector('.bt-chat-toolbar');
         this.hiddenTypes = new Set(DEFAULT_HIDDEN);   // filter keys currently hidden
         this.seenTypes   = new Set();   // keys that already have a checkbox
         this.keyByIdx    = new Map();   // idx → filter key (drives effHeight)
@@ -308,9 +317,22 @@ class BonitoChat {
         // bottom" while an agent/tool/thinking turn is running. The
         // gesture is the authoritative signal; the chase queued under
         // stale followMode must yield to it.
+        // The recency window alone has a hole: a single SLOW main-thread
+        // frame (forced layout when a scroll suddenly needs a fresh
+        // virtual-scroll range full of Monaco editors can run ~1s) eats
+        // the whole 400ms between the user's wheel and the resulting
+        // scroll event — the genuine gesture then classifies as a layout
+        // shift and the chase yanks the viewport back ("wheel did
+        // nothing"). `_pendingUserScroll` closes it: the FIRST scroll
+        // event after a gesture is user-driven no matter how long the
+        // intervening frame took. Consumed on use; wall-clock can't
+        // expire it because a blocked main thread can't deliver an
+        // unrelated scroll event in between anyway.
         this._lastUserInputT = 0;
+        this._pendingUserScroll = false;
         const markUserInput = () => {
             this._lastUserInputT = performance.now();
+            this._pendingUserScroll = true;
             this._cancelPendingScroll();
         };
         container.addEventListener('wheel',      markUserInput, { passive: true });
@@ -318,6 +340,22 @@ class BonitoChat {
         container.addEventListener('touchmove',  markUserInput, { passive: true });
         container.addEventListener('keydown',    markUserInput, { passive: true });
         this._markUserInput = markUserInput;
+
+        // File-path links: ONE delegated listener for every `.bt-path-link`
+        // in the chat (tool titles, diff headers, search hits, linkified
+        // paths in agent messages) → open the file in the plotpane editor.
+        // Capture phase, so a click on a linked TOOL TITLE opens the editor
+        // instead of toggling the pill's expand state (the Collapsable
+        // listener sits on the header, below us on the capture path).
+        container.addEventListener('click', (e) => {
+            const link = e.target.closest('.bt-path-link');
+            if (!link || !container.contains(link)) return;
+            const path = link.dataset.path || link.textContent.trim();
+            if (!path) return;
+            e.preventDefault();
+            e.stopPropagation();
+            this.comm.notify({ type: 'edit_file', path });
+        }, { capture: true });
 
         // Scrollbar drags emit NO wheel/touch/key events — only mousedown on
         // the container (the scrollbar is part of its hit area) and then
@@ -533,7 +571,9 @@ class BonitoChat {
 
         this._onScroll = () => {
             const userDriven = this._scrollbarDrag ||
+                this._pendingUserScroll ||
                 (performance.now() - this._lastUserInputT) < 400;
+            this._pendingUserScroll = false;
             const atBot      = this.atBottom();
             if (userDriven) {
                 // User-driven scroll → followMode reflects whether
@@ -664,6 +704,7 @@ class BonitoChat {
 
         switch (msg.type) {
             case 'msgs.count':   return this.applyCount(msg.n);
+            case 'turn_begin':   this.turnSeq = msg.seq; return;
             case 'msgs.range':   return this.onRange(msg);
             case 'session_reset':return this.onSessionReset();
             case 'busy_start':
@@ -680,13 +721,17 @@ class BonitoChat {
                 return;
             case 'agent_final':  return this.onAgentFinal(msg);
             case 'thinking':     return this.onThinking(msg);
+            case 'permission':      return this.onPermission(msg);
+            case 'permission_done': return this.onPermissionDone(msg);
+            case 'question':        return this.onQuestion(msg);
+            case 'question_done':   return this.onPermissionDone(msg);
             case 'thought_final':return this.onThoughtFinal(msg);
             case 'thought.body': return this.onThoughtBody(msg);
             case 'tool_update':  return this.onToolUpdate(msg);
             case 'plan_update':  return this.onPlanUpdate(msg);
             case 'chunk':        return this.appendChunk(msg);
             case 'user_chunk':   return this.appendUserChunk(msg.text);
-            case 'user_unqueue': return this.unqueueOldestUser();
+            case 'user_unqueue': return this.unqueueUser(msg);
             case 'summary_final':return this.onSummaryFinal(msg);
             case 'attach_error':
                 return this._showAttachError(msg.error || 'Attachment failed');
@@ -784,9 +829,13 @@ class BonitoChat {
         this._settleDone  = true;
         this._settleWatch = false;
         // Land exactly at the bottom of the SETTLED layout before the
-        // overlay reveals it.
-        this.setFollowMode(true);
-        this.scrollToBottom();
+        // overlay reveals it — but ONLY if follow mode is still on.
+        // followMode starts true on construction, so it's false here only
+        // because the user actively scrolled away while the watch was
+        // running (slow image chats can ride out the 5s hard cap with the
+        // pane fully interactive). Forcing it back on would yank them to
+        // the bottom mid-read.
+        if (this.followMode) this.scrollToBottom();
         if (this._paneEl) {
             delete this._paneEl.dataset.btSettling;
             this._paneEl.dataset.btSettled = '1';
@@ -1267,7 +1316,10 @@ class BonitoChat {
 
     onAgentFinal(msg) {
         const node = this.nodeById.get(msg.id);
-        if (node && msg.html) node.innerHTML = msg.html;
+        if (node && msg.html) {
+            node.innerHTML = msg.html;
+            linkifyPaths(node);
+        }
     }
 
     // A committed thought ships its html on close — pre-fill so the body is
@@ -1288,11 +1340,190 @@ class BonitoChat {
     onThinking(msg) {
         const active = msg.active;
         if (this.thinkingEl) this.thinkingEl.classList.toggle('bt-thinking-active', !!active);
+        // The busy dots and the reasoning line are redundant while a thought
+        // streams — suppress the dots so exactly ONE liveness indicator shows.
+        if (this.busyEl) this.busyEl.classList.toggle('bt-busy-suppressed', !!active);
         // Show the running chunk count while active; clear it on teardown so the
         // next think starts fresh. count 0 (initial activation) shows no number.
+        // Spell the unit out — a bare number next to "reasoning…" read as noise.
         if (this.thinkingCountEl)
-            this.thinkingCountEl.textContent = (active && msg.count) ? String(msg.count) : '';
+            this.thinkingCountEl.textContent =
+                (active && msg.count) ? `${msg.count} token chunks` : '';
         if (active && this.followMode) this._queueScrollToBottom();
+    }
+
+    // ── Permission / question cards ──────────────────────────────────────
+    // A `session/request_permission` (AskUserQuestion, plan approval, …)
+    // renders as an interactive card with one button per option. The card is
+    // PLAIN scroll content (like the busy/thinking indicators — inserted
+    // after the bottom spacer, never tracked by the virtual-scroll
+    // geometry): it lives exactly under the last message for the lifetime
+    // of the request and is dropped via `permission_done` once the answer
+    // (from ANY tab, or the server-side timeout) resolves the RPC.
+    onPermission(msg) {
+        if (!msg.key || !Array.isArray(msg.options)) return;
+        // Re-emit / remount safety: one card per key.
+        if (this.container.querySelector(
+                `.bt-permission-card[data-perm-key="${CSS.escape(msg.key)}"]`)) return;
+        const card = document.createElement('div');
+        card.className = 'bt-permission-card';
+        card.dataset.permKey = msg.key;
+        const q = document.createElement('div');
+        q.className = 'bt-permission-question';
+        q.textContent = msg.question || 'The agent is asking for permission';
+        const row = document.createElement('div');
+        row.className = 'bt-permission-options';
+        for (const opt of msg.options) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'bt-permission-btn' +
+                (String(opt.kind || '').startsWith('allow') ? ' bt-perm-allow' :
+                 String(opt.kind || '').startsWith('reject') ? ' bt-perm-reject' : '');
+            btn.textContent = opt.name || opt.optionId;
+            btn.addEventListener('click', () => {
+                if (card.classList.contains('bt-perm-answered')) return;
+                card.classList.add('bt-perm-answered');
+                btn.classList.add('bt-perm-chosen');
+                row.querySelectorAll('button').forEach(b => b.disabled = true);
+                this.comm.notify({ type: 'permission_answer',
+                                   key: msg.key, optionId: opt.optionId });
+            });
+            row.appendChild(btn);
+        }
+        card.append(q, row);
+        // Under the last message: before the busy indicator (which follows
+        // the bottom spacer).
+        this.container.insertBefore(card, this.busyEl || null);
+        if (this.followMode) this._queueScrollToBottom();
+    }
+
+    onPermissionDone(msg) {
+        const card = this.container.querySelector(
+            `.bt-permission-card[data-perm-key="${CSS.escape(msg.key || '')}"]`);
+        if (!card) return;
+        if (card.classList.contains('bt-perm-answered')) {
+            // Leave the chosen state visible for a beat, then clear.
+            setTimeout(() => card.remove(), 1500);
+        } else {
+            card.remove();   // answered elsewhere (other tab / timeout)
+        }
+    }
+
+    // ── Question forms (AskUserQuestion via ACP form elicitation) ────────
+    // `fields` is the flattened requestedSchema: select / multiselect
+    // fields carry option lists; text fields render as a free-text input
+    // (the "Other" box). The common case — ONE single-select question —
+    // submits on option click; everything else collects picks and submits
+    // through the Answer button. Skip = decline ("the user skipped", the
+    // agent continues on its own).
+    onQuestion(msg) {
+        if (!msg.key || !Array.isArray(msg.fields)) return;
+        if (this.container.querySelector(
+                `.bt-permission-card[data-perm-key="${CSS.escape(msg.key)}"]`)) return;
+        const card = document.createElement('div');
+        card.className = 'bt-permission-card';
+        card.dataset.permKey = msg.key;
+        const q = document.createElement('div');
+        q.className = 'bt-permission-question';
+        q.textContent = msg.message || 'The agent has a question';
+        card.appendChild(q);
+
+        const selects = msg.fields.filter(f => f.kind === 'select' || f.kind === 'multiselect');
+        const texts   = msg.fields.filter(f => f.kind === 'text');
+        const instant = selects.length === 1 && selects[0].kind === 'select';
+        const chosen  = {};   // field key → value (string) or Set (multiselect)
+
+        const submit = () => {
+            if (card.classList.contains('bt-perm-answered')) return;
+            card.classList.add('bt-perm-answered');
+            const content = {};
+            for (const [k, v] of Object.entries(chosen)) {
+                content[k] = v instanceof Set ? [...v] : v;
+            }
+            for (const inp of card.querySelectorAll('input.bt-question-text')) {
+                if (inp.value.trim() !== '') content[inp.dataset.fieldKey] = inp.value;
+            }
+            card.querySelectorAll('button, input').forEach(el => el.disabled = true);
+            this.comm.notify({ type: 'question_answer', key: msg.key, content });
+        };
+        const skip = () => {
+            if (card.classList.contains('bt-perm-answered')) return;
+            card.classList.add('bt-perm-answered');
+            card.querySelectorAll('button, input').forEach(el => el.disabled = true);
+            this.comm.notify({ type: 'question_skip', key: msg.key });
+        };
+
+        for (const f of selects) {
+            if ((f.title || f.description) && !instant) {
+                const lbl = document.createElement('div');
+                lbl.className = 'bt-question-field-label';
+                lbl.textContent = f.title ? `${f.title}${f.description ? ' — ' + f.description : ''}`
+                                          : f.description;
+                card.appendChild(lbl);
+            }
+            const row = document.createElement('div');
+            row.className = 'bt-permission-options';
+            for (const opt of (f.options || [])) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'bt-permission-btn';
+                btn.textContent = opt.label || opt.value;
+                btn.addEventListener('click', () => {
+                    if (card.classList.contains('bt-perm-answered')) return;
+                    if (f.kind === 'multiselect') {
+                        if (!(chosen[f.key] instanceof Set)) chosen[f.key] = new Set();
+                        if (chosen[f.key].has(opt.value)) {
+                            chosen[f.key].delete(opt.value);
+                            btn.classList.remove('bt-perm-chosen');
+                        } else {
+                            chosen[f.key].add(opt.value);
+                            btn.classList.add('bt-perm-chosen');
+                        }
+                    } else {
+                        chosen[f.key] = opt.value;
+                        row.querySelectorAll('button').forEach(b =>
+                            b.classList.remove('bt-perm-chosen'));
+                        btn.classList.add('bt-perm-chosen');
+                        if (instant) submit();
+                    }
+                });
+                row.appendChild(btn);
+            }
+            card.appendChild(row);
+        }
+        for (const f of texts) {
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 'bt-question-text';
+            inp.dataset.fieldKey = f.key;
+            inp.placeholder = f.title || 'Other…';
+            if (f.description) inp.title = f.description;
+            inp.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') submit();
+            });
+            card.appendChild(inp);
+        }
+        const actions = document.createElement('div');
+        actions.className = 'bt-permission-actions';
+        if (!instant || texts.length > 0) {
+            const answer = document.createElement('button');
+            answer.type = 'button';
+            answer.className = 'bt-permission-btn bt-perm-allow';
+            answer.textContent = 'Answer';
+            answer.addEventListener('click', submit);
+            actions.appendChild(answer);
+        }
+        const skipBtn = document.createElement('button');
+        skipBtn.type = 'button';
+        skipBtn.className = 'bt-permission-btn bt-question-skip';
+        skipBtn.textContent = 'Skip';
+        skipBtn.title = 'Skip — let the agent decide on its own';
+        skipBtn.addEventListener('click', skip);
+        actions.appendChild(skipBtn);
+        card.appendChild(actions);
+
+        this.container.insertBefore(card, this.busyEl || null);
+        if (this.followMode) this._queueScrollToBottom();
     }
 
     // Julia called `restart_chat_session!` — the ACP subprocess was killed
@@ -1320,6 +1551,7 @@ class BonitoChat {
     onSessionReset() {
         this.thinkingEl?.classList.remove('bt-thinking-active');
         this.busyEl?.classList.remove('bt-busy-active');
+        this.busyEl?.classList.remove('bt-busy-suppressed');
         this._cancelPendingScroll();
         for (const node of this.nodeById.values()) {
             node.classList?.remove('bt-stream-active');
@@ -1336,6 +1568,9 @@ class BonitoChat {
             // class. Terminal status sheds it; mid-flight gets it.
             const live = !(msg.status === 'completed' || msg.status === 'failed');
             node.classList.toggle('bt-tool-live', live);
+            // The live code preview's job ends with the eval — the completed
+            // body renders the same code as its Monaco "Code" section.
+            if (!live) node.querySelector('.bt-eval-preview')?.remove();
         }
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
@@ -1344,6 +1579,12 @@ class BonitoChat {
         if (msg.title) {
             const t = node.querySelector('.bt-tool-title');
             if (t) t.textContent = msg.title;
+        }
+        // Bash: the raw command rides as a header tooltip once known (the
+        // visible title is claude's human-readable description).
+        if (msg.command) {
+            const h = node.querySelector('.bt-tool-header');
+            if (h) h.title = msg.command;
         }
         if (msg.summary != null) {
             const s = node.querySelector('.bt-tool-summary');
@@ -1379,16 +1620,63 @@ class BonitoChat {
                 node.dataset.btAutoExpand = '1';
             }
         }
-        // A background bash/Task only learns it's a taskbar item when its launch
-        // result arrives (rawInput doesn't carry run_in_background), so the server
-        // flips `taskbar` on a later update. The taskbar filter keys off this
-        // attr — set it so `_refreshTaskbar` below adds the slot. (Set-only,
-        // matching createNode; nothing clears it.)
-        if (msg.taskbar) node.dataset.toolTaskbar = '1';
-        // Live-set / timer / taskbar all sit on the same DOM data attrs the
-        // ticker reads — rebuild now so the taskbar reflects this change
-        // instantly instead of waiting for the next 1s tick.
-        this._refreshTaskbar();
+        // Eval extras arrive LATE for real agents: claude-agent-acp streams
+        // tool input, so the initial tool_call has an empty rawInput and the
+        // code/timeout/stoppable fields only ride a later update. Insert the
+        // missing affordances on demand (mirrors createNode's wiring).
+        const headerEl = node.querySelector('.bt-tool-header');
+        const stillLive = !node.dataset.toolFinished &&
+            !['completed', 'failed'].includes(
+                node.querySelector('.bt-tool-status')?.textContent || '');
+        if (msg.timeout_s && headerEl && !headerEl.querySelector('.bt-tool-timeout')) {
+            const badge = document.createElement('span');
+            badge.className = 'bt-tool-timeout';
+            badge.title = 'Soft eval timeout — the call checkpoints with partial output at this cadence';
+            badge.textContent = `⏱ ${String(msg.timeout_s)}`;
+            const timer = headerEl.querySelector('.bt-tool-timer');
+            headerEl.insertBefore(badge, timer || null);
+        }
+        if (msg.stoppable && headerEl && !headerEl.querySelector('.bt-tool-stop')) {
+            const sb = document.createElement('button');
+            sb.type = 'button';
+            sb.className = 'bt-tool-stop bt-stop-mini';
+            sb.title = 'Stop';
+            sb.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.comm.notify({ type: 'stop_tool', id: msg.id });
+            });
+            headerEl.insertBefore(sb,
+                headerEl.querySelector('.bt-tool-fullwidth') || null);
+        }
+        if (msg.code && stillLive && headerEl && !node.querySelector('.bt-eval-preview')) {
+            const pv = document.createElement('div');
+            pv.className = 'bt-eval-preview';
+            const pre = document.createElement('pre');
+            pre.textContent = msg.code;
+            const tg = document.createElement('button');
+            tg.type = 'button';
+            tg.className = 'bt-eval-preview-toggle';
+            tg.title = 'Enlarge';
+            tg.textContent = '⌄';
+            tg.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const full = pv.classList.toggle('bt-eval-preview-full');
+                tg.textContent = full ? '⌃' : '⌄';
+                tg.title = full ? 'Collapse' : 'Enlarge';
+            });
+            pv.append(pre, tg);
+            headerEl.insertAdjacentElement('afterend', pv);
+        }
+        // The file path usually arrives with a later update (the initial
+        // header has no arguments/content yet) — turn the title into a
+        // path link on demand.
+        if (msg.editable && msg.edit_path && headerEl) {
+            const t = headerEl.querySelector('.bt-tool-title');
+            if (t) {
+                t.classList.add('bt-path-link');
+                t.dataset.path = msg.edit_path;
+            }
+        }
     }
 
     // ── Message filter (toolbar below the composer) ──────────────────────
@@ -1540,6 +1828,7 @@ class BonitoChat {
                     div.appendChild(span);
                 } else {
                     div.innerHTML = msg.html || '';
+                    linkifyPaths(div);
                 }
                 break;
             case 'thought': {
@@ -1572,7 +1861,6 @@ class BonitoChat {
                     div.dataset.toolFinished = String(msg.finished_at);
                 // Server-decided opt-in for the taskbar slot. Background bash
                 // / Task land here; regular tools don't.
-                if (msg.taskbar) div.dataset.toolTaskbar = '1';
                 const liveTool = !(msg.status === 'completed' || msg.status === 'failed') &&
                                   msg.finished_at == null;
                 if (liveTool) div.classList.add('bt-tool-live');
@@ -1594,11 +1882,13 @@ class BonitoChat {
                       onExpand: () => this.comm.notify({type: 'tool.render', id}) });
                 // Detach (bonito_app only): pop the embed into the floating
                 // window. Lives on the ⤢ header button — the conventional "open
-                // in a window" glyph, and where users expect detach.
+                // in a window" glyph, and where users expect detach. Routed
+                // through the comm (→ DetachAppCommand → pane.detach_app →
+                // PopupController); no window-global controller.
                 const detachBtn = div.querySelector('.bt-tool-detach');
                 if (detachBtn) detachBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    window._btPopup && window._btPopup.detach(id);
+                    this.comm.notify({ type: 'detach_app', id });
                 });
                 // Full-chat-width toggle, vertically centered on the bubble's
                 // right edge (CSS reveals it only while the body is expanded —
@@ -1613,6 +1903,25 @@ class BonitoChat {
                     wideBtn.textContent = active ? '«' : '»';
                     wideBtn.title = active ?
                         'Collapse to default width' : 'Expand to full chat width';
+                });
+                // Per-pill interrupt (eval family). Routes through the same
+                // stop_tool command the taskbar uses; the server dispatches
+                // per tool kind (eval → SIGINT the worker's eval process).
+                const stopBtn2 = div.querySelector('.bt-tool-stop');
+                if (stopBtn2) stopBtn2.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.comm.notify({ type: 'stop_tool', id });
+                });
+                // Live code preview enlarge/collapse — same small-preview →
+                // grow interaction as the diff view, no re-fetch.
+                const pvToggle = div.querySelector('.bt-eval-preview-toggle');
+                if (pvToggle) pvToggle.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const pv = div.querySelector('.bt-eval-preview');
+                    if (!pv) return;
+                    const full = pv.classList.toggle('bt-eval-preview-full');
+                    pvToggle.textContent = full ? '⌃' : '⌄';
+                    pvToggle.title = full ? 'Collapse' : 'Enlarge';
                 });
                 // The show's mime (bt_show results) — the native-media
                 // toggles key on it.
@@ -1673,10 +1982,19 @@ class BonitoChat {
         return div;
     }
 
-    // Clear the "queued" state from the FIRST (oldest) still-queued user
-    // bubble. Server-side FIFO under `promote_queued_user_bubble!` matches the
-    // DOM order the bubbles were created in, so first-match is correct.
-    unqueueOldestUser() {
+    // Clear the "queued" badge from the promoted user bubble. Targeted by
+    // STORE INDEX into the node cache — the bubble may be virtually
+    // scrolled out of the DOM, and a DOM-only lookup would leave its cached
+    // node wearing a stale QUEUED badge forever (the "chat looks wedged"
+    // bug). Falls back to oldest-in-DOM for events without an index.
+    unqueueUser(msg) {
+        if (Number.isInteger(msg.idx)) {
+            const node = this.cache.get(msg.idx);
+            if (node) { node.classList.remove('bt-queued'); return; }
+            // No cached node yet: nothing stale to clear — a later render
+            // builds it from the (already-promoted) store dict.
+            return;
+        }
         const q = this.container.querySelector('.bt-user-msg.bt-queued');
         if (q) q.classList.remove('bt-queued');
     }
@@ -1700,33 +2018,66 @@ class BonitoChat {
 
     toolHTML(msg) {
         const statusCls = `bt-tool-status bt-status-${msg.status || 'pending'}`;
-        const preview   = msg.preview ?
-            `<div class="bt-edit-preview">${msg.preview}</div>` : '';
         // MCP tools carry a `server` (e.g. "bonitoteam"); show it as a dim
         // badge before the (already prefix-stripped) tool name.
         const server = msg.server ?
             `<span class="bt-tool-server">${escapeHTML(msg.server)}</span>` : '';
+        // Eval-family extras (bt_julia_eval & friends):
+        //   • `timeout_s` — the soft-checkpoint cadence, always visible so
+        //     "why did this come back after 30s" answers itself.
+        //   • `code` — the source being executed; painted as a compact live
+        //     preview under the header WHILE the eval runs (the completed
+        //     body's Monaco "Code" section replaces it — see onToolUpdate).
+        //   • `stoppable` — the ⊗ interrupt button (CSS shows it only while
+        //     the pill is live).
+        const timeoutBadge = msg.timeout_s ?
+            `<span class="bt-tool-timeout" title="Soft eval timeout — the call checkpoints with partial output at this cadence">⏱ ${escapeHTML(String(msg.timeout_s))}</span>` : '';
+        const stopBtn = msg.stoppable ?
+            `<button class="bt-tool-stop bt-stop-mini" type="button"
+                     title="Stop"></button>` : '';
+        // File-path link: when the tool identifies a file (the server ships
+        // `edit_path`), its TITLE becomes a clickable link that opens the
+        // file in the plotpane editor — same affordance as every other path
+        // link in the chat (diff headers, search hits, paths in messages).
+        // One delegated container listener handles all of them.
+        const titleLink = msg.edit_path
+            ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
+        const live = !(msg.status === 'completed' || msg.status === 'failed') &&
+                     msg.finished_at == null;
+        const evalPreview = (msg.code && live) ? `
+            <div class="bt-eval-preview">
+                <pre>${escapeHTML(msg.code)}</pre>
+                <button class="bt-eval-preview-toggle" type="button"
+                        title="Enlarge">⌄</button>
+            </div>` : '';
         // Elapsed timer — only renders text once > 1s have passed (see
         // _tickLiveTimers). Always emitted so the same span can be updated
         // in place by every tick + by `onToolUpdate`.
+        // The full-width toggle lives IN the header (right edge, after the
+        // status pill) — an overlay button floating over the body covered
+        // the actual app/diff content. CSS reveals it only while the body
+        // is expanded (nothing to widen on a collapsed header).
         return `
-            <div class="bt-tool-header" data-expanded="false">
+            <div class="bt-tool-header" data-expanded="false"${
+                msg.command ? ` title="${escapeAttr(msg.command)}"` : ''}>
                 <span class="bt-tool-toggle">▶</span>
                 <span class="bt-tool-kind">${msg.icon || '⚙'}</span>
                 ${server}
-                <span class="bt-tool-title">${escapeHTML(msg.title || '')}</span>
+                <span class="bt-tool-title${titleLink}">${escapeHTML(msg.title || '')}</span>
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
+                ${timeoutBadge}
                 <span class="bt-tool-timer"></span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
+                ${stopBtn}
                 ${msg.kind === 'bonito_app'
                     ? `<button class="bt-tool-detach" type="button"
                               title="Detach to floating window">⤢</button>`
                     : ''}
+                <button class="bt-tool-fullwidth" type="button"
+                        title="Expand to full chat width">»</button>
             </div>
-            ${preview}
-            <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>
-            <button class="bt-tool-fullwidth" type="button"
-                    title="Expand to full chat width">»</button>`;
+            ${evalPreview}
+            <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
     }
 
     // ── Live tools / todos: pulse + timer + taskbar ──────────────────────
@@ -1751,46 +2102,40 @@ class BonitoChat {
             node.classList.add('bt-plan-live');
         }
         if (msg.summary) node.dataset.planSummary = msg.summary;
-        this._refreshTaskbar();
     }
 
     _setupLiveTicker() {
-        // The taskbar element is mounted by the Julia side as a sibling of
-        // `.bt-messages`. Bail gracefully if it's absent (older mount points
-        // / tests skipping the chat shell).
-        this.taskbarEl = this.app ?
-            this.app.querySelector('.bt-taskbar') :
-            this.container.parentElement.querySelector('.bt-taskbar');
-        if (!this.taskbarEl) return;
-        // Delegated click on the taskbar:
-        //   - hitting the ⊗ stop affordance → notify the server, which
-        //     dispatches per-tool via `StopToolCommand` (synthetic user
-        //     message asking Claude to stop the background tool — we don't
-        //     fake an immediate-stop UI because the SDK has no kill primitive
-        //     for background bash, so the slot keeps living until the tool
-        //     itself transitions to terminal status).
-        //   - anywhere else on the slot → scroll back to the source pill.
-        this._onTaskbarClick = (ev) => {
-            const stopBtn = ev.target.closest('.bt-taskbar-slot-stop');
-            if (stopBtn) {
-                ev.stopPropagation();
-                const slot = stopBtn.closest('.bt-taskbar-slot');
-                const id = slot?.dataset.targetId;
-                if (id) this.comm.notify({ type: 'stop_tool', id });
-                return;
-            }
-            const slot = ev.target.closest('.bt-taskbar-slot');
-            if (!slot) return;
-            const id = slot.dataset.targetId;
-            if (!id) return;
-            const target = this.nodeById.get(id);
-            if (target) target.scrollIntoView({ block: 'center', behavior: 'smooth' });
-        };
-        this.taskbarEl.addEventListener('click', this._onTaskbarClick);
+        // The taskbar itself is a Julia-rendered Bonito component (see
+        // taskbar.jl) — state-first, untouched by virtual scrolling. The
+        // chat module only contributes click-to-scroll: a slot click jumps
+        // back to the source pill IF it's currently rendered. (The ⊗ stop
+        // is the component's own observable.)
+        this.taskbarEl = (this.app || this.container.closest('.bt-app') ||
+                          this.container.parentElement).querySelector('.bt-taskbar');
+        if (this.taskbarEl) {
+            this._onTaskbarClick = (ev) => {
+                if (ev.target.closest('.bt-taskbar-slot-stop')) return;
+                const slot = ev.target.closest('.bt-taskbar-slot');
+                if (!slot) return;
+                const idx = parseInt(slot.dataset.msgIndex ?? '-1', 10);
+                if (!Number.isInteger(idx) || idx < 0 || idx >= this.totalCount) return;
+                // Jump via the scroller's own geometry — works whether or
+                // not the pill is currently rendered (scrollIntoView on a
+                // recycled node silently does nothing). Two passes: the
+                // first render swaps estimated heights for real ones, the
+                // second corrects the target with the settled geometry.
+                const jump = () => {
+                    this.container.scrollTop =
+                        Math.max(0, this.cumHeight(0, idx) - 60);
+                };
+                this.followMode = false;
+                jump();
+                requestAnimationFrame(() => requestAnimationFrame(jump));
+            };
+            this.taskbarEl.addEventListener('click', this._onTaskbarClick);
+        }
+        // 1s ticker for the inline pill timers.
         this._tickerId = setInterval(() => this._tickLiveTimers(), 1000);
-        // Initial paint so the bar is populated immediately on first mount
-        // (not after a 1s delay).
-        this._refreshTaskbar();
     }
 
     _tickLiveTimers() {
@@ -1805,60 +2150,6 @@ class BonitoChat {
             const timer = el.querySelector('.bt-tool-timer');
             if (timer) timer.textContent = elapsed > 1 ? _formatElapsed(elapsed) : '';
         }
-        // Also tick the taskbar slot timers (cheaper than full rebuild).
-        for (const slot of this.taskbarEl.querySelectorAll('.bt-taskbar-slot')) {
-            const started = parseFloat(slot.dataset.started ?? '0');
-            if (!started) continue;
-            const elapsed = now - started;
-            const t = slot.querySelector('.bt-taskbar-slot-timer');
-            if (t) t.textContent = elapsed > 1 ? _formatElapsed(elapsed) : '';
-        }
-    }
-
-    _refreshTaskbar() {
-        if (this.destroyed || !this.taskbarEl) return;
-        // Collect live source nodes in document order: tool pills that
-        // opted into the taskbar (background bash / Task) plus every live
-        // todo list. The `[data-tool-taskbar]` filter mirrors the server-
-        // side `is_taskbar_item` decision — a regular live Read pulses
-        // briefly but doesn't crowd the bar.
-        const live = this.container.querySelectorAll(
-            'div.bt-tool-msg.bt-tool-live[data-tool-taskbar], div.bt-plan-msg.bt-plan-live');
-        if (live.length === 0) {
-            this.taskbarEl.replaceChildren();
-            return;
-        }
-        const frag = document.createDocumentFragment();
-        for (const el of live) {
-            const id = el.dataset.msgId;
-            if (!id) continue;
-            const isPlan = el.classList.contains('bt-plan-msg');
-            const icon = isPlan ? '📋' :
-                (el.querySelector('.bt-tool-kind')?.textContent || '⚙');
-            const label = isPlan ?
-                (el.dataset.planSummary || 'Todo list') :
-                (el.querySelector('.bt-tool-title')?.textContent || 'Tool');
-            const started = isPlan ? el.dataset.planStarted : el.dataset.toolStarted;
-            const slot = document.createElement('div');
-            slot.className = 'bt-taskbar-slot';
-            slot.dataset.targetId = id;
-            if (started) slot.dataset.started = started;
-            // Todo lists are passive trackers — no SDK primitive to "stop"
-            // them. Only tool slots get the ⊗ affordance.
-            const stop = isPlan ? '' :
-                `<span class="bt-taskbar-slot-stop" title="Ask Claude to stop this">⊗</span>`;
-            slot.innerHTML =
-                `<span class="bt-taskbar-slot-icon">${icon}</span>` +
-                `<span class="bt-taskbar-slot-label"></span>` +
-                `<span class="bt-taskbar-slot-timer"></span>` +
-                stop;
-            slot.querySelector('.bt-taskbar-slot-label').textContent = label;
-            frag.appendChild(slot);
-        }
-        this.taskbarEl.replaceChildren(frag);
-        // Prime the timers now so a freshly added slot doesn't wait a full
-        // tick to show its elapsed time.
-        this._tickLiveTimers();
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
@@ -2011,7 +2302,11 @@ class BonitoChat {
     // claude as multimodal content blocks.
     _setupInputs() {
         if (this.destroyed) return;
-        const app = this.container?.parentElement;
+        // The chat shell root. `closest` — the messages container sits
+        // inside a positioning wrapper (.bt-messages-wrap), so a bare
+        // parentElement is NOT the app. Fallback for bare test mounts.
+        const app = this.container?.closest('.bt-app') ||
+                    this.container?.parentElement;
         if (!app) return;
         this.app       = app;
         this.inputArea = app.querySelector('.bt-input-area');
@@ -2124,8 +2419,10 @@ class BonitoChat {
     // Fire a cancel notification. Used by both the stop button click
     // and the ESC keystroke. Stays a one-line helper so the two
     // entry points can't drift in what they send.
+    // Carries the sequence number of the turn the user is LOOKING AT
+    // (`turn_begin`), so a stale click can never cancel a later turn.
     _cancel() {
-        this.comm.notify({type: 'cancel'});
+        this.comm.notify({type: 'cancel', seq: this.turnSeq ?? -1});
     }
 
     _dragHasImage(e) {
@@ -2306,7 +2603,8 @@ class BonitoChat {
     // area. We append it once and toggle its visibility class. Click →
     // re-engage follow mode and scroll to the bottom.
     _createNewMessagePill() {
-        const app = this.container?.parentElement;
+        const app = this.container?.closest('.bt-app') ||
+                    this.container?.parentElement;
         if (!app) return;
         const pill = document.createElement('button');
         pill.type = 'button';
@@ -2321,6 +2619,26 @@ class BonitoChat {
         app.appendChild(pill);
         this._pillEl = pill;
     }
+}
+
+// Conservative "this inline code span IS a file path" test: at least one
+// directory separator, path-ish characters only, optional trailing :line —
+// and not a URL. Bare names like `foo.jl` stay unlinked on purpose (too many
+// false positives: package names, "Project.toml" as a concept, …).
+const PATH_RE = /^(~|\.{1,2})?\/?[\w.@+-]+(\/[\w.@+-]+)+(:\d+)?$/;
+
+// Turn path-looking inline `code` spans inside an agent message into
+// clickable path links (the delegated container listener opens them in the
+// plotpane editor). Fenced blocks (<pre><code>) are skipped — linkifying
+// inside code listings is noise.
+function linkifyPaths(rootEl) {
+    rootEl.querySelectorAll('code').forEach((el) => {
+        if (el.closest('pre') || el.closest('a')) return;
+        const text = (el.textContent || '').trim();
+        if (!PATH_RE.test(text) || text.includes('://')) return;
+        el.classList.add('bt-path-link');
+        el.dataset.path = text;
+    });
 }
 
 function escapeHTML(str) {

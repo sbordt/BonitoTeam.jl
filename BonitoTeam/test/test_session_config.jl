@@ -195,9 +195,13 @@ option_by_id(opts, id) = opts[findfirst(o -> o.id == id, opts)]
         @test [o.id for o in opts] == ["mode", "model", "effort"]
         @test option_by_id(opts, "mode").current_value == "default"
 
+        # Record busy transitions via a LISTENER, not by polling: a fast
+        # scripted turn can flip busy on AND off inside one `timedwait` poll
+        # interval, which made the bare `timedwait(() -> busy[])` flaky.
+        busy_seen = Bool[]
+        BT.Bonito.Observables.on(b -> push!(busy_seen, b), model.busy_active)
         BT.send_message!(model, BT.UserMsg("go"))
-        @test timedwait(() -> model.busy_active[], 5.0) === :ok
-        @test timedwait(() -> !model.busy_active[], 5.0) === :ok
+        @test timedwait(() -> busy_seen == [true, false], 5.0) === :ok
 
         # The mid-turn metadata update landed…
         opts = [x for x in model.session_meta[] if x isa ACP.ConfigOption]

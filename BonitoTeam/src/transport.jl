@@ -173,6 +173,21 @@ mcp_list_payload(mcp_servers) =
           "env"     => [Dict("name" => k, "value" => v) for (k,v) in s.env])
      for s in mcp_servers]
 
+# Server-global system prompt (state_dir/AGENTS.md) as the `_meta` extension
+# claude-agent-acp honors on `session/new` / `session/load`:
+# `{_meta: {systemPrompt: {type: "preset", preset: "claude_code", append}}}` —
+# the text is APPENDED to claude's stock system prompt, so it composes with
+# (never replaces) the per-project CLAUDE.md hierarchy. Empty file ⇒ empty
+# dict ⇒ the params stay byte-identical to before.
+function system_prompt_meta(text::AbstractString)
+    isempty(text) && return Dict{String,Any}()
+    return Dict{String,Any}("_meta" => Dict{String,Any}(
+        "systemPrompt" => Dict{String,Any}(
+            "type"   => "preset",
+            "preset" => "claude_code",
+            "append" => String(text))))
+end
+
 # All three bring-ups accept `on_frame` — the optional ACP wire tap passed
 # through to `ACP.Connection` (see `acp_frame_logger`). Threading it here
 # (rather than per-transport state) keeps the tap per-session: a restart
@@ -192,8 +207,14 @@ function start_session(t::LocalTransport, handler::ACP.Handler;
     conn = ACP.Connection(t, handler; on_frame)
     ACP.send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
-        "clientCapabilities" => Dict("fs" => Dict(
-            "readTextFile" => true, "writeTextFile" => true)),
+        "clientCapabilities" => Dict(
+            "fs" => Dict("readTextFile" => true, "writeTextFile" => true),
+            # Form elicitation: claude-agent-acp only ENABLES the
+            # AskUserQuestion tool when the client can render a form
+            # elicitation (otherwise it launches claude with
+            # `--disallowedTools AskUserQuestion`). The chat renders these
+            # as interactive question cards — see `handle_elicitation_request`.
+            "elicitation" => Dict("form" => true)),
         "clientInfo"         => Dict("name"    => "BonitoTeam.LocalTransport",
                                       "version" => "0.1.0")))
     result = ACP.send_request(conn, "session/new",
@@ -239,8 +260,14 @@ function start_session(t::WorkerTransport, handler::ACP.Handler;
     conn = ACP.Connection(t, handler; on_frame)
     ACP.send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
-        "clientCapabilities" => Dict("fs" => Dict(
-            "readTextFile" => true, "writeTextFile" => true)),
+        "clientCapabilities" => Dict(
+            "fs" => Dict("readTextFile" => true, "writeTextFile" => true),
+            # Form elicitation: claude-agent-acp only ENABLES the
+            # AskUserQuestion tool when the client can render a form
+            # elicitation (otherwise it launches claude with
+            # `--disallowedTools AskUserQuestion`). The chat renders these
+            # as interactive question cards — see `handle_elicitation_request`.
+            "elicitation" => Dict("form" => true)),
         "clientInfo"         => Dict("name"    => "BonitoTeam.WorkerTransport",
                                       "version" => "0.1.0")))
 
@@ -248,18 +275,21 @@ function start_session(t::WorkerTransport, handler::ACP.Handler;
     # history as session/update notifications; `replay_history` captures them.
     # Fresh → `session/new`, no replay. Either way the response carries the
     # session-config blocks (models/modes/configOptions) — keep it raw on the
-    # Client for typed views downstream.
+    # Client for typed views downstream. Both carry the server-global
+    # AGENTS.md as an appended system prompt (see `system_prompt_meta`).
+    prompt_meta = system_prompt_meta(global_agents_md(t.state))
     session_id, replay, result = if t.resume_session_id !== nothing
         @info "ACP: resuming session" cwd=t.worker_path resume=t.resume_session_id
-        msgs, load_result = ACP.replay_history(conn, Dict(
+        msgs, load_result = ACP.replay_history(conn, merge(Dict(
             "sessionId"  => t.resume_session_id,
             "cwd"        => t.worker_path,
             "mcpServers" => mcp_list,
-        ))
+        ), prompt_meta))
         t.resume_session_id, msgs, load_result
     else
         new_result = ACP.send_request(conn, "session/new",
-                                  Dict("cwd" => t.worker_path, "mcpServers" => mcp_list))
+                                  merge(Dict("cwd" => t.worker_path,
+                                             "mcpServers" => mcp_list), prompt_meta))
         new_result["sessionId"], ACP.Message[], new_result
     end
 

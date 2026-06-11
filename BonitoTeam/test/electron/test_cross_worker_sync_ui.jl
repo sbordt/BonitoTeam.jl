@@ -40,18 +40,14 @@ results = Pair{String,Bool}[]
 record(name, ok) = push!(results, name => ok)
 
 try
-    # Navigate into p-1's chat. Sidebar labels are now "name · worker", so
-    # match on the worker suffix to pick the right row.
-    idx = TH.eval_js(ctx, """
-        (() => {
-            const items = document.querySelectorAll('.bt-side-item .bt-side-name');
-            for (let i = 0; i < items.length; i++)
-                if (items[i].innerText.includes('w-1')) return i;
-            return -1;
-        })()
-    """)
-    record("found p-1 sidebar row", @TH.test_true idx >= 0)
-    TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[$idx].click()""")
+    # Navigate into p-1's chat. The worker tag lives in the icon now (the
+    # name span carries just the title), so select the row by its stable
+    # data-project-id instead of matching label text.
+    found = TH.wait_for(ctx,
+        """document.querySelector('.bt-side-item[data-project-id="p-1"]') !== null""";
+        timeout = 5.0)
+    record("found p-1 sidebar row", @TH.test_true found)
+    TH.eval_js(ctx, """document.querySelector('.bt-side-item[data-project-id="p-1"]').click()""")
     @assert TH.wait_for(ctx, "document.querySelector('.bt-text-input') !== null") "chat didn't mount"
 
     TH.section("⇄ button present only because a sibling exists") do

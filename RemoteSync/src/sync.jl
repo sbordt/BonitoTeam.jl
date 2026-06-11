@@ -74,7 +74,8 @@ end
 # Decide what to do with each entry the sender announced + which local files
 # should be deleted. The plan is what we ask the sender to send back to us.
 function build_plan(local_root::AbstractString,
-                    remote_manifest::Vector{ManifestEntry})
+                    remote_manifest::Vector{ManifestEntry};
+                    quick_check::Bool = true)
     plan = PlanEntry[]
     # Canonicalize every remote rel up front and drop anything that escapes the
     # root (R1/R7). The membership set used by the delete pass is built from the
@@ -102,7 +103,17 @@ function build_plan(local_root::AbstractString,
         # size + mtime (within ~1ms) is treated as identical. The 1ms tolerance
         # absorbs Float64 precision loss in the stat→wire→utimes→stat round-trip
         # (ns precision can't survive Float64 at modern Unix epoch values).
-        if UInt64(st.size) == e.size && abs(Float64(st.mtime) - e.mtime) < 0.001
+        #
+        # `quick_check = false` disables the skip entirely: like rsync's
+        # --checksum, every shared file goes through the signature/delta
+        # exchange (cheap for identical content — the delta degenerates to
+        # copy ops). Callers doing a user-confirmed DIRECTIONAL OVERWRITE
+        # use this, because the heuristic has a real false-negative: two
+        # same-length variants written within the same clock tick (e.g.
+        # "FROM A\n" vs "FROM B\n") match size+mtime and would silently
+        # keep the stale side.
+        if quick_check &&
+           UInt64(st.size) == e.size && abs(Float64(st.mtime) - e.mtime) < 0.001
             push!(plan, PlanEntry(rel, ACTION_SKIP, UInt8[]))
             continue
         end
@@ -196,15 +207,22 @@ end
 
 # ── Public: receiver side ──────────────────────────────────────────────────
 """
-    receive_directory(root, transport::IO; on_progress = nothing) → Stats
+    receive_directory(root, transport::IO; on_progress = nothing,
+                      quick_check = true) → Stats
 
 Receive into `root` over `transport`. Atomic per-file writes (`<rel>.partial`
 then `mv`) so a transport crash mid-file leaves the prior version intact.
 
+`quick_check = false` disables the size+mtime skip heuristic (rsync
+`--checksum` semantics) — every shared file is verified through the
+signature/delta exchange. Use for user-confirmed directional overwrites
+where correctness beats the round-trips saved by skipping.
+
 Returns a NamedTuple `(written, deleted, skipped)` with file counts.
 """
 function receive_directory(root::AbstractString, transport::IO;
-                           on_progress = nothing)
+                           on_progress = nothing,
+                           quick_check::Bool = true)
     mkpath(root)
     notify_progress(on_progress, :wait_manifest, NamedTuple())
 
@@ -214,7 +232,7 @@ function receive_directory(root::AbstractString, transport::IO;
     manifest = decode_manifest(payload)
     notify_progress(on_progress, :manifest_received, (count = length(manifest),))
 
-    plan = build_plan(root, manifest)
+    plan = build_plan(root, manifest; quick_check)
     write_frame(transport, TAG_PLAN, encode_plan(plan))
 
     skipped = count(p -> p.action == ACTION_SKIP, plan)

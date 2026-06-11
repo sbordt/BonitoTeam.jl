@@ -711,6 +711,8 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 @async handle_inspect_path(ws, cmd)
             elseif t == "tail_file"
                 @async handle_tail_file(ws, cmd)
+            elseif t == "kill_file_writers"
+                @async handle_kill_file_writers(ws, cmd)
             elseif t == "scan_sessions"
                 @async handle_scan_sessions(ws, cmd)
             elseif t == "clone_repo"
@@ -924,20 +926,134 @@ end
 # on other OSes so the server can fall back to mtime quiescence.
 function file_held_open(path::AbstractString)::Union{Bool,Nothing}
     Sys.islinux() || return nothing
-    target = try realpath(path) catch; abspath(path) end
-    for pid in readdir("/proc")
-        all(isdigit, pid) || continue
-        fddir = joinpath("/proc", pid, "fd")
+    return !isempty(file_writer_pids(path))
+end
+
+# Every OTHER process holding `path` open — for a background shell that's
+# the shell itself (its `>> output` redirect stays open until exit). Used
+# both for the "still running" signal above and for `kill_file_writers`:
+# claude-agent-acp runs shells inside the SDK with no ACP-level kill, so
+# the redirect fd is the one reliable handle for stopping one directly.
+#
+# Linux: scan `/proc/*/fd` (no external deps). macOS / other unix: fall back
+# to `lsof`. Windows: empty (no portable fd→pid map; the caller still
+# finalizes the UI, the process just isn't force-killed).
+function file_writer_pids(path::AbstractString)::Vector{Int}
+    me = getpid()
+    if Sys.islinux()
+        target = try realpath(path) catch; abspath(path) end
+        pids = Int[]
+        for pid in readdir("/proc")
+            all(isdigit, pid) || continue
+            p = parse(Int, pid)
+            p == me && continue          # our own tail read must not count/die
+            fddir = joinpath("/proc", pid, "fd")
+            try
+                for fd in readdir(fddir)
+                    lnk = try realpath(joinpath(fddir, fd)) catch; "" end
+                    if lnk == target
+                        push!(pids, p)
+                        break
+                    end
+                end
+            catch
+                # process vanished mid-scan or fd not readable — skip
+            end
+        end
+        return pids
+    elseif Sys.isunix()
+        return lsof_pids(path, me)
+    else
+        return Int[]                     # Windows: no portable mechanism
+    end
+end
+
+# `lsof -t -- <path>`: the pids with the file open, one per line. `-t`
+# terse-mode prints bare pids. Missing lsof / no holders → empty.
+function lsof_pids(path::AbstractString, me::Int)::Vector{Int}
+    out = try
+        read(pipeline(`lsof -t -- $path`; stderr = devnull), String)
+    catch
+        return Int[]                     # lsof absent or exit≠0 (no holders)
+    end
+    pids = Int[]
+    for tok in split(out)
+        p = tryparse(Int, tok)
+        p === nothing || p == me || push!(pids, p)
+    end
+    return pids
+end
+
+# Direct children of `pid`, read from /proc/<pid>/task/*/children. Empty on
+# non-Linux or when the file isn't present (older kernels without
+# CONFIG_PROC_CHILDREN — rare; the writer-set still covers the common case).
+function child_pids(pid::Int)::Vector{Int}
+    Sys.islinux() || return Int[]
+    kids = Int[]
+    taskdir = "/proc/$pid/task"
+    isdir(taskdir) || return kids
+    for tid in readdir(taskdir)
+        f = joinpath(taskdir, tid, "children")
         try
-            for fd in readdir(fddir)
-                lnk = try realpath(joinpath(fddir, fd)) catch; "" end
-                lnk == target && return true
+            for tok in split(read(f, String))
+                isempty(tok) || push!(kids, parse(Int, tok))
             end
         catch
-            # process vanished mid-scan or fd not readable — skip
+            # children file absent / process vanished — skip
         end
     end
-    return false
+    return kids
+end
+
+# `pid` plus its full descendant tree (BFS). The background bash that holds
+# the `.output` fd typically spawns the real command as a CHILD (`bash -c
+# 'sleep 600'`), and SIGTERM to the parent does NOT reach the child — so a
+# writer-only kill could orphan the actual work. (In practice the child
+# inherits the redirected stdout, so it ALSO holds the fd and the writer
+# set already contains it — confirmed against the real agent — but we walk
+# the tree anyway to cover a child that closed/reopened stdout.) On
+# non-Linux `child_pids` is empty, so this is the identity; the lsof writer
+# set is the coverage there.
+function process_tree(roots::Vector{Int})::Vector{Int}
+    seen = Set{Int}()
+    queue = copy(roots)
+    while !isempty(queue)
+        p = popfirst!(queue)
+        p in seen && continue
+        push!(seen, p)
+        append!(queue, child_pids(p))
+    end
+    return collect(seen)
+end
+
+# SIGTERM every holder of the file AND its descendant tree — the direct stop
+# for a background shell. The SDK observes the exit as a normal one (its task
+# notification fires; the server's poller sees the file released).
+function handle_kill_file_writers(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    raw_path   = String(get(cmd, "path", ""))
+    response = try
+        writers = file_writer_pids(raw_path)
+        me = getpid()
+        # Whole tree, minus ourselves (defensive — the writer scan already
+        # excludes us, but a descendant walk could in principle re-reach it).
+        targets = filter(!=(me), process_tree(writers))
+        for p in targets
+            r = ccall(:kill, Cint, (Cint, Cint), Cint(p), Cint(15))   # SIGTERM
+            r == 0 || @debug "kill_file_writers: SIGTERM failed" pid=p errno=Libc.errno()
+        end
+        Dict("type" => "kill_file_writers_response", "request_id" => request_id,
+             "killed" => targets, "writers" => writers, "supported" => Sys.islinux())
+    catch e
+        Dict("type" => "kill_file_writers_response", "request_id" => request_id,
+             "error" => sprint(showerror, e))
+    end
+    try
+        WebSockets.send(ws, JSON.json(response))
+    catch e
+        @warn "kill_file_writers response failed" exception=e
+    end
+    return nothing
 end
 
 # Stream a file from byte `offset`, plus whether it's still being written
@@ -1152,9 +1268,14 @@ function handle_open_transfer(server_url::String, secret::String,
             wsio = RemoteSync.WebSocketIO(ws)
             if direction == "to_worker"
                 # Server is sending; we're the receiver. Directory transfer.
+                # `quick_check=false` (sent for user-confirmed directional
+                # overwrites, e.g. cross-worker sync) forces delta transfer
+                # even for files whose size+mtime match — rsync --checksum
+                # semantics.
                 dst = String(cmd["dst_path"])
+                qc  = get(cmd, "quick_check", true) === true
                 mkpath(dst)
-                RemoteSync.receive_directory(dst, wsio)
+                RemoteSync.receive_directory(dst, wsio; quick_check = qc)
                 @info "BonitoWorker: transfer to_worker complete" dst
             elseif direction == "from_worker"
                 # Worker is sending; server is the receiver. Directory transfer.

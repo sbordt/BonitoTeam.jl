@@ -131,25 +131,41 @@ end
 function handle_cancelled!(req::AbstractDict)
     params = get(req, "params", Dict{String,Any}())
     rid = get(params, "requestId", get(params, "id", nothing))
-    m = manager()
-    # `JuliaSession` isn't defined yet at this file's include time (session.jl
-    # loads after server.jl), so stay untyped here — runtime values are sessions.
-    #
     # Target ONLY the session the cancelled request owns, when we can map it
     # (M9). If the requestId isn't tracked (unknown id, or a cancel that arrived
     # after the handler cleared it), fall back to interrupting all in-flight
     # evals — never silently fail to stop a runaway computation.
-    target_env = rid === nothing ? nothing :
+    target_env = rid === nothing ? :unknown :
         @lock INFLIGHT_LOCK get(INFLIGHT_REQUESTS, rid, :unknown)
-    scoped = rid !== nothing && target_env !== :unknown
+    n = target_env === :unknown ?
+        interrupt_in_flight!(nothing) :
+        interrupt_in_flight!(target_env; scope_temp = target_env === nothing)
+    log_info("notifications/cancelled (requestId=$rid) → interrupted $n in-flight eval(s)")
+    return nothing
+end
+
+# SIGINT every in-flight eval matching `env_path` and arm the worker-kill
+# fallback for each (see `finalize_cancelled_eval!`). Shared by the MCP
+# `notifications/cancelled` path and the BonitoTeam control channel's
+# `interrupt_eval` op (ctrl_ws.jl). Returns the number of evals interrupted.
+#
+# `env_path === nothing` means "every in-flight eval" — this process serves
+# ONE chat, so that's the right scope when the caller can't name the env.
+# A tracked TEMP session (env_path recorded as `nothing`) is addressed with
+# `scope_temp = true` instead.
+#
+# `JuliaSession` isn't defined yet at this file's include time (session.jl
+# loads after server.jl), so stay untyped here — runtime values are sessions.
+function interrupt_in_flight!(env_path::Union{String,Nothing}; scope_temp::Bool = false)
+    m = manager()
     targets = Any[]
     lock(m.global_lock) do
         for s in values(m.sessions)
             s.in_flight === nothing && continue
-            if scoped
-                _key(s.env_path) == _key(target_env) && push!(targets, s)
-            else
+            if env_path === nothing && !scope_temp
                 push!(targets, s)
+            else
+                _key(s.env_path) == _key(env_path) && push!(targets, s)
             end
         end
     end
@@ -161,12 +177,11 @@ function handle_cancelled!(req::AbstractDict)
         try
             is_alive(s) && Malt.interrupt(s.worker)
         catch e
-            log_info("cancelled: Malt.interrupt failed: $(sprint(showerror, e))")
+            log_info("interrupt: Malt.interrupt failed: $(sprint(showerror, e))")
         end
         f === nothing || @async finalize_cancelled_eval!(s, f)
     end
-    log_info("notifications/cancelled (requestId=$rid) → interrupted $(length(targets)) in-flight eval(s)")
-    return nothing
+    return length(targets)
 end
 
 # After the grace: if the interrupt landed, the eval task is done — clear
@@ -209,6 +224,9 @@ function run_stdio(; in::IO = stdin, out::IO = stdout)
     log_info("$(SERVER_NAME) v$(SERVER_VERSION) listening on stdio (protocol $(PROTOCOL_VERSION))")
     log_info("Registered $(length(TOOLS)) tool(s): " *
              join((t.name for t in TOOLS), ", "))
+    # BonitoTeam-hosted runs get a control dial-back so the chat UI can
+    # interrupt in-flight evals per tool (no-op standalone; see ctrl_ws.jl).
+    start_ctrl_dialback!()
     for line in eachline(in)
         s = strip(line)
         isempty(s) && continue

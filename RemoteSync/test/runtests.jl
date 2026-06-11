@@ -444,6 +444,36 @@ RS.close_ws!(::BlockingWS) = nothing
         end
     end
 
+    # ── quick_check=false bypasses the size+mtime skip heuristic ─────────────
+    # The heuristic has a real false-negative: two same-length variants
+    # written within the same clock tick ("FROM A\n" vs "FROM B\n") match
+    # size+mtime and would silently keep the stale side. Directional
+    # overwrites (cross-worker sync) pass quick_check=false to force the
+    # signature/delta exchange for every shared file.
+    @testset "build_plan quick_check toggles the skip heuristic" begin
+        root = mktempdir()
+        try
+            local_path = joinpath(root, "README.md")
+            write(local_path, "FROM B\n")
+            st = stat(local_path)
+            # Manifest entry with IDENTICAL size + mtime but different content.
+            manifest = RS.ManifestEntry[
+                RS.ManifestEntry("README.md", UInt64(st.size), Float64(st.mtime)),
+            ]
+
+            plan_quick = RS.build_plan(root, manifest)               # default true
+            @test length(plan_quick) == 1
+            @test plan_quick[1].action == RS.ACTION_SKIP             # the false-negative
+
+            plan_full = RS.build_plan(root, manifest; quick_check = false)
+            @test length(plan_full) == 1
+            @test plan_full[1].action == RS.ACTION_PATCH             # delta-checked
+            @test !isempty(plan_full[1].sig)                         # carries a signature
+        finally
+            rm(root; recursive = true, force = true)
+        end
+    end
+
     # ── R3: oversized / malformed frame lengths are refused, not allocated ────
     @testset "R3 frame size caps" begin
         @test RS.MAX_FRAME_BYTES < typemax(UInt32)   # cap leaves room to exceed

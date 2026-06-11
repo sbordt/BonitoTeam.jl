@@ -22,7 +22,10 @@ class Collapsable {
             this.details && this.details.addEventListener('toggle', ()=>this.applyExpanded(this.details.open));
         } else {
             headerEl.style.cursor = 'pointer';
-            headerEl.addEventListener('click', ()=>this.applyExpanded(!this.expanded));
+            headerEl.addEventListener('click', (e)=>{
+                if (this.expanded && this.toggle && e.target !== this.toggle && !this.toggle.contains(e.target)) return;
+                this.applyExpanded(!this.expanded);
+            });
         }
     }
     setExpanded(expanded) {
@@ -109,7 +112,7 @@ class BonitoChat {
         this.AT_BOTTOM_PX = 20;
         this.spacerTop = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
-        this.toolbarEl = container.parentElement.querySelector('.bt-chat-toolbar');
+        this.toolbarEl = (container.closest('.bt-app') || container.parentElement).querySelector('.bt-chat-toolbar');
         this.hiddenTypes = new Set(DEFAULT_HIDDEN);
         this.seenTypes = new Set();
         this.keyByIdx = new Map();
@@ -162,8 +165,10 @@ class BonitoChat {
             type: 'init'
         });
         this._lastUserInputT = 0;
+        this._pendingUserScroll = false;
         const markUserInput = ()=>{
             this._lastUserInputT = performance.now();
+            this._pendingUserScroll = true;
             this._cancelPendingScroll();
         };
         container.addEventListener('wheel', markUserInput, {
@@ -179,6 +184,20 @@ class BonitoChat {
             passive: true
         });
         this._markUserInput = markUserInput;
+        container.addEventListener('click', (e)=>{
+            const link = e.target.closest('.bt-path-link');
+            if (!link || !container.contains(link)) return;
+            const path = link.dataset.path || link.textContent.trim();
+            if (!path) return;
+            e.preventDefault();
+            e.stopPropagation();
+            this.comm.notify({
+                type: 'edit_file',
+                path
+            });
+        }, {
+            capture: true
+        });
         this._scrollbarDrag = false;
         this._onContainerMouseDown = ()=>{
             this._scrollbarDrag = true;
@@ -345,7 +364,8 @@ class BonitoChat {
         this._onPanMove = onPanMove;
         this._onPanUp = onPanUp;
         this._onScroll = ()=>{
-            const userDriven = this._scrollbarDrag || performance.now() - this._lastUserInputT < 400;
+            const userDriven = this._scrollbarDrag || this._pendingUserScroll || performance.now() - this._lastUserInputT < 400;
+            this._pendingUserScroll = false;
             const atBot = this.atBottom();
             if (userDriven) {
                 this.setFollowMode(atBot);
@@ -450,6 +470,9 @@ class BonitoChat {
         switch(msg.type){
             case 'msgs.count':
                 return this.applyCount(msg.n);
+            case 'turn_begin':
+                this.turnSeq = msg.seq;
+                return;
             case 'msgs.range':
                 return this.onRange(msg);
             case 'session_reset':
@@ -466,6 +489,14 @@ class BonitoChat {
                 return this.onAgentFinal(msg);
             case 'thinking':
                 return this.onThinking(msg);
+            case 'permission':
+                return this.onPermission(msg);
+            case 'permission_done':
+                return this.onPermissionDone(msg);
+            case 'question':
+                return this.onQuestion(msg);
+            case 'question_done':
+                return this.onPermissionDone(msg);
             case 'thought_final':
                 return this.onThoughtFinal(msg);
             case 'thought.body':
@@ -479,7 +510,7 @@ class BonitoChat {
             case 'user_chunk':
                 return this.appendUserChunk(msg.text);
             case 'user_unqueue':
-                return this.unqueueOldestUser();
+                return this.unqueueUser(msg);
             case 'summary_final':
                 return this.onSummaryFinal(msg);
             case 'attach_error':
@@ -542,8 +573,7 @@ class BonitoChat {
         if (this._settleDone) return;
         this._settleDone = true;
         this._settleWatch = false;
-        this.setFollowMode(true);
-        this.scrollToBottom();
+        if (this.followMode) this.scrollToBottom();
         if (this._paneEl) {
             delete this._paneEl.dataset.btSettling;
             this._paneEl.dataset.btSettled = '1';
@@ -899,7 +929,10 @@ class BonitoChat {
     }
     onAgentFinal(msg) {
         const node = this.nodeById.get(msg.id);
-        if (node && msg.html) node.innerHTML = msg.html;
+        if (node && msg.html) {
+            node.innerHTML = msg.html;
+            linkifyPaths(node);
+        }
     }
     onThoughtFinal(msg) {
         const node = this.nodeById.get(msg.id);
@@ -912,12 +945,167 @@ class BonitoChat {
     onThinking(msg) {
         const active = msg.active;
         if (this.thinkingEl) this.thinkingEl.classList.toggle('bt-thinking-active', !!active);
-        if (this.thinkingCountEl) this.thinkingCountEl.textContent = active && msg.count ? String(msg.count) : '';
+        if (this.busyEl) this.busyEl.classList.toggle('bt-busy-suppressed', !!active);
+        if (this.thinkingCountEl) this.thinkingCountEl.textContent = active && msg.count ? `${msg.count} token chunks` : '';
         if (active && this.followMode) this._queueScrollToBottom();
+    }
+    onPermission(msg) {
+        if (!msg.key || !Array.isArray(msg.options)) return;
+        if (this.container.querySelector(`.bt-permission-card[data-perm-key="${CSS.escape(msg.key)}"]`)) return;
+        const card = document.createElement('div');
+        card.className = 'bt-permission-card';
+        card.dataset.permKey = msg.key;
+        const q = document.createElement('div');
+        q.className = 'bt-permission-question';
+        q.textContent = msg.question || 'The agent is asking for permission';
+        const row = document.createElement('div');
+        row.className = 'bt-permission-options';
+        for (const opt of msg.options){
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'bt-permission-btn' + (String(opt.kind || '').startsWith('allow') ? ' bt-perm-allow' : String(opt.kind || '').startsWith('reject') ? ' bt-perm-reject' : '');
+            btn.textContent = opt.name || opt.optionId;
+            btn.addEventListener('click', ()=>{
+                if (card.classList.contains('bt-perm-answered')) return;
+                card.classList.add('bt-perm-answered');
+                btn.classList.add('bt-perm-chosen');
+                row.querySelectorAll('button').forEach((b)=>b.disabled = true);
+                this.comm.notify({
+                    type: 'permission_answer',
+                    key: msg.key,
+                    optionId: opt.optionId
+                });
+            });
+            row.appendChild(btn);
+        }
+        card.append(q, row);
+        this.container.insertBefore(card, this.busyEl || null);
+        if (this.followMode) this._queueScrollToBottom();
+    }
+    onPermissionDone(msg) {
+        const card = this.container.querySelector(`.bt-permission-card[data-perm-key="${CSS.escape(msg.key || '')}"]`);
+        if (!card) return;
+        if (card.classList.contains('bt-perm-answered')) {
+            setTimeout(()=>card.remove(), 1500);
+        } else {
+            card.remove();
+        }
+    }
+    onQuestion(msg) {
+        if (!msg.key || !Array.isArray(msg.fields)) return;
+        if (this.container.querySelector(`.bt-permission-card[data-perm-key="${CSS.escape(msg.key)}"]`)) return;
+        const card = document.createElement('div');
+        card.className = 'bt-permission-card';
+        card.dataset.permKey = msg.key;
+        const q = document.createElement('div');
+        q.className = 'bt-permission-question';
+        q.textContent = msg.message || 'The agent has a question';
+        card.appendChild(q);
+        const selects = msg.fields.filter((f)=>f.kind === 'select' || f.kind === 'multiselect');
+        const texts = msg.fields.filter((f)=>f.kind === 'text');
+        const instant = selects.length === 1 && selects[0].kind === 'select';
+        const chosen = {};
+        const submit = ()=>{
+            if (card.classList.contains('bt-perm-answered')) return;
+            card.classList.add('bt-perm-answered');
+            const content = {};
+            for (const [k, v] of Object.entries(chosen)){
+                content[k] = v instanceof Set ? [
+                    ...v
+                ] : v;
+            }
+            for (const inp of card.querySelectorAll('input.bt-question-text')){
+                if (inp.value.trim() !== '') content[inp.dataset.fieldKey] = inp.value;
+            }
+            card.querySelectorAll('button, input').forEach((el)=>el.disabled = true);
+            this.comm.notify({
+                type: 'question_answer',
+                key: msg.key,
+                content
+            });
+        };
+        const skip = ()=>{
+            if (card.classList.contains('bt-perm-answered')) return;
+            card.classList.add('bt-perm-answered');
+            card.querySelectorAll('button, input').forEach((el)=>el.disabled = true);
+            this.comm.notify({
+                type: 'question_skip',
+                key: msg.key
+            });
+        };
+        for (const f of selects){
+            if ((f.title || f.description) && !instant) {
+                const lbl = document.createElement('div');
+                lbl.className = 'bt-question-field-label';
+                lbl.textContent = f.title ? `${f.title}${f.description ? ' — ' + f.description : ''}` : f.description;
+                card.appendChild(lbl);
+            }
+            const row = document.createElement('div');
+            row.className = 'bt-permission-options';
+            for (const opt of f.options || []){
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'bt-permission-btn';
+                btn.textContent = opt.label || opt.value;
+                btn.addEventListener('click', ()=>{
+                    if (card.classList.contains('bt-perm-answered')) return;
+                    if (f.kind === 'multiselect') {
+                        if (!(chosen[f.key] instanceof Set)) chosen[f.key] = new Set();
+                        if (chosen[f.key].has(opt.value)) {
+                            chosen[f.key].delete(opt.value);
+                            btn.classList.remove('bt-perm-chosen');
+                        } else {
+                            chosen[f.key].add(opt.value);
+                            btn.classList.add('bt-perm-chosen');
+                        }
+                    } else {
+                        chosen[f.key] = opt.value;
+                        row.querySelectorAll('button').forEach((b)=>b.classList.remove('bt-perm-chosen'));
+                        btn.classList.add('bt-perm-chosen');
+                        if (instant) submit();
+                    }
+                });
+                row.appendChild(btn);
+            }
+            card.appendChild(row);
+        }
+        for (const f of texts){
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 'bt-question-text';
+            inp.dataset.fieldKey = f.key;
+            inp.placeholder = f.title || 'Other…';
+            if (f.description) inp.title = f.description;
+            inp.addEventListener('keydown', (e)=>{
+                if (e.key === 'Enter') submit();
+            });
+            card.appendChild(inp);
+        }
+        const actions = document.createElement('div');
+        actions.className = 'bt-permission-actions';
+        if (!instant || texts.length > 0) {
+            const answer = document.createElement('button');
+            answer.type = 'button';
+            answer.className = 'bt-permission-btn bt-perm-allow';
+            answer.textContent = 'Answer';
+            answer.addEventListener('click', submit);
+            actions.appendChild(answer);
+        }
+        const skipBtn = document.createElement('button');
+        skipBtn.type = 'button';
+        skipBtn.className = 'bt-permission-btn bt-question-skip';
+        skipBtn.textContent = 'Skip';
+        skipBtn.title = 'Skip — let the agent decide on its own';
+        skipBtn.addEventListener('click', skip);
+        actions.appendChild(skipBtn);
+        card.appendChild(actions);
+        this.container.insertBefore(card, this.busyEl || null);
+        if (this.followMode) this._queueScrollToBottom();
     }
     onSessionReset() {
         this.thinkingEl?.classList.remove('bt-thinking-active');
         this.busyEl?.classList.remove('bt-busy-active');
+        this.busyEl?.classList.remove('bt-busy-suppressed');
         this._cancelPendingScroll();
         for (const node of this.nodeById.values()){
             node.classList?.remove('bt-stream-active');
@@ -934,6 +1122,7 @@ class BonitoChat {
             }
             const live = !(msg.status === 'completed' || msg.status === 'failed');
             node.classList.toggle('bt-tool-live', live);
+            if (!live) node.querySelector('.bt-eval-preview')?.remove();
         }
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
@@ -942,6 +1131,10 @@ class BonitoChat {
         if (msg.title) {
             const t = node.querySelector('.bt-tool-title');
             if (t) t.textContent = msg.title;
+        }
+        if (msg.command) {
+            const h = node.querySelector('.bt-tool-header');
+            if (h) h.title = msg.command;
         }
         if (msg.summary != null) {
             const s = node.querySelector('.bt-tool-summary');
@@ -969,8 +1162,59 @@ class BonitoChat {
                 node.dataset.btAutoExpand = '1';
             }
         }
-        if (msg.taskbar) node.dataset.toolTaskbar = '1';
-        this._refreshTaskbar();
+        const headerEl = node.querySelector('.bt-tool-header');
+        const stillLive = !node.dataset.toolFinished && ![
+            'completed',
+            'failed'
+        ].includes(node.querySelector('.bt-tool-status')?.textContent || '');
+        if (msg.timeout_s && headerEl && !headerEl.querySelector('.bt-tool-timeout')) {
+            const badge = document.createElement('span');
+            badge.className = 'bt-tool-timeout';
+            badge.title = 'Soft eval timeout — the call checkpoints with partial output at this cadence';
+            badge.textContent = `⏱ ${String(msg.timeout_s)}`;
+            const timer = headerEl.querySelector('.bt-tool-timer');
+            headerEl.insertBefore(badge, timer || null);
+        }
+        if (msg.stoppable && headerEl && !headerEl.querySelector('.bt-tool-stop')) {
+            const sb = document.createElement('button');
+            sb.type = 'button';
+            sb.className = 'bt-tool-stop bt-stop-mini';
+            sb.title = 'Stop';
+            sb.addEventListener('click', (e)=>{
+                e.stopPropagation();
+                this.comm.notify({
+                    type: 'stop_tool',
+                    id: msg.id
+                });
+            });
+            headerEl.insertBefore(sb, headerEl.querySelector('.bt-tool-fullwidth') || null);
+        }
+        if (msg.code && stillLive && headerEl && !node.querySelector('.bt-eval-preview')) {
+            const pv = document.createElement('div');
+            pv.className = 'bt-eval-preview';
+            const pre = document.createElement('pre');
+            pre.textContent = msg.code;
+            const tg = document.createElement('button');
+            tg.type = 'button';
+            tg.className = 'bt-eval-preview-toggle';
+            tg.title = 'Enlarge';
+            tg.textContent = '⌄';
+            tg.addEventListener('click', (e)=>{
+                e.stopPropagation();
+                const full = pv.classList.toggle('bt-eval-preview-full');
+                tg.textContent = full ? '⌃' : '⌄';
+                tg.title = full ? 'Collapse' : 'Enlarge';
+            });
+            pv.append(pre, tg);
+            headerEl.insertAdjacentElement('afterend', pv);
+        }
+        if (msg.editable && msg.edit_path && headerEl) {
+            const t = headerEl.querySelector('.bt-tool-title');
+            if (t) {
+                t.classList.add('bt-path-link');
+                t.dataset.path = msg.edit_path;
+            }
+        }
     }
     noteKey(msg) {
         const key = filterKey(msg);
@@ -1072,6 +1316,7 @@ class BonitoChat {
                     div.appendChild(span);
                 } else {
                     div.innerHTML = msg.html || '';
+                    linkifyPaths(div);
                 }
                 break;
             case 'thought':
@@ -1097,7 +1342,6 @@ class BonitoChat {
                     if (msg.id) div.dataset.msgId = msg.id;
                     if (msg.started_at != null) div.dataset.toolStarted = String(msg.started_at);
                     if (msg.finished_at != null) div.dataset.toolFinished = String(msg.finished_at);
-                    if (msg.taskbar) div.dataset.toolTaskbar = '1';
                     const liveTool = !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
                     if (liveTool) div.classList.add('bt-tool-live');
                     const id = msg.id;
@@ -1115,7 +1359,10 @@ class BonitoChat {
                     const detachBtn = div.querySelector('.bt-tool-detach');
                     if (detachBtn) detachBtn.addEventListener('click', (e)=>{
                         e.stopPropagation();
-                        window._btPopup && window._btPopup.detach(id);
+                        this.comm.notify({
+                            type: 'detach_app',
+                            id
+                        });
                     });
                     const wideBtn = div.querySelector('.bt-tool-fullwidth');
                     if (wideBtn) wideBtn.addEventListener('click', (e)=>{
@@ -1123,6 +1370,23 @@ class BonitoChat {
                         const active = div.classList.toggle('bt-tool-wide-active');
                         wideBtn.textContent = active ? '«' : '»';
                         wideBtn.title = active ? 'Collapse to default width' : 'Expand to full chat width';
+                    });
+                    const stopBtn2 = div.querySelector('.bt-tool-stop');
+                    if (stopBtn2) stopBtn2.addEventListener('click', (e)=>{
+                        e.stopPropagation();
+                        this.comm.notify({
+                            type: 'stop_tool',
+                            id
+                        });
+                    });
+                    const pvToggle = div.querySelector('.bt-eval-preview-toggle');
+                    if (pvToggle) pvToggle.addEventListener('click', (e)=>{
+                        e.stopPropagation();
+                        const pv = div.querySelector('.bt-eval-preview');
+                        if (!pv) return;
+                        const full = pv.classList.toggle('bt-eval-preview-full');
+                        pvToggle.textContent = full ? '⌃' : '⌄';
+                        pvToggle.title = full ? 'Collapse' : 'Enlarge';
                     });
                     if (msg.show_mime) div.dataset.showMime = msg.show_mime;
                     if (this._wantsNative(div)) {
@@ -1161,7 +1425,15 @@ class BonitoChat {
         if (this.hiddenTypes.has(fkey)) div.style.display = 'none';
         return div;
     }
-    unqueueOldestUser() {
+    unqueueUser(msg) {
+        if (Number.isInteger(msg.idx)) {
+            const node = this.cache.get(msg.idx);
+            if (node) {
+                node.classList.remove('bt-queued');
+                return;
+            }
+            return;
+        }
         const q = this.container.querySelector('.bt-user-msg.bt-queued');
         if (q) q.classList.remove('bt-queued');
     }
@@ -1179,24 +1451,36 @@ class BonitoChat {
     }
     toolHTML(msg) {
         const statusCls = `bt-tool-status bt-status-${msg.status || 'pending'}`;
-        const preview = msg.preview ? `<div class="bt-edit-preview">${msg.preview}</div>` : '';
         const server = msg.server ? `<span class="bt-tool-server">${escapeHTML(msg.server)}</span>` : '';
+        const timeoutBadge = msg.timeout_s ? `<span class="bt-tool-timeout" title="Soft eval timeout — the call checkpoints with partial output at this cadence">⏱ ${escapeHTML(String(msg.timeout_s))}</span>` : '';
+        const stopBtn = msg.stoppable ? `<button class="bt-tool-stop bt-stop-mini" type="button"
+                     title="Stop"></button>` : '';
+        const titleLink = msg.edit_path ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
+        const live = !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
+        const evalPreview = msg.code && live ? `
+            <div class="bt-eval-preview">
+                <pre>${escapeHTML(msg.code)}</pre>
+                <button class="bt-eval-preview-toggle" type="button"
+                        title="Enlarge">⌄</button>
+            </div>` : '';
         return `
-            <div class="bt-tool-header" data-expanded="false">
+            <div class="bt-tool-header" data-expanded="false"${msg.command ? ` title="${escapeAttr(msg.command)}"` : ''}>
                 <span class="bt-tool-toggle">▶</span>
                 <span class="bt-tool-kind">${msg.icon || '⚙'}</span>
                 ${server}
-                <span class="bt-tool-title">${escapeHTML(msg.title || '')}</span>
+                <span class="bt-tool-title${titleLink}">${escapeHTML(msg.title || '')}</span>
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
+                ${timeoutBadge}
                 <span class="bt-tool-timer"></span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
+                ${stopBtn}
                 ${msg.kind === 'bonito_app' ? `<button class="bt-tool-detach" type="button"
                               title="Detach to floating window">⤢</button>` : ''}
+                <button class="bt-tool-fullwidth" type="button"
+                        title="Expand to full chat width">»</button>
             </div>
-            ${preview}
-            <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>
-            <button class="bt-tool-fullwidth" type="button"
-                    title="Expand to full chat width">»</button>`;
+            ${evalPreview}
+            <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
     }
     onPlanUpdate(msg) {
         const node = this.nodeById.get(msg.id);
@@ -1212,36 +1496,26 @@ class BonitoChat {
             node.classList.add('bt-plan-live');
         }
         if (msg.summary) node.dataset.planSummary = msg.summary;
-        this._refreshTaskbar();
     }
     _setupLiveTicker() {
-        this.taskbarEl = this.app ? this.app.querySelector('.bt-taskbar') : this.container.parentElement.querySelector('.bt-taskbar');
-        if (!this.taskbarEl) return;
-        this._onTaskbarClick = (ev)=>{
-            const stopBtn = ev.target.closest('.bt-taskbar-slot-stop');
-            if (stopBtn) {
-                ev.stopPropagation();
-                const slot = stopBtn.closest('.bt-taskbar-slot');
-                const id = slot?.dataset.targetId;
-                if (id) this.comm.notify({
-                    type: 'stop_tool',
-                    id
-                });
-                return;
-            }
-            const slot = ev.target.closest('.bt-taskbar-slot');
-            if (!slot) return;
-            const id = slot.dataset.targetId;
-            if (!id) return;
-            const target = this.nodeById.get(id);
-            if (target) target.scrollIntoView({
-                block: 'center',
-                behavior: 'smooth'
-            });
-        };
-        this.taskbarEl.addEventListener('click', this._onTaskbarClick);
+        this.taskbarEl = (this.app || this.container.closest('.bt-app') || this.container.parentElement).querySelector('.bt-taskbar');
+        if (this.taskbarEl) {
+            this._onTaskbarClick = (ev)=>{
+                if (ev.target.closest('.bt-taskbar-slot-stop')) return;
+                const slot = ev.target.closest('.bt-taskbar-slot');
+                if (!slot) return;
+                const idx = parseInt(slot.dataset.msgIndex ?? '-1', 10);
+                if (!Number.isInteger(idx) || idx < 0 || idx >= this.totalCount) return;
+                const jump = ()=>{
+                    this.container.scrollTop = Math.max(0, this.cumHeight(0, idx) - 60);
+                };
+                this.followMode = false;
+                jump();
+                requestAnimationFrame(()=>requestAnimationFrame(jump));
+            };
+            this.taskbarEl.addEventListener('click', this._onTaskbarClick);
+        }
         this._tickerId = setInterval(()=>this._tickLiveTimers(), 1000);
-        this._refreshTaskbar();
     }
     _tickLiveTimers() {
         if (this.destroyed) return;
@@ -1253,40 +1527,6 @@ class BonitoChat {
             const timer = el.querySelector('.bt-tool-timer');
             if (timer) timer.textContent = elapsed > 1 ? _formatElapsed(elapsed) : '';
         }
-        for (const slot of this.taskbarEl.querySelectorAll('.bt-taskbar-slot')){
-            const started = parseFloat(slot.dataset.started ?? '0');
-            if (!started) continue;
-            const elapsed = now - started;
-            const t = slot.querySelector('.bt-taskbar-slot-timer');
-            if (t) t.textContent = elapsed > 1 ? _formatElapsed(elapsed) : '';
-        }
-    }
-    _refreshTaskbar() {
-        if (this.destroyed || !this.taskbarEl) return;
-        const live = this.container.querySelectorAll('div.bt-tool-msg.bt-tool-live[data-tool-taskbar], div.bt-plan-msg.bt-plan-live');
-        if (live.length === 0) {
-            this.taskbarEl.replaceChildren();
-            return;
-        }
-        const frag = document.createDocumentFragment();
-        for (const el of live){
-            const id = el.dataset.msgId;
-            if (!id) continue;
-            const isPlan = el.classList.contains('bt-plan-msg');
-            const icon = isPlan ? '📋' : el.querySelector('.bt-tool-kind')?.textContent || '⚙';
-            const label = isPlan ? el.dataset.planSummary || 'Todo list' : el.querySelector('.bt-tool-title')?.textContent || 'Tool';
-            const started = isPlan ? el.dataset.planStarted : el.dataset.toolStarted;
-            const slot = document.createElement('div');
-            slot.className = 'bt-taskbar-slot';
-            slot.dataset.targetId = id;
-            if (started) slot.dataset.started = started;
-            const stop = isPlan ? '' : `<span class="bt-taskbar-slot-stop" title="Ask Claude to stop this">⊗</span>`;
-            slot.innerHTML = `<span class="bt-taskbar-slot-icon">${icon}</span>` + `<span class="bt-taskbar-slot-label"></span>` + `<span class="bt-taskbar-slot-timer"></span>` + stop;
-            slot.querySelector('.bt-taskbar-slot-label').textContent = label;
-            frag.appendChild(slot);
-        }
-        this.taskbarEl.replaceChildren(frag);
-        this._tickLiveTimers();
     }
     _sizeTail() {
         if (!this.tailEl) return;
@@ -1344,7 +1584,7 @@ class BonitoChat {
     }
     _setupInputs() {
         if (this.destroyed) return;
-        const app = this.container?.parentElement;
+        const app = this.container?.closest('.bt-app') || this.container?.parentElement;
         if (!app) return;
         this.app = app;
         this.inputArea = app.querySelector('.bt-input-area');
@@ -1421,7 +1661,8 @@ class BonitoChat {
     }
     _cancel() {
         this.comm.notify({
-            type: 'cancel'
+            type: 'cancel',
+            seq: this.turnSeq ?? -1
         });
     }
     _dragHasImage(e) {
@@ -1567,7 +1808,7 @@ class BonitoChat {
         if (this._pillEl) this._pillEl.classList.remove('bt-new-msg-pill-visible');
     }
     _createNewMessagePill() {
-        const app = this.container?.parentElement;
+        const app = this.container?.closest('.bt-app') || this.container?.parentElement;
         if (!app) return;
         const pill = document.createElement('button');
         pill.type = 'button';
@@ -1581,6 +1822,16 @@ class BonitoChat {
         app.appendChild(pill);
         this._pillEl = pill;
     }
+}
+const PATH_RE = /^(~|\.{1,2})?\/?[\w.@+-]+(\/[\w.@+-]+)+(:\d+)?$/;
+function linkifyPaths(rootEl) {
+    rootEl.querySelectorAll('code').forEach((el)=>{
+        if (el.closest('pre') || el.closest('a')) return;
+        const text = (el.textContent || '').trim();
+        if (!PATH_RE.test(text) || text.includes('://')) return;
+        el.classList.add('bt-path-link');
+        el.dataset.path = text;
+    });
 }
 function escapeHTML(str) {
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

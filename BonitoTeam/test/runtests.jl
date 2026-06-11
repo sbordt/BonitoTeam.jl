@@ -88,6 +88,7 @@ end
 # spawn_worker) and cleans it up on close. Spawns a worker subprocess (no
 # Electron / agent needed), so it's in the default suite.
 include("test_dev_server_worker.jl")
+include("test_bg_kill_e2e.jl")
 
 include("test_history_sync.jl")
 
@@ -109,7 +110,14 @@ include("test_cancel_stress.jl")
 
 include("test_tool_messages.jl")
 
+include("test_render_extras.jl")
+
+include("test_streamed_rawinput.jl")
+
+include("test_mcp_ctrl.jl")
+
 include("test_tool_close_total.jl")
+include("test_concurrent_turns.jl")
 
 include("test_acp_log.jl")
 

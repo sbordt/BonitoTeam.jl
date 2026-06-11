@@ -92,9 +92,13 @@ end
         model = BT.ChatModel(state, mktempdir(); project_id = pid,
                              transport = scripted_transport())
         BT.start_chat_client!(model)
+        # Record busy transitions via a LISTENER, not by polling: the scripted
+        # turn can flip busy on AND off inside one `timedwait` poll interval,
+        # which made the bare `timedwait(() -> busy[])` flaky.
+        busy_seen = Bool[]
+        BT.Bonito.Observables.on(b -> push!(busy_seen, b), model.busy_active)
         BT.send_message!(model, BT.UserMsg("go"))
-        @test timedwait(() -> model.busy_active[], 5.0) === :ok
-        @test timedwait(() -> !model.busy_active[], 5.0) === :ok
+        @test timedwait(() -> busy_seen == [true, false], 5.0) === :ok
 
         path = BT.acp_log_file(model.chat_dir)
         @test path == joinpath(state.state_dir, "chats", pid, "acp.jsonl")

@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="BonitoTeam/assets/logo/bonitoteam-dark.svg">
+    <img src="BonitoTeam/assets/logo/bonitoteam-light.svg" alt="BonitoTeam" width="160">
+  </picture>
+</p>
+
 # BonitoTeam
 
 Self-hosted multi-host orchestrator for agentic coding sessions. Architecture:

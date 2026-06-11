@@ -4,6 +4,13 @@
 isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
 
 state = TH.make_state(; n_workers = 1, n_projects = 2)
+# The sidebar lists OPEN chats only (persisted-interacted or live ChatModel).
+# Mark both projects as interacted (a title) so this layout test gets its two
+# project entries without bringing up chat sessions.
+for p in values(state.projects[])
+    p.title = "Chat about $(p.name)"
+end
+notify(state.projects)
 ctx   = TH.open_window(state)
 
 results = Pair{String,Bool}[]

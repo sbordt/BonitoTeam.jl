@@ -687,7 +687,13 @@ const DashboardStyles = Bonito.Styles(
         "margin-bottom" => "4px"),
     CSS(".bt-header h1",
         "font-size" => "22px", "font-weight" => "600",
-        "letter-spacing" => "-0.01em", "margin" => "0"),
+        "letter-spacing" => "-0.01em", "margin" => "0",
+        "display" => "flex", "align-items" => "center", "gap" => "10px"),
+    # The hexagon logo next to the wordmark — same asset as the favicon.
+    CSS(".bt-logo",
+        "width" => "28px", "height" => "28px",
+        "display" => "block", "flex-shrink" => "0",
+        "user-select" => "none"),
     CSS(".bt-tagline",
         "color" => "var(--bt-text-muted)", "font-size" => "13px"),
 
@@ -703,7 +709,7 @@ const DashboardStyles = Bonito.Styles(
         "display" => "flex", "align-items" => "center", "gap" => "6px"),
     CSS(".bt-stat-value", "font-weight" => "600"),
     CSS(".bt-stat-label", "color" => "var(--bt-text-muted)"),
-    CSS(".bt-stat-sep",   "color" => "var(--bt-text-faint)", "user-select" => "none"),
+    CSS(".bt-stat-sep",   "color" => "var(--bt-text-faint)"),
 
     # ── Section headings ─────────────────────────────────────────────────────
     CSS(".bt-section",
@@ -822,8 +828,7 @@ const DashboardStyles = Bonito.Styles(
         "font-weight" => "600",
         "color" => "var(--bt-text-muted)",
         "letter-spacing" => "0.04em",
-        "flex-shrink" => "0",
-        "user-select" => "none"),
+        "flex-shrink" => "0"),
     # Folder name shown under the title as a meta line. Same tone as the
     # rest of `.bt-card-meta`; explicit class so the test suite can target it.
     CSS(".bt-card-folder-name",
@@ -1060,7 +1065,7 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-discover-header",
         "display" => "flex", "align-items" => "center",
         "justify-content" => "space-between",
-        "cursor" => "pointer", "user-select" => "none",
+        "cursor" => "pointer",
         "list-style" => "none",
         # Add some breathing room between the chevron and title.
         "gap" => "10px",
@@ -1156,7 +1161,7 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-group-summary",
         "display" => "flex", "align-items" => "baseline", "gap" => "10px",
         "padding" => "10px 12px",
-        "cursor" => "pointer", "user-select" => "none",
+        "cursor" => "pointer",
         "list-style" => "none",
         "background" => "var(--bt-surface)"),
     CSS(".bt-group-summary::-webkit-details-marker", "display" => "none"),
@@ -1210,6 +1215,7 @@ const DashboardStyles = Bonito.Styles(
         "border-radius" => "50%",
         "border" => "2px solid var(--bt-border)",
         "border-top-color" => "var(--bt-accent)",
+        "will-change" => "transform",   # compositor-driven; survives main-thread jank
         "animation" => "bt-spin 0.7s linear infinite",
         "flex-shrink" => "0"),
     CSS(".bt-spinner-sm",
@@ -1224,11 +1230,18 @@ const DashboardStyles = Bonito.Styles(
         "display" => "flex", "flex-direction" => "column",
         "align-items" => "center", "justify-content" => "center",
         "gap" => "12px", "padding" => "40px", "text-align" => "center"),
+    # `will-change: transform` promotes the spinner to its own compositor
+    # layer so the rotation keeps running while the main thread is busy —
+    # which it very much is right when this spinner shows (chat bring-up:
+    # Monaco bundle eval, virtual-scroll measuring). Without the promotion
+    # the animation runs on the main thread and freezes for seconds at a
+    # time — "the spinner doesn't spin".
     CSS(".bt-loading-spinner",
         "width" => "30px", "height" => "30px",
         "border-radius" => "50%",
         "border" => "3px solid var(--bt-border)",
         "border-top-color" => "var(--bt-accent)",
+        "will-change" => "transform",
         "animation" => "bt-spin 0.7s linear infinite"),
     CSS(".bt-loading-glyph", "font-size" => "28px", "opacity" => "0.7"),
     CSS(".bt-loading-title",
@@ -1374,6 +1387,37 @@ const DashboardStyles = Bonito.Styles(
         "transition" => "background 120ms"),
     CSS(".bt-install-copy:hover",
         "background" => "rgba(255,255,255,0.12)"),
+
+    # ── Global agent instructions (AGENTS.md) editor ─────────────────────────
+    CSS(".bt-agents-body",
+        "display" => "flex", "flex-direction" => "column", "gap" => "8px",
+        "padding-top" => "8px"),
+    CSS(".bt-agents-hint",
+        "font-size" => "12px", "color" => "var(--bt-text-muted)",
+        "line-height" => "1.5"),
+    CSS(".bt-agents-textarea",
+        "width" => "100%", "box-sizing" => "border-box",
+        "padding" => "10px 12px",
+        "border" => "1px solid var(--bt-border-strong)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
+        "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
+        "font-size" => "12.5px", "line-height" => "1.5",
+        "resize" => "vertical",
+        "outline" => "none",
+        "transition" => "border-color 120ms, box-shadow 120ms"),
+    CSS(".bt-agents-textarea:focus",
+        "border-color" => "var(--bt-accent)",
+        "box-shadow" => "0 0 0 3px rgba(59,130,246,0.18)"),
+    CSS(".bt-agents-actions",
+        "display" => "flex", "align-items" => "center", "gap" => "10px",
+        "justify-content" => "flex-end"),
+    CSS(".bt-agents-status",
+        "font-size" => "12px", "color" => "var(--bt-text-muted)",
+        "flex" => "1 1 auto", "min-width" => "0",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "white-space" => "nowrap"),
 
     # ── Responsive ───────────────────────────────────────────────────────────
     # Below ~560px is the "phone" branch. Each rule pairs with a non-mobile
@@ -2304,9 +2348,13 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # wrapper, PowerShell's `irm` gets the PS1 wrapper. Both wrappers verify
     # `julia` is on PATH and then run the cross-platform install.jl. The /install
     # URL gives us one shape per OS that mirrors the familiar `curl URL | sh`.
-    install_url  = "$(public_url_or_default())/install"
+    install_url  = "$(install_base_url(state))/install"
     install_unix = "curl -fsSL $install_url | sh"
     install_win  = "irm $install_url | iex"
+    # Copy MUST work on plain-http origins too: `navigator.clipboard` is
+    # undefined outside secure contexts (https / localhost), which is exactly
+    # how a LAN-hosted BonitoTeam is reached — that's why the button "did
+    # nothing". Fall back to the hidden-textarea + execCommand path there.
     install_row(label, cmd) = DOM.div(
         DOM.div(label; class = "bt-install-os"),
         DOM.div(
@@ -2314,9 +2362,26 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             DOM.span("Copy";
                 class   = "bt-install-copy",
                 onclick = js"""event => {
-                    navigator.clipboard.writeText($cmd);
-                    event.target.textContent = 'Copied';
-                    setTimeout(() => event.target.textContent = 'Copy', 1200);
+                    const btn  = event.target;
+                    const done = () => {
+                        btn.textContent = 'Copied';
+                        setTimeout(() => btn.textContent = 'Copy', 1200);
+                    };
+                    const fallback = () => {
+                        const ta = document.createElement('textarea');
+                        ta.value = $cmd;
+                        ta.style.position = 'fixed';
+                        ta.style.opacity = '0';
+                        document.body.appendChild(ta);
+                        ta.select();
+                        try { document.execCommand('copy'); done(); }
+                        finally { ta.remove(); }
+                    };
+                    if (navigator.clipboard && window.isSecureContext) {
+                        navigator.clipboard.writeText($cmd).then(done, fallback);
+                    } else {
+                        fallback();
+                    }
                 }"""),
             class = "bt-install-cmd"))
     # Headline text reflects whether any workers have connected yet — but the
@@ -2333,6 +2398,49 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         install_row("Linux / macOS", install_unix),
         install_row("Windows (PowerShell)", install_win);
         class = "bt-install-block")
+    # ── Global agent instructions (AGENTS.md) ────────────────────────────────
+    # A server-wide system-prompt appendix every agent session gets, across
+    # all workers (state_dir/AGENTS.md; see `system_prompt_meta`). Read at
+    # session bring-up, so a save applies to the NEXT chat opened.
+    agents_status = Observable("")
+    agents_saved  = Observable{Union{Nothing,String}}(nothing)
+    on(session, agents_saved) do txt
+        txt === nothing && return
+        try
+            set_global_agents_md!(state, txt)
+            safe_set!(agents_status,
+                "saved · applies to chats opened from now on")
+        catch e
+            @warn "AGENTS.md save failed" exception = e
+            safe_set!(agents_status, "save failed: $(sprint(showerror, e))")
+        end
+    end
+    agents_block = DOM.details(
+        DOM.summary(
+            DOM.span("Global agent instructions (AGENTS.md)";
+                     class = "bt-discover-title");
+            class = "bt-discover-header"),
+        DOM.div(
+            DOM.div("Appended to the system prompt of every agent session " *
+                    "on every worker — shared conventions, house rules, " *
+                    "tool guidance. Saved to the server's state dir.";
+                    class = "bt-agents-hint"),
+            DOM.textarea(global_agents_md(state);
+                class = "bt-agents-textarea", rows = 10,
+                placeholder = "e.g. ## Conventions every agent must follow…"),
+            DOM.div(
+                DOM.span(agents_status; class = "bt-agents-status"),
+                DOM.button("Save";
+                    class = "bt-btn bt-btn-sm",
+                    onclick = js"""event => {
+                        const ta = event.target.closest('.bt-agents-body')
+                                       .querySelector('textarea');
+                        $(agents_saved).notify(ta.value);
+                    }""");
+                class = "bt-agents-actions");
+            class = "bt-agents-body");
+        class = "bt-card bt-agents-block")
+
     # Drive the KeyedList off a derived Observable that yields a stable
     # vector of WorkerCard instances (same widget objects across renders →
     # same hash → no spurious unmount/remount).
@@ -2393,7 +2501,10 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     DOM.div(
         busy_card,
         DOM.div(
-            DOM.h1("BonitoTeam"),
+            DOM.h1(
+                DOM.img(src = LOGO_SVG, alt = "", class = "bt-logo",
+                        draggable = "false"),
+                "BonitoTeam"),
             DOM.div("Multi-host orchestrator for agentic coding sessions";
                     class = "bt-tagline");
             class = "bt-header"),
@@ -2402,6 +2513,9 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
 
         DOM.div(DOM.h2("Workers"); class = "bt-section"),
         worker_list,
+
+        DOM.div(DOM.h2("Agents"); class = "bt-section"),
+        agents_block,
 
         DOM.div(
             DOM.h2("New project"),
@@ -2435,8 +2549,12 @@ function render_sync_modal(session::Bonito.Session,
                             state::ServerState,
                             sync_modal_state::Observable,
                             on_apply::Function)
+    # Always return a SyncModalContent (c === nothing renders the hidden
+    # state inside jsrender): the map's output Observable takes the type of
+    # the FIRST result, and the modal always starts hidden — returning a
+    # DOM.div() here would pin the Observable to Node{HTMLSVG} and the
+    # later open (a SyncModalContent) would throw a convert MethodError.
     map(session, sync_modal_state) do c
-        c === nothing && return DOM.div()
         # Return a renderable: its jsrender runs in this map iteration's
         # sub-session, so the button handlers it registers are freed when this
         # value is superseded (modal closed or reopened) — fixing the handler
@@ -2446,6 +2564,8 @@ function render_sync_modal(session::Bonito.Session,
 end
 
 function Bonito.jsrender(session::Bonito.Session, m::SyncModalContent)
+    # Hidden state — no comparison to show.
+    m.c === nothing && return Bonito.jsrender(session, DOM.div())
     state            = m.state
     sync_modal_state = m.sync_modal_state
     on_apply         = m.on_apply
@@ -2610,9 +2730,15 @@ function dashboard_app(state::ServerState)
     end
 end
 
-# Best-effort lookup of the public URL for the install one-liner shown in the
-# empty state. Reads the same env BONITOTEAM_PUBLIC_URL that the service uses.
-function public_url_or_default()
+# The base URL shown in the dashboard's install one-liner. MUST match what
+# the /install routes were templated with — so the snippet the user copies is
+# the literal command that works, not a "<your-server>" placeholder. `serve()`
+# records the resolved url on `state.base_url`; fallbacks cover states built
+# outside `serve()` (tests, standalone dashboards).
+function install_base_url(state::ServerState)
+    isempty(state.base_url[]) || return state.base_url[]
     url = get(ENV, "BONITOTEAM_PUBLIC_URL", "")
-    isempty(url) ? "http://<your-server>:8038" : rstrip(url, '/')
+    isempty(url) || return rstrip(url, '/')
+    state.srv === nothing || return rstrip(Bonito.online_url(state.srv, ""), '/')
+    return "http://<your-server>:8038"
 end

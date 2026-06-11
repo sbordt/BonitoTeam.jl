@@ -126,6 +126,10 @@ function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
     # leak an orphaned claude-agent-acp process or hang forever on a dead agent
     # (A3). The setup RPCs carry a timeout for the same reason.
     try
+        # NOTE: no `elicitation` capability here — the standalone Client has
+        # no UI to render a question form, and advertising it would re-enable
+        # claude's AskUserQuestion only to auto-skip every question. UI
+        # frontends (BonitoTeam's transports) advertise it themselves.
         send_request(conn, "initialize", Dict(
             "protocolVersion"    => 1,
             "clientCapabilities" => Dict(
@@ -255,8 +259,8 @@ function cancel!(client::Client)
     # `cancelling` latched true and poison the NEXT turn (its consumer would
     # fast-discard every update). Only flip the flag + send the notification
     # when a turn is actually in flight. Checked under `conn.lock` so we read a
-    # consistent view of `active_id`.
-    has_turn = lock(() -> conn.active_id !== nothing, conn.lock)
+    # consistent view of `active_turns`.
+    has_turn = lock(() -> !isempty(conn.active_turns), conn.lock)
     has_turn || return nothing
     @atomic conn.cancelling = true
     send_notification(conn, "session/cancel",

@@ -1,18 +1,18 @@
 # Claude Code on-disk internals
 
 A reference for what Claude Code persists under `~/.claude/` (and adjacent
-locations on macOS), and exactly which parts of it BonitoTeam.jl depends on.
+locations on macOS), and exactly which parts of it BonitoAgents.jl depends on.
 
 ## 1. Purpose & scope
 
-Authoritative source for the bits BonitoTeam.jl reads:
+Authoritative source for the bits BonitoAgents.jl reads:
 `BonitoWorker/src/BonitoWorker.jl` § "Claude session scanner" (lines
 606-745). Everything else in this doc is empirical, captured against Claude
 Code **2.1.x** on **2026-05-27**. Layouts can and do change between Claude
 Code releases — re-verify before relying on anything not marked ★
 "load-bearing".
 
-★ marks entries the BonitoTeam.jl codebase reads or writes today.
+★ marks entries the BonitoAgents.jl codebase reads or writes today.
 
 ## 2. Top-level inventory
 
@@ -42,7 +42,7 @@ Code releases — re-verify before relying on anything not marked ★
 ## 3. ★ `~/.claude/projects/<encoded>/` — session content
 
 The canonical place. Every byte of every chat Claude Code persists lives
-here. Everything BonitoTeam scans comes from this tree.
+here. Everything BonitoAgents scans comes from this tree.
 
 ### Encoded folder name
 
@@ -58,15 +58,15 @@ _                 →  -
 )                 →  -
 ```
 
-The inverse is therefore ambiguous — `BonitoTeam-jl`, `BonitoTeam.jl`,
-`BonitoTeam_jl` all encode to the same string. **Do not invert the folder
+The inverse is therefore ambiguous — `BonitoAgents-jl`, `BonitoAgents.jl`,
+`BonitoAgents_jl` all encode to the same string. **Do not invert the folder
 name.** Read `cwd` from the jsonl content instead (see below).
 
 Worked examples:
 
 ```
-/Users/sbordt/Nextcloud/BonitoTeam.jl
-  → -Users-sbordt-Nextcloud-BonitoTeam-jl
+/Users/sbordt/Nextcloud/BonitoAgents.jl
+  → -Users-sbordt-Nextcloud-BonitoAgents-jl
 
 /Users/sbordt/Nextcloud/post-train-hallucinations-the-actual-repo/experiment_2_controlled_bigraphical_data
   → -Users-sbordt-Nextcloud-post-train-hallucinations-the-actual-repo-experiment-2-controlled-bigraphical-data
@@ -198,7 +198,7 @@ For a given path the user has run Claude in:
    `history.jsonl` either → `lastSessionFirstPrompt`, cost, tokens, but
    no per-prompt history.
 
-BonitoTeam.jl today only surfaces tier 1.
+BonitoAgents.jl today only surfaces tier 1.
 
 ## 6. Other `~/.claude/` subdirectories (informational)
 
@@ -240,7 +240,7 @@ BonitoTeam.jl today only surfaces tier 1.
 - **`debug/latest`** — symlink to `<uuid>.txt`; Claude's debug log.
 - **`telemetry/`, `downloads/`** — empty on this install. Reserved.
 
-## 7. ★ BonitoTeam.jl consumption map
+## 7. ★ BonitoAgents.jl consumption map
 
 The contract between the worker (producer) and the server (consumer).
 **This section is the audit surface for future refactors** — if you change
@@ -283,12 +283,12 @@ Dict(
 
 | Code site | What it does |
 |---|---|
-| `BonitoTeam/src/session_widget.jl:16-30` | `SessionRow(c, r)` reads `path`, `session_id`, `last_used`, `agent_type`; renders the row. `Resume` if `session_id` present, else `Import`. |
-| `BonitoTeam/src/worker_widget.jl:220-235` | Splits the result list into `active` vs `historical` keyed lists; row_key = `path|session_id`. |
-| `BonitoTeam/src/dashboard.jl:1956-1968` | Import handler extracts `path` + `session_id` from the JS click payload; passes them to `add_project(...; resume_session_id=…)`. |
-| `BonitoTeam/src/state.jl:64,304,327-328,419-421` | `ProjectInfo.resume_session_id` is persisted into `projects.json` so the resume link survives server restarts. |
-| `BonitoTeam/src/transport.jl:62,205-220` | `WorkerTransport.start_session` branches: if `resume_session_id !== nothing`, ACP `session/load`; else ACP `session/new`. |
-| `BonitoTeam/src/persistence.jl:5,109,120,128-143` | Chat.md TOML frontmatter stores `session_id` so resuming a chat re-issues `session/load` with the same id. |
+| `BonitoAgents/src/session_widget.jl:16-30` | `SessionRow(c, r)` reads `path`, `session_id`, `last_used`, `agent_type`; renders the row. `Resume` if `session_id` present, else `Import`. |
+| `BonitoAgents/src/worker_widget.jl:220-235` | Splits the result list into `active` vs `historical` keyed lists; row_key = `path|session_id`. |
+| `BonitoAgents/src/dashboard.jl:1956-1968` | Import handler extracts `path` + `session_id` from the JS click payload; passes them to `add_project(...; resume_session_id=…)`. |
+| `BonitoAgents/src/state.jl:64,304,327-328,419-421` | `ProjectInfo.resume_session_id` is persisted into `projects.json` so the resume link survives server restarts. |
+| `BonitoAgents/src/transport.jl:62,205-220` | `WorkerTransport.start_session` branches: if `resume_session_id !== nothing`, ACP `session/load`; else ACP `session/new`. |
+| `BonitoAgents/src/persistence.jl:5,109,120,128-143` | Chat.md TOML frontmatter stores `session_id` so resuming a chat re-issues `session/load` with the same id. |
 
 ### Protocol frames
 
@@ -299,7 +299,7 @@ WS `/worker-ws`:
 ```
 
 Produced by `BonitoWorker.jl:748-765` (`handle_scan_sessions`), consumed by
-`BonitoTeam/src/worker_client.jl:171`.
+`BonitoAgents/src/worker_client.jl:171`.
 
 ACP (worker ↔ `claude-agent-acp`):
 

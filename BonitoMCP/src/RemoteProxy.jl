@@ -1,6 +1,6 @@
 module RemoteProxy
 
-# Worker-side bridge for proxying a Bonito.App's session through to the BonitoTeam
+# Worker-side bridge for proxying a Bonito.App's session through to the BonitoAgents
 # server, which fronts the browser.
 #
 # This is the REMOTE driver for Bonito's transport-agnostic proxy framework (see

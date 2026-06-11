@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# BonitoAgents server — listens for workers, serves the dashboard.
+#
+# Thin wrapper around `julia --project=<monorepo root> -m BonitoAgents`. All flags
+# are passed straight through; everything has a baked-in default (port 8038,
+# host 0.0.0.0) and the worker secret is generated + persisted in the state dir
+# on first run, so no env vars are required:
+#
+#   bonitoagents-server                         # defaults
+#   bonitoagents-server --port 8080
+#   bonitoagents-server --public-url https://team.example.com --state-dir /var/lib/bonitoagents/state
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+# The Julia env is the MONOREPO ROOT (two levels up from BonitoAgents/bin/), never
+# the BonitoAgents package's own Project.toml — that one is metadata for declaring
+# deps; the operational env is the monorepo root with its [sources] + Manifest.
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# juliaup installs per-user; add common locations so the system service finds it.
+for JULIAUP_BIN in \
+        "${HOME:-}/.juliaup/bin" \
+        /var/lib/bonitoagents/.juliaup/bin \
+        /opt/juliaup/bin; do
+    [[ -d "$JULIAUP_BIN" ]] && export PATH="$JULIAUP_BIN:$PATH"
+done
+
+exec julia \
+    "--project=${PROJECT_DIR}" \
+    --startup-file=no \
+    --threads=auto \
+    -m BonitoAgents "$@"

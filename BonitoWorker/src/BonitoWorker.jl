@@ -1,6 +1,6 @@
 module BonitoWorker
 
-# Outbound-only worker: dials the BonitoTeam server, holds a "control" WS open,
+# Outbound-only worker: dials the BonitoAgents server, holds a "control" WS open,
 # spawns claude-agent-acp + a dedicated per-session WS each time the server
 # requests a new session.
 #
@@ -16,12 +16,12 @@ using Scratch: @get_scratch!
 # `HOME` / `%APPDATA%` ourselves. Holds the stable `worker_id`, the install
 # `config.json`, and the detached worker's `worker.log`.
 #
-# `BONITOTEAM_CONFIG_DIR` overrides it — used by `dev_server` to run a real
+# `BONITOAGENTS_CONFIG_DIR` overrides it — used by `dev_server` to run a real
 # install + worker against a throwaway dir (isolated from a machine's real
 # install, and removable on cleanup). The spawned worker inherits the env var,
 # so it reads the same dir.
 function config_dir()
-    override = get(ENV, "BONITOTEAM_CONFIG_DIR", "")
+    override = get(ENV, "BONITOAGENTS_CONFIG_DIR", "")
     isempty(override) && return @get_scratch!("config")
     mkpath(override)
     return override
@@ -167,13 +167,13 @@ end
 # but `julia` + an argv array runs identically on Linux/macOS/Windows.
 #
 # `julia_bin()` resolves the current interpreter; `Base.active_project()` is
-# whatever env this worker itself runs in (the shared `@bonito-team` after a
+# whatever env this worker itself runs in (the shared `@bonito-agents` after a
 # normal install, or the monorepo project in dev) — BonitoMCP is co-installed
 # there, so the MCP process resolves it without any extra setup.
 julia_bin() = joinpath(Sys.BINDIR::String, Base.julia_exename())
 
 function mcp_args()
-    project = something(Base.active_project(), "@bonito-team")
+    project = something(Base.active_project(), "@bonito-agents")
     return String[
         "--project=$(project)",
         "--startup-file=no",
@@ -213,7 +213,7 @@ end
 # shell's PATH — without it the worker can't find `claude-agent-acp`/`node`/`git`
 # at runtime. We capture the install-time PATH, which has them resolved.
 function render_service_unit(; julia::AbstractString = julia_bin(),
-                               project::AbstractString = "@bonito-team",
+                               project::AbstractString = "@bonito-agents",
                                projects_root::AbstractString = pwd(),
                                memory_max::AbstractString = "85%",
                                path_env::AbstractString = get(ENV, "PATH", ""))
@@ -221,7 +221,7 @@ function render_service_unit(; julia::AbstractString = julia_bin(),
            "-e 'using BonitoWorker; BonitoWorker.start()'"
     return """
     [Unit]
-    Description=BonitoTeam worker
+    Description=BonitoAgents worker
     After=network-online.target
     Wants=network-online.target
 
@@ -440,7 +440,7 @@ function choose_run_mode()
         "[1] Service (current, recommended) — keep the boot/restart/memory-capped service" :
         "[1] Service (recommended) — start on boot, restart on crash, memory-capped"
     answer = prompt_tty("""
-==> How should the BonitoTeam worker run?$(note)
+==> How should the BonitoAgents worker run?$(note)
     $(svc_line)
     [2] Background process — stops on reboot; you restart it manually
   choice [1]: """)
@@ -517,7 +517,7 @@ function install!(; server_url::String,
     println()
     if mode === :service
         verb = result.changed ? (service_installed() ? "installed/updated" : "installed") : "already up to date"
-        println("==> BonitoTeam worker service $(verb)")
+        println("==> BonitoAgents worker service $(verb)")
         println("    unit   : ", result.path)
         println("    config : ", cfg)
         println("    server : ", server_url)
@@ -539,7 +539,7 @@ function install!(; server_url::String,
         # running worker picks up new server/secret on its next reconnect; only
         # a different binary (julia path / Pkg env shift not covered by
         # code_changed) needs the manual restart hint below.
-        println("==> BonitoTeam worker already running (pid $(running_worker_pid()))")
+        println("==> BonitoAgents worker already running (pid $(running_worker_pid()))")
         println("    config updated : ", cfg)
         println("    log            : ", result.logfile)
         println("    server         : ", server_url)
@@ -548,11 +548,11 @@ function install!(; server_url::String,
         println("    server/secret on its next reconnect. If you need a hard restart")
         println("    anyway:")
         println()
-        println("      julia --project=@bonito-team -e \"using BonitoWorker; BonitoWorker.stop_running_worker!(); BonitoWorker.start()\"")
+        println("      julia --project=@bonito-agents -e \"using BonitoWorker; BonitoWorker.stop_running_worker!(); BonitoWorker.start()\"")
         println()
         return result
     end
-    println("==> BonitoTeam worker started (pid $(getpid(proc)))")
+    println("==> BonitoAgents worker started (pid $(getpid(proc)))")
     println("    config : ", cfg)
     println("    log    : ", result.logfile)
     println("    server : ", server_url)
@@ -560,7 +560,7 @@ function install!(; server_url::String,
     println("    The worker runs detached and survives this shell. To start it")
     println("    again later (e.g. after a reboot), run:")
     println()
-    println("      julia --project=@bonito-team -e \"using BonitoWorker; BonitoWorker.start()\"")
+    println("      julia --project=@bonito-agents -e \"using BonitoWorker; BonitoWorker.start()\"")
     println()
     return result
 end
@@ -591,7 +591,7 @@ function spawn_worker(; force_restart::Bool = false)
             return nothing, logfile
         end
     end
-    project = something(Base.active_project(), "@bonito-team")
+    project = something(Base.active_project(), "@bonito-agents")
     cmd = `$(julia_bin()) --project=$(project) --startup-file=no -e $("using BonitoWorker; BonitoWorker.start()")`
     proc = run(pipeline(detach(cmd); stdout = logfile, stderr = logfile, append = true);
                wait = false)
@@ -645,7 +645,7 @@ function connect_and_serve(; server_url::String,
                             name::String          = default_worker_name(worker_id),
                             mcp_command::String   = julia_bin(),
                             mcp_arguments::Vector{String} = mcp_args(),
-                            projects_root::String = joinpath(homedir(), "bonitoteam-projects"),
+                            projects_root::String = joinpath(homedir(), "bonitoagents-projects"),
                             agent_bin::String     = find_agent_bin(),
                             retry_delay::Real     = 5.0)
     while true
@@ -772,7 +772,7 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
         end
     end
 
-    # `BONITOTEAM_SERVER_URL` flows from here all the way down to BonitoMCP's
+    # `BONITOAGENTS_SERVER_URL` flows from here all the way down to BonitoMCP's
     # eval-ws dial-back: claude-agent-acp inherits this env, and MCP children
     # spawned by the agent inherit it too. The worker is the right side to set
     # it — `server_url` is the URL we ourselves dialed in on, so by construction
@@ -782,7 +782,7 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
     env = merge(Dict(string(k) => string(v) for (k, v) in ENV),
                 Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
                      "CLAUDE_MAX_TURNS"       => "100",
-                     "BONITOTEAM_SERVER_URL"  => server_url),
+                     "BONITOAGENTS_SERVER_URL"  => server_url),
                 env_overrides)
 
     proc = try
@@ -855,7 +855,7 @@ Reply over the same control WS:
 
     {type: "list_dir_response", request_id, path, entries: [{name, dir}, …]}
 
-Entries are sorted; dotfiles, .git/, .bonitoTeam/ skipped to keep noise down.
+Entries are sorted; dotfiles, .git/, .bonitoAgents/ skipped to keep noise down.
 On error, returns `{type: "list_dir_response", request_id, error: "..."}`.
 """
 function handle_list_dir(ws, cmd::AbstractDict)

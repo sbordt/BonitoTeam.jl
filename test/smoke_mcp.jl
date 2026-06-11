@@ -1,16 +1,16 @@
-# BonitoTeam/test/smoke_mcp.jl
+# BonitoAgents/test/smoke_mcp.jl
 #
-# Smoke test for the BonitoTeam.MCP server. Two layers:
+# Smoke test for the BonitoAgents.MCP server. Two layers:
 #   1. In-process: dispatch! against a IOBuffer, verify response shapes
 #   2. Subprocess: spawn `julia -e 'using BonitoMCP; BonitoMCP.run_stdio()'`,
 #      drive it over stdio with JSON-RPC, verify a real round-trip works
 #
 # Run via:
-#   julia_eval(include("BonitoTeam/test/smoke_mcp.jl"))
+#   julia_eval(include("BonitoAgents/test/smoke_mcp.jl"))
 
 using JSON
-using BonitoTeam
-using BonitoTeam.MCP: dispatch!, TOOLS, register!, run_stdio
+using BonitoAgents
+using BonitoAgents.MCP: dispatch!, TOOLS, register!, run_stdio
 
 function _run(req::Dict)
     io = IOBuffer()
@@ -138,7 +138,7 @@ function test_subprocess()
     # Launch BonitoMCP the same way the worker does: a plain `julia` process
     # with an argv array (no shell wrapper — cross-platform).
     julia = joinpath(Sys.BINDIR, Base.julia_exename())
-    project = something(Base.active_project(), Base.load_path_expand("@bonito-team"))
+    project = something(Base.active_project(), Base.load_path_expand("@bonito-agents"))
     proc = open(`$julia --project=$project --startup-file=no -e $("using BonitoMCP; BonitoMCP.run_stdio()")`, "r+")
     try
         # initialize

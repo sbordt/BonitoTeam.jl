@@ -147,11 +147,11 @@ interactive Bonito apps into the chat. Idempotent + lazy (call when Bonito is
 loaded, e.g. from `bt_show_app`).
 """
 function ensure_eval_dialed!(s::JuliaSession)
-    # `BONITOTEAM_SERVER_URL` is set by the BonitoWorker daemon (the install
+    # `BONITOAGENTS_SERVER_URL` is set by the BonitoWorker daemon (the install
     # URL it dialed in on) and inherited down through claude-agent-acp → MCP
     # child. Single source of truth for "where the server is", shared with the
     # worker-control WS so the two dial-backs can't disagree.
-    server_url = get(ENV, "BONITOTEAM_SERVER_URL", "")
+    server_url = get(ENV, "BONITOAGENTS_SERVER_URL", "")
     isempty(server_url) && return s
     wsurl = replace(rstrip(server_url, '/'), r"^http" => "ws") * "/eval-ws"
     # The whole bootstrap (start! + RemoteProxy include + dial_loop spawn + the
@@ -166,8 +166,8 @@ end
 
 function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
     is_alive(s) || start!(s)
-    secret     = get(ENV, "BONITOTEAM_SECRET", "")
-    project_id = get(ENV, "BONITOTEAM_PROJECT_ID", "")
+    secret     = get(ENV, "BONITOAGENTS_SECRET", "")
+    project_id = get(ENV, "BONITOAGENTS_PROJECT_ID", "")
     # Dedupe against this session's own state — avoids a Main-global
     # idempotency flag on the worker (Julia 1.12 strict-globals would force
     # a `Core.eval`/world-age dance, and we'd be inventing the dedupe twice).
@@ -176,7 +176,7 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
     # the connection IS currently up; if it's between reconnect attempts
     # (backoff sleep), wait briefly for it to come back before failing. This
     # is the path that fires when bt_show_app runs against a worker whose WS
-    # was lost (e.g. after a BonitoTeam server restart).
+    # was lost (e.g. after a BonitoAgents server restart).
     if s.dialed_back
         worker_ws_live() = try
             Malt.remote_eval_fetch(s.worker,
@@ -383,13 +383,13 @@ function execute(s::JuliaSession, code::AbstractString;
                     elapsed_s = 0.0)
         end
 
-        # Anchor the .bonitoTeam/show/ dir in env_path so rich-output files
+        # Anchor the .bonitoAgents/show/ dir in env_path so rich-output files
         # written by format_value travel with the project. RemoteSync
-        # already covers .bonitoTeam/, so show files persist alongside the
+        # already covers .bonitoAgents/, so show files persist alongside the
         # chat history. For temp envs we fall back to a tmp dir.
         out_dir = s.env_path === nothing ?
             mktempdir(prefix = "bt-show-") :
-            joinpath(s.env_path, ".bonitoTeam", "show")
+            joinpath(s.env_path, ".bonitoAgents", "show")
 
         s.in_flight_code    = String(code)
         s.in_flight_started = time()
@@ -531,7 +531,7 @@ mutable struct SessionManager
 end
 
 function SessionManager()
-    log_dir = mktempdir(; prefix = "bonitoteam-mcp-logs-")
+    log_dir = mktempdir(; prefix = "bonitoagents-mcp-logs-")
     SessionManager(Dict{String,JuliaSession}(),
                    Dict{String,ReentrantLock}(),
                    ReentrantLock(), log_dir)
@@ -564,7 +564,7 @@ function get_or_create!(m::SessionManager, env_path::Union{String,Nothing};
         haskey(m.sessions, key) && (kill_session!(m.sessions[key]); delete!(m.sessions, key))
 
         is_temp = env_path === nothing
-        env_dir = is_temp ? mktempdir(; prefix = "bonitoteam-mcp-") : abspath(env_path)
+        env_dir = is_temp ? mktempdir(; prefix = "bonitoagents-mcp-") : abspath(env_path)
         # Temp envs are otherwise empty, so `using Bonito` on the Malt worker
         # falls back to the user depot and resolves the REGISTERED Bonito —
         # which doesn't have the remote-app proxy API (`id_prefix`, …) that

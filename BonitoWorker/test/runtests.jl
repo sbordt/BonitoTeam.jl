@@ -234,7 +234,7 @@ end
                                  memory_max = "80%",
                                  path_env = "/usr/bin:/home/u/.local/bin")
     # ExecStart launches start() in the shared env.
-    @test occursin("ExecStart=/opt/julia/bin/julia --project=@bonito-team", u)
+    @test occursin("ExecStart=/opt/julia/bin/julia --project=@bonito-agents", u)
     @test occursin("BonitoWorker.start()", u)
     # PATH is baked in (systemd --user doesn't inherit the shell PATH; without
     # this the worker can't find claude-agent-acp/node/git at runtime).

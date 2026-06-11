@@ -1,5 +1,5 @@
 # Control dial-back from THIS process (the stdio MCP server) to the
-# BonitoTeam server — the lever that lets the chat's per-tool ⊗ button
+# BonitoAgents server — the lever that lets the chat's per-tool ⊗ button
 # interrupt an in-flight bt_julia_eval WITHOUT cancelling the whole agent
 # turn.
 #
@@ -18,9 +18,9 @@
 #                 {"type": "pong", "request_id": id}
 #
 # The dial is configured by the same env the eval-ws dial-back uses
-# (BONITOTEAM_SERVER_URL from the worker daemon, BONITOTEAM_SECRET /
-# BONITOTEAM_PROJECT_ID injected by the server into the MCP launch env).
-# Standalone BonitoMCP use (no BonitoTeam) has none of them set → no dial,
+# (BONITOAGENTS_SERVER_URL from the worker daemon, BONITOAGENTS_SECRET /
+# BONITOAGENTS_PROJECT_ID injected by the server into the MCP launch env).
+# Standalone BonitoMCP use (no BonitoAgents) has none of them set → no dial,
 # zero overhead.
 
 using HTTP.WebSockets: WebSockets
@@ -32,9 +32,9 @@ const CTRL_TASK = Ref{Union{Task,Nothing}}(nothing)
 const CTRL_STOP = Ref(false)
 
 function start_ctrl_dialback!()
-    server_url = get(ENV, "BONITOTEAM_SERVER_URL", "")
-    secret     = get(ENV, "BONITOTEAM_SECRET", "")
-    project_id = get(ENV, "BONITOTEAM_PROJECT_ID", "")
+    server_url = get(ENV, "BONITOAGENTS_SERVER_URL", "")
+    secret     = get(ENV, "BONITOAGENTS_SECRET", "")
+    project_id = get(ENV, "BONITOAGENTS_PROJECT_ID", "")
     (isempty(server_url) || isempty(secret) || isempty(project_id)) && return nothing
     CTRL_TASK[] === nothing || return nothing
     wsurl = replace(rstrip(server_url, '/'), r"^http" => "ws") * "/mcp-ws"

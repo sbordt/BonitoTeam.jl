@@ -52,7 +52,7 @@ end
 
 # Custom handlers compose with FSRequestHandler by wrapping it: the chat
 # layer's ChatHandler delegates its on_request to a FSRequestHandler
-# instance. Update handling is per-subtype, see e.g. BonitoTeam.ChatHandler.
+# instance. Update handling is per-subtype, see e.g. BonitoAgents.ChatHandler.
 function on_request(h::FSRequestHandler, method::AbstractString, params)
     if method == "fs/read_text_file"
         path = get(params, "path", "")
@@ -129,7 +129,7 @@ function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
         # NOTE: no `elicitation` capability here — the standalone Client has
         # no UI to render a question form, and advertising it would re-enable
         # claude's AskUserQuestion only to auto-skip every question. UI
-        # frontends (BonitoTeam's transports) advertise it themselves.
+        # frontends (BonitoAgents's transports) advertise it themselves.
         send_request(conn, "initialize", Dict(
             "protocolVersion"    => 1,
             "clientCapabilities" => Dict(

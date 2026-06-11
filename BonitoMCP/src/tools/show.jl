@@ -4,7 +4,7 @@
 # fetches the file via the worker control WS's fetch_blob command, and
 # renders an inline preview based on the file's extension/MIME.
 #
-# bt_julia_eval already auto-saves rich values to <env>/.bonitoTeam/show/
+# bt_julia_eval already auto-saves rich values to <env>/.bonitoAgents/show/
 # when their richest MIME is image/HTML/SVG, so the typical flow is:
 #
 #   1. agent calls bt_julia_eval(some_makie_figure) — gets `shown: …`
@@ -78,7 +78,7 @@ reference; the chat does the rest.
 Common flow:
   1. Run `bt_julia_eval` for any value with rich output (Makie / Plots
      figure, Colorant matrix, DataFrame with HTML show). The eval
-     auto-writes the rendered output to <env>/.bonitoTeam/show/<id>.<ext>
+     auto-writes the rendered output to <env>/.bonitoAgents/show/<id>.<ext>
      and returns the `shown: …` path alongside the text repr.
   2. Pass that path to `bt_show` (or any other path on the worker) when
      you want the user to see the file inline.
@@ -105,7 +105,7 @@ register!(
 # (which must evaluate to a `Bonito.App`) runs in the eval session; the server
 # renders it there and proxies it into the browser, so widgets/observables stay
 # fully interactive (unlike bt_show, which snapshots a file). Requires the eval
-# session to have dialed back to the server (automatic under BonitoTeam).
+# session to have dialed back to the server (automatic under BonitoAgents).
 const SHOW_APP_DESCRIPTION = """
 Display a LIVE, interactive Bonito app in the chat. `code` must evaluate to a
 `Bonito.App(...)`. Pass the SAME `env_path` you use for bt_julia_eval (the
@@ -169,7 +169,7 @@ function julia_show_app_handler(args::AbstractDict)
     end
     bridge_live || return Dict{String,Any}(
         "content" => [Dict("type"=>"text",
-            "text"=>"error: eval-ws bridge not connected — the worker could not dial back to the BonitoTeam server. Common causes: server restarted while the worker session was running (the worker keeps a stale dial state); BONITOTEAM_SERVER_URL not set in the MCP env; BONITOTEAM_SECRET mismatch. Try bt_julia_restart to rebuild the worker process, or restart the BonitoTeam server cleanly.")],
+            "text"=>"error: eval-ws bridge not connected — the worker could not dial back to the BonitoAgents server. Common causes: server restarted while the worker session was running (the worker keeps a stale dial state); BONITOAGENTS_SERVER_URL not set in the MCP env; BONITOAGENTS_SECRET mismatch. Try bt_julia_restart to rebuild the worker process, or restart the BonitoAgents server cleanly.")],
         "isError" => true)
     id = string(rand(UInt64); base = 16)
     try

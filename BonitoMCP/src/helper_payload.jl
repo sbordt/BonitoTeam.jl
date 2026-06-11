@@ -117,7 +117,7 @@ function write_show_file(out_dir::AbstractString, base::AbstractString,
     open(io -> write(io, bytes), path, "w")
     # Relative path so the chat side can resolve under either cwd. Path is
     # stable across server restarts because it lives on disk.
-    relpath_str = joinpath(".bonitoTeam", "show", fname)
+    relpath_str = joinpath(".bonitoAgents", "show", fname)
     text = string("shown: ", relpath_str,
                   " (", mime, ", ", format_bytes_short(length(bytes)), ")",
                   "\ntype: ", typeof_short(val))

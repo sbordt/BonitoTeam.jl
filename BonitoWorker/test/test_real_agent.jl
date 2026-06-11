@@ -8,7 +8,7 @@
 # bugs are observable there. This test exercises the real path:
 #
 #   1. Stand up a minimal HTTP+WS server in this process, just /worker-ws +
-#      /worker-acp routes — no Bonito, no BonitoTeam dep.
+#      /worker-acp routes — no Bonito, no BonitoAgents dep.
 #   2. Spawn BonitoWorker as a real subprocess via worker_standalone.jl.
 #   3. Wait for the worker's hello on /worker-ws, ack it.
 #   4. Send `open_session` over the control WS.
@@ -148,9 +148,9 @@ end
     pkg_root    = normpath(joinpath(@__DIR__, ".."))
     standalone  = joinpath(pkg_root, "src", "worker_standalone.jl")
     env         = copy(ENV)
-    env["BONITOTEAM_WORKER_SECRET"] = secret
-    env["BONITOTEAM_SERVER_URL"]    = server_url
-    env["BONITOTEAM_PROJECTS_ROOT"] = projects_root
+    env["BONITOAGENTS_WORKER_SECRET"] = secret
+    env["BONITOAGENTS_SERVER_URL"]    = server_url
+    env["BONITOAGENTS_PROJECTS_ROOT"] = projects_root
 
     worker_log  = tempname() * ".log"
     worker_cmd  = Cmd(`$julia_bin --project=$pkg_root --startup-file=no $standalone`)

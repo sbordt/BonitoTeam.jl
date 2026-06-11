@@ -96,7 +96,7 @@ mutable struct MCPCall <: ToolCall
     status::String
     content::Vector{ToolContent}
     updates::Channel{ToolCall}
-    server::String                     # "bonitoteam"
+    server::String                     # "bonitoagents"
     tool_name::String                  # bare name without `mcp__server__` prefix
     raw_input::Dict{String,Any}
 end
@@ -155,7 +155,7 @@ drain_message!(m::ModeUpdate) = m
 
 # ── Wire → typed dispatch ────────────────────────────────────────────────────
 # One place maps Claude Code's tool name to a concrete `ToolCall` subtype.
-# After this, downstream code (BonitoTeam's `build_msg`, persistence, taskbar)
+# After this, downstream code (BonitoAgents's `build_msg`, persistence, taskbar)
 # dispatches on the subtype — no more `tool.kind == "execute" && ...` probes.
 build_tool_call(n::ToolCallNotif) =
     build_tool_call(Val(Symbol(n.tool_name)), n)
@@ -278,7 +278,7 @@ TurnState() = TurnState(nothing, Dict{String,ToolCall}(), "")
 # the turn ended (cancel, EOF, peer hang-up) before its `tool_call_update` with
 # a completed/failed status arrived. Force it to `"failed"` and push ONE final
 # snapshot through its `updates` channel BEFORE closing, so downstream consumers
-# (BonitoTeam's `process_update!`) see a terminal status and finalize naturally —
+# (BonitoAgents's `process_update!`) see a terminal status and finalize naturally —
 # instead of draining a channel that just-closed with the status frozen mid-flight.
 function Base.close(st::TurnState)
     st.current_message === nothing || close(st.current_message)
@@ -345,7 +345,7 @@ end
 # Late rawInput/name: claude-agent-acp STREAMS tool input, so the initial
 # `tool_call` frequently arrives with an empty (or partial) `rawInput`; the
 # complete arguments ride a later `tool_call_update`. Merge them into the
-# tracked call so snapshot consumers (BonitoTeam's code preview, timeout
+# tracked call so snapshot consumers (BonitoAgents's code preview, timeout
 # badge, path hints, the taskbar's background flag) see the real arguments
 # instead of the empty stub. `GenericTool`/`MCPCall` keep the raw dict; the
 # typed variants re-extract the fields they pulled out at build time.

@@ -4,7 +4,7 @@
 # (a single bidirectional IO; can be a Pipe, a WebSocketIO, an IOBuffer pair
 # bridged with a background task, anything).
 
-# No directory is excluded any more. `.bonitoTeam/` used to live inside
+# No directory is excluded any more. `.bonitoAgents/` used to live inside
 # each project tree (chat.md + tools/) and had to be skipped because
 # workers don't write one — mirror-sync would otherwise wipe the server's
 # chat history when pulling. The chat storage now lives under

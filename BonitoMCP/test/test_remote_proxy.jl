@@ -5,7 +5,7 @@
 # the worker sends (so we can assert on worker→browser traffic) and can be fed
 # inbound frames. Inbound browser→worker frames are driven straight through
 # `process_message` on the bridge's session (exactly how Bonito's own proxy.jl
-# test and BonitoTeam's test_real_e2e drive the host side), so we exercise the
+# test and BonitoAgents's test_real_e2e drive the host side), so we exercise the
 # real render + observable round-trip without standing up the whole stack.
 #
 # This guards the pieces a "reuse Bonito's ProxyConnection / render_proxied"

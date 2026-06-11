@@ -83,13 +83,6 @@ After instantiate:
 julia --project=. test/smoke_mcp.jl
 ```
 
-Or interactively from this project's root via julia_eval:
-
-```julia
-import Pkg; Pkg.activate("/sim/Programmieren/ClaudeExperiments")
-include("/sim/Programmieren/ClaudeExperiments/BonitoTeam/src/MCP/MCP.jl")
-# in-process tests work without instantiating BonitoTeam env
-```
 
 The 9 in-process tests in [test/smoke_mcp.jl](test/smoke_mcp.jl) cover:
 initialize handshake, tools/list, simple eval, state persistence, stdout

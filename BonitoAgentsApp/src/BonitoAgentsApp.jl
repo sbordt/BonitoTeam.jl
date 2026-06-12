@@ -223,91 +223,28 @@ function (@main)(args)
     return 0
 end
 
-# Precompile the full first-launch path (minus the Electron window): boot the
-# REAL server against throwaway state, render the dashboard through a real
-# HTTP request, and run one worker control-session handshake. This is what
-# makes the bundled app start fast — most of BonitoAgents/BonitoWorker/Bonito
-# ends up cached in this package's pkgimage.
-#
-# DANGER ZONE: the precompile process waits for EVERY task spawned here to
-# finish before it can serialize the cache. A lingering task (server accept
-# loop, WS handler, pooled HTTP connection, the worker session) hangs the
-# whole precompile. Hence the strict teardown discipline below:
-#   - `Connection: close` on the GET → no pooled keep-alive reader task
-#   - `run_control_session` (single session, no reconnect loop) for the worker
-#   - the worker WS is closed server-side BEFORE `close(state.srv)` — a
-#     still-connected worker deadlocks the server's handler drain
-#   - every wait is bounded and FAILS the precompile instead of hanging
 @setup_workload begin
-    # The precompile process suppresses ALL stdout/stderr/logging from the
-    # workload, so a hang in here is otherwise undebuggable. Step markers go
-    # to a file instead: tail it to see where a stuck precompile sits.
-    precompile_log = joinpath(tempdir(), "BonitoAgentsApp-precompile.log")
-    workload_t0 = time()
-    logstep(msg) = open(precompile_log, "a") do io
-        println(io, "[+", lpad(round(time() - workload_t0; digits = 2), 7), "s] ", msg)
-    end
     @compile_workload begin
-        logstep("workload start (pid $(getpid()))")
-        try
-            mktempdir() do dir
-                secret = randstring(32)
-                state = BonitoAgents.serve(; host = "127.0.0.1", port = 0,
-                    worker_secret = secret,
-                    state_dir     = mkpath(joinpath(dir, "state")),
-                    working_dir   = mkpath(joinpath(dir, "working")))
-                url = "http://127.0.0.1:$(state.srv.port)"
-                logstep("server up at $url")
-                resp = HTTP.get(url, ["Connection" => "close"])
-                resp.status == 200 || error("precompile workload: dashboard returned $(resp.status)")
-                logstep("dashboard GET done")
-
-                ENV["BONITOAGENTS_CONFIG_DIR"] = mkpath(joinpath(dir, "wcfg"))
-                worker_task = @async BonitoWorker.run_control_session(;
-                    server_url    = url,
-                    secret        = secret,
-                    worker_id     = "precompile-worker",
-                    name          = "precompile",
-                    mcp_command   = BonitoWorker.julia_bin(),
-                    mcp_arguments = BonitoWorker.mcp_args(),
-                    projects_root = mkpath(joinpath(dir, "projects")),
-                    agent_bin     = "claude-agent-acp")
-                registered() = lock(state.lock) do
-                    haskey(state.workers[], "precompile-worker")
-                end
-                # Generous window: the handshake JIT-compiles the whole WS
-                # client stack on first use (3-30s depending on machine load).
-                t0 = time()
-                while !registered() && time() - t0 < 120
-                    # The session ending before registration means it errored —
-                    # fetch rethrows that error and fails the precompile loudly.
-                    istaskdone(worker_task) && fetch(worker_task)
-                    sleep(0.05)
-                end
-                registered() || error("precompile workload: worker never registered")
-                logstep("worker registered")
-
-                close_worker_ws(state, "precompile-worker")
-                t0 = time()
-                while !istaskdone(worker_task) && time() - t0 < 30
-                    sleep(0.025)
-                end
-                istaskdone(worker_task) ||
-                    error("precompile workload: worker session did not end after WS close")
-                logstep("worker session ended")
-
-                close(state.srv)
-                logstep("server closed")
-                delete!(ENV, "BONITOAGENTS_CONFIG_DIR")
+        mktempdir() do dir
+            state = BonitoAgents.serve(;
+                host          = "127.0.0.1",
+                port          = 0,
+                worker_secret = "precompile-secret",
+                state_dir     = mkpath(joinpath(dir, "state")),
+                working_dir   = mkpath(joinpath(dir, "working")))
+            url = "http://127.0.0.1:$(state.srv.port)"
+            # Connection:close avoids a lingering keep-alive reader task that
+            # would stall the precompile serializer.
+            HTTP.get(url, ["Connection" => "close"])
+            # Close sessions the GET created — compiles the teardown paths too.
+            for (_, v) in state.srv.routes.table
+                v isa Bonito.App && !isnothing(v.session[]) && close(v.session[])
             end
-            # Stop Bonito's per-server 1-Hz cleanup tasks etc. — anything still
-            # ticking here would stall the precompile serializer.
-            Bonito.cleanup_globals()
-            logstep("workload done")
-        catch e
-            logstep("workload FAILED: $(sprint(showerror, e))")
-            rethrow()
+            close(state.srv)
         end
+        # Signal Bonito's per-server cleanup tasks to stop and clear globals.
+        Bonito.cleanup_globals()
+        yield()
     end
 end
 

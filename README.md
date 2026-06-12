@@ -97,6 +97,41 @@ capture, error handling, output truncation, full_output bypass, large-container
 summarization. The subprocess test additionally drives the binary end-to-end
 over real stdio.
 
+## Desktop app (BonitoAgentsApp)
+
+[BonitoAgentsApp/](BonitoAgentsApp/) is the AppBundler-packaged desktop app:
+one process that starts the BonitoAgents server on loopback, registers this
+machine as a local worker, and opens the dashboard in an
+[ElectronCall](https://github.com/JuliaWeb/ElectronCall.jl) window. Closing
+the window shuts everything down. State persists across launches under the
+platform data dir (`~/.local/share/BonitoAgents` on Linux).
+
+Run from source:
+
+```bash
+julia --project=BonitoAgentsApp -m BonitoAgentsApp            # Electron window
+julia --project=BonitoAgentsApp -m BonitoAgentsApp --no-window # server only
+```
+
+The package carries a `PrecompileTools.@compile_workload` that boots the
+server, renders the dashboard through a real HTTP request and performs a
+worker handshake, so most of the first-launch latency is precompiled into the
+bundle.
+
+## Release bundles (CI)
+
+[.github/workflows/build-app.yml](.github/workflows/build-app.yml) builds the
+app with [AppBundler](https://github.com/PeaceFounder/AppBundler.jl) for
+Linux (snap, x86_64 + aarch64), macOS (dmg, x86_64 + aarch64) and Windows
+(msix, x86_64):
+
+- every push to `main` → bundles as workflow artifacts
+- every `v*` tag → a GitHub release is created for the tag and the bundles
+  are attached to it
+
+Local build: `julia --project=BonitoAgentsApp/meta -m AppBundler build
+BonitoAgentsApp --build-dir=build`.
+
 ## Output discipline (enforced server-side)
 
 LLM-prompt rules like "always end with `nothing`" are unreliable. Instead, this

@@ -1,0 +1,118 @@
+# Build the BonitoAgentsApp desktop bundles (ElectronCall + local server +
+# worker) with AppBundler on every push to main and every v* tag.
+#
+# - main pushes / manual runs: bundles end up as workflow artifacts.
+# - tag pushes: a GitHub release is created for the tag (if it doesn't exist
+#   yet) and the bundles are attached to it.
+#
+# Adapted from AppBundler's recipes/workflows/GitHub.yml.
+name: Build app bundles
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      upload_tag:
+        description: 'Optional: existing release tag to upload the bundles to'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: build-app-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            os: macos
+            arch: aarch64
+          - runner: macos-13
+            os: macos
+            arch: x86_64
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            xvfb: true
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: aarch64
+            xvfb: true
+          - runner: windows-latest
+            os: windows
+            arch: x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+
+      - uses: julia-actions/cache@v2
+
+      - name: Instantiate AppBundler (meta env)
+        run: julia --project=BonitoAgentsApp/meta -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Instantiate app project
+        run: julia --project=BonitoAgentsApp -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Build bundle
+        run: >
+          ${{ matrix.xvfb && 'xvfb-run -s ''-screen 0 1024x768x24''' || '' }}
+          julia --project=BonitoAgentsApp/meta -m AppBundler build BonitoAgentsApp
+          --build-dir=build --target-arch=${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bonitoagents-${{ matrix.os }}-${{ matrix.arch }}
+          path: build/*
+          retention-days: 14
+
+  upload:
+    name: Upload to release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.upload_tag != ''
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Create release (tag pushes) and upload bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${{ github.event.inputs.upload_tag || github.ref_name }}"
+          echo "Uploading to release: $TAG_NAME"
+
+          if ! gh release view "$TAG_NAME" > /dev/null 2>&1; then
+            gh release create "$TAG_NAME" --verify-tag --generate-notes \
+              --title "$TAG_NAME"
+          fi
+
+          find artifacts/ -type f | while read -r file; do
+            # Prefix the platform (taken from the artifact dir name) so the
+            # five bundles don't collide on the release.
+            platform="$(basename "$(dirname "$file")")"
+            name="${platform}-$(basename "$file")"
+            echo "Uploading: $file as $name"
+            cp "$file" "/tmp/$name"
+            gh release upload "$TAG_NAME" "/tmp/$name" --clobber
+          done
+
+          echo "All bundles uploaded."

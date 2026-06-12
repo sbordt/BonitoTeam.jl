@@ -43,11 +43,12 @@ export class Collapsable {
         this.lazy     = !!this.onExpand;
         this.loaded   = !this.lazy;                    // eager bodies start loaded
 
-        // Edit tools start in COMPACT visual state (Monaco capped to 240px)
-        // but the body element is rendered/visible from the start. The
-        // initial `setMaxHeight` lookup is deferred to the first toggle
-        // (Monaco may not have finished its async init when createNode runs).
-        this.expanded = this.editMode ? false : false;
+        // Everything (edit tools included) starts collapsed. Edit tools are
+        // in COMPACT visual state (Monaco capped to 240px) but their body
+        // element is rendered/visible from the start; the initial
+        // `setMaxHeight` lookup is deferred to the first toggle (Monaco may
+        // not have finished its async init when createNode runs).
+        this.expanded = false;
 
         if (this.native) {
             this.details = headerEl.closest('details') || bodyEl.closest('details');
@@ -144,12 +145,54 @@ class BonitoChat {
         this.heights  = new Map();
         this.rendered = new Set();
         this.nodeById = new Map();  // msg_id → DOMNode  (for streaming updates)
-        this.ros      = new Map();
+        this.observed = new Set();  // idx currently watched by the shared RO
 
         this.totalCount    = 0;
-        this.EST_HEIGHT    = 80;
+        this.EST_HEIGHT    = 80;    // adapted to the measured average, see _measureNodes
         this.OVERSCAN      = 8;
         this.initialLoad   = false;
+        this._bootstrapped = false; // first msgs.count seen (guards initialLoad re-arm)
+        this._measSum      = 0;     // running mean of measured heights → EST_HEIGHT
+        this._measCount    = 0;
+        this._spacerTopH   = -1;    // last written spacer px (skip no-op style writes)
+        this._spacerBotH   = -1;
+        this._requestedAt  = new Map(); // idx → time of in-flight msgs.request
+        this.STREAM_APPLY_MS = 100; // min interval between streaming innerHTML applies
+
+        // ONE shared ResizeObserver for every node in the render window.
+        // (A fresh observer per node made every window enter/exit allocate +
+        // tear down an observer — churn on each scroll tick.)
+        //
+        // Heights are recorded as the BORDER BOX so they agree with the
+        // offsetHeight that `_measureNodes` records: `contentRect` is the
+        // CONTENT box and undercounts every bubble by its padding + border
+        // (~22px for a text bubble). That undercount accumulated across the
+        // render window to MORE than the overscan, so the computed window
+        // start landed inside the viewport — visible bubbles were evicted
+        // ("bubbles hide before they leave the screen") and every eviction
+        // shrank scrollHeight mid-scroll (stutter).
+        this._ro = new ResizeObserver((entries) => {
+            if (this.destroyed) return;
+            let changed = false;
+            for (const e of entries) {
+                const idx = e.target.__btIdx;
+                if (idx === undefined) continue;
+                const h = (e.borderBoxSize && e.borderBoxSize.length)
+                    ? e.borderBoxSize[0].blockSize
+                    : e.target.offsetHeight;
+                // h>0 guard keeps the last measured height through a
+                // hide/show cycle, so re-showing restores exact sizes.
+                if (h > 0 && this.heights.get(idx) !== h) {
+                    this.heights.set(idx, h);
+                    changed = true;
+                }
+            }
+            // Apply corrections NOW (rAF-batched) instead of letting them
+            // ambush the next scroll tick. EXCEPT mid-scrollbar-drag:
+            // corrections then wait for release — re-spacing under a held
+            // thumb is exactly the flicker.
+            if (changed && !this._scrollbarDrag) this._queueRefresh();
+        });
 
         // ── Live-app keep-alive LRU ──────────────────────────────────────
         // App embeds (msg.kind === 'bonito_app', marked data-bt-app) host a
@@ -206,44 +249,30 @@ class BonitoChat {
 
         this.spacerTop    = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
-        // ── Message filter ─────────────────────────────────────────────
-        // Checkboxes appear in the toolbar (below the composer) the first
-        // time a filter key occurs (a base message type, or `tool:<name>`
-        // per tool). Unchecking hides matching nodes (inline display:none)
-        // AND zeroes their entries in the height math (effHeight), so
-        // spacers/scroll mapping stay exact. Per-tab — rebuilt on remount.
+        // ── Filter / lens state ────────────────────────────────────────
+        // The per-tool filter toolbar is GONE — the header lens bar
+        // (`_setupLens`) replaces it. `keyByIdx` still drives effHeight, and
+        // the lens hides messages by a server-computed visible-index set
+        // (`lensVisible`). Native-media toggles live in the lens bar now.
         this.toolbarEl   = (container.closest('.bt-app') || container.parentElement)
             .querySelector('.bt-chat-toolbar');
-        this.hiddenTypes = new Set(DEFAULT_HIDDEN);   // filter keys currently hidden
-        this.seenTypes   = new Set();   // keys that already have a checkbox
+        if (this.toolbarEl) this.toolbarEl.style.display = 'none';
+        this.hiddenTypes = new Set(DEFAULT_HIDDEN);   // kept for DEFAULT_HIDDEN
+        this.seenTypes   = new Set();   // keys seen (drives the waiting line)
         this.keyByIdx    = new Map();   // idx → filter key (drives effHeight)
-        // Two toolbar rows: the dynamic filter checkboxes on top, static
-        // display options below ("Depict Images Natively in Chat", …).
-        this.filterRow  = null;
-        this.optionsRow = null;
+        this.filterRow   = null;        // no per-tool checkboxes anymore
         this.nativeImages = true;       // bt_show image results: bare by default
         this.nativeVideos = true;       // bt_show video results: ditto
-        if (this.toolbarEl) {
-            this.filterRow = document.createElement('div');
-            this.filterRow.className = 'bt-toolbar-filters';
-            this.optionsRow = document.createElement('div');
-            this.optionsRow.className = 'bt-toolbar-options';
-            this.toolbarEl.append(this.filterRow, this.optionsRow);
-            const addOption = (text, checked, onChange) => {
-                const label = document.createElement('label');
-                label.className = 'bt-filter-toggle';
-                const cb = document.createElement('input');
-                cb.type = 'checkbox';
-                cb.checked = checked;
-                cb.addEventListener('change', () => onChange(cb.checked));
-                label.append(cb, text);
-                this.optionsRow.appendChild(label);
-            };
-            addOption('Native Images', this.nativeImages,
-                      (on) => this._setNativeMedia('image/', on));
-            addOption('Native Videos', this.nativeVideos,
-                      (on) => this._setNativeMedia('video/', on));
-        }
+        // Lens: server returns the set of VISIBLE 0-based indices for the
+        // current query (+ per-index actions). `lensActive=false` shows all.
+        this.lensActive  = false;
+        this.lensVisible = null;        // Set<idx> when active
+        this.lensActions = null;        // Map<idx, action>
+        this.lensQuery   = '';          // the query this tab currently applies
+        this.lensVocab   = [];          // autocomplete keys (from the server)
+        this.savedLenses = [];          // global favorites (from the server)
+        this.lensClauses = [];          // committed pills: [{sign:'+'|'-', text}]
+        this.lensPendingSign = '+';     // sign for the clause being composed
         // Busy dots + thinking indicator are scroll CONTENT — they sit
         // between the bottom spacer and the overscroll tail so they appear
         // directly under the last message (not below the tail, down by the
@@ -281,7 +310,9 @@ class BonitoChat {
         // Single subscription. `comm` is a Bonito Observable bridged via
         // WS; every message Julia sets via `model.comm[] = {...}` arrives here.
         comm.on((msg) => {
-            if (this.destroyed) return;
+            // Returning `false` deregisters the callback (Observable.notify
+            // contract) — a destroyed instance must not stay subscribed.
+            if (this.destroyed) return false;
             if (msg && typeof msg === 'object') this.dispatch(msg);
         });
 
@@ -371,13 +402,20 @@ class BonitoChat {
             markUserInput();
         };
         this._onWindowMouseUp      = () => {
+            // Window-level listener: a pane whose subtree was unmounted above
+            // the direct parent (MutationObserver in `connect` can't see
+            // that) self-destroys lazily here.
+            if (!this.container.isConnected) { this._lazyDestroy(); return; }
             if (!this._scrollbarDrag) return;
             this._scrollbarDrag = false;
             markUserInput();   // the release tick still counts as user input
             // Auto-expands deferred during the drag (image bodies inflate
-            // scrollHeight — poison for a held thumb): mount them now.
-            for (const node of this.cache.values()) {
-                if (node.isConnected && node.dataset.btAutoExpand) {
+            // scrollHeight — poison for a held thumb): mount them now. Only
+            // rendered nodes can carry a deferred flag from a mid-drag
+            // insert; detached flagged nodes expand on their insertSorted.
+            for (const idx of this.rendered) {
+                const node = this.cache.get(idx);
+                if (node && node.isConnected && node.dataset.btAutoExpand) {
                     delete node.dataset.btAutoExpand;
                     node.collapsable?.setExpanded(true);
                 }
@@ -416,6 +454,13 @@ class BonitoChat {
         const setOverscroll = (v) => {
             this._overscroll = v;
             this.container.style.setProperty('--bt-overscroll', v + 'px');
+            // The rubberband translateY is applied to EVERY rendered child;
+            // a non-`none` transform on each child turns one composited scroll
+            // layer into N stacking contexts, hurting steady-state scroll
+            // smoothness. Gate it behind a class so the transform exists ONLY
+            // during an active overscroll gesture (the only time it's needed),
+            // and normal scrolling composites natively.
+            this.container.classList.toggle('bt-overscrolling', v !== 0);
         };
 
         this._cancelMomentum = () => {
@@ -622,6 +667,7 @@ class BonitoChat {
         Promise.resolve().then(() => {
             this._setupInputs();
             this._setupLiveTicker();
+            this._setupLens();
         });
     }
 
@@ -658,8 +704,8 @@ class BonitoChat {
         if (this._containerRO) {
             this._containerRO.disconnect();
         }
-        this.ros.forEach((ro) => ro.disconnect());
-        this.ros.clear();
+        if (this._ro) this._ro.disconnect();
+        this.observed.clear();
         if (this._onPaste && this.textInput) {
             this.textInput.removeEventListener('paste', this._onPaste);
         }
@@ -691,6 +737,21 @@ class BonitoChat {
         if (this.taskbarEl && this._onTaskbarClick) {
             this.taskbarEl.removeEventListener('click', this._onTaskbarClick);
         }
+        if (this._onLensDocClick) {
+            document.removeEventListener('click', this._onLensDocClick);
+        }
+    }
+
+    // Backstop teardown for an instance whose container left the document
+    // without the `connect` MutationObserver seeing it (that observer only
+    // watches the DIRECT parent's childList; an ancestor-level unmount slips
+    // past). Document/window-level handlers call this when they notice
+    // `container.isConnected === false`, so leaked instances clean up on the
+    // next global event instead of reacting forever.
+    _lazyDestroy() {
+        if (this.destroyed) return;
+        try { this.destroy(); } catch (_) { /* already half-gone */ }
+        CHAT_INSTANCES.delete(this);
     }
 
     // Single dispatch table. Julia sends `{type, ...}`; we route here.
@@ -705,6 +766,9 @@ class BonitoChat {
         switch (msg.type) {
             case 'msgs.count':   return this.applyCount(msg.n);
             case 'turn_begin':   this.turnSeq = msg.seq; return;
+            case 'lens.vocab':   this.lensVocab = msg.keys || []; return;
+            case 'lens.saved':   return this.onLensSaved(msg);
+            case 'lens.result':  return this.onLensResult(msg);
             case 'msgs.range':   return this.onRange(msg);
             case 'session_reset':return this.onSessionReset();
             case 'busy_start':
@@ -758,7 +822,16 @@ class BonitoChat {
             return;
         }
         this.totalCount  = n;
-        this.initialLoad = true;
+        // Only the FIRST count arms initial-mount behavior. `msgs.count` is
+        // re-broadcast on a shared channel (another tab's init handshake, a
+        // session restart), and re-arming `initialLoad` here made the NEXT
+        // msgs.range — including ranges OTHER tabs requested — run the
+        // initial scroll cascade: follow mode force-enabled and the pane
+        // yanked to the bottom while the user was reading scrollback.
+        if (!this._bootstrapped) {
+            this._bootstrapped = true;
+            this.initialLoad = true;
+        }
         this._startSettle();
         this.refresh();
         this._startPrefetch();
@@ -900,10 +973,36 @@ class BonitoChat {
     // `observe`'s h>0 guard keeps the last measured height through a
     // hide/show cycle, so re-showing restores exact sizes.
     effHeight(i) {
+        // Lens-hidden indices contribute 0 height (their nodes are
+        // display:none), so the spacer/scroll geometry matches the visible
+        // subset exactly.
+        if (this.lensActive && !this.lensVisible.has(i)) return 0;
         if (this.hiddenTypes.has(this.keyByIdx.get(i))) return 0;
         return (this.heights.get(i) ?? this.EST_HEIGHT) + this.ITEM_GAP;
     }
 
+    // Is index `i` hidden by the active lens?
+    lensHides(i) { return this.lensActive && !this.lensVisible.has(i); }
+
+    // THE one owner of a cached node's `display`. Three mechanisms hide
+    // nodes — parking (live-app keep-alive), the type filter (hiddenTypes)
+    // and the lens — and they used to write style.display independently:
+    // clearing a lens could un-hide a PARKED live app far outside the
+    // viewport (updateDOM never re-hides an already-parked idx), and could
+    // reveal filter-hidden nodes whose effHeight stays 0, desyncing the
+    // virtual geometry from the real pixels. Every writer routes here so
+    // the decision is always the conjunction of all three.
+    applyVisibility(idx, node = this.cache.get(idx)) {
+        if (!node) return;
+        const hidden = this.parked.has(idx) ||
+            this.lensHides(idx) ||
+            this.hiddenTypes.has(this.keyByIdx.get(idx));
+        node.style.display = hidden ? 'none' : '';
+    }
+
+    // Linear scan — profiled at 0.23ms for N=6000, far under a frame, so the
+    // O(N) here is not a scroll-smoothness factor (an O(log n) prefix sum was
+    // tried and dropped: it optimized something already imperceptible).
     indexAt(offset) {
         let h = 0;
         for (let i = 0; i < this.totalCount; i++) {
@@ -939,17 +1038,35 @@ class BonitoChat {
         // only (uncached regions show as spacer); the release handler's
         // refresh fetches whatever the thumb landed on.
         if (!this._scrollbarDrag) {
+            // Dedup in-flight requests: refresh() runs on EVERY scroll event,
+            // so without this each tick re-sent the same range until the
+            // response landed — dozens of identical server renders (each
+            // broadcast to every tab) while scrolling through an uncached
+            // region. The 2s expiry is the lost-response retry.
+            const now = performance.now();
             const missing = [];
-            for (let i = s; i <= e; i++) if (!this.cache.has(i)) missing.push(i);
+            for (let i = s; i <= e; i++) {
+                if (this.cache.has(i)) continue;
+                const t = this._requestedAt.get(i);
+                if (t !== undefined && (now - t) < 2000) continue;
+                missing.push(i);
+            }
             if (missing.length > 0) {
+                for (const i of missing) this._requestedAt.set(i, now);
                 this.comm.notify({type: 'msgs.request',
                                   range: [missing[0], missing[missing.length - 1]]});
             }
         }
         this.updateDOM(s, e);
-        // Never pin while the user is actively dragging the scrollbar —
-        // the drag IS the authority on where scrollTop should be.
-        if (wasAtBottom && !this._scrollbarDrag &&
+        // Re-pin the bottom only for CONTENT-driven geometry changes (height
+        // corrections, streaming growth). Never while the user is driving
+        // scrollTop: a held scrollbar owns the position outright, and a slow
+        // upward wheel/trackpad gesture starting inside AT_BOTTOM_PX used to
+        // coincide with a respacing here and get yanked straight back down
+        // ("wheel did nothing" at the bottom edge).
+        const userDriving = this._scrollbarDrag || this._pendingUserScroll ||
+            (performance.now() - this._lastUserInputT) < 400;
+        if (wasAtBottom && !userDriving &&
             this.container.scrollHeight !== preHeight) {
             this.container.scrollTop = this.container.scrollHeight;
         }
@@ -960,12 +1077,17 @@ class BonitoChat {
         const fresh = [];
         messages.forEach((data, i) => {
             const idx = start + i;
+            this._requestedAt.delete(idx);   // no longer in flight
             if (this.cache.has(idx)) return;
             const node = this.createNode(data);
             this.cache.set(idx, node);
             this.keyByIdx.set(idx, filterKey(data));
             if (data.id) this.nodeById.set(data.id, node);
-            this.observe(idx, node);
+            // Do NOT observe at creation — a node is observed only while it's
+            // in the render window (updateDOM), so the live ResizeObserver set
+            // stays bounded to ~the viewport instead of accumulating one per
+            // message for the whole session (which grows per-layout cost
+            // without bound). Off-screen heights come from `_measureNodes`.
             fresh.push([idx, node]);
         });
         this._measureNodes(fresh);
@@ -1037,29 +1159,31 @@ class BonitoChat {
         for (const [, node] of toMeasure) this.measureEl.appendChild(node);
         for (const [idx, node] of toMeasure) {
             const h = node.offsetHeight;
-            if (h > 0) this.heights.set(idx, h);
+            if (h > 0) {
+                this.heights.set(idx, h);
+                this._measSum += h;
+                this._measCount++;
+            }
         }
         for (const [, node] of toMeasure) {
             if (node.parentNode === this.measureEl) this.measureEl.removeChild(node);
         }
+        // Adapt the estimate to this chat's real average so the pre-measure
+        // spacer geometry (and the pixel overscan derived from EST_HEIGHT)
+        // tracks tall-message chats instead of the fixed 80px guess.
+        if (this._measCount >= 20) {
+            this.EST_HEIGHT = Math.min(400, Math.max(24,
+                this._measSum / this._measCount));
+        }
     }
 
+    // Register `node` (at store index `idx`) with the shared ResizeObserver
+    // (constructed once in the constructor — see there for the border-box
+    // rationale). The reverse mapping rides on the node itself.
     observe(idx, node) {
-        const ro = new ResizeObserver(([e]) => {
-            const h = e.contentRect.height;
-            if (h > 0 && this.heights.get(idx) !== h) {
-                this.heights.set(idx, h);
-                // Apply the correction NOW (rAF-batched) instead of letting
-                // it ambush the next scroll tick: the spacers re-true while
-                // refresh()'s bottom anchoring keeps the viewport pinned,
-                // so estimate→measured corrections are invisible. EXCEPT
-                // mid-scrollbar-drag: corrections then wait for release —
-                // re-spacing under a held thumb is exactly the flicker.
-                if (!this._scrollbarDrag) this._queueRefresh();
-            }
-        });
-        ro.observe(node);
-        this.ros.set(idx, ro);
+        node.__btIdx = idx;
+        this.observed.add(idx);
+        this._ro.observe(node);
     }
 
     // rAF-batched refresh: many ResizeObserver measurements land in the
@@ -1087,11 +1211,16 @@ class BonitoChat {
                 // node is 0px). Spilled nodes (Stage 2) are plain again.
                 if (node && node.dataset && node.dataset.btApp && !node.dataset.btSpilled) {
                     if (!this.parked.has(idx)) {
-                        node.style.display = 'none';
                         this.parked.add(idx);
+                        this.applyVisibility(idx, node);
                         this.touchApp(idx);   // just left the viewport
                     }
                 } else {
+                    // Leaving the window: unobserve so the live observer set
+                    // stays bounded to the rendered window. A detached node
+                    // doesn't resize anyway; on re-entry the insert branch
+                    // re-observes it.
+                    if (this.observed.delete(idx) && node) this._ro.unobserve(node);
                     node?.remove();
                     this.rendered.delete(idx);
                     this.parked.delete(idx);
@@ -1100,20 +1229,39 @@ class BonitoChat {
         }
         for (let i = s; i <= e; i++) {
             if (this.parked.has(i)) {
-                // Re-entering the viewport: un-hide the kept-alive app.
+                // Re-entering the viewport: un-park the kept-alive app
+                // (visibility still honors lens/filter state).
                 const node = this.cache.get(i);
-                if (node) node.style.display = '';
                 this.parked.delete(i);
+                this.applyVisibility(i, node);
                 this.touchApp(i);
             } else if (this.cache.has(i) && !this.rendered.has(i)) {
-                this.insertSorted(i, this.cache.get(i));
+                const node = this.cache.get(i);
+                this.insertSorted(i, node);
                 this.rendered.add(i);
-                if (this.cache.get(i)?.dataset?.btApp) this.touchApp(i);
+                // Entering the window: (re-)observe for live height
+                // corrections. Bounded to the window (see the remove branch).
+                if (!this.observed.has(i)) this.observe(i, node);
+                // A lens-/filter-hidden index scrolled into the window stays
+                // hidden (one display owner — see applyVisibility).
+                this.applyVisibility(i, node);
+                if (node?.dataset?.btApp) this.touchApp(i);
             }
         }
         this.enforceAppLru();
-        this.spacerTop.style.height    = this.cumHeight(0, s) + 'px';
-        this.spacerBottom.style.height = this.cumHeight(e + 1, this.totalCount) + 'px';
+        // Skip no-op spacer writes: this runs on every scroll event, and an
+        // unconditional style write per tick invalidates style/layout even
+        // when the window didn't move.
+        const topH = this.cumHeight(0, s);
+        const botH = this.cumHeight(e + 1, this.totalCount);
+        if (topH !== this._spacerTopH) {
+            this.spacerTop.style.height = topH + 'px';
+            this._spacerTopH = topH;
+        }
+        if (botH !== this._spacerBotH) {
+            this.spacerBottom.style.height = botH + 'px';
+            this._spacerBotH = botH;
+        }
         // NOTE: no drag-time scrollHeight freeze here. An earlier freeze
         // (pin total at drag-start, absorb deltas in the spacers) turned
         // estimate-vs-real drift into PHANTOM BLANK at the end of the
@@ -1186,10 +1334,12 @@ class BonitoChat {
             slot.appendChild(wrap);
         }
         node.dataset.btSpilled = '1';
-        node.style.display = '';   // a spilled node is a plain <img>, render it normally
         node.remove();             // off-screen → leaves the DOM like any normal node
         this.rendered.delete(idx);
         this.parked.delete(idx);
+        // A spilled node is a plain <img> — visible again unless the lens /
+        // filter hides it (applyVisibility owns the decision).
+        this.applyVisibility(idx, node);
         const li = this.appLru.indexOf(idx);
         if (li !== -1) this.appLru.splice(li, 1);
     }
@@ -1240,6 +1390,12 @@ class BonitoChat {
             this.keyByIdx.set(idx, filterKey(msg));
             if (msg.id) this.nodeById.set(msg.id, node);
             this.observe(idx, node);
+            // A lens result is a STATIC index set computed when the query
+            // ran — new indices can't be in it, which used to hide every
+            // message arriving while a lens was active (matches included).
+            // Default new messages to visible; re-running the query
+            // re-evaluates them properly.
+            if (this.lensActive) this.lensVisible.add(idx);
         }
         // Strict no-yank semantics: any new message (including the
         // user's own) auto-scrolls ONLY while followMode is on.
@@ -1276,10 +1432,12 @@ class BonitoChat {
         if (!node) return;
         // Server ships the FULL rendered html of the message-so-far each
         // chunk (CommonMark-rendered, so intraword `_`s don't italicize and
-        // newlines/lists/headings format correctly while streaming). Just
-        // replace the bubble's content.
+        // newlines/lists/headings format correctly while streaming). Each
+        // payload is self-contained, so intermediate frames are droppable —
+        // apply through the throttle below instead of re-parsing and
+        // re-laying-out the whole (growing) bubble at chunk rate.
         if (msg.html !== undefined) {
-            node.innerHTML = msg.html;
+            this._applyStreamHtml(node, msg.html);
         } else if (msg.text !== undefined) {
             // Legacy text-delta path (kept for the streaming-stress mocks
             // that still feed plain text). Append to the streaming span.
@@ -1314,9 +1472,39 @@ class BonitoChat {
         }
     }
 
+    // Leading+trailing throttle for streaming innerHTML. The first chunk
+    // paints immediately; chunks inside the STREAM_APPLY_MS window are
+    // coalesced (last one wins — payloads are cumulative) and flushed by the
+    // trailing timer, so the final chunk always lands even if the stream
+    // stops mid-window. Per-chunk replacement re-parsed + re-laid-out the
+    // entire message at chunk rate — a real stutter source on long replies.
+    _applyStreamHtml(node, html) {
+        node.__btStreamHtml = html;
+        if (node.__btStreamTimer != null) return;   // window open: coalesce
+        const flush = () => {
+            node.__btStreamTimer = null;
+            if (this.destroyed || node.__btStreamHtml == null) return;
+            node.innerHTML = node.__btStreamHtml;
+            node.__btStreamHtml = null;
+            node.__btStreamTimer = setTimeout(flush, this.STREAM_APPLY_MS);
+        };
+        flush();
+    }
+
+    // Final html supersedes any throttled stream payload still pending — a
+    // trailing flush after this would resurrect the older streaming state.
+    _clearPendingStream(node) {
+        node.__btStreamHtml = null;
+        if (node.__btStreamTimer != null) {
+            clearTimeout(node.__btStreamTimer);
+            node.__btStreamTimer = null;
+        }
+    }
+
     onAgentFinal(msg) {
         const node = this.nodeById.get(msg.id);
         if (node && msg.html) {
+            this._clearPendingStream(node);
             node.innerHTML = msg.html;
             linkifyPaths(node);
         }
@@ -1575,6 +1763,8 @@ class BonitoChat {
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
             node.classList.remove('bt-tool-live');
+            // Final duration, written once on completion (no timer).
+            _writeToolElapsed(node);
         }
         if (msg.title) {
             const t = node.querySelector('.bt-tool-title');
@@ -1685,47 +1875,14 @@ class BonitoChat {
     // toolbar, checked. Base types sit first in TYPE_ORDER; tool keys go in
     // a trailing "Tools:" group, alphabetical — stable positions either way,
     // independent of arrival order. No-op when the toolbar isn't mounted.
+    // Track which filter keys have appeared. The per-tool filter checkboxes
+    // are gone (the lens replaces them); we keep this only for the side
+    // effect that the FIRST agent reply lets the idle "waiting" line show.
     noteKey(msg) {
         const key = filterKey(msg);
-        if (!key || this.seenTypes.has(key) || !this.filterRow) return;
+        if (!key || this.seenTypes.has(key)) return;
         this.seenTypes.add(key);
-        // First agent reply in the chat → the idle "waiting" line below the
-        // last message earns its right to show (see _updateWaiting).
         if (key === 'agent') this._updateWaiting();
-        const isTool = key.startsWith('tool:');
-        const text   = isTool ? key.slice(5) : (TYPE_LABELS[key] ?? key);
-        const label = document.createElement('label');
-        label.className = 'bt-filter-toggle';
-        label.dataset.key = key;
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.checked = !this.hiddenTypes.has(key);
-        cb.addEventListener('change', () => this.setKeyHidden(key, !cb.checked));
-        label.append(cb, text);
-        const toggles = () => [...this.filterRow.querySelectorAll('.bt-filter-toggle')];
-        if (isTool) {
-            this.ensureToolGroupLabel();
-            const next = toggles().find(el =>
-                el.dataset.key.startsWith('tool:') &&
-                el.dataset.key.slice(5).localeCompare(text) > 0);
-            this.filterRow.insertBefore(label, next ?? null);
-        } else {
-            const order = t => { const i = TYPE_ORDER.indexOf(t); return i < 0 ? TYPE_ORDER.length : i; };
-            // Before the first base toggle that sorts after us; else before
-            // the Tools: group; else at the end.
-            const next = toggles().find(el =>
-                !el.dataset.key.startsWith('tool:') && order(el.dataset.key) > order(key))
-                ?? this.filterRow.querySelector('.bt-filter-group-label');
-            this.filterRow.insertBefore(label, next ?? null);
-        }
-    }
-
-    ensureToolGroupLabel() {
-        if (this.filterRow.querySelector('.bt-filter-group-label')) return;
-        const span = document.createElement('span');
-        span.className = 'bt-filter-group-label';
-        span.textContent = 'Tools:';
-        this.filterRow.appendChild(span);
     }
 
     // ── Native media display (bt_show results) ───────────────────────────
@@ -1782,8 +1939,10 @@ class BonitoChat {
     // current state in createNode.
     setKeyHidden(key, hidden) {
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
-        for (const node of this.cache.values()) {
-            if (node.dataset.filterKey === key) node.style.display = hidden ? 'none' : '';
+        for (const [idx, node] of this.cache) {
+            // applyVisibility, not a raw display write: un-hiding a key must
+            // not reveal nodes the lens hides or un-park live apps.
+            if (node.dataset.filterKey === key) this.applyVisibility(idx, node);
         }
         // Hiding the agent stream also hides the idle "waiting" line that
         // would otherwise dangle under messages that aren't there.
@@ -1850,15 +2009,18 @@ class BonitoChat {
                 // Live Bonito/WGLMakie embeds get kept alive (display:none) on
                 // scroll-off instead of removed — see the keep-alive LRU.
                 if (msg.kind === 'bonito_app') div.dataset.btApp = '1';
-                // Live state + start time live on the message node itself so
-                // the 1s ticker can find them by selector. Status `pending` /
-                // `in_progress` count as live until a terminal update flips
-                // the class via `onToolUpdate`.
+                // Live state + start/finish time live on the message node.
+                // Status `pending` / `in_progress` count as live until a
+                // terminal update flips the class via `onToolUpdate`; the
+                // final duration is written from these attrs on completion.
                 if (msg.id) div.dataset.msgId = msg.id;
                 if (msg.started_at != null)
                     div.dataset.toolStarted = String(msg.started_at);
                 if (msg.finished_at != null)
                     div.dataset.toolFinished = String(msg.finished_at);
+                // History replay / late mount of an already-finished pill:
+                // write its final duration now (event-driven, no timer).
+                _writeToolElapsed(div);
                 // Server-decided opt-in for the taskbar slot. Background bash
                 // / Task land here; regular tools don't.
                 const liveTool = !(msg.status === 'completed' || msg.status === 'failed') &&
@@ -2000,9 +2162,16 @@ class BonitoChat {
     }
 
     onSummaryFinal(msg) {
-        // Find the LAST summary node still in streaming/placeholder state and
-        // fill it. We don't carry an id (summaries are rare — one per session
-        // continuation — and there's no ambiguity in practice).
+        // By id through the node cache — a DOM-only lookup missed summaries
+        // the virtual scroll currently holds detached, leaving the cached
+        // node on "summary loading…" forever.
+        const node = msg.id ? this.nodeById.get(msg.id) : null;
+        if (node) {
+            const body = node.querySelector('.bt-summary-body');
+            if (body) { body.innerHTML = msg.html || ''; return; }
+        }
+        // Fallback (id-less event from an older server): last summary node
+        // in the DOM.
         const nodes = this.container.querySelectorAll('.bt-summary-msg .bt-summary-body');
         const tgt = nodes[nodes.length - 1];
         if (tgt) tgt.innerHTML = msg.html || '';
@@ -2050,9 +2219,10 @@ class BonitoChat {
                 <button class="bt-eval-preview-toggle" type="button"
                         title="Enlarge">⌄</button>
             </div>` : '';
-        // Elapsed timer — only renders text once > 1s have passed (see
-        // _tickLiveTimers). Always emitted so the same span can be updated
-        // in place by every tick + by `onToolUpdate`.
+        // Elapsed timer — empty until the pill finishes, then filled ONCE
+        // with the final duration by `_writeToolElapsed` (on creation of an
+        // already-finished pill, and on the completion update). Live elapsed
+        // time is the taskbar's job (Julia clock); no JS timer touches this.
         // The full-width toggle lives IN the header (right edge, after the
         // status pill) — an overlay button floating over the body covered
         // the actual app/diff content. CSS reveals it only while the body
@@ -2134,21 +2304,384 @@ class BonitoChat {
             };
             this.taskbarEl.addEventListener('click', this._onTaskbarClick);
         }
-        // 1s ticker for the inline pill timers.
-        this._tickerId = setInterval(() => this._tickLiveTimers(), 1000);
+        // NO ticker here. Live elapsed time is shown in the TASKBAR, driven
+        // by a Julia clock (taskbar.jl / ensure_taskbar_clock!). In-chat tool
+        // pills show their FINAL duration, written ONCE on completion
+        // (`_writeToolElapsed`) — event-driven, never polled, so the scroll
+        // container is never queried on a timer.
     }
 
-    _tickLiveTimers() {
-        if (this.destroyed) return;
-        const now = Date.now() / 1000;
-        // Update inline timers on every live pill — both tools and todos.
-        for (const el of this.container.querySelectorAll(
-                'div.bt-tool-msg.bt-tool-live, div.bt-plan-msg.bt-plan-live')) {
-            const started = parseFloat(el.dataset.toolStarted ?? el.dataset.planStarted ?? '0');
-            if (!started) continue;
-            const elapsed = now - started;
-            const timer = el.querySelector('.bt-tool-timer');
-            if (timer) timer.textContent = elapsed > 1 ? _formatElapsed(elapsed) : '';
+    // ── Lens search bar (header) ─────────────────────────────────────────
+    // Builds: [ input (with autocomplete) | save ] [ search ]  + saved chips.
+    // The query is parsed + run SERVER-SIDE (lens.query → lens.result with the
+    // visible index set + actions); this side just renders the bar, drives
+    // autocomplete from the chat vocabulary, and applies the result.
+    // The lens bar is PILL-based: each committed clause renders as a pill, an
+    // inline input composes the next clause. After a `/key` is picked the
+    // autocomplete switches from KEYS to ACTIONS (expand/collapse) + OPERATORS
+    // (＋ include / − exclude), each starting the next clause. The serialized
+    // query (pills + the in-progress tail) is what runs server-side.
+    _setupLens() {
+        const host = (this.app || this.container.closest('.bt-app') ||
+                      this.container.parentElement).querySelector('.bt-lens-bar');
+        if (!host) return;
+        this.lensBarEl = host;
+        this.lensClauses = [];          // committed: [{sign:'+'|'-', text}]
+        this.lensPendingSign = '+';     // sign for the clause being composed
+        host.innerHTML = `
+            <div class="bt-lens-row">
+                <div class="bt-lens-field">
+                    <span class="bt-lens-pills"></span>
+                    <input class="bt-lens-input" type="text" spellcheck="false"
+                           placeholder="/ to pick a type, or type to search everything" />
+                    <button class="bt-lens-save" type="button" title="Save lens">★</button>
+                    <div class="bt-lens-autocomplete" hidden></div>
+                </div>
+                <button class="bt-lens-go" type="button" title="Apply lens">Search</button>
+                <button class="bt-lens-clear" type="button" title="Clear lens" hidden>✕</button>
+            </div>
+            <div class="bt-lens-chips"></div>`;
+        this.lensInput = host.querySelector('.bt-lens-input');
+        this.lensAC    = host.querySelector('.bt-lens-autocomplete');
+        this.lensPills = host.querySelector('.bt-lens-pills');
+        this.lensChips = host.querySelector('.bt-lens-chips');
+        const go    = host.querySelector('.bt-lens-go');
+        const save  = host.querySelector('.bt-lens-save');
+        const clear = host.querySelector('.bt-lens-clear');
+        this.lensClearBtn = clear;
+
+        const apply = () => { this._lensCommitTail(); this._hideLensAutocomplete();
+                              this.runLens(this._lensSerialize()); };
+        go.addEventListener('click', apply);
+        save.addEventListener('click', () => {
+            this._lensCommitTail();
+            const q = this._lensSerialize();
+            if (q) this.comm.notify({ type: 'lens.save', q });
+        });
+        clear.addEventListener('click', () => this._lensClearAll());
+        this.lensInput.addEventListener('input', () => {
+            this._lensAutoCommitOnOperator();
+            this._updateLensAutocomplete();
+        });
+        this.lensInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault();
+                if (!this._acceptLensAutocomplete()) apply(); }
+            else if (e.key === 'Escape') this._hideLensAutocomplete();
+            else if (e.key === 'ArrowDown' || e.key === 'ArrowUp')
+                this._moveLensAutocomplete(e.key === 'ArrowDown' ? 1 : -1, e);
+            else if (e.key === 'Backspace' && this.lensInput.value === '' &&
+                     this.lensClauses.length) { e.preventDefault(); this._lensPopPill(); }
+        });
+        // Click-away closes the autocomplete. (Document-level: lazy
+        // self-destroy backstop, same as the ESC handler.)
+        this._onLensDocClick = (e) => {
+            if (!this.container.isConnected) { this._lazyDestroy(); return; }
+            if (!host.contains(e.target)) this._hideLensAutocomplete();
+        };
+        document.addEventListener('click', this._onLensDocClick);
+        this._renderLensPills();
+        this._renderSavedLenses();
+    }
+
+    // ── Clause model: parse / serialize / split ───────────────────────────
+    // Light client-side parse of one clause's text, for the pill label + to
+    // know whether a structured key is present (mirrors lens.jl parse_clause).
+    _lensClauseParts(text) {
+        text = (text || '').trim();
+        let sign = '+';
+        if (text.startsWith('!') || text.startsWith('-')) { sign = '-'; text = text.slice(1).trim(); }
+        let key = '', rest = text;
+        if (text.startsWith('/')) {
+            const m = text.slice(1).match(/^([\w.@*-]+)\s*:?\s*(.*)$/);
+            if (m) { key = m[1]; rest = m[2]; } else { rest = text.slice(1); }
+        }
+        let action = null; const qparts = [];
+        const re = /"([^"]*)"|(\S+)/g; let mm;
+        while ((mm = re.exec(rest))) {
+            if (mm[1] !== undefined) qparts.push(mm[1]);
+            else if (mm[2] === 'expand' || mm[2] === 'collapse') action = mm[2];
+            else qparts.push(mm[2]);
+        }
+        return { sign, key, action, query: qparts.join(' ') };
+    }
+
+    // Serialize committed clauses to a query string (sign carried by the join
+    // operator; first exclude clause keeps a leading `!`). Parsed back verbatim
+    // by lens.jl split_lens_clauses.
+    _lensSerialize() {
+        return this.lensClauses.map((c, i) => i === 0
+            ? (c.sign === '-' ? '!' + c.text.replace(/^[!-]\s*/, '') : c.text)
+            : (c.sign === '-' ? '- ' + c.text.replace(/^[!-]\s*/, '') : '+ ' + c.text)
+        ).join(' ').trim();
+    }
+
+    // Split a saved query back into clauses (mirrors lens.jl split_lens_clauses).
+    _lensSplit(str) {
+        const segs = []; let buf = '', inq = false, sign = '+';
+        for (let i = 0; i < str.length; i++) {
+            const c = str[i];
+            if (c === '"') { inq = !inq; buf += c; }
+            else if (!inq && (c === '+' || c === '-') &&
+                     i > 0 && /\s/.test(str[i - 1]) &&
+                     i < str.length - 1 && /\s/.test(str[i + 1])) {
+                segs.push({ sign, text: buf.trim() });
+                sign = c === '-' ? '-' : '+'; buf = '';
+            } else buf += c;
+        }
+        segs.push({ sign, text: buf.trim() });
+        return segs.filter(s => s.text !== '');
+    }
+
+    // ── Pill commit / edit / remove ───────────────────────────────────────
+    _lensCommitTail() {
+        const t = this.lensInput.value.trim();
+        if (t) this.lensClauses.push({ sign: this.lensPendingSign, text: t });
+        this.lensInput.value = '';
+        this.lensPendingSign = '+';
+        this._renderLensPills();
+    }
+
+    // Auto-commit when the user types a top-level ` + ` / ` - ` (quote-balanced):
+    // the operator finalizes the current clause and opens the next.
+    _lensAutoCommitOnOperator() {
+        const v = this.lensInput.value;
+        const m = v.match(/^(.*\S)\s+([+-])\s$/);
+        if (!m) return;
+        if (((v.match(/"/g) || []).length) % 2 !== 0) return;   // inside a quote
+        this.lensClauses.push({ sign: this.lensPendingSign, text: m[1].trim() });
+        this.lensPendingSign = m[2] === '-' ? '-' : '+';
+        this.lensInput.value = '';
+        this._renderLensPills();
+    }
+
+    _lensClearAll() {
+        this.lensClauses = []; this.lensPendingSign = '+';
+        this.lensInput.value = '';
+        this._renderLensPills();
+        this._hideLensAutocomplete();
+        this.runLens('');
+    }
+
+    _lensRemovePill(i) {
+        this.lensClauses.splice(i, 1);
+        this._renderLensPills();
+        this.runLens(this._lensSerialize());
+    }
+
+    _lensEditPill(i) {
+        this._lensCommitTail();                 // don't lose the in-progress tail
+        const c = this.lensClauses.splice(i, 1)[0];
+        this.lensInput.value = c.text;
+        this.lensPendingSign = c.sign;
+        this._renderLensPills();
+        this.lensInput.focus();
+        const n = this.lensInput.value.length; this.lensInput.setSelectionRange(n, n);
+        this._updateLensAutocomplete();
+    }
+
+    _lensPopPill() {
+        const c = this.lensClauses.pop();
+        if (!c) return;
+        this.lensInput.value = c.text;
+        this.lensPendingSign = c.sign;
+        this._renderLensPills();
+        const n = this.lensInput.value.length; this.lensInput.setSelectionRange(n, n);
+        this._updateLensAutocomplete();
+    }
+
+    _lensLoadQuery(q) {
+        this.lensClauses = this._lensSplit(q);
+        this.lensPendingSign = '+';
+        this.lensInput.value = '';
+        this._renderLensPills();
+        this.runLens(q);
+    }
+
+    _renderLensPills() {
+        if (!this.lensPills) return;
+        this.lensPills.innerHTML = '';
+        this.lensClauses.forEach((c, i) => {
+            const p = this._lensClauseParts(c.text);
+            const sign = (c.sign === '-' || p.sign === '-') ? '-' : '+';
+            const pill = document.createElement('span');
+            pill.className = 'bt-lens-pill' + (sign === '-' ? ' bt-lens-pill-ex' : '');
+            let html = sign === '-' ? `<span class="bt-lens-pill-sign">−</span>` : '';
+            html += `<span class="bt-lens-pill-key">${escapeHTML(p.key || 'text')}</span>`;
+            if (p.query)  html += `<span class="bt-lens-pill-q">“${escapeHTML(p.query)}”</span>`;
+            if (p.action) html += `<span class="bt-lens-pill-act">${escapeHTML(p.action)}</span>`;
+            html += `<span class="bt-lens-pill-x" title="Remove">✕</span>`;
+            pill.innerHTML = html;
+            pill.querySelector('.bt-lens-pill-x').addEventListener('mousedown', (e) => {
+                e.preventDefault(); e.stopPropagation(); this._lensRemovePill(i); });
+            pill.addEventListener('mousedown', (e) => {
+                if (e.target.classList.contains('bt-lens-pill-x')) return;
+                e.preventDefault(); this._lensEditPill(i); });
+            this.lensPills.appendChild(pill);
+        });
+        this.lensBarEl?.classList.toggle('bt-lens-pending-ex', this.lensPendingSign === '-');
+    }
+
+    // ── Autocomplete (contextual: keys, then actions + operators) ─────────
+    // Suggest keys for the token currently being typed after the last `/`.
+    _currentLensToken() {
+        const v = this.lensInput.value;
+        const caret = this.lensInput.selectionStart ?? v.length;
+        const head = v.slice(0, caret);
+        const slash = head.lastIndexOf('/');
+        if (slash < 0) return null;
+        const frag = head.slice(slash + 1);
+        if (/[\s:"]/.test(frag)) return null;       // KEY only (stop at space/colon/quote)
+        return { start: slash + 1, end: caret, frag };
+    }
+
+    _updateLensAutocomplete() {
+        const tok = this._currentLensToken();
+        if (tok) {                                   // KEY suggestions
+            const f = tok.frag.toLowerCase();
+            const matches = this.lensVocab.filter(k => _subseqMatch(f, k)).slice(0, 8);
+            if (!matches.length) return this._hideLensAutocomplete();
+            this._renderLensAC(matches.map(k => ({ kind: 'key', val: k, label: '/' + k })), true);
+            return;
+        }
+        // Past the key (or composing free text) → ACTIONS + OPERATORS.
+        if (this.lensInput.value.trim() !== '') {
+            const p = this._lensClauseParts(this.lensInput.value);
+            const items = [];
+            if (p.key) for (const a of ['expand', 'collapse'])
+                if (p.action !== a) items.push({ kind: 'action', val: a, label: a, hint: `${a} matches` });
+            items.push({ kind: 'op', val: '+', label: '＋ add',     hint: 'include another clause' });
+            items.push({ kind: 'op', val: '-', label: '− exclude',  hint: 'hide the next clause' });
+            this._renderLensAC(items, false);        // no pre-select → Enter applies the lens
+            return;
+        }
+        this._hideLensAutocomplete();
+    }
+
+    _renderLensAC(items, selectFirst) {
+        if (!items.length) return this._hideLensAutocomplete();
+        this.lensAC.innerHTML = items.map((it, i) =>
+            `<div class="bt-lens-ac-item${selectFirst && i === 0 ? ' bt-ac-sel' : ''}" ` +
+            `data-kind="${it.kind}" data-val="${escapeAttr(it.val)}">` +
+            `<span class="bt-lens-ac-label">${escapeHTML(it.label)}</span>` +
+            (it.hint ? `<span class="bt-lens-ac-hint">${escapeHTML(it.hint)}</span>` : '') +
+            `</div>`).join('');
+        this.lensAC.hidden = false;
+        for (const el of this.lensAC.querySelectorAll('.bt-lens-ac-item')) {
+            el.addEventListener('mousedown', (e) => { e.preventDefault();
+                this._applyLensAC(el.dataset.kind, el.dataset.val); });
+        }
+    }
+    _hideLensAutocomplete() { if (this.lensAC) { this.lensAC.hidden = true; this.lensAC.innerHTML = ''; } }
+    _moveLensAutocomplete(dir, e) {
+        if (this.lensAC.hidden) return;
+        e.preventDefault();
+        const items = [...this.lensAC.querySelectorAll('.bt-lens-ac-item')];
+        if (!items.length) return;
+        let i = items.findIndex(el => el.classList.contains('bt-ac-sel'));
+        if (i >= 0) items[i].classList.remove('bt-ac-sel');
+        i = (i + dir + items.length) % items.length;
+        items[i].classList.add('bt-ac-sel');
+    }
+    _acceptLensAutocomplete() {
+        if (this.lensAC.hidden) return false;
+        const sel = this.lensAC.querySelector('.bt-ac-sel');
+        if (!sel) return false;
+        this._applyLensAC(sel.dataset.kind, sel.dataset.val);
+        return true;
+    }
+    _applyLensAC(kind, val) {
+        if (kind === 'key') return this._fillLensKey(val);
+        if (kind === 'action') return this._lensAppendToken(val);
+        if (kind === 'op') {                          // commit clause, open the next
+            this._lensCommitTail();
+            this.lensPendingSign = val === '-' ? '-' : '+';
+            this._renderLensPills();
+            this._hideLensAutocomplete();
+            this.lensInput.focus();
+        }
+    }
+    _lensAppendToken(tok) {
+        let v = this.lensInput.value;
+        if (v && !v.endsWith(' ')) v += ' ';
+        this.lensInput.value = v + tok + ' ';
+        this._hideLensAutocomplete();
+        this.lensInput.focus();
+        this._updateLensAutocomplete();
+    }
+    _fillLensKey(key) {
+        const tok = this._currentLensToken();
+        const v = this.lensInput.value;
+        if (!tok) return;
+        const before = v.slice(0, tok.start), after = v.slice(tok.end);
+        this.lensInput.value = before + key + (after.startsWith(' ') ? '' : ' ') + after;
+        const caret = (before + key + ' ').length;
+        this.lensInput.setSelectionRange(caret, caret);
+        this._hideLensAutocomplete();
+        this.lensInput.focus();
+        this._updateLensAutocomplete();
+    }
+
+    // ── Run / receive / apply ─────────────────────────────────────────────
+    runLens(query) {
+        this.lensQuery = query;
+        this.comm.notify({ type: 'lens.query', q: query });
+    }
+
+    onLensResult(msg) {
+        // Only apply results for the query THIS tab currently has pending
+        // (the channel is shared across tabs — see the server handler).
+        if (msg.q !== this.lensQuery) return;
+        if (!msg.active) {
+            this.lensActive = false; this.lensVisible = null; this.lensActions = null;
+        } else {
+            this.lensActive  = true;
+            this.lensVisible = new Set(msg.visible || []);
+            this.lensActions = new Map(Object.entries(msg.actions || {}).map(([k, v]) => [+k, v]));
+        }
+        if (this.lensClearBtn) this.lensClearBtn.hidden = !this.lensActive;
+        this.lensBarEl?.classList.toggle('bt-lens-on', this.lensActive);
+        // Re-apply visibility to every rendered node, then re-window (heights
+        // of hidden indices are now 0) and run any actions (expand).
+        // applyVisibility (not a raw display write) keeps parked live apps
+        // parked and filter-hidden nodes hidden when a lens is cleared.
+        for (const [idx, node] of this.cache) {
+            if (this.rendered.has(idx)) this.applyVisibility(idx, node);
+        }
+        this.refresh();
+        if (this.lensActions) {
+            for (const [idx, action] of this.lensActions) {
+                const node = this.cache.get(idx);
+                if (!node) continue;
+                if (action === 'expand')        node.collapsable?.setExpanded(true);
+                else if (action === 'collapse') node.collapsable?.setExpanded(false);
+            }
+        }
+        // Jump to the top of the filtered view so the first match is visible.
+        if (this.lensActive) { this.followMode = false; this.container.scrollTop = 0; this.refresh(); }
+    }
+
+    onLensSaved(msg) {
+        this.savedLenses = msg.lenses || [];
+        this._renderSavedLenses();
+    }
+
+    _renderSavedLenses() {
+        if (!this.lensChips) return;
+        this.lensChips.innerHTML = '';
+        for (const l of this.savedLenses) {
+            const chip = document.createElement('span');
+            chip.className = 'bt-lens-chip';
+            chip.style.setProperty('--chip', l.color);
+            chip.title = l.query;
+            chip.innerHTML = `<span class="bt-lens-chip-label"></span><span class="bt-lens-chip-x" title="Remove">✕</span>`;
+            chip.querySelector('.bt-lens-chip-label').textContent = l.title;
+            chip.querySelector('.bt-lens-chip-label').addEventListener('click', () => {
+                this._lensLoadQuery(l.query);    // populate pills + apply
+            });
+            chip.querySelector('.bt-lens-chip-x').addEventListener('click', (e) => {
+                e.stopPropagation(); this.comm.notify({ type: 'lens.delete', q: l.query });
+            });
+            this.lensChips.appendChild(chip);
         }
     }
 
@@ -2408,6 +2941,15 @@ class BonitoChat {
         // semantics — skip when the user is editing inside one.
         this._onEscapeKey = (e) => {
             if (e.key !== 'Escape' || e.repeat) return;
+            // Document-level listener + kept-alive panes (display:none but
+            // connected) = EVERY chat instance hears this. Only the VISIBLE
+            // pane may cancel — one ESC used to cancel the running turn of
+            // every open chat. offsetParent is null while the pane (or any
+            // ancestor) is display:none. A container that left the document
+            // entirely means the `connect` MutationObserver missed an
+            // ancestor-level unmount: self-destroy.
+            if (!this.container.isConnected) { this._lazyDestroy(); return; }
+            if (this.container.offsetParent === null) return;
             const t = e.target;
             if (t && t.closest && t.closest('.monaco-editor')) return;
             e.preventDefault();
@@ -2554,8 +3096,11 @@ class BonitoChat {
         // height, then chase the tail across the keyboard's slide-in
         // animation (~250ms on iOS; the container's ResizeObserver
         // picks up each frame of it once .bt-app's height has changed).
+        // OUR pane, not document.querySelector('.bt-app') — that grabbed the
+        // FIRST pane in the document, so every kept-alive instance resized
+        // the same (wrong) one.
         const vv  = window.visualViewport;
-        const app = document.querySelector('.bt-app');
+        const app = this.app || this.container.closest('.bt-app');
         if (app) app.style.height = vv.height + 'px';
         if (this.followMode) this._queueScrollToBottom();
     }
@@ -2648,6 +3193,16 @@ function escapeAttr(str) {
     return escapeHTML(str).replace(/"/g, '&quot;');
 }
 
+// Case-insensitive subsequence test ("bt_eval" ⊆ "bt_julia_eval") — the
+// lens autocomplete matcher; mirrors `subseq_match` in lens.jl.
+function _subseqMatch(needle, haystack) {
+    if (!needle) return true;
+    const n = needle.toLowerCase(), h = haystack.toLowerCase();
+    let j = 0;
+    for (let i = 0; i < h.length && j < n.length; i++) if (h[i] === n[j]) j++;
+    return j === n.length;
+}
+
 // Compact elapsed-time formatting for the inline tool timer + taskbar slot.
 // `< 60s` shows seconds; minutes-and-up shows `<m>m<s>s`. Only callers that
 // have already crossed the 1s threshold reach here, so we never render "0s".
@@ -2656,6 +3211,22 @@ function _formatElapsed(sec) {
     const m = Math.floor(sec / 60);
     const s = Math.round(sec - m * 60);
     return s === 0 ? `${m}m` : `${m}m${s}s`;
+}
+
+// Write a tool pill's FINAL duration into its `.bt-tool-timer`, once, from
+// its started/finished data attrs. Event-driven (called on creation of an
+// already-finished pill and on the completion update) — there is no timer.
+// A still-running pill (no finished attr) shows nothing; its live elapsed
+// is the taskbar's job (Julia clock).
+function _writeToolElapsed(node) {
+    if (!node) return;
+    const timer = node.querySelector('.bt-tool-timer');
+    if (!timer) return;
+    const started  = parseFloat(node.dataset.toolStarted  ?? '0');
+    const finished = parseFloat(node.dataset.toolFinished ?? '0');
+    if (!started || !finished) return;
+    const dt = finished - started;
+    timer.textContent = dt > 1 ? _formatElapsed(dt) : '';
 }
 
 // Chunked base64 encoder. `btoa(String.fromCharCode(...new Uint8Array(buf)))`
@@ -2676,17 +3247,22 @@ function arrayBufferToBase64(buf) {
 // via `js"$(ChatLib).then(lib => lib.connect($(node), $(comm)))"`. The
 // MutationObserver auto-cleans the BonitoChat instance when its container
 // leaves the document, so no Julia-side lifecycle plumbing is needed.
-// Live chat instances, so `window._btToolSlot` can find tool-body slots on
-// nodes the virtual scroll currently holds DETACHED (cached but not in the
-// document). The server's tool.render reply mounts via this helper — filling
-// a detached node is fine, the content shows when the node is re-inserted.
-// Without it, a reply racing an eviction was silently dropped and the body
-// stayed on "loading…".
+// Live chat instances, so `toolSlot` can find tool-body slots on nodes the
+// virtual scroll currently holds DETACHED (cached but not in the document).
+// The server's tool.render reply mounts via this helper — filling a detached
+// node is fine, the content shows when the node is re-inserted. Without it,
+// a reply racing an eviction was silently dropped and the body stayed on
+// "loading…".
 const CHAT_INSTANCES = new Set();
 // Debug/test introspection: e.g. `[...window.__btChats][0].APP_KEEPALIVE` /
 // `.parked.size`. Read-only convenience; not used by product code.
 if (typeof window !== 'undefined') window.__btChats = CHAT_INSTANCES;
-window._btToolSlot = (id) => {
+
+// Find the tool-body slot for `id` — in the live DOM, or on a cached node a
+// virtual-scroll window currently holds detached. A module export (Julia's
+// dom_in_js callbacks resolve it via `$(ChatLib).then(lib => lib.toolSlot(...))`)
+// instead of the former `window._btToolSlot` global.
+export function toolSlot(id) {
     const direct = document.querySelector(
         `.bt-tool-body[data-tool-id="${CSS.escape(id)}"]`);
     if (direct) return direct;
@@ -2696,7 +3272,7 @@ window._btToolSlot = (id) => {
         if (slot) return slot;
     }
     return null;
-};
+}
 
 export function connect(node, comm) {
     const chat = new BonitoChat(node, comm);

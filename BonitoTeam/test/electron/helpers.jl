@@ -215,7 +215,8 @@ plan_update(entries::Vector) = Dict(
 Boot a Bonito Electron window pointed at `unified_app(state)`. Returns a
 NamedTuple `(disp, app, session, state)` to pass to the rest of the helpers.
 """
-function open_window(state::BonitoTeam.ServerState; devtools::Bool = false)
+function open_window(state::BonitoTeam.ServerState; devtools::Bool = false,
+                     show::Bool = false)
     # `show: false` keeps the suite headless — important so the local dev
     # session isn't interrupted by a flurry of windows, and so CI doesn't
     # need a compositor. Width/height are still set explicitly so layout
@@ -233,9 +234,15 @@ function open_window(state::BonitoTeam.ServerState; devtools::Bool = false)
     disp    = Bonito.use_electron_display(;
         devtools,
         options = Dict{String,Any}(
-            "show"   => false,
+            "show"   => show,
             "width"  => 1280,
             "height" => 800,
+            # Chromium throttles requestAnimationFrame to ~1 Hz in any window
+            # that isn't focused/visible — which an automated window never is,
+            # so frame-time profiling reads 1000 ms frames regardless of
+            # `show`. Disabling background throttling forces real ~60 Hz rAF
+            # so the profiler measures genuine paint/frame cost.
+            "webPreferences" => Dict{String,Any}("backgroundThrottling" => false),
         ),
         electron_args = ["--ozone-platform=x11"],
     )

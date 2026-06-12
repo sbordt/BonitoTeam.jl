@@ -135,6 +135,14 @@ mutable struct ChatModel
     # response, indefinitely) — so the busy spinner keys off THIS, not off
     # prompt resolution. See `update_busy!`.
     last_stream_at::Base.RefValue{Float64}
+
+    # The taskbar's elapsed-time clock (shared). A Julia `Timer`
+    # (`ensure_taskbar_clock!`) sets this to `time()` once a second while
+    # items are live; the TaskBar's elapsed labels are `map(clock)` text
+    # bindings. This is the ONLY taskbar ticking mechanism — there is no JS
+    # poller. `taskbar_clock_on` guards the single timer.
+    taskbar_clock::Observable{Float64}
+    taskbar_clock_on::Base.RefValue{Bool}
 end
 
 function ChatModel(state::ServerState, cwd::AbstractString;
@@ -178,6 +186,8 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Ref(0),                     # turn_seq
         Ref(0),                     # turns_active
         Ref(0.0),                   # last_stream_at
+        Observable(time()),         # taskbar_clock (ticked by a Julia Timer)
+        Ref(false),                 # taskbar_clock_on
     )
 end
 
@@ -209,6 +219,8 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.turn_seq,                # shared counter
             m.turns_active,            # shared counter
             m.last_stream_at,          # shared timestamp
+            map(identity, session, m.taskbar_clock),   # per-tab clock bridge
+            m.taskbar_clock_on,        # shared guard
         )
     end
 end
@@ -243,14 +255,22 @@ UserMsg(chat::ChatModel, text::AbstractString) = UserMsg(String(text), false, ch
 # `SUMMARY_PREFIX` / `is_summary_text`). `html` caches the rendered markdown the
 # same way `AgentMsg` does.
 mutable struct SummaryMsg <: ChatMsg
+    # Wire identity for the JS node cache: `summary_final` targets the bubble
+    # by id (a DOM-only lookup missed virtually-scrolled-out summaries).
+    # Reload-constructed summaries get a fresh uuid — finals only happen live.
+    id::String
     text::String
     html::String
     chat::Union{ChatModel,Nothing}
 end
-SummaryMsg(text::AbstractString) = SummaryMsg(String(text), "", nothing)
-SummaryMsg(chat::ChatModel, text::AbstractString) = SummaryMsg(String(text), "", chat)
-ensure_html!(m::SummaryMsg) =
+SummaryMsg(text::AbstractString) = SummaryMsg(string(uuid4()), String(text), "", nothing)
+SummaryMsg(chat::ChatModel, text::AbstractString) = SummaryMsg(string(uuid4()), String(text), "", chat)
+# Under MARKDOWN_LOCK (reentrant — markdown_html locks it again): the
+# read-render-write must be atomic against `append!`'s text-grow+cache-clear,
+# see the lock's doc near its definition.
+ensure_html!(m::SummaryMsg) = lock(MARKDOWN_LOCK) do
     isempty(m.html) ? (m.html = markdown_html(m.text)) : m.html
+end
 
 # The exact opening Claude Code writes on `/compact` resume. Verbatim Claude
 # Code text — extremely unlikely as a real user message, and the only signal we
@@ -289,9 +309,11 @@ AgentMsg(id::AbstractString, text::AbstractString) =
 AgentMsg(chat::ChatModel, text::AbstractString) =
     AgentMsg(string(uuid4()), String(text), "", chat, true)
 
-# Lazy cache populate. Used by `msg_to_dict` / `wire_final`.
-ensure_html!(m::AgentMsg) =
+# Lazy cache populate. Used by `msg_to_dict` / `wire_final`. Atomic under
+# MARKDOWN_LOCK against `append!` (see the lock's doc near its definition).
+ensure_html!(m::AgentMsg) = lock(MARKDOWN_LOCK) do
     isempty(m.html) ? (m.html = markdown_html(m.text)) : m.html
+end
 
 # ── Tool messages — abstract + typed variants ──────────────────────────────
 # Replaces the previous "one ToolMsg struct with a `kind::String` discriminator"
@@ -553,6 +575,34 @@ function pin_task!(chat::ChatModel, item::TaskbarItem)
         v
     end
     s.taskbar_items[] = items
+    ensure_taskbar_clock!(s)
+    return nothing
+end
+
+# The taskbar's elapsed-time ticker — IN JULIA, not a browser setInterval.
+# ONE `Timer` per chat ticks `taskbar_clock` once a second while items are
+# live, and stops itself when the bar empties (or the chat closes). The
+# TaskBar's labels are `map(clock)` text bindings, so a tick updates exactly
+# those text nodes. `taskbar_clock_on` guards against spawning a second timer.
+function ensure_taskbar_clock!(chat::ChatModel)
+    s = shared(chat)
+    start = lock(s.lock) do
+        (s.taskbar_clock_on[] || isempty(s.taskbar_items[])) ? false :
+            (s.taskbar_clock_on[] = true)
+    end
+    start || return nothing
+    Timer(1.0; interval = 1.0) do timer
+        stop = lock(s.lock) do
+            done = !isopen(s.user_messages) || isempty(s.taskbar_items[])
+            done && (s.taskbar_clock_on[] = false)
+            done
+        end
+        if stop
+            close(timer)
+        else
+            s.taskbar_clock[] = time()
+        end
+    end
     return nothing
 end
 
@@ -982,7 +1032,7 @@ function msg_to_dict(m::AgentMsg, _chat_dir::AbstractString="")
 end
 
 function msg_to_dict(m::SummaryMsg, _chat_dir::AbstractString="")
-    Dict{String,Any}("type" => "summary", "html" => ensure_html!(m))
+    Dict{String,Any}("type" => "summary", "id" => m.id, "html" => ensure_html!(m))
 end
 
 msg_to_dict(m::ToolMsg, chat_dir::AbstractString="") = tool_header_dict(m, chat_dir)
@@ -1361,8 +1411,8 @@ end
 # Always render synchronously: the fetch (minutes for a multi-GB video)
 # blocks only the per-render @async task in `handle_command!(::ToolRender-
 # Command)`, and the finished element ships through that handler's
-# `dom_in_js` → `_btToolSlot` mount, which finds nodes the virtual scroll
-# holds DETACHED. The earlier `@async` + `jsrender(::Task)` spinner path
+# `dom_in_js` → `ChatLib.toolSlot` mount, which finds nodes the virtual
+# scroll holds DETACHED. The earlier `@async` + `jsrender(::Task)` spinner path
 # swapped the result in via Bonito's Observable machinery, whose
 # document-scoped uuid lookup polls for 30s and then gives up — a video
 # whose fetch outlived that window (or whose node was off-window at swap
@@ -1679,8 +1729,12 @@ end
 # (`close` → `wire_final`) still ships the final partial, so the bubble is
 # correct; we just don't stream the now-discarded tail.
 function Base.append!(m::AgentMsg, t::AbstractString)
-    m.text *= t
-    m.html = ""
+    # Grow + clear-cache atomically w.r.t. a concurrent `ensure_html!` on the
+    # comm task (msgs.request) — see MARKDOWN_LOCK.
+    lock(MARKDOWN_LOCK) do
+        m.text *= t
+        m.html = ""
+    end
     c = m.chat === nothing ? nothing : m.chat.client[]
     (c !== nothing && (@atomic c.conn.cancelling)) || chat_emit(m.chat, wire_chunk(m, t))
     return m
@@ -1689,7 +1743,8 @@ Base.append!(m::UserMsg, t::AbstractString) = (m.text *= t; chat_emit(m.chat, wi
 # Summaries arrive whole on replay; live they can stream through `process_update!`
 # like a UserMessage. Append clears the HTML cache so the eventual close-time
 # render reflects the full text.
-Base.append!(m::SummaryMsg, t::AbstractString) = (m.text *= t; m.html = ""; m)
+Base.append!(m::SummaryMsg, t::AbstractString) =
+    (lock(MARKDOWN_LOCK) do; m.text *= t; m.html = ""; end; m)
 
 # Finalize a message: persist to chat.md (per-type writer) + emit its closing
 # event. UserMsg / TodoListMsg have no `*_final` event; a ToolMsg only persists once
@@ -1789,13 +1844,25 @@ Base.close(m::SummaryMsg) = (ensure_html!(m); append_summary(m.chat.chat_session
 # The parser is reused across calls; CommonMark.Parser is mutating but the
 # parse + write_html cycle leaves it in the same state each time.
 const MARKDOWN_PARSER = Bonito.bonito_parser()
+# Serializes everything that touches MARKDOWN_PARSER and the per-message
+# html caches. Two tasks render concurrently — the `run_chat!` consumer
+# (append!/close → wire_chunk/wire_final) and the comm/session task
+# (msgs.request → msg_to_dict → ensure_html!):
+#   • MARKDOWN_PARSER is a MUTATING CommonMark parser; interleaved use from
+#     two tasks can corrupt a parse.
+#   • `ensure_html!`'s read-text → render → write-cache must not interleave
+#     with `append!`'s text-grow + cache-clear, or a stale render computed
+#     before the append lands in `m.html` AFTER the clear — `close` then
+#     ships a final missing the trailing chunks.
+const MARKDOWN_LOCK = ReentrantLock()
 # Wrap the rendered html in `.markdown-body` so `Bonito.MarkdownCSS` (which
 # is GitHub-style and already loaded into the shell) handles tables, code
 # blocks, lists, etc. — we don't have to duplicate the styling.
-markdown_html(text::AbstractString) =
+markdown_html(text::AbstractString) = lock(MARKDOWN_LOCK) do
     "<div class=\"markdown-body\">" *
     sprint(io -> CM.html(io, MARKDOWN_PARSER(String(text)))) *
     "</div>"
+end
 
 # "new message" event. Streaming-open shape for agent/thought (seeded with the
 # first chunk); plain shape for user/tool/plan. `send!` adds the `n` count.
@@ -1808,9 +1875,10 @@ wire_new(::ChatModel, m::UserMsg) =
     Dict{String,Any}("type" => "user", "text" => m.text, "queued" => m.queued)
 wire_new(model::ChatModel, m::ToolMsg) = tool_header_dict(m, model.chat_dir)
 wire_new(model::ChatModel, m::TodoListMsg) = msg_to_dict(m, model.chat_dir)
-# Summary opens as a centered placeholder; `close` ships the rendered html.
-wire_new(::ChatModel, ::SummaryMsg) =
-    Dict{String,Any}("type" => "summary", "html" => "", "streaming" => true)
+# Summary opens as a centered placeholder; `close` ships the rendered html
+# (targeted by id — see `onSummaryFinal` in bonitoteam.js).
+wire_new(::ChatModel, m::SummaryMsg) =
+    Dict{String,Any}("type" => "summary", "id" => m.id, "html" => "", "streaming" => true)
 
 # Stream the FULL rendered html of the message-so-far rather than the text
 # delta — so a live agent message reads as proper markdown (lists, headings,
@@ -1826,7 +1894,7 @@ wire_chunk(m::UserMsg, t) = Dict{String,Any}("type" => "user_chunk", "text" => t
 
 wire_final(m::AgentMsg) = Dict{String,Any}("type" => "agent_final", "id" => m.id, "html" => ensure_html!(m))
 wire_final(m::ThoughtMsg) = Dict{String,Any}("type" => "thought_final", "id" => m.id, "html" => markdown_html(m.text))
-wire_final(m::SummaryMsg) = Dict{String,Any}("type" => "summary_final", "html" => ensure_html!(m))
+wire_final(m::SummaryMsg) = Dict{String,Any}("type" => "summary_final", "id" => m.id, "html" => ensure_html!(m))
 
 # ── Rendering one ACP message into a bubble ─────────────────────────────────
 # `process!` is the per-message renderer used by the `run_chat!` loop: turn the
@@ -1852,6 +1920,7 @@ function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
     # model is still churning. Shipped next to the "reasoning…" indicator.
     n = 0
     c = chat.client[]
+    last_emit = 0.0
     try
         for delta in m.updates
             text *= delta
@@ -1859,8 +1928,14 @@ function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
             # Mirror AgentMsg.append!: once stop is pressed, quit shipping per-
             # chunk wire events (the one thing that keeps the turn "busy" after a
             # cancel). The final active=false below still fires from the finally.
-            (c !== nothing && (@atomic c.conn.cancelling)) ||
+            # Throttled to ~6/s — the count is a liveness ticker, and a wire
+            # event per redacted token chunk (broadcast to every tab) was
+            # pure overhead at high token rates. A ≤150 ms-stale count is
+            # invisible; the finally's active=false handles teardown.
+            if !(c !== nothing && (@atomic c.conn.cancelling)) && time() - last_emit > 0.15
+                last_emit = time()
                 chat_emit(chat, Dict{String,Any}("type" => "thinking", "active" => true, "count" => n))
+            end
         end
     finally
         # MUST fire even if the update iteration threw (session died mid-
@@ -2642,6 +2717,11 @@ function drain_turn!(chat::ChatModel, turn)
         last_turn = lock(() -> (s.turns_active[] -= 1) == 0, s.lock)
         if last_turn
             chat.busy_active[] = false
+            # The turn added messages (agent reply, tools, …) → refresh the
+            # lens autocomplete vocabulary so new tool/type keys are
+            # suggestable. (Emitted on mount too, but that's before any
+            # messages exist.)
+            emit_lens_vocab(chat)
             # Defensive thinking=off. `process!(::Thought)` already emits this
             # in its own finally, but in the multi-thought turn case the LAST
             # thought may not be reached if an exception unwinds through
@@ -3102,10 +3182,12 @@ function restart_chat_session!(model::ChatModel)
             # `bt-busy-active`, cancels any pending chase rAF, strips
             # `bt-stream-active` from leftover streaming nodes. Emitted BEFORE
             # the new client so a chunk from the fresh session can't be applied
-            # to a node that hasn't been cleared yet. The followup `msgs.count`
-            # below tells the virtual scroll the post-restart truth so any
-            # bubble whose final-form HTML changed during the orphan sweep
-            # gets re-fetched on next range request.
+            # to a node that hasn't been cleared yet. Bubbles whose final-form
+            # HTML changed during the orphan sweep are updated by the sweep's
+            # own per-id `agent_final` / `thought_final` / `tool_update`
+            # events (the JS node cache skips already-cached indices on range
+            # fetches, so a count re-broadcast alone would NOT refresh them).
+            # The followup `msgs.count` below only re-syncs the total.
             chat_emit(s, Dict{String,Any}("type" => "session_reset"))
 
             start_chat_client!(model)      # brings up a fresh client[]; consumer keeps running
@@ -3717,7 +3799,11 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
             sync_button,
             restart_button;
             class="bt-header-row"),
-        meta_line;
+        meta_line,
+        # Lens search bar — under the title. JS (`_setupLens`) builds the
+        # input + autocomplete + saved-lens chips inside it and wires it to
+        # `comm`. Replaces the old per-tool filter toolbar.
+        DOM.div(class="bt-lens-bar");
         class="bt-header")
 end
 
@@ -3869,6 +3955,12 @@ abstract type ChatCommand end
 # message count to bootstrap virtual scroll.
 struct InitCommand <: ChatCommand end
 
+# Lens search (see lens.jl). The query is parsed + applied server-side over
+# the full msgs_store; the result is the set of visible indices + actions.
+struct LensQueryCommand <: ChatCommand;  query::String;  end
+struct LensSaveCommand   <: ChatCommand;  query::String;  end
+struct LensDeleteCommand <: ChatCommand;  query::String;  end
+
 # Wire `{type: "msgs.request", range: [s, e]}` — JS virtual-scroll wants
 # messages [s..e] (zero-based, inclusive) for the visible window.
 struct MsgsRequestCommand <: ChatCommand
@@ -4000,6 +4092,14 @@ function parse_chat_command(msg::AbstractDict)::ChatCommand
     elseif type == "detach_app"
         id = String(get(msg, "id", ""))
         return isempty(id) ? UnknownCommand() : DetachAppCommand(id)
+    elseif type == "lens.query"
+        return LensQueryCommand(String(get(msg, "q", "")))
+    elseif type == "lens.save"
+        q = String(get(msg, "q", ""))
+        return isempty(strip(q)) ? UnknownCommand() : LensSaveCommand(q)
+    elseif type == "lens.delete"
+        q = String(get(msg, "q", ""))
+        return isempty(strip(q)) ? UnknownCommand() : LensDeleteCommand(q)
     end
     return UnknownCommand()
 end
@@ -4013,9 +4113,20 @@ handle_command!(::ChatModel, ::Session, ::UnknownCommand) = nothing
 
 # (The TaskBar needs no init handshake: it's an Observable component — a
 # tab joining mid-turn renders the current pin-board state on mount.)
-handle_command!(model::ChatModel, ::Session, ::InitCommand) =
+function handle_command!(model::ChatModel, ::Session, ::InitCommand)
     chat_emit(model, Dict{String,Any}(
         "type" => "msgs.count", "n" => length(model.msgs_store)))
+    # Seed the lens UI: the chat-derived autocomplete vocabulary + the global
+    # saved lenses. Broadcasts are fine — every tab of this chat shares the
+    # same vocabulary, and saved lenses are global favorites.
+    emit_lens_vocab(model)
+    emit_saved_lenses(model, load_saved_lenses())
+    return nothing
+end
+
+# (Lens search wiring — emit_lens_vocab / emit_saved_lenses and the
+#  Lens*Command handlers — lives in lens.jl, included after this file so the
+#  `SavedLens` type is defined.)
 
 function handle_command!(model::ChatModel, ::Session, cmd::MsgsRequestCommand)
     # Snapshot the requested slice under `model.lock` — the single `run_chat!`
@@ -4025,6 +4136,9 @@ function handle_command!(model::ChatModel, ::Session, cmd::MsgsRequestCommand)
     batch = lock(model.lock) do
         store = model.msgs_store
         n = length(store)
+        # Empty store: clamp(x, 0, -1) inverts the bounds and `store[0:0]`
+        # throws — a stale request right after a reset must be a no-op.
+        n == 0 && return nothing
         s = clamp(cmd.s, 0, n - 1)
         e = clamp(cmd.e, 0, n - 1)
         s > e && return nothing
@@ -4063,18 +4177,18 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
     Base.errormonitor(@async try
         body = render_tool_body(model.state, msg,
             model.cwd, model.chat_dir; project_id=model.project_id)
-        # `_btToolSlot` (bonitoteam.js) also finds slots on nodes the virtual
-        # scroll holds DETACHED (cache window / prefetch) — a plain
-        # document.querySelector misses those and the body would be stuck on
-        # "loading…". Fallback covers a not-yet-loaded chat module.
+        # `toolSlot` (a ChatLib module export — no window.* global) also
+        # finds slots on nodes the virtual scroll holds DETACHED (cache
+        # window / prefetch) — a plain document.querySelector misses those
+        # and the body would be stuck on "loading…".
         Bonito.dom_in_js(
             session,
             body,
             js"""(elem) => {
-    const slot = window._btToolSlot ? window._btToolSlot($(cmd.tool_id)) :
-        document.querySelector(
-            '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
-    if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
+    $(ChatLib).then(lib => {
+        const slot = lib.toolSlot($(cmd.tool_id));
+        if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
+    });
 }"""
         )
     catch e
@@ -4090,10 +4204,10 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
                 DOM.div("tool body unavailable: $(sprint(showerror, e))";
                         class = "bt-tool-error"),
                 js"""(elem) => {
-    const slot = window._btToolSlot ? window._btToolSlot($(cmd.tool_id)) :
-        document.querySelector(
-            '.bt-tool-body[data-tool-id="' + $(cmd.tool_id) + '"]');
-    if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
+    $(ChatLib).then(lib => {
+        const slot = lib.toolSlot($(cmd.tool_id));
+        if (slot) { slot.innerHTML = ''; slot.appendChild(elem); }
+    });
 }""")
         catch fallback_e
             # The fallback render itself failed — almost always the tab's session
@@ -4114,7 +4228,10 @@ function handle_command!(model::ChatModel, ::Session, cmd::ThoughtRenderCommand)
         idx === nothing ? nothing : model.msgs_store[idx].text
     end
     text === nothing && return nothing
-    html = sprint(show, MIME("text/html"), Markdown.parse(text))
+    # Same renderer as `thought_final` (markdown_html / CommonMark). The
+    # stdlib `Markdown.parse` used here before italicized intraword `_` and
+    # dropped tables — the body looked different live vs. on reload-expand.
+    html = markdown_html(text)
     chat_emit(model, Dict{String,Any}("type" => "thought.body",
         "id" => cmd.thought_id, "html" => html))
     return nothing
@@ -4451,7 +4568,7 @@ function Bonito.jsrender(session::Session, m::ChatModel)
 
     # The pin-board (taskbar.jl): renders the Julia-owned item list; its ⊗
     # routes through the same per-tool stop dispatch the old slots used.
-    taskbar = TaskBar(model.taskbar_items)
+    taskbar = TaskBar(model.taskbar_items, model.taskbar_clock)
     on(session, taskbar.stop_request) do id
         isempty(id) || handle_command!(model, session, StopToolCommand(id))
     end

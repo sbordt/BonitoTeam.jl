@@ -88,20 +88,23 @@ try
         record("stop button",     @TH.test_true TH.dom_exists(ctx, ".bt-stop-btn"))
 
         # Geometry sanity: the composer block sits at the bottom of .bt-app.
-        # The bottom-most element is the per-type display toolbar
-        # (.bt-chat-toolbar, populated client-side; min-height 38px even when
-        # empty), with the input area directly above it. If the layout
-        # regressed (input floating mid-page), input.top would be ~half of
-        # app height.
+        # The old per-tool filter toolbar (.bt-chat-toolbar) is GONE — the
+        # header lens bar replaces it — so the input area is now the bottom-
+        # most block. If the layout regressed (input floating mid-page),
+        # input.bottom would be ~half of app height.
         app     = TH.dom_rect(ctx, ".bt-app")
         input   = TH.dom_rect(ctx, ".bt-input-area")
-        toolbar = TH.dom_rect(ctx, ".bt-chat-toolbar")
         record("app fills .bt-main",
                @TH.test_true abs(TH.dom_rect(ctx, ".bt-main")["h"] - app["h"]) < 2)
-        record("toolbar pinned at bottom (gap < 8px)",
-               @TH.test_true app["bottom"] - toolbar["bottom"] < 8)
-        record("input sits directly above the toolbar",
-               @TH.test_true abs(toolbar["top"] - input["bottom"]) < 8)
+        record("input area pinned at bottom (gap < 12px)",
+               @TH.test_true app["bottom"] - input["bottom"] < 12)
+        record("old filter toolbar removed from layout",
+               @TH.test_true TH.eval_js(ctx, """(() => {
+                   const t = document.querySelector('.bt-chat-toolbar');
+                   return !t || getComputedStyle(t).display === 'none';
+               })()"""))
+        record("lens bar present in the header",
+               @TH.test_true TH.dom_exists(ctx, ".bt-header .bt-lens-bar"))
 
         msgs = TH.dom_rect(ctx, ".bt-messages")
         record("messages occupies > 50% of app height",

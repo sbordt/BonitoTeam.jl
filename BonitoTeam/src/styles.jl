@@ -79,6 +79,121 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-header-row",
         "display" => "flex", "align-items" => "center", "gap" => "10px",
         "width" => "100%"),
+
+    # ── Lens search bar (header) ─────────────────────────────────────────────
+    CSS(".bt-lens-bar",
+        "display" => "flex", "flex-direction" => "column", "gap" => "6px",
+        "margin-top" => "8px", "width" => "100%"),
+    CSS(".bt-lens-row",
+        "display" => "flex", "align-items" => "center", "gap" => "6px"),
+    CSS(".bt-lens-field",
+        "position" => "relative", "flex" => "1 1 auto", "display" => "flex",
+        "align-items" => "center", "flex-wrap" => "wrap", "gap" => "5px",
+        "padding" => "3px 30px 3px 6px",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "8px",
+        "background" => "var(--bt-surface-2)"),
+    CSS(".bt-lens-bar.bt-lens-on .bt-lens-field",
+        "border-color" => "var(--bt-accent)",
+        "background" => "rgba(59,130,246,0.06)"),
+    # The input is now borderless — the .bt-lens-field is the visible box that
+    # holds the committed pills + the inline input together.
+    CSS("input.bt-lens-input",
+        "flex" => "1 1 120px", "min-width" => "120px",
+        "padding" => "3px 4px",
+        "border" => "none", "background" => "transparent",
+        "color" => "var(--bt-text)",
+        "font-size" => "12.5px", "box-sizing" => "border-box",
+        "font-family" => "inherit"),
+    # Committed clause pills.
+    CSS(".bt-lens-pills",
+        "display" => "inline-flex", "align-items" => "center",
+        "flex-wrap" => "wrap", "gap" => "5px"),
+    CSS(".bt-lens-pill",
+        "display" => "inline-flex", "align-items" => "center", "gap" => "4px",
+        "padding" => "2px 4px 2px 8px", "border-radius" => "6px",
+        "background" => "rgba(59,130,246,0.16)",
+        "border" => "1px solid rgba(59,130,246,0.35)",
+        "color" => "var(--bt-text)", "font-size" => "11.5px",
+        "font-family" => "ui-monospace, monospace", "cursor" => "pointer",
+        "max-width" => "260px", "white-space" => "nowrap"),
+    CSS(".bt-lens-pill:hover", "border-color" => "var(--bt-accent)"),
+    # Exclude pills read as "remove this" — red-tinted.
+    CSS(".bt-lens-pill-ex",
+        "background" => "rgba(239,68,68,0.14)",
+        "border-color" => "rgba(239,68,68,0.4)"),
+    CSS(".bt-lens-pill-sign", "color" => "var(--bt-error)", "font-weight" => "700"),
+    CSS(".bt-lens-pill-key", "font-weight" => "600"),
+    CSS(".bt-lens-pill-q",
+        "color" => "var(--bt-text-muted)", "overflow" => "hidden",
+        "text-overflow" => "ellipsis", "max-width" => "130px"),
+    CSS(".bt-lens-pill-act",
+        "font-size" => "10px", "text-transform" => "uppercase",
+        "letter-spacing" => "0.04em", "padding" => "0 5px",
+        "border-radius" => "999px", "background" => "var(--bt-accent)",
+        "color" => "#fff"),
+    CSS(".bt-lens-pill-x",
+        "opacity" => "0.55", "padding" => "0 3px", "border-radius" => "4px",
+        "font-size" => "9px"),
+    CSS(".bt-lens-pill-x:hover", "opacity" => "1", "background" => "rgba(0,0,0,0.18)"),
+    # While composing an exclude clause, tint the input box red.
+    CSS(".bt-lens-bar.bt-lens-pending-ex input.bt-lens-input::placeholder",
+        "color" => "var(--bt-error)"),
+    CSS("input.bt-lens-input:focus", "outline" => "none"),
+    CSS(".bt-lens-save",
+        "position" => "absolute", "right" => "6px",
+        "background" => "transparent", "border" => "none",
+        "color" => "var(--bt-text-faint)", "cursor" => "pointer",
+        "font-size" => "15px", "padding" => "0 2px", "line-height" => "1"),
+    CSS(".bt-lens-save:hover", "color" => "var(--bt-accent)"),
+    CSS(".bt-lens-go",
+        "padding" => "6px 14px", "border" => "none", "border-radius" => "8px",
+        "background" => "var(--bt-accent)", "color" => "#fff",
+        "font-size" => "12.5px", "cursor" => "pointer", "flex-shrink" => "0"),
+    CSS(".bt-lens-go:hover", "background" => "var(--bt-accent-hover)"),
+    CSS(".bt-lens-clear",
+        "padding" => "6px 10px", "border" => "1px solid var(--bt-border)",
+        "border-radius" => "8px", "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text-muted)", "cursor" => "pointer",
+        "font-size" => "12px", "flex-shrink" => "0"),
+    CSS(".bt-lens-clear:hover", "border-color" => "var(--bt-error)",
+        "color" => "var(--bt-error)"),
+    # Autocomplete dropdown.
+    CSS(".bt-lens-autocomplete",
+        "position" => "absolute", "top" => "calc(100% + 4px)", "left" => "0",
+        "min-width" => "200px", "z-index" => "30",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "8px",
+        "box-shadow" => "var(--bt-shadow-md, 0 4px 16px rgba(0,0,0,0.18))",
+        "overflow" => "hidden", "padding" => "4px"),
+    CSS(".bt-lens-ac-item",
+        "display" => "flex", "align-items" => "baseline", "gap" => "8px",
+        "padding" => "5px 10px", "border-radius" => "5px",
+        "font-size" => "12.5px", "cursor" => "pointer",
+        "font-family" => "ui-monospace, monospace", "color" => "var(--bt-text)"),
+    CSS(".bt-lens-ac-item.bt-ac-sel, .bt-lens-ac-item:hover",
+        "background" => "var(--bt-accent)", "color" => "#fff"),
+    CSS(".bt-lens-ac-label", "flex" => "0 0 auto"),
+    CSS(".bt-lens-ac-hint",
+        "margin-left" => "auto", "font-size" => "10.5px",
+        "opacity" => "0.6", "font-family" => "inherit"),
+    CSS(".bt-lens-ac-item.bt-ac-sel .bt-lens-ac-hint", "opacity" => "0.85"),
+    # Saved-lens chips.
+    CSS(".bt-lens-chips",
+        "display" => "flex", "flex-wrap" => "wrap", "gap" => "6px"),
+    CSS(".bt-lens-chip",
+        "display" => "inline-flex", "align-items" => "center", "gap" => "5px",
+        "padding" => "3px 4px 3px 9px", "border-radius" => "999px",
+        "background" => "var(--chip, var(--bt-surface-2))",
+        "color" => "#fff", "font-size" => "11px", "cursor" => "pointer",
+        "max-width" => "180px"),
+    CSS(".bt-lens-chip-label",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "white-space" => "nowrap"),
+    CSS(".bt-lens-chip-x",
+        "opacity" => "0.7", "padding" => "0 4px", "border-radius" => "999px",
+        "font-size" => "10px"),
+    CSS(".bt-lens-chip-x:hover",
+        "opacity" => "1", "background" => "rgba(0,0,0,0.2)"),
     CSS(".bt-header-back",
         "color" => "var(--bt-text)", "text-decoration" => "none",
         "font-size" => "20px", "line-height" => "1",
@@ -260,12 +375,18 @@ const ChatStyles = Bonito.Styles(
     # right scrollbar and the shell border. Individual bubbles still cap their
     # own width (see `.bt-user-msg`/`.bt-agent-msg` `max-width: min(…)`) so a
     # very wide viewport doesn't sprawl any single message.
+    # overflow-anchor: NONE — the virtual scroller owns scroll anchoring.
+    # With the browser's native anchoring on, message nodes were anchor
+    # candidates: every spacer resize / node insert made Chromium adjust
+    # scrollTop on its own, concurrently with the scroller's bottom-pin and
+    # spacer compensation — two systems correcting the same scroll position
+    # is jumpy and makes geometry bugs non-deterministic.
     CSS(".bt-messages",
         "flex" => "1 1 0", "min-height" => "0",
         "overflow-y" => "auto", "overflow-x" => "hidden",
         "-webkit-overflow-scrolling" => "touch",
         "overscroll-behavior-y" => "contain",
-        "overflow-anchor" => "auto",
+        "overflow-anchor" => "none",
         "padding" => "16px",
         "display" => "flex", "flex-direction" => "column",
         "gap" => "10px",
@@ -284,7 +405,12 @@ const ChatStyles = Bonito.Styles(
     # is untouched — overscroll-behavior-y: contain (above) just stops
     # the bounce from leaking to the parent; rubberband is exclusively
     # the pan handler's affordance.
-    CSS(".bt-messages > *",
+    # Rubberband translateY, applied ONLY while actively overscrolling
+    # (`bt-overscrolling` is toggled by the pan handler's setOverscroll). A
+    # non-`none` transform on every child promotes each to its own stacking
+    # context and defeats native scroll compositing — so we keep it off for
+    # steady-state scrolling and switch it on only for the brief rubberband.
+    CSS(".bt-messages.bt-overscrolling > *",
         "transform" => "translateY(var(--bt-overscroll, 0px))"),
     # While the user is panning, the cursor lands as grabbing on any
     # child (text bubbles included): the gesture has hijacked the
@@ -1023,11 +1149,18 @@ const ChatStyles = Bonito.Styles(
     # are laid out here — same width as the messages content box — to get
     # real heights before they're ever rendered. Hidden but NOT display:none
     # (children must lay out); zero own height so it never affects the page.
+    # Same formatting context as `.bt-messages` (flex column, same gap):
+    # bubbles are flex items there (`align-self` ⇒ fit-content width); in a
+    # plain block host they'd be measured at fill-width instead. Heights
+    # mostly coincide thanks to the max-width caps, but the contexts must
+    # match so off-screen measurements can never diverge from the live layout.
     CSS(".bt-measure",
         "position" => "absolute", "left" => "0", "top" => "0",
         "height" => "0", "overflow" => "hidden",
         "visibility" => "hidden",
         "pointer-events" => "none",
+        "display" => "flex", "flex-direction" => "column",
+        "gap" => "10px",
         "z-index" => "-1"),
 
     # (The per-chat mount curtain used to live here — the dashboard's load

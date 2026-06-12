@@ -42,6 +42,7 @@ const FILES = [
     "test_tool_kinds_extra.jl",
     "test_streamed_tool_input.jl",
     "test_todo_taskbar.jl",
+    "test_lens.jl",
     "test_markdown.jl",
     "test_virtual_scroll.jl",
     "test_chat_controls.jl",

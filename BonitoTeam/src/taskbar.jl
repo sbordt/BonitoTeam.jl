@@ -33,24 +33,42 @@ TaskbarItem(id, kind, icon, label; started = time(), stoppable = false,
                 collect(Tuple{String,String}, entries))
 
 """
-    TaskBar(items::Observable{Vector{TaskbarItem}}) -> TaskBar
+    TaskBar(items, clock) -> TaskBar
 
-The chat's pin-board. `stop_request` fires with the item id when the user
-clicks an item's ⊗ — the chat render wires it to `request_tool_stop!`.
+The chat's pin-board. State-first, ALL polling in Julia: `clock` is an
+`Observable{Float64}` ticked once per second by a Julia `Timer` (see
+`ensure_taskbar_clock!` in chat.jl) while items are live; the elapsed-time
+labels are `map(clock)` text bindings, so Bonito updates exactly those text
+nodes — there is NO JS poller and nothing ever scans the DOM. `stop_request`
+fires with the item id when the user clicks an item's ⊗.
 """
 struct TaskBar
     items        :: Observable{Vector{TaskbarItem}}
+    clock        :: Observable{Float64}
     stop_request :: Observable{String}
 end
 
-TaskBar(items::Observable{Vector{TaskbarItem}}) = TaskBar(items, Observable(""))
+TaskBar(items::Observable{Vector{TaskbarItem}}, clock::Observable{Float64}) =
+    TaskBar(items, clock, Observable(""))
 
-function render_taskbar_item(bar::TaskBar, item::TaskbarItem)
+# "12s" / "3m" / "3m20s" — same shape the old JS ticker produced.
+function elapsed_str(sec::Real)
+    sec <= 1 && return ""
+    sec < 60 && return string(round(Int, sec), "s")
+    m = floor(Int, sec / 60); s = round(Int, sec - 60m)
+    s == 0 ? string(m, "m") : string(m, "m", s, "s")
+end
+
+function render_taskbar_item(session::Bonito.Session, bar::TaskBar, item::TaskbarItem)
+    # Elapsed label: a Julia-driven text binding. Ticks come from `bar.clock`
+    # (a Julia Timer), NOT a browser setInterval — Bonito updates just this
+    # text node when the clock advances.
+    timer = DOM.span(map(now -> elapsed_str(now - item.started), session, bar.clock);
+                     class = "bt-taskbar-slot-timer")
     head = Any[
         DOM.span(item.icon; class = "bt-taskbar-slot-icon"),
         DOM.span(item.label; class = "bt-taskbar-slot-label"),
-        DOM.span(""; class = "bt-taskbar-slot-timer",
-                 dataStarted = string(item.started)),
+        timer,
     ]
     # Always-visible stop, styled like the composer's stop button
     # (.bt-stop-mini draws the red square).
@@ -78,33 +96,15 @@ end
 function Bonito.jsrender(session::Bonito.Session, bar::TaskBar)
     # Whole-bar re-render per update is fine: a handful of pinned items,
     # plain DOM (AGENTS.md §5 — small bounded region). Per-render click
-    # handlers live in the map's sub-session, freed on the next render.
+    # handlers + the per-item clock bindings live in the map's sub-session,
+    # freed on the next render. NO JS poller — the elapsed labels tick from
+    # `bar.clock`, a Julia Timer.
     slots = map(session, bar.items) do items
         isempty(items) ?
             DOM.div(; class = "bt-taskbar-slots",
                     style = Styles("display" => "none")) :
-            DOM.div((render_taskbar_item(bar, it) for it in items)...;
+            DOM.div((render_taskbar_item(session, bar, it) for it in items)...;
                     class = "bt-taskbar-slots")
     end
-    root = DOM.div(slots; class = "bt-taskbar")
-    # Elapsed-time ticker — pure presentation, scoped to this bar's element;
-    # stops itself when the bar leaves the DOM.
-    Bonito.onload(session, root, js"""(el) => {
-        const fmt = (sec) => {
-            if (sec < 60) return Math.round(sec) + 's';
-            const m = Math.floor(sec / 60), s = Math.round(sec - m * 60);
-            return s === 0 ? m + 'm' : m + 'm' + s + 's';
-        };
-        const tick = () => {
-            if (!el.isConnected) { clearInterval(h); return; }
-            const now = Date.now() / 1000;
-            el.querySelectorAll('[data-started]').forEach((t) => {
-                const dt = now - parseFloat(t.dataset.started);
-                t.textContent = dt > 1 ? fmt(dt) : '';
-            });
-        };
-        const h = setInterval(tick, 1000);
-        tick();
-    }""")
-    return Bonito.jsrender(session, root)
+    return Bonito.jsrender(session, DOM.div(slots; class = "bt-taskbar"))
 end

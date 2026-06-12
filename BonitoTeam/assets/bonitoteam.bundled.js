@@ -16,7 +16,7 @@ class Collapsable {
         this.onExpand = opts.onExpand || null;
         this.lazy = !!this.onExpand;
         this.loaded = !this.lazy;
-        this.expanded = this.editMode ? false : false;
+        this.expanded = false;
         if (this.native) {
             this.details = headerEl.closest('details') || bodyEl.closest('details');
             this.details && this.details.addEventListener('toggle', ()=>this.applyExpanded(this.details.open));
@@ -70,20 +70,6 @@ class Collapsable {
         this.loaded = true;
     }
 }
-const TYPE_LABELS = {
-    user: 'User',
-    agent: 'Agent',
-    thought: 'Thoughts',
-    plan: 'Todos',
-    summary: 'Summaries'
-};
-const TYPE_ORDER = [
-    'user',
-    'agent',
-    'thought',
-    'plan',
-    'summary'
-];
 const filterKey = (msg)=>msg.type === 'tool' ? 'tool:' + (msg.tool || 'other') : msg.type;
 const DEFAULT_HIDDEN = [
     'tool:ToolSearch'
@@ -97,11 +83,32 @@ class BonitoChat {
         this.heights = new Map();
         this.rendered = new Set();
         this.nodeById = new Map();
-        this.ros = new Map();
+        this.observed = new Set();
         this.totalCount = 0;
         this.EST_HEIGHT = 80;
         this.OVERSCAN = 8;
         this.initialLoad = false;
+        this._bootstrapped = false;
+        this._measSum = 0;
+        this._measCount = 0;
+        this._spacerTopH = -1;
+        this._spacerBotH = -1;
+        this._requestedAt = new Map();
+        this.STREAM_APPLY_MS = 100;
+        this._ro = new ResizeObserver((entries)=>{
+            if (this.destroyed) return;
+            let changed = false;
+            for (const e of entries){
+                const idx = e.target.__btIdx;
+                if (idx === undefined) continue;
+                const h = e.borderBoxSize && e.borderBoxSize.length ? e.borderBoxSize[0].blockSize : e.target.offsetHeight;
+                if (h > 0 && this.heights.get(idx) !== h) {
+                    this.heights.set(idx, h);
+                    changed = true;
+                }
+            }
+            if (changed && !this._scrollbarDrag) this._queueRefresh();
+        });
         const wantKeepalive = typeof window !== 'undefined' && Number.isFinite(window.BT_APP_KEEPALIVE) ? window.BT_APP_KEEPALIVE : 6;
         this.APP_KEEPALIVE = Math.min(10, Math.max(0, wantKeepalive));
         this.parked = new Set();
@@ -113,32 +120,21 @@ class BonitoChat {
         this.spacerTop = container.querySelector('.bt-spacer-top');
         this.spacerBottom = container.querySelector('.bt-spacer-bottom');
         this.toolbarEl = (container.closest('.bt-app') || container.parentElement).querySelector('.bt-chat-toolbar');
+        if (this.toolbarEl) this.toolbarEl.style.display = 'none';
         this.hiddenTypes = new Set(DEFAULT_HIDDEN);
         this.seenTypes = new Set();
         this.keyByIdx = new Map();
         this.filterRow = null;
-        this.optionsRow = null;
         this.nativeImages = true;
         this.nativeVideos = true;
-        if (this.toolbarEl) {
-            this.filterRow = document.createElement('div');
-            this.filterRow.className = 'bt-toolbar-filters';
-            this.optionsRow = document.createElement('div');
-            this.optionsRow.className = 'bt-toolbar-options';
-            this.toolbarEl.append(this.filterRow, this.optionsRow);
-            const addOption = (text, checked, onChange)=>{
-                const label = document.createElement('label');
-                label.className = 'bt-filter-toggle';
-                const cb = document.createElement('input');
-                cb.type = 'checkbox';
-                cb.checked = checked;
-                cb.addEventListener('change', ()=>onChange(cb.checked));
-                label.append(cb, text);
-                this.optionsRow.appendChild(label);
-            };
-            addOption('Native Images', this.nativeImages, (on)=>this._setNativeMedia('image/', on));
-            addOption('Native Videos', this.nativeVideos, (on)=>this._setNativeMedia('video/', on));
-        }
+        this.lensActive = false;
+        this.lensVisible = null;
+        this.lensActions = null;
+        this.lensQuery = '';
+        this.lensVocab = [];
+        this.savedLenses = [];
+        this.lensClauses = [];
+        this.lensPendingSign = '+';
         this.busyEl = container.querySelector('.bt-busy');
         this.waitingEl = container.querySelector('.bt-waiting');
         this.thinkingEl = container.querySelector('.bt-thinking');
@@ -150,7 +146,7 @@ class BonitoChat {
         container.parentElement.appendChild(this.measureEl);
         this._startSettle();
         comm.on((msg)=>{
-            if (this.destroyed) return;
+            if (this.destroyed) return false;
             if (msg && typeof msg === 'object') this.dispatch(msg);
         });
         const cur = comm.value;
@@ -204,11 +200,16 @@ class BonitoChat {
             markUserInput();
         };
         this._onWindowMouseUp = ()=>{
+            if (!this.container.isConnected) {
+                this._lazyDestroy();
+                return;
+            }
             if (!this._scrollbarDrag) return;
             this._scrollbarDrag = false;
             markUserInput();
-            for (const node of this.cache.values()){
-                if (node.isConnected && node.dataset.btAutoExpand) {
+            for (const idx of this.rendered){
+                const node = this.cache.get(idx);
+                if (node && node.isConnected && node.dataset.btAutoExpand) {
                     delete node.dataset.btAutoExpand;
                     node.collapsable?.setExpanded(true);
                 }
@@ -229,6 +230,7 @@ class BonitoChat {
         const setOverscroll = (v)=>{
             this._overscroll = v;
             this.container.style.setProperty('--bt-overscroll', v + 'px');
+            this.container.classList.toggle('bt-overscrolling', v !== 0);
         };
         this._cancelMomentum = ()=>{
             if (this._momentumRaf !== null) {
@@ -394,6 +396,7 @@ class BonitoChat {
         Promise.resolve().then(()=>{
             this._setupInputs();
             this._setupLiveTicker();
+            this._setupLens();
         });
     }
     destroy() {
@@ -429,8 +432,8 @@ class BonitoChat {
         if (this._containerRO) {
             this._containerRO.disconnect();
         }
-        this.ros.forEach((ro)=>ro.disconnect());
-        this.ros.clear();
+        if (this._ro) this._ro.disconnect();
+        this.observed.clear();
         if (this._onPaste && this.textInput) {
             this.textInput.removeEventListener('paste', this._onPaste);
         }
@@ -462,6 +465,16 @@ class BonitoChat {
         if (this.taskbarEl && this._onTaskbarClick) {
             this.taskbarEl.removeEventListener('click', this._onTaskbarClick);
         }
+        if (this._onLensDocClick) {
+            document.removeEventListener('click', this._onLensDocClick);
+        }
+    }
+    _lazyDestroy() {
+        if (this.destroyed) return;
+        try {
+            this.destroy();
+        } catch (_) {}
+        CHAT_INSTANCES.delete(this);
     }
     dispatch(msg) {
         if (typeof msg.n === 'number' && msg.n > this.totalCount) {
@@ -473,6 +486,13 @@ class BonitoChat {
             case 'turn_begin':
                 this.turnSeq = msg.seq;
                 return;
+            case 'lens.vocab':
+                this.lensVocab = msg.keys || [];
+                return;
+            case 'lens.saved':
+                return this.onLensSaved(msg);
+            case 'lens.result':
+                return this.onLensResult(msg);
             case 'msgs.range':
                 return this.onRange(msg);
             case 'session_reset':
@@ -531,7 +551,10 @@ class BonitoChat {
             return;
         }
         this.totalCount = n;
-        this.initialLoad = true;
+        if (!this._bootstrapped) {
+            this._bootstrapped = true;
+            this.initialLoad = true;
+        }
         this._startSettle();
         this.refresh();
         this._startPrefetch();
@@ -633,8 +656,17 @@ class BonitoChat {
         ];
     }
     effHeight(i) {
+        if (this.lensActive && !this.lensVisible.has(i)) return 0;
         if (this.hiddenTypes.has(this.keyByIdx.get(i))) return 0;
         return (this.heights.get(i) ?? this.EST_HEIGHT) + this.ITEM_GAP;
+    }
+    lensHides(i) {
+        return this.lensActive && !this.lensVisible.has(i);
+    }
+    applyVisibility(idx, node = this.cache.get(idx)) {
+        if (!node) return;
+        const hidden = this.parked.has(idx) || this.lensHides(idx) || this.hiddenTypes.has(this.keyByIdx.get(idx));
+        node.style.display = hidden ? 'none' : '';
     }
     indexAt(offset) {
         let h = 0;
@@ -655,9 +687,16 @@ class BonitoChat {
         const preHeight = this.container.scrollHeight;
         const [s, e] = this.visibleRange();
         if (!this._scrollbarDrag) {
+            const now = performance.now();
             const missing = [];
-            for(let i = s; i <= e; i++)if (!this.cache.has(i)) missing.push(i);
+            for(let i = s; i <= e; i++){
+                if (this.cache.has(i)) continue;
+                const t = this._requestedAt.get(i);
+                if (t !== undefined && now - t < 2000) continue;
+                missing.push(i);
+            }
             if (missing.length > 0) {
+                for (const i of missing)this._requestedAt.set(i, now);
                 this.comm.notify({
                     type: 'msgs.request',
                     range: [
@@ -668,7 +707,8 @@ class BonitoChat {
             }
         }
         this.updateDOM(s, e);
-        if (wasAtBottom && !this._scrollbarDrag && this.container.scrollHeight !== preHeight) {
+        const userDriving = this._scrollbarDrag || this._pendingUserScroll || performance.now() - this._lastUserInputT < 400;
+        if (wasAtBottom && !userDriving && this.container.scrollHeight !== preHeight) {
             this.container.scrollTop = this.container.scrollHeight;
         }
     }
@@ -677,12 +717,12 @@ class BonitoChat {
         const fresh = [];
         messages.forEach((data, i)=>{
             const idx = start + i;
+            this._requestedAt.delete(idx);
             if (this.cache.has(idx)) return;
             const node = this.createNode(data);
             this.cache.set(idx, node);
             this.keyByIdx.set(idx, filterKey(data));
             if (data.id) this.nodeById.set(data.id, node);
-            this.observe(idx, node);
             fresh.push([
                 idx,
                 node
@@ -733,22 +773,23 @@ class BonitoChat {
         for (const [, node] of toMeasure)this.measureEl.appendChild(node);
         for (const [idx, node] of toMeasure){
             const h = node.offsetHeight;
-            if (h > 0) this.heights.set(idx, h);
+            if (h > 0) {
+                this.heights.set(idx, h);
+                this._measSum += h;
+                this._measCount++;
+            }
         }
         for (const [, node] of toMeasure){
             if (node.parentNode === this.measureEl) this.measureEl.removeChild(node);
         }
+        if (this._measCount >= 20) {
+            this.EST_HEIGHT = Math.min(400, Math.max(24, this._measSum / this._measCount));
+        }
     }
     observe(idx, node) {
-        const ro = new ResizeObserver(([e])=>{
-            const h = e.contentRect.height;
-            if (h > 0 && this.heights.get(idx) !== h) {
-                this.heights.set(idx, h);
-                if (!this._scrollbarDrag) this._queueRefresh();
-            }
-        });
-        ro.observe(node);
-        this.ros.set(idx, ro);
+        node.__btIdx = idx;
+        this.observed.add(idx);
+        this._ro.observe(node);
     }
     _queueRefresh() {
         if (this._refreshQueued || this.destroyed) return;
@@ -767,11 +808,12 @@ class BonitoChat {
                 const node = this.cache.get(idx);
                 if (node && node.dataset && node.dataset.btApp && !node.dataset.btSpilled) {
                     if (!this.parked.has(idx)) {
-                        node.style.display = 'none';
                         this.parked.add(idx);
+                        this.applyVisibility(idx, node);
                         this.touchApp(idx);
                     }
                 } else {
+                    if (this.observed.delete(idx) && node) this._ro.unobserve(node);
                     node?.remove();
                     this.rendered.delete(idx);
                     this.parked.delete(idx);
@@ -781,18 +823,29 @@ class BonitoChat {
         for(let i = s; i <= e; i++){
             if (this.parked.has(i)) {
                 const node = this.cache.get(i);
-                if (node) node.style.display = '';
                 this.parked.delete(i);
+                this.applyVisibility(i, node);
                 this.touchApp(i);
             } else if (this.cache.has(i) && !this.rendered.has(i)) {
-                this.insertSorted(i, this.cache.get(i));
+                const node = this.cache.get(i);
+                this.insertSorted(i, node);
                 this.rendered.add(i);
-                if (this.cache.get(i)?.dataset?.btApp) this.touchApp(i);
+                if (!this.observed.has(i)) this.observe(i, node);
+                this.applyVisibility(i, node);
+                if (node?.dataset?.btApp) this.touchApp(i);
             }
         }
         this.enforceAppLru();
-        this.spacerTop.style.height = this.cumHeight(0, s) + 'px';
-        this.spacerBottom.style.height = this.cumHeight(e + 1, this.totalCount) + 'px';
+        const topH = this.cumHeight(0, s);
+        const botH = this.cumHeight(e + 1, this.totalCount);
+        if (topH !== this._spacerTopH) {
+            this.spacerTop.style.height = topH + 'px';
+            this._spacerTopH = topH;
+        }
+        if (botH !== this._spacerBotH) {
+            this.spacerBottom.style.height = botH + 'px';
+            this._spacerBotH = botH;
+        }
     }
     touchApp(idx) {
         const i = this.appLru.indexOf(idx);
@@ -847,10 +900,10 @@ class BonitoChat {
             slot.appendChild(wrap);
         }
         node.dataset.btSpilled = '1';
-        node.style.display = '';
         node.remove();
         this.rendered.delete(idx);
         this.parked.delete(idx);
+        this.applyVisibility(idx, node);
         const li = this.appLru.indexOf(idx);
         if (li !== -1) this.appLru.splice(li, 1);
     }
@@ -893,6 +946,7 @@ class BonitoChat {
             this.keyByIdx.set(idx, filterKey(msg));
             if (msg.id) this.nodeById.set(msg.id, node);
             this.observe(idx, node);
+            if (this.lensActive) this.lensVisible.add(idx);
         }
         if (this.followMode) {
             this.scrollToBottom();
@@ -904,7 +958,7 @@ class BonitoChat {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
         if (msg.html !== undefined) {
-            node.innerHTML = msg.html;
+            this._applyStreamHtml(node, msg.html);
         } else if (msg.text !== undefined) {
             const t = node.querySelector('.bt-stream-text');
             if (t) t.textContent += msg.text;
@@ -927,9 +981,29 @@ class BonitoChat {
             }
         }
     }
+    _applyStreamHtml(node, html) {
+        node.__btStreamHtml = html;
+        if (node.__btStreamTimer != null) return;
+        const flush = ()=>{
+            node.__btStreamTimer = null;
+            if (this.destroyed || node.__btStreamHtml == null) return;
+            node.innerHTML = node.__btStreamHtml;
+            node.__btStreamHtml = null;
+            node.__btStreamTimer = setTimeout(flush, this.STREAM_APPLY_MS);
+        };
+        flush();
+    }
+    _clearPendingStream(node) {
+        node.__btStreamHtml = null;
+        if (node.__btStreamTimer != null) {
+            clearTimeout(node.__btStreamTimer);
+            node.__btStreamTimer = null;
+        }
+    }
     onAgentFinal(msg) {
         const node = this.nodeById.get(msg.id);
         if (node && msg.html) {
+            this._clearPendingStream(node);
             node.innerHTML = msg.html;
             linkifyPaths(node);
         }
@@ -1127,6 +1201,7 @@ class BonitoChat {
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
             node.classList.remove('bt-tool-live');
+            _writeToolElapsed(node);
         }
         if (msg.title) {
             const t = node.querySelector('.bt-tool-title');
@@ -1218,41 +1293,9 @@ class BonitoChat {
     }
     noteKey(msg) {
         const key = filterKey(msg);
-        if (!key || this.seenTypes.has(key) || !this.filterRow) return;
+        if (!key || this.seenTypes.has(key)) return;
         this.seenTypes.add(key);
         if (key === 'agent') this._updateWaiting();
-        const isTool = key.startsWith('tool:');
-        const text = isTool ? key.slice(5) : TYPE_LABELS[key] ?? key;
-        const label = document.createElement('label');
-        label.className = 'bt-filter-toggle';
-        label.dataset.key = key;
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.checked = !this.hiddenTypes.has(key);
-        cb.addEventListener('change', ()=>this.setKeyHidden(key, !cb.checked));
-        label.append(cb, text);
-        const toggles = ()=>[
-                ...this.filterRow.querySelectorAll('.bt-filter-toggle')
-            ];
-        if (isTool) {
-            this.ensureToolGroupLabel();
-            const next = toggles().find((el)=>el.dataset.key.startsWith('tool:') && el.dataset.key.slice(5).localeCompare(text) > 0);
-            this.filterRow.insertBefore(label, next ?? null);
-        } else {
-            const order = (t)=>{
-                const i = TYPE_ORDER.indexOf(t);
-                return i < 0 ? TYPE_ORDER.length : i;
-            };
-            const next = toggles().find((el)=>!el.dataset.key.startsWith('tool:') && order(el.dataset.key) > order(key)) ?? this.filterRow.querySelector('.bt-filter-group-label');
-            this.filterRow.insertBefore(label, next ?? null);
-        }
-    }
-    ensureToolGroupLabel() {
-        if (this.filterRow.querySelector('.bt-filter-group-label')) return;
-        const span = document.createElement('span');
-        span.className = 'bt-filter-group-label';
-        span.textContent = 'Tools:';
-        this.filterRow.appendChild(span);
     }
     _wantsNative(node) {
         const mime = node.dataset.showMime || '';
@@ -1284,8 +1327,8 @@ class BonitoChat {
     }
     setKeyHidden(key, hidden) {
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
-        for (const node of this.cache.values()){
-            if (node.dataset.filterKey === key) node.style.display = hidden ? 'none' : '';
+        for (const [idx, node] of this.cache){
+            if (node.dataset.filterKey === key) this.applyVisibility(idx, node);
         }
         if (key === 'agent') this._updateWaiting();
         this.refresh();
@@ -1342,6 +1385,7 @@ class BonitoChat {
                     if (msg.id) div.dataset.msgId = msg.id;
                     if (msg.started_at != null) div.dataset.toolStarted = String(msg.started_at);
                     if (msg.finished_at != null) div.dataset.toolFinished = String(msg.finished_at);
+                    _writeToolElapsed(div);
                     const liveTool = !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
                     if (liveTool) div.classList.add('bt-tool-live');
                     const id = msg.id;
@@ -1438,6 +1482,14 @@ class BonitoChat {
         if (q) q.classList.remove('bt-queued');
     }
     onSummaryFinal(msg) {
+        const node = msg.id ? this.nodeById.get(msg.id) : null;
+        if (node) {
+            const body = node.querySelector('.bt-summary-body');
+            if (body) {
+                body.innerHTML = msg.html || '';
+                return;
+            }
+        }
         const nodes = this.container.querySelectorAll('.bt-summary-msg .bt-summary-body');
         const tgt = nodes[nodes.length - 1];
         if (tgt) tgt.innerHTML = msg.html || '';
@@ -1515,17 +1567,417 @@ class BonitoChat {
             };
             this.taskbarEl.addEventListener('click', this._onTaskbarClick);
         }
-        this._tickerId = setInterval(()=>this._tickLiveTimers(), 1000);
     }
-    _tickLiveTimers() {
-        if (this.destroyed) return;
-        const now = Date.now() / 1000;
-        for (const el of this.container.querySelectorAll('div.bt-tool-msg.bt-tool-live, div.bt-plan-msg.bt-plan-live')){
-            const started = parseFloat(el.dataset.toolStarted ?? el.dataset.planStarted ?? '0');
-            if (!started) continue;
-            const elapsed = now - started;
-            const timer = el.querySelector('.bt-tool-timer');
-            if (timer) timer.textContent = elapsed > 1 ? _formatElapsed(elapsed) : '';
+    _setupLens() {
+        const host = (this.app || this.container.closest('.bt-app') || this.container.parentElement).querySelector('.bt-lens-bar');
+        if (!host) return;
+        this.lensBarEl = host;
+        this.lensClauses = [];
+        this.lensPendingSign = '+';
+        host.innerHTML = `
+            <div class="bt-lens-row">
+                <div class="bt-lens-field">
+                    <span class="bt-lens-pills"></span>
+                    <input class="bt-lens-input" type="text" spellcheck="false"
+                           placeholder="/ to pick a type, or type to search everything" />
+                    <button class="bt-lens-save" type="button" title="Save lens">★</button>
+                    <div class="bt-lens-autocomplete" hidden></div>
+                </div>
+                <button class="bt-lens-go" type="button" title="Apply lens">Search</button>
+                <button class="bt-lens-clear" type="button" title="Clear lens" hidden>✕</button>
+            </div>
+            <div class="bt-lens-chips"></div>`;
+        this.lensInput = host.querySelector('.bt-lens-input');
+        this.lensAC = host.querySelector('.bt-lens-autocomplete');
+        this.lensPills = host.querySelector('.bt-lens-pills');
+        this.lensChips = host.querySelector('.bt-lens-chips');
+        const go = host.querySelector('.bt-lens-go');
+        const save = host.querySelector('.bt-lens-save');
+        const clear = host.querySelector('.bt-lens-clear');
+        this.lensClearBtn = clear;
+        const apply = ()=>{
+            this._lensCommitTail();
+            this._hideLensAutocomplete();
+            this.runLens(this._lensSerialize());
+        };
+        go.addEventListener('click', apply);
+        save.addEventListener('click', ()=>{
+            this._lensCommitTail();
+            const q = this._lensSerialize();
+            if (q) this.comm.notify({
+                type: 'lens.save',
+                q
+            });
+        });
+        clear.addEventListener('click', ()=>this._lensClearAll());
+        this.lensInput.addEventListener('input', ()=>{
+            this._lensAutoCommitOnOperator();
+            this._updateLensAutocomplete();
+        });
+        this.lensInput.addEventListener('keydown', (e)=>{
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                if (!this._acceptLensAutocomplete()) apply();
+            } else if (e.key === 'Escape') this._hideLensAutocomplete();
+            else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') this._moveLensAutocomplete(e.key === 'ArrowDown' ? 1 : -1, e);
+            else if (e.key === 'Backspace' && this.lensInput.value === '' && this.lensClauses.length) {
+                e.preventDefault();
+                this._lensPopPill();
+            }
+        });
+        this._onLensDocClick = (e)=>{
+            if (!this.container.isConnected) {
+                this._lazyDestroy();
+                return;
+            }
+            if (!host.contains(e.target)) this._hideLensAutocomplete();
+        };
+        document.addEventListener('click', this._onLensDocClick);
+        this._renderLensPills();
+        this._renderSavedLenses();
+    }
+    _lensClauseParts(text) {
+        text = (text || '').trim();
+        let sign = '+';
+        if (text.startsWith('!') || text.startsWith('-')) {
+            sign = '-';
+            text = text.slice(1).trim();
+        }
+        let key = '', rest = text;
+        if (text.startsWith('/')) {
+            const m = text.slice(1).match(/^([\w.@*-]+)\s*:?\s*(.*)$/);
+            if (m) {
+                key = m[1];
+                rest = m[2];
+            } else {
+                rest = text.slice(1);
+            }
+        }
+        let action = null;
+        const qparts = [];
+        const re = /"([^"]*)"|(\S+)/g;
+        let mm;
+        while(mm = re.exec(rest)){
+            if (mm[1] !== undefined) qparts.push(mm[1]);
+            else if (mm[2] === 'expand' || mm[2] === 'collapse') action = mm[2];
+            else qparts.push(mm[2]);
+        }
+        return {
+            sign,
+            key,
+            action,
+            query: qparts.join(' ')
+        };
+    }
+    _lensSerialize() {
+        return this.lensClauses.map((c, i)=>i === 0 ? c.sign === '-' ? '!' + c.text.replace(/^[!-]\s*/, '') : c.text : c.sign === '-' ? '- ' + c.text.replace(/^[!-]\s*/, '') : '+ ' + c.text).join(' ').trim();
+    }
+    _lensSplit(str) {
+        const segs = [];
+        let buf = '', inq = false, sign = '+';
+        for(let i = 0; i < str.length; i++){
+            const c = str[i];
+            if (c === '"') {
+                inq = !inq;
+                buf += c;
+            } else if (!inq && (c === '+' || c === '-') && i > 0 && /\s/.test(str[i - 1]) && i < str.length - 1 && /\s/.test(str[i + 1])) {
+                segs.push({
+                    sign,
+                    text: buf.trim()
+                });
+                sign = c === '-' ? '-' : '+';
+                buf = '';
+            } else buf += c;
+        }
+        segs.push({
+            sign,
+            text: buf.trim()
+        });
+        return segs.filter((s)=>s.text !== '');
+    }
+    _lensCommitTail() {
+        const t = this.lensInput.value.trim();
+        if (t) this.lensClauses.push({
+            sign: this.lensPendingSign,
+            text: t
+        });
+        this.lensInput.value = '';
+        this.lensPendingSign = '+';
+        this._renderLensPills();
+    }
+    _lensAutoCommitOnOperator() {
+        const v = this.lensInput.value;
+        const m = v.match(/^(.*\S)\s+([+-])\s$/);
+        if (!m) return;
+        if ((v.match(/"/g) || []).length % 2 !== 0) return;
+        this.lensClauses.push({
+            sign: this.lensPendingSign,
+            text: m[1].trim()
+        });
+        this.lensPendingSign = m[2] === '-' ? '-' : '+';
+        this.lensInput.value = '';
+        this._renderLensPills();
+    }
+    _lensClearAll() {
+        this.lensClauses = [];
+        this.lensPendingSign = '+';
+        this.lensInput.value = '';
+        this._renderLensPills();
+        this._hideLensAutocomplete();
+        this.runLens('');
+    }
+    _lensRemovePill(i) {
+        this.lensClauses.splice(i, 1);
+        this._renderLensPills();
+        this.runLens(this._lensSerialize());
+    }
+    _lensEditPill(i) {
+        this._lensCommitTail();
+        const c = this.lensClauses.splice(i, 1)[0];
+        this.lensInput.value = c.text;
+        this.lensPendingSign = c.sign;
+        this._renderLensPills();
+        this.lensInput.focus();
+        const n = this.lensInput.value.length;
+        this.lensInput.setSelectionRange(n, n);
+        this._updateLensAutocomplete();
+    }
+    _lensPopPill() {
+        const c = this.lensClauses.pop();
+        if (!c) return;
+        this.lensInput.value = c.text;
+        this.lensPendingSign = c.sign;
+        this._renderLensPills();
+        const n = this.lensInput.value.length;
+        this.lensInput.setSelectionRange(n, n);
+        this._updateLensAutocomplete();
+    }
+    _lensLoadQuery(q) {
+        this.lensClauses = this._lensSplit(q);
+        this.lensPendingSign = '+';
+        this.lensInput.value = '';
+        this._renderLensPills();
+        this.runLens(q);
+    }
+    _renderLensPills() {
+        if (!this.lensPills) return;
+        this.lensPills.innerHTML = '';
+        this.lensClauses.forEach((c, i)=>{
+            const p = this._lensClauseParts(c.text);
+            const sign = c.sign === '-' || p.sign === '-' ? '-' : '+';
+            const pill = document.createElement('span');
+            pill.className = 'bt-lens-pill' + (sign === '-' ? ' bt-lens-pill-ex' : '');
+            let html = sign === '-' ? `<span class="bt-lens-pill-sign">−</span>` : '';
+            html += `<span class="bt-lens-pill-key">${escapeHTML(p.key || 'text')}</span>`;
+            if (p.query) html += `<span class="bt-lens-pill-q">“${escapeHTML(p.query)}”</span>`;
+            if (p.action) html += `<span class="bt-lens-pill-act">${escapeHTML(p.action)}</span>`;
+            html += `<span class="bt-lens-pill-x" title="Remove">✕</span>`;
+            pill.innerHTML = html;
+            pill.querySelector('.bt-lens-pill-x').addEventListener('mousedown', (e)=>{
+                e.preventDefault();
+                e.stopPropagation();
+                this._lensRemovePill(i);
+            });
+            pill.addEventListener('mousedown', (e)=>{
+                if (e.target.classList.contains('bt-lens-pill-x')) return;
+                e.preventDefault();
+                this._lensEditPill(i);
+            });
+            this.lensPills.appendChild(pill);
+        });
+        this.lensBarEl?.classList.toggle('bt-lens-pending-ex', this.lensPendingSign === '-');
+    }
+    _currentLensToken() {
+        const v = this.lensInput.value;
+        const caret = this.lensInput.selectionStart ?? v.length;
+        const head = v.slice(0, caret);
+        const slash = head.lastIndexOf('/');
+        if (slash < 0) return null;
+        const frag = head.slice(slash + 1);
+        if (/[\s:"]/.test(frag)) return null;
+        return {
+            start: slash + 1,
+            end: caret,
+            frag
+        };
+    }
+    _updateLensAutocomplete() {
+        const tok = this._currentLensToken();
+        if (tok) {
+            const f = tok.frag.toLowerCase();
+            const matches = this.lensVocab.filter((k)=>_subseqMatch(f, k)).slice(0, 8);
+            if (!matches.length) return this._hideLensAutocomplete();
+            this._renderLensAC(matches.map((k)=>({
+                    kind: 'key',
+                    val: k,
+                    label: '/' + k
+                })), true);
+            return;
+        }
+        if (this.lensInput.value.trim() !== '') {
+            const p = this._lensClauseParts(this.lensInput.value);
+            const items = [];
+            if (p.key) {
+                for (const a of [
+                    'expand',
+                    'collapse'
+                ])if (p.action !== a) items.push({
+                    kind: 'action',
+                    val: a,
+                    label: a,
+                    hint: `${a} matches`
+                });
+            }
+            items.push({
+                kind: 'op',
+                val: '+',
+                label: '＋ add',
+                hint: 'include another clause'
+            });
+            items.push({
+                kind: 'op',
+                val: '-',
+                label: '− exclude',
+                hint: 'hide the next clause'
+            });
+            this._renderLensAC(items, false);
+            return;
+        }
+        this._hideLensAutocomplete();
+    }
+    _renderLensAC(items, selectFirst) {
+        if (!items.length) return this._hideLensAutocomplete();
+        this.lensAC.innerHTML = items.map((it, i)=>`<div class="bt-lens-ac-item${selectFirst && i === 0 ? ' bt-ac-sel' : ''}" ` + `data-kind="${it.kind}" data-val="${escapeAttr(it.val)}">` + `<span class="bt-lens-ac-label">${escapeHTML(it.label)}</span>` + (it.hint ? `<span class="bt-lens-ac-hint">${escapeHTML(it.hint)}</span>` : '') + `</div>`).join('');
+        this.lensAC.hidden = false;
+        for (const el of this.lensAC.querySelectorAll('.bt-lens-ac-item')){
+            el.addEventListener('mousedown', (e)=>{
+                e.preventDefault();
+                this._applyLensAC(el.dataset.kind, el.dataset.val);
+            });
+        }
+    }
+    _hideLensAutocomplete() {
+        if (this.lensAC) {
+            this.lensAC.hidden = true;
+            this.lensAC.innerHTML = '';
+        }
+    }
+    _moveLensAutocomplete(dir, e) {
+        if (this.lensAC.hidden) return;
+        e.preventDefault();
+        const items = [
+            ...this.lensAC.querySelectorAll('.bt-lens-ac-item')
+        ];
+        if (!items.length) return;
+        let i = items.findIndex((el)=>el.classList.contains('bt-ac-sel'));
+        if (i >= 0) items[i].classList.remove('bt-ac-sel');
+        i = (i + dir + items.length) % items.length;
+        items[i].classList.add('bt-ac-sel');
+    }
+    _acceptLensAutocomplete() {
+        if (this.lensAC.hidden) return false;
+        const sel = this.lensAC.querySelector('.bt-ac-sel');
+        if (!sel) return false;
+        this._applyLensAC(sel.dataset.kind, sel.dataset.val);
+        return true;
+    }
+    _applyLensAC(kind, val) {
+        if (kind === 'key') return this._fillLensKey(val);
+        if (kind === 'action') return this._lensAppendToken(val);
+        if (kind === 'op') {
+            this._lensCommitTail();
+            this.lensPendingSign = val === '-' ? '-' : '+';
+            this._renderLensPills();
+            this._hideLensAutocomplete();
+            this.lensInput.focus();
+        }
+    }
+    _lensAppendToken(tok) {
+        let v = this.lensInput.value;
+        if (v && !v.endsWith(' ')) v += ' ';
+        this.lensInput.value = v + tok + ' ';
+        this._hideLensAutocomplete();
+        this.lensInput.focus();
+        this._updateLensAutocomplete();
+    }
+    _fillLensKey(key) {
+        const tok = this._currentLensToken();
+        const v = this.lensInput.value;
+        if (!tok) return;
+        const before = v.slice(0, tok.start), after = v.slice(tok.end);
+        this.lensInput.value = before + key + (after.startsWith(' ') ? '' : ' ') + after;
+        const caret = (before + key + ' ').length;
+        this.lensInput.setSelectionRange(caret, caret);
+        this._hideLensAutocomplete();
+        this.lensInput.focus();
+        this._updateLensAutocomplete();
+    }
+    runLens(query) {
+        this.lensQuery = query;
+        this.comm.notify({
+            type: 'lens.query',
+            q: query
+        });
+    }
+    onLensResult(msg) {
+        if (msg.q !== this.lensQuery) return;
+        if (!msg.active) {
+            this.lensActive = false;
+            this.lensVisible = null;
+            this.lensActions = null;
+        } else {
+            this.lensActive = true;
+            this.lensVisible = new Set(msg.visible || []);
+            this.lensActions = new Map(Object.entries(msg.actions || {}).map(([k, v])=>[
+                    +k,
+                    v
+                ]));
+        }
+        if (this.lensClearBtn) this.lensClearBtn.hidden = !this.lensActive;
+        this.lensBarEl?.classList.toggle('bt-lens-on', this.lensActive);
+        for (const [idx, node] of this.cache){
+            if (this.rendered.has(idx)) this.applyVisibility(idx, node);
+        }
+        this.refresh();
+        if (this.lensActions) {
+            for (const [idx, action] of this.lensActions){
+                const node = this.cache.get(idx);
+                if (!node) continue;
+                if (action === 'expand') node.collapsable?.setExpanded(true);
+                else if (action === 'collapse') node.collapsable?.setExpanded(false);
+            }
+        }
+        if (this.lensActive) {
+            this.followMode = false;
+            this.container.scrollTop = 0;
+            this.refresh();
+        }
+    }
+    onLensSaved(msg) {
+        this.savedLenses = msg.lenses || [];
+        this._renderSavedLenses();
+    }
+    _renderSavedLenses() {
+        if (!this.lensChips) return;
+        this.lensChips.innerHTML = '';
+        for (const l of this.savedLenses){
+            const chip = document.createElement('span');
+            chip.className = 'bt-lens-chip';
+            chip.style.setProperty('--chip', l.color);
+            chip.title = l.query;
+            chip.innerHTML = `<span class="bt-lens-chip-label"></span><span class="bt-lens-chip-x" title="Remove">✕</span>`;
+            chip.querySelector('.bt-lens-chip-label').textContent = l.title;
+            chip.querySelector('.bt-lens-chip-label').addEventListener('click', ()=>{
+                this._lensLoadQuery(l.query);
+            });
+            chip.querySelector('.bt-lens-chip-x').addEventListener('click', (e)=>{
+                e.stopPropagation();
+                this.comm.notify({
+                    type: 'lens.delete',
+                    q: l.query
+                });
+            });
+            this.lensChips.appendChild(chip);
         }
     }
     _sizeTail() {
@@ -1652,6 +2104,11 @@ class BonitoChat {
         this.textInput.addEventListener('keydown', this._onTextInputKeyCapture, true);
         this._onEscapeKey = (e)=>{
             if (e.key !== 'Escape' || e.repeat) return;
+            if (!this.container.isConnected) {
+                this._lazyDestroy();
+                return;
+            }
+            if (this.container.offsetParent === null) return;
             const t = e.target;
             if (t && t.closest && t.closest('.monaco-editor')) return;
             e.preventDefault();
@@ -1777,7 +2234,7 @@ class BonitoChat {
     }
     onViewportResize() {
         const vv = window.visualViewport;
-        const app = document.querySelector('.bt-app');
+        const app = this.app || this.container.closest('.bt-app');
         if (app) app.style.height = vv.height + 'px';
         if (this.followMode) this._queueScrollToBottom();
     }
@@ -1839,11 +2296,28 @@ function escapeHTML(str) {
 function escapeAttr(str) {
     return escapeHTML(str).replace(/"/g, '&quot;');
 }
+function _subseqMatch(needle, haystack) {
+    if (!needle) return true;
+    const n = needle.toLowerCase(), h = haystack.toLowerCase();
+    let j = 0;
+    for(let i = 0; i < h.length && j < n.length; i++)if (h[i] === n[j]) j++;
+    return j === n.length;
+}
 function _formatElapsed(sec) {
     if (sec < 60) return `${Math.round(sec)}s`;
     const m = Math.floor(sec / 60);
     const s = Math.round(sec - m * 60);
     return s === 0 ? `${m}m` : `${m}m${s}s`;
+}
+function _writeToolElapsed(node) {
+    if (!node) return;
+    const timer = node.querySelector('.bt-tool-timer');
+    if (!timer) return;
+    const started = parseFloat(node.dataset.toolStarted ?? '0');
+    const finished = parseFloat(node.dataset.toolFinished ?? '0');
+    if (!started || !finished) return;
+    const dt = finished - started;
+    timer.textContent = dt > 1 ? _formatElapsed(dt) : '';
 }
 function arrayBufferToBase64(buf) {
     const bytes = new Uint8Array(buf);
@@ -1856,7 +2330,7 @@ function arrayBufferToBase64(buf) {
 }
 const CHAT_INSTANCES = new Set();
 if (typeof window !== 'undefined') window.__btChats = CHAT_INSTANCES;
-window._btToolSlot = (id)=>{
+function toolSlot(id) {
     const direct = document.querySelector(`.bt-tool-body[data-tool-id="${CSS.escape(id)}"]`);
     if (direct) return direct;
     for (const chat of CHAT_INSTANCES){
@@ -1865,7 +2339,7 @@ window._btToolSlot = (id)=>{
         if (slot) return slot;
     }
     return null;
-};
+}
 function connect(node, comm) {
     const chat = new BonitoChat(node, comm);
     node.__bt_chat = chat;
@@ -1889,5 +2363,6 @@ function connect(node, comm) {
 }
 export { BonitoChat as BonitoChat };
 export { Collapsable as Collapsable };
+export { toolSlot as toolSlot };
 export { connect as connect };
 

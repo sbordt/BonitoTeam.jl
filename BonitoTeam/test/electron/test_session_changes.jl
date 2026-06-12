@@ -2,15 +2,19 @@
 # Boots a real serve()-style setup against a `MockTransport` and exercises:
 #
 #   #1 centered SummaryMsg renders with `.bt-summary-msg` class + html body
-#   #2 tool pill's wide-mode toggle adds `.bt-tool-wide-active` (independent
-#       of expand/collapse — clicking the button does NOT toggle the body)
-#   #5 `.bt-tool-title` is user-select-text (Read paths are copy-pasteable)
+#   #2 tool pill's wide-mode toggle (`.bt-tool-fullwidth` button) adds
+#       `.bt-tool-wide-active` (independent of expand/collapse — clicking the
+#       button does NOT toggle the body)
+#   #5 `.bt-tool-title` stays selectable (Read paths are copy-pasteable) —
+#       the header deliberately has NO user-select rule (see styles.jl), so
+#       the computed value must just not be `none`
 #   #6 streamed agent chunks render as CommonMark — `**bold**`, `_emph_`, and
 #       intraword `_` left alone (no italic-eats-underscore)
 #   #7 sidebar resumable row appears for a project whose worker has a
 #       `running:true` discovered session but isn't in `chat_models`
 #   #8 localStorage `bt-last-pid` updates on view change (the last-route memory
-#       that complements Bonito's soft_close window)
+#       that complements Bonito's soft_close window). The stored value is
+#       `<boot-id>|<pid>` (sidebar.jl LAST_PID_KEY), so we match the suffix.
 #   #9 a UserMsg pushed while `busy_active[]` is true gets `.bt-queued`, and
 #       `promote_queued_user_bubble!` clears it
 isdefined(Main, :TH) || include(joinpath(@__DIR__, "helpers.jl"))
@@ -86,12 +90,12 @@ try
                    "document.querySelectorAll('.bt-tool-msg').length >= 1";
                    timeout = 5.0))
         record("wide button present",
-               @TH.test_true TH.dom_exists(ctx, ".bt-tool-msg .bt-tool-wide"))
+               @TH.test_true TH.dom_exists(ctx, ".bt-tool-msg .bt-tool-fullwidth"))
         # Before clicking: not in wide mode, header collapsed.
         before = TH.eval_js(ctx,
             "document.querySelector('.bt-tool-msg').classList.contains('bt-tool-wide-active')")
         record("not wide initially", @TH.test_eq before false)
-        TH.dom_click(ctx, ".bt-tool-msg .bt-tool-wide")
+        TH.dom_click(ctx, ".bt-tool-msg .bt-tool-fullwidth")
         after = TH.eval_js(ctx,
             "document.querySelector('.bt-tool-msg').classList.contains('bt-tool-wide-active')")
         record("wide-active class after click", @TH.test_eq after true)
@@ -101,17 +105,20 @@ try
             "document.querySelector('.bt-tool-header').dataset.expanded")
         record("wide click did not expand body", @TH.test_eq expanded "false")
         # Toggle off.
-        TH.dom_click(ctx, ".bt-tool-msg .bt-tool-wide")
+        TH.dom_click(ctx, ".bt-tool-msg .bt-tool-fullwidth")
         record("wide-active class removed",
                @TH.test_eq TH.eval_js(ctx,
                    "document.querySelector('.bt-tool-msg').classList.contains('bt-tool-wide-active')") false)
     end
 
     # ── #5 user-select on tool title ──────────────────────────────────────
+    # The header deliberately carries NO user-select rule (styles.jl): text
+    # selects by default (`auto`), only chrome like the ▶ glyph opts out via
+    # `none`. So the contract is "anything but none".
     TH.section("Tool title is text-selectable (copyable paths)") do
         sel = TH.eval_js(ctx,
             "getComputedStyle(document.querySelector('.bt-tool-title')).userSelect")
-        record("title user-select == text", @TH.test_eq String(sel) "text")
+        record("title user-select != none", @TH.test_true String(sel) != "none")
     end
 
     # ── #1 centered session summary ───────────────────────────────────────
@@ -165,24 +172,30 @@ try
     end
 
     # ── #8 last-route memory in localStorage ──────────────────────────────
+    # Stored as `<boot-id>|<pid>` (the boot-id scopes the memory to one server
+    # run — see LAST_PID_KEY in sidebar.jl), so match the `|pid` suffix.
     TH.section("Last route persists to localStorage") do
         stored = TH.eval_js(ctx, "localStorage.getItem('bt-last-pid')")
-        record("localStorage[bt-last-pid] == 'p-1'", @TH.test_eq String(stored) "p-1")
-        # Navigate to home; key should update to empty string.
+        record("localStorage[bt-last-pid] ends with '|p-1'",
+               @TH.test_true endswith(String(stored), "|p-1"))
+        # Navigate to home; the pid part should update to empty.
         TH.eval_js(ctx,
             "document.querySelector('.bt-side-item[data-project-id=\"\"]').click()")
         sleep(0.3)
-        record("localStorage[bt-last-pid] == '' after home",
-               @TH.test_eq String(TH.eval_js(ctx, "localStorage.getItem('bt-last-pid')")) "")
+        record("localStorage[bt-last-pid] pid part empty after home",
+               @TH.test_true endswith(
+                   String(TH.eval_js(ctx, "localStorage.getItem('bt-last-pid')")), "|"))
     end
 
     # ── #3 plotpane resize handle ─────────────────────────────────────────
-    # The plotpane is hidden by default (`width:0`); the visible-class is
-    # toggled by `_btPopup` in response to a real `bt_show_app` detach. We
-    # force it on with JS to make the handle interactive, then dispatch a
-    # pointer-drag sequence and assert (a) the `--bt-pp-width` var updates,
-    # (b) localStorage records the new width, (c) double-click resets it.
-    TH.section("Plotpane resize handle drives --bt-pp-width + localStorage") do
+    # The handle on the plotpane's left edge resizes the CHAT column: it sets
+    # `--bt-chat-width` on `.bt-main` during the drag (clamped to
+    # [CHAT_MIN=480, CHAT_MAX=1400]) and notifies a Julia-side saver on
+    # release (no localStorage — see PopupController.setupDivider in
+    # popup.js). Double-click clears the override. The plotpane is hidden by
+    # default (`width:0`); we force the visible-class on to make the handle
+    # interactive.
+    TH.section("Plotpane resize handle drives --bt-chat-width on .bt-main") do
         record("plotpane element present",
                @TH.test_true TH.dom_exists(ctx, "#bt-plotpane-dropzone"))
         record("resize handle present",
@@ -193,14 +206,13 @@ try
             (() => {
                 const pp = document.getElementById('bt-plotpane-dropzone');
                 pp.classList.add('bt-plotpane-visible');
-                // Clear any stored width so the drag starts from the default.
-                localStorage.removeItem('bt-pp-width');
-                pp.style.removeProperty('--bt-pp-width');
+                const main = pp.closest('.bt-stage')?.querySelector('.bt-main');
+                if (main) main.style.removeProperty('--bt-chat-width');
                 return true;
             })()""")
         sleep(0.2)
-        # Drag the handle 120 px to the LEFT (handle is on pane's left edge, so
-        # leftward drag widens the pane).
+        # Drag the handle 120 px to the RIGHT (the handle sizes the chat
+        # column, so rightward widens the chat).
         TH.eval_js(ctx, """
             (() => {
                 const handle = document.querySelector('#bt-plotpane-dropzone .bt-pp-resize');
@@ -210,21 +222,24 @@ try
                 handle.dispatchEvent(new PointerEvent('pointerdown',
                     { clientX: startX, clientY: startY, bubbles: true }));
                 window.dispatchEvent(new PointerEvent('pointermove',
-                    { clientX: startX - 120, clientY: startY, bubbles: true }));
+                    { clientX: startX + 120, clientY: startY, bubbles: true }));
                 window.dispatchEvent(new PointerEvent('pointerup',
-                    { clientX: startX - 120, clientY: startY, bubbles: true }));
+                    { clientX: startX + 120, clientY: startY, bubbles: true }));
                 return true;
             })()""")
-        @assert TH.wait_for(ctx,
-            "document.getElementById('bt-plotpane-dropzone').style.getPropertyValue('--bt-pp-width').length > 0";
-            timeout = 2.0) "drag never wrote --bt-pp-width"
-        new_w = TH.eval_js(ctx,
-            "parseFloat(document.getElementById('bt-plotpane-dropzone').style.getPropertyValue('--bt-pp-width'))")
-        record("--bt-pp-width set by drag", @TH.test_true (Float64(new_w) >= 280.0))
-        record("localStorage[bt-pp-width] persisted",
-               @TH.test_true !isnothing(TH.eval_js(ctx, "localStorage.getItem('bt-pp-width')")))
+        chat_w_js = """
+            (() => {
+                const pp = document.getElementById('bt-plotpane-dropzone');
+                const main = pp.closest('.bt-stage')?.querySelector('.bt-main');
+                return main ? main.style.getPropertyValue('--bt-chat-width') : '';
+            })()"""
+        @assert TH.wait_for(ctx, "($chat_w_js).length > 0";
+            timeout = 2.0) "drag never wrote --bt-chat-width"
+        new_w = TH.eval_js(ctx, "parseFloat($chat_w_js)")
+        record("--bt-chat-width clamped into [480, 1400]",
+               @TH.test_true (480.0 <= Float64(new_w) <= 1400.0))
 
-        # Double-click on the handle should clear the override + localStorage.
+        # Double-click on the handle should clear the override.
         TH.eval_js(ctx, """
             (() => {
                 const handle = document.querySelector('#bt-plotpane-dropzone .bt-pp-resize');
@@ -232,11 +247,8 @@ try
                 return true;
             })()""")
         sleep(0.2)
-        record("dblclick cleared inline --bt-pp-width",
-               @TH.test_eq String(TH.eval_js(ctx,
-                   "document.getElementById('bt-plotpane-dropzone').style.getPropertyValue('--bt-pp-width')")) "")
-        record("dblclick cleared localStorage",
-               @TH.test_eq TH.eval_js(ctx, "localStorage.getItem('bt-pp-width')") nothing)
+        record("dblclick cleared inline --bt-chat-width",
+               @TH.test_eq String(TH.eval_js(ctx, chat_w_js)) "")
 
         # Clean up — drop the bt-plotpane-visible class so later sections start fresh.
         TH.eval_js(ctx,
@@ -247,8 +259,11 @@ try
     # The on(current_view) handler in install_popup! flips visible[] = false
     # when navigating to home. To exercise it we first have to flip the FW
     # ON — the handler ignores no-op transitions (Observable doesn't notify on
-    # same value). The cleanest way is to invoke `_btPopup.detach('fake')`,
-    # which requires a `bt-embed-fake` element to exist; we create one. After
+    # same value). There is no window-global controller anymore (the
+    # PopupController is observable-driven); the supported route is the chat
+    # comm's `detach_app` command, which lands in DetachAppCommand →
+    # `pane.detach_app[] = id` → controller.detach(id). detach() looks for a
+    # `bt-embed-<id>` element + `bt-slot-<id>` slot; we create fakes. After
     # detach the FW's inline `display` should be `flex`. Then click Home and
     # assert it flips back to `none`.
     TH.section("FloatingWindow auto-hides when navigating Home") do
@@ -258,7 +273,8 @@ try
         @assert TH.wait_for(ctx,
             "document.querySelector('.bt-text-input') !== null"; timeout = 5.0) "chat re-mount failed"
 
-        # Stage: create a fake embed + a fake slot so detach() can find it.
+        # Stage: create a fake embed + a fake slot so detach() can find it,
+        # then route the detach through the comm (the ⤢ button's path).
         TH.eval_js(ctx, """
             (() => {
                 if (!document.getElementById('bt-embed-fake')) {
@@ -270,7 +286,8 @@ try
                     slot.id = 'bt-slot-fake';
                     document.body.appendChild(slot);
                 }
-                window._btPopup.detach('fake');
+                document.querySelector('.bt-messages').__bt_chat
+                    .comm.notify({ type: 'detach_app', id: 'fake' });
                 return true;
             })()""")
         @assert TH.wait_for(ctx, """(() => {
@@ -290,24 +307,22 @@ try
         record("FW hidden after navigating home", true)
     end
 
-    # ── #7 sidebar resumable row ──────────────────────────────────────────
-    # Tear down the live ChatModel so the project drops out of `chat_models`,
-    # then seed `state.discovered` with a `running:true` record matching the
-    # project's worker_path. The sidebar map() depends on `state.discovered`,
-    # so notifying it forces a re-render.
-    TH.section("Resumable thread surfaces in the sidebar") do
+    # ── #7 sidebar keeps a touched project after chat teardown ────────────
+    # The old `bt-side-resumable` row class is gone: the sidebar now renders
+    # ONE unified "Open chats" list — a project is listed iff the user has
+    # touched it (title backfilled / resume_session_id persisted in
+    # projects.json), independent of whether a live ChatModel exists; the
+    # per-entry LED encodes liveness instead. So the contract to guard is:
+    # tearing down the live ChatModel must NOT drop the project's row.
+    TH.section("Touched project row survives ChatModel teardown") do
         lock(state.lock) do
             delete!(state.chat_models, "p-1")
         end
         BT.notify_chats!(state)
-        state.discovered[]["w-1"] = Dict{String,Any}[Dict(
-            "path" => proj.worker_path, "running" => true, "kind" => "session",
-            "session_id" => "abc")]
-        BT.safe_notify!(state.discovered)
         @assert TH.wait_for(ctx,
-            "document.querySelector('.bt-side-item.bt-side-resumable[data-project-id=\"p-1\"]') !== null";
-            timeout = 3.0) "resumable row never appeared"
-        record("resumable row mounted", true)
+            "document.querySelector('.bt-side-item[data-project-id=\"p-1\"]') !== null";
+            timeout = 3.0) "project row vanished after chat teardown"
+        record("row still mounted without a live ChatModel", true)
     end
 
     # ── JS errors gate ────────────────────────────────────────────────────

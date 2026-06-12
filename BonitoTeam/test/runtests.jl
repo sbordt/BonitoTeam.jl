@@ -94,6 +94,15 @@ include("test_history_sync.jl")
 
 include("test_summary_msg.jl")
 
+# Regressions from the 2026-06 lazy-streaming review: summary wire ids,
+# empty-store msgs.request, thought.render renderer parity, the
+# ensure_html!/append! race, throttled thinking ticks. Pure headless.
+include("test_review_fixes.jl")
+
+# Agent-thinking path (coalescer, indicator, persistence, wire shapes).
+# Pure headless — was previously not wired into any suite.
+include("test_thinking.jl")
+
 # Stability regressions (T1–T22): duplicate-session funnel, JSON-corruption
 # locking, chat-teardown leak, lock coverage. Pure Julia — no Electron/worker.
 include("test_stability.jl")
@@ -118,6 +127,7 @@ include("test_mcp_ctrl.jl")
 
 include("test_tool_close_total.jl")
 include("test_concurrent_turns.jl")
+include("test_lens.jl")
 
 include("test_acp_log.jl")
 
@@ -151,6 +161,12 @@ end
 # guards the bt_show_app open/collapse trashing (relay head-of-line blocking). Self-
 # gates on BT_RUN_E2E (needs a worker + Electron).
 include("test_bonito_app_churn.jl")
+
+# Real-wire lens search + scroll e2e via the mock-claude-agent-acp BINARY
+# (TestKit): real dev_server + worker + WorkerTransport + ACP dispatcher +
+# Electron, scripted agent responses over the real wire. Self-gates on
+# BT_RUN_E2E.
+include("test_real_lens_e2e.jl")
 
 # Real-browser resident-layout test: plotpane-fills-whitespace + two-stage resize,
 # keep-alive DOM preservation across navigation (no re-delegate / no

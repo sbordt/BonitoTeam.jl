@@ -97,10 +97,15 @@ try
 
     TH.section("Backgrounded-tab rAF pause: new bubble still lands in DOM") do
         # Force rAF into the "queued-but-never-fires" state — the exact
-        # condition a real backgrounded tab leaves the chat in.
+        # condition a real backgrounded tab leaves the chat in. Cancel any
+        # REAL chase rAF still in flight from the initial mount first:
+        # planting `_scrollRafId = -1` over a live id leaves that callback
+        # scheduled, and when it fires it clears `_scrollQueued` — the
+        # sentinel assertion below then fails on a pure timing race.
         ElectronCall.run(w.win, """
             (() => {
                 const c = document.querySelector('.bt-messages').__bt_chat;
+                c._cancelPendingScroll();
                 c._scrollQueued = true;
                 c._scrollRafId  = -1;
                 return true;

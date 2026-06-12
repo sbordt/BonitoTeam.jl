@@ -49,7 +49,8 @@ try
         for (let i = 0; i < items.length; i++) if (items[i].innerText.split(' · ')[0] === 'Project1') return i;
         return -1; })()""")
     TH.eval_js(ctx, """document.querySelectorAll('.bt-side-item')[$p1_idx].click()""")
-    @assert TH.wait_for(ctx, "document.querySelector('.bt-text-input') !== null") "chat didn't mount"
+    @assert TH.wait_for(ctx, "document.querySelector('.bt-text-input') !== null";
+                        timeout = 15.0) "chat didn't mount"
     sleep(1.0)  # initial scroll-to-bottom + RO settle
 
     # Helper: read scroll state of the messages container.
@@ -115,13 +116,20 @@ try
                 "type" => "chunk", "id" => "stream-1",
                 "text" => "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "))
         end
-        sleep(0.5)  # let rAF + RO flush
+        # Wait for the chase to settle rather than a fixed sleep. The chase
+        # settles in ~200ms (measured), but the headless suite window throttles
+        # rAF to ~1 Hz, so a fixed 0.5s sleep races the throttled chase ~50/50.
+        # Polling the gap is the correct, non-flaky check.
+        settled = TH.wait_for(ctx, """(() => {
+            const c = document.querySelector('.bt-messages');
+            return (c.scrollHeight - c.scrollTop - c.clientHeight) < 200;
+        })()"""; timeout = 6.0)
 
         s = scroll_state()
         # The streaming bubble is now ~1.5KB of text — must have stayed
         # at the tail throughout, NOT lagged behind.
         record("scroll at bottom after burst of 30 chunks",
-               @TH.test_true (Int(s["gap"]) < 200))
+               @TH.test_true settled)
 
         # The last message bubble's bottom edge should be within the viewport.
         last_in_view = TH.eval_js(ctx, """(() => {

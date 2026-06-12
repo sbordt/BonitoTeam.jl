@@ -104,9 +104,15 @@ thought(text) = ACP.AgentThoughtChunk(ACP.TextContent(text))
         @test length(tms) == 1
         @test tms[1].text == "Hello world"
 
-        # Indicator raised+lowered, then the bubble's new + final events.
+        # Indicator raised (count=0), the first delta's count tick (later
+        # ticks are throttled to ~150 ms, irrelevant for one delta), then
+        # lowered — plus the bubble's new + final events. The active pattern
+        # is what matters: starts true, ends false.
         kinds = [get(e, "type", "") for e in events]
-        @test count(==("thinking"), kinds) == 2
+        @test count(==("thinking"), kinds) == 3
+        thinking = [e for e in events if get(e, "type", "") == "thinking"]
+        @test first(thinking)["active"] === true
+        @test last(thinking)["active"] === false
         @test count(==("thought"), kinds) == 1          # wire_new
         @test count(==("thought_final"), kinds) == 1    # wire_final
 

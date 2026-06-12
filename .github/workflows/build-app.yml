@@ -35,20 +35,25 @@ jobs:
           - runner: macos-latest
             os: macos
             arch: aarch64
+            bundle: dmg
           - runner: macos-13
             os: macos
             arch: x86_64
+            bundle: dmg
           - runner: ubuntu-latest
             os: linux
             arch: x86_64
+            bundle: tarball
             xvfb: true
           - runner: ubuntu-24.04-arm
             os: linux
             arch: aarch64
+            bundle: tarball
             xvfb: true
           - runner: windows-latest
             os: windows
             arch: x86_64
+            bundle: msix
 
     steps:
       - uses: actions/checkout@v4
@@ -70,6 +75,7 @@ jobs:
           ${{ matrix.xvfb && 'xvfb-run -s ''-screen 0 1024x768x24''' || '' }}
           julia --project=BonitoAgentsApp/meta -m AppBundler build BonitoAgentsApp
           --build-dir=build --target-arch=${{ matrix.arch }}
+          --target-bundle=${{ matrix.bundle }}
 
       - uses: actions/upload-artifact@v4
         with:

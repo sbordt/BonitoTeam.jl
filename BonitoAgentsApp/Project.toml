@@ -6,18 +6,27 @@ authors = ["Simon Danisch <sdanisch@gmail.com>"]
 [deps]
 Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 BonitoAgents = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
+BonitoMCP = "4a1c91af-1c90-46a4-8594-a3846516869d"
 BonitoWorker = "98909ed9-6989-4829-81af-73688ee23085"
 ElectronCall = "8ddd578f-0c94-4c64-8c65-f083f291b266"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 URIs = "5c2747f8-b7ea-4ff2-ba2e-563bfd36b1d4"
+WGLMakie = "276b4fcb-3e11-5398-bf8b-a0c2d153d008"
 
 [sources]
 Bonito = {rev = "sd/remote-app", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 BonitoAgents = {path = "../BonitoAgents"}
+BonitoMCP = {path = "../BonitoMCP"}
 BonitoWorker = {path = "../BonitoWorker"}
 ElectronCall = {url = "https://github.com/JuliaWeb/ElectronCall.jl.git", rev = "main"}
+# Makie stack pinned together on the ElectronCall-integration branch (monorepo
+# subdirs). git-url (not path) so CI, which clones only the BonitoAgents repo,
+# can fetch them too.
+ComputePipeline = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "sd/electroncall", subdir = "ComputePipeline"}
+Makie = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "sd/electroncall", subdir = "Makie"}
+WGLMakie = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "sd/electroncall", subdir = "WGLMakie"}
 
 [compat]
 ElectronCall = "1"

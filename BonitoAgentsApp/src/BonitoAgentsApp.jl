@@ -199,21 +199,62 @@ function desktop(; port::Union{Int,Nothing} = nothing, window::Bool = true)
 end
 
 const USAGE = """
-BonitoAgents desktop app
+BonitoAgents — one bundle, three roles.
 
-Usage: bonitoagents [--port=N] [--no-window] [--data-dir=PATH]
+Usage: bonitoagents [MODE] [options]
 
-  --port=N        bind the dashboard server to a fixed port (default: ephemeral)
-  --no-window     run server + local worker only; print the URL instead of
-                  opening the Electron window
-  --data-dir=PATH store all app state under PATH instead of the default
-                  platform directory (~/.local/share/BonitoAgents on Linux,
-                  ~/Library/Application Support/BonitoAgents on macOS,
-                  %LOCALAPPDATA%\\BonitoAgents on Windows)
+Modes (default: desktop):
+  desktop                 server + local worker + dashboard window
+  server                  headless dashboard server (workers dial back to it)
+  worker                  connect this machine to a remote server as a worker
+
+Desktop options:
+  --port=N                bind the dashboard to a fixed port (default: ephemeral)
+  --no-window             run server + local worker only; print the URL
+  --data-dir=PATH         store all app state under PATH
+
+Server options:
+  --port=N                listen port (default: 8038)
+  --host=HOST             bind host (default: 0.0.0.0)
+  --public-url=URL        base URL workers dial back to (default: auto)
+  --secret=HEX            shared worker secret (default: persisted/generated)
+  --state-dir=PATH        workers.json / projects.json / chats
+  --working-dir=PATH      canonical project copies
+  --data-dir=PATH         store all server state under PATH
+
+Worker options:
+  --server-url=URL        dashboard server to connect to (required)
+  --secret=HEX            shared worker secret (required)
+  --worker-id=ID          stable worker id (default: persisted/generated)
+  --projects-root=PATH    where project checkouts live
+  --data-dir=PATH         store all worker state under PATH
+
+Default data dir: ~/.local/share/BonitoAgents (Linux),
+~/Library/Application Support/BonitoAgents (macOS),
+%LOCALAPPDATA%\\BonitoAgents (Windows).
 """
 
-function (@main)(args)
-    port   = nothing
+# --key=value → opts["key"]="value"; bare --flag → opts["flag"]="". Errors on
+# anything not starting with `--`, so a typo fails loudly instead of being
+# silently ignored.
+function parse_opts(args)
+    opts = Dict{String,String}()
+    for a in args
+        startswith(a, "--") || error("unexpected argument `$a` (use --key=value)")
+        body = a[3:end]
+        if occursin('=', body)
+            k, v = split(body, '='; limit = 2)
+            opts[String(k)] = String(v)
+        else
+            opts[body] = ""
+        end
+    end
+    return opts
+end
+
+# `desktop`: the original behaviour — server + local worker + Electron window.
+function run_desktop(args)
+    port = nothing
     window = true
     for arg in args
         if arg == "--no-window"
@@ -222,17 +263,95 @@ function (@main)(args)
             port = parse(Int, split(arg, '='; limit = 2)[2])
         elseif startswith(arg, "--data-dir=")
             ENV["USER_DATA"] = split(arg, '='; limit = 2)[2]
-        elseif arg in ("-h", "--help")
-            print(USAGE)
-            return 0
         else
-            println(stderr, "Unknown argument: $arg\n")
+            println(stderr, "Unknown desktop argument: $arg\n")
             print(stderr, USAGE)
             return 1
         end
     end
     desktop(; port, window)
     return 0
+end
+
+# `server`: headless dashboard, mirroring `BonitoAgents`'s own entry point but
+# rooting its state under our shared data dir by default.
+function run_server(args)
+    opts = parse_opts(args)
+    haskey(opts, "data-dir") && (ENV["USER_DATA"] = opts["data-dir"])
+    root        = data_root()
+    state_dir   = get(opts, "state-dir",   mkpath(joinpath(root, "state")))
+    working_dir = get(opts, "working-dir", mkpath(joinpath(root, "working")))
+    secret = get(opts, "secret", "")
+    isempty(secret) && (secret = BonitoAgents.persisted_worker_secret(state_dir))
+    export_julia_env!()
+    BonitoAgents.serve(;
+        host          = get(opts, "host", "0.0.0.0"),
+        port          = parse(Int, get(opts, "port", "8038")),
+        public_url    = get(opts, "public-url", ""),
+        worker_secret = secret,
+        state_dir     = state_dir,
+        working_dir   = working_dir)
+    block_until_interrupt()
+    return 0
+end
+
+# `worker`: dial back to a remote server. connect_and_serve loops internally
+# (reconnect-forever), so it blocks until interrupted.
+function run_worker(args)
+    opts = parse_opts(args)
+    haskey(opts, "data-dir") && (ENV["USER_DATA"] = opts["data-dir"])
+    for req in ("server-url", "secret")
+        haskey(opts, req) && !isempty(opts[req]) && continue
+        println(stderr, "worker: --$req is required\n")
+        print(stderr, USAGE)
+        return 1
+    end
+    root     = data_root()
+    projects = get(opts, "projects-root", mkpath(joinpath(root, "projects")))
+    ENV["BONITOAGENTS_CONFIG_DIR"] = mkpath(joinpath(root, "worker-config"))
+    worker_id = get(opts, "worker-id", "")
+    isempty(worker_id) && (worker_id = BonitoWorker.load_or_generate_worker_id())
+    export_julia_env!()
+    BonitoWorker.connect_and_serve(;
+        server_url    = opts["server-url"],
+        secret        = opts["secret"],
+        worker_id     = worker_id,
+        projects_root = projects)
+    return 0
+end
+
+function block_until_interrupt()
+    try
+        while true
+            sleep(3600)
+        end
+    catch e
+        e isa InterruptException || rethrow()
+    end
+    return
+end
+
+function (@main)(args)
+    args = collect(String, args)
+    # Help is matched before mode-defaulting so `--help`/`-h` (which start with
+    # `-`, and would otherwise fall through to desktop) print usage.
+    if !isempty(args) && first(args) in ("-h", "--help", "help")
+        print(USAGE)
+        return 0
+    end
+    # First non-flag token selects the mode; default is `desktop`.
+    mode = (!isempty(args) && !startswith(first(args), "-")) ? popfirst!(args) : "desktop"
+    if mode == "desktop"
+        return run_desktop(args)
+    elseif mode == "server"
+        return run_server(args)
+    elseif mode == "worker"
+        return run_worker(args)
+    else
+        println(stderr, "Unknown mode: $mode\n")
+        print(stderr, USAGE)
+        return 1
+    end
 end
 
 @setup_workload begin

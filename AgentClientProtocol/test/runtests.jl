@@ -249,4 +249,32 @@ next_out(t::MockTransport) = JSON.parse(take!(t.outbox))
         @test !isready(t.outbox)              # no session/cancel sent
         close(conn)
     end
+
+    # ── Regression: a long resumed history with an un-terminated tool must not
+    # deadlock replay collection. A message the agent leaves open mid-stream,
+    # followed by more than `BUF` further messages, used to wedge the sequential
+    # drain: the open message blocked the `out` consumer → the feeder backed up
+    # on the bounded `out` → the dispatcher could never deliver the session/load
+    # response behind the backlog → "restoring the conversation…" forever.
+    # Concurrent per-message draining + close(TurnState) at stream end fixes it.
+    @testset "replay survives an un-terminated tool in a >BUF history" begin
+        tc(id, status) = ACP.parse_session_update(Dict(
+            "sessionUpdate" => "tool_call", "toolCallId" => id,
+            "title" => "t", "kind" => "other", "status" => status))
+        updates  = Channel{ACP.SessionUpdate}(ACP.BUF)
+        response = Channel{Any}(1)
+        feeder = @async begin
+            put!(updates, tc("open", "pending"))          # never terminated
+            for i in 1:(ACP.BUF + 50)                     # > BUF: the deadlock trigger
+                put!(updates, tc("t$i", "completed"))
+            end
+            close(updates)
+            put!(response, Dict{String,Any}())            # the session/load response
+        end
+        res = @async ACP.collect_replayed_updates(updates, response)
+        @test timedwait(() -> istaskdone(res), 20.0) == :ok   # must NOT hang
+        msgs, _ = fetch(res)
+        @test length(msgs) == ACP.BUF + 51                # open tool + every follower
+        wait(feeder)
+    end
 end

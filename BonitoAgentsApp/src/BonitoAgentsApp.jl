@@ -24,7 +24,13 @@ export main
 # Platform-conventional persistent data root for the desktop app. Unlike
 # `BonitoAgents.dev_server` (ephemeral tempdirs), the desktop app keeps its
 # state across launches: projects, chats and the worker identity survive.
+#
+# USER_DATA is the AppBundler/AppEnv convention for the user data directory;
+# the bundled launcher sets it to the same platform path so app state and the
+# Julia depot cache live under the same root. Honour it here so --data-dir
+# (which sets USER_DATA at runtime) moves all state consistently.
 function data_root()
+    haskey(ENV, "USER_DATA") && return ENV["USER_DATA"]
     base = if Sys.iswindows()
         get(ENV, "LOCALAPPDATA", joinpath(homedir(), "AppData", "Local"))
     elseif Sys.isapple()
@@ -195,11 +201,15 @@ end
 const USAGE = """
 BonitoAgents desktop app
 
-Usage: bonitoagents [--port=N] [--no-window]
+Usage: bonitoagents [--port=N] [--no-window] [--data-dir=PATH]
 
-  --port=N      bind the dashboard server to a fixed port (default: ephemeral)
-  --no-window   run server + local worker only; print the URL instead of
-                opening the Electron window
+  --port=N        bind the dashboard server to a fixed port (default: ephemeral)
+  --no-window     run server + local worker only; print the URL instead of
+                  opening the Electron window
+  --data-dir=PATH store all app state under PATH instead of the default
+                  platform directory (~/.local/share/BonitoAgents on Linux,
+                  ~/Library/Application Support/BonitoAgents on macOS,
+                  %LOCALAPPDATA%\\BonitoAgents on Windows)
 """
 
 function (@main)(args)
@@ -210,6 +220,8 @@ function (@main)(args)
             window = false
         elseif startswith(arg, "--port=")
             port = parse(Int, split(arg, '='; limit = 2)[2])
+        elseif startswith(arg, "--data-dir=")
+            ENV["USER_DATA"] = split(arg, '='; limit = 2)[2]
         elseif arg in ("-h", "--help")
             print(USAGE)
             return 0

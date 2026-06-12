@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "63da851ae318d6f84c2626809b3f4b59b3b0e044"
+project_hash = "3c2eb8da45120819296d6c431c01aa09e5f2348b"
 
 [[deps.ANSIColoredPrinters]]
 git-tree-sha1 = "574baf8110975760d391c710b6341da1afa48d8c"
@@ -40,11 +40,17 @@ version = "0.1.9"
 
 [[deps.Bonito]]
 deps = ["ANSIColoredPrinters", "Base64", "CodecZlib", "Colors", "CommonMark", "Dates", "Deno_jll", "HTTP", "Hyperscript", "JSON", "LinearAlgebra", "Markdown", "MbedTLS", "MsgPack", "Observables", "OrderedCollections", "Random", "RelocatableFolders", "SHA", "Sockets", "Tables", "ThreadPools", "URIs", "UUIDs", "WidgetsBase"]
-git-tree-sha1 = "bcca8adcd3a1475da27897d277b060f746987434"
-repo-rev = "sd/v5"
+git-tree-sha1 = "557ea4bc97ab21fe71b2acf30d1d5553bbc1faf4"
+repo-rev = "sd/remote-app"
 repo-url = "https://github.com/SimonDanisch/Bonito.jl.git"
 uuid = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 version = "4.2.0"
+
+[[deps.BonitoAgents]]
+deps = ["AgentClientProtocol", "Base64", "Bonito", "BonitoBook", "BonitoMCP", "BonitoWorker", "CommonMark", "Dates", "ElectronCall", "HTTP", "JSON", "Markdown", "Pkg", "Random", "RemoteSync", "SHA", "Sockets", "TOML", "UUIDs"]
+path = "."
+uuid = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
+version = "0.1.0"
 
 [[deps.BonitoBook]]
 deps = ["ANSIColoredPrinters", "Base64", "Bonito", "CommonMark", "Dates", "FileWatching", "Glob", "InteractiveUtils", "JSON3", "Logging", "Markdown", "Observables", "Pkg", "REPL", "Random", "TOML", "Typst_jll", "UUIDs", "ZipFile", "p7zip_jll"]
@@ -68,15 +74,9 @@ version = "0.2.0"
     PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 
 [[deps.BonitoMCP]]
-deps = ["Base64", "Dates", "JSON", "Malt", "Pkg"]
+deps = ["Base64", "Dates", "HTTP", "JSON", "Malt", "Pkg"]
 path = "../BonitoMCP"
 uuid = "4a1c91af-1c90-46a4-8594-a3846516869d"
-version = "0.1.0"
-
-[[deps.BonitoAgents]]
-deps = ["AgentClientProtocol", "Base64", "Bonito", "BonitoBook", "BonitoMCP", "BonitoWorker", "CommonMark", "Dates", "HTTP", "JSON", "Markdown", "Random", "RemoteSync", "SHA", "Sockets", "TOML", "UUIDs"]
-path = "."
-uuid = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
 version = "0.1.0"
 
 [[deps.BonitoWorker]]

@@ -302,7 +302,19 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         DOM.div(entries...; class = "bt-side-list")
     end
 
-    aside = DOM.aside(body; class = "bt-sidebar", dataBootId = server_boot_id())
+    # VSCode-style collapse toggle: shrinks the sidebar to an icons-only rail
+    # (more room for the workspace). State persists in localStorage and is
+    # restored on the aside's onload below. Pure-JS toggle — no server hop.
+    collapse_btn = DOM.div(
+        DOM.span("«"; class = "bt-side-collapse-glyph");
+        class = "bt-side-collapse", title = "Collapse / expand sidebar",
+        onclick = js"""event => {
+            const aside = event.target.closest('.bt-sidebar');
+            const collapsed = aside.classList.toggle('bt-collapsed');
+            try { localStorage.setItem('bt-sidebar-collapsed', collapsed ? '1' : '0'); } catch (_) {}
+        }""")
+
+    aside = DOM.aside(collapse_btn, body; class = "bt-sidebar", dataBootId = server_boot_id())
 
     # Delegated click handler: one listener on the aside. A click on a
     # `.bt-side-close` ✕ routes to `close_trigger`; anything else on a
@@ -337,6 +349,8 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             const item = e.target.closest('.bt-side-item');
             if (item) $(current_view).notify(item.dataset.projectId || '');
         });
+        // Restore the collapsed/expanded sidebar state from a previous visit.
+        try { if ((localStorage.getItem('bt-sidebar-collapsed') || '0') === '1') el.classList.add('bt-collapsed'); } catch (_) {}
         // Restore last route on fresh sessions (when soft_close didn't catch us).
         const saved = localStorage.getItem(LAST_PID_KEY) || '';
         const sep = saved.indexOf('|');
@@ -435,6 +449,23 @@ const SidebarStyles = Bonito.Styles(
         "padding" => "10px 0"),
     CSS(".bt-side-list",
         "display" => "flex", "flex-direction" => "column", "gap" => "2px"),
+    # VSCode-style collapse toggle (top of the rail) + the collapsed rail itself.
+    CSS(".bt-side-collapse",
+        "display" => "flex", "align-items" => "center", "justify-content" => "flex-end",
+        "padding" => "0 12px 8px", "cursor" => "pointer",
+        "color" => "var(--bt-text-muted)", "user-select" => "none",
+        "font-size" => "15px", "line-height" => "1"),
+    CSS(".bt-side-collapse:hover", "color" => "var(--bt-text)"),
+    CSS(".bt-side-collapse-glyph",
+        "display" => "inline-block",
+        "transition" => "transform 120ms ease"),
+    CSS(".bt-sidebar.bt-collapsed", "width" => "56px"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-name", "display" => "none"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-item", "justify-content" => "center"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-section", "display" => "none"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-empty", "display" => "none"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-collapse", "justify-content" => "center"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-collapse-glyph", "transform" => "rotate(180deg)"),
     CSS(".bt-side-item",
         # `align-items: flex-start` keeps the icon at the top of two-line
         # titles instead of jumping down to vertical-center the row.
@@ -1102,24 +1133,17 @@ function unified_app(state::ServerState)
             safe_notify!(current_view)
         end
         sidebar = project_sidebar(session, view, current_view)
-        # Chat-global floating "show-app target" + right-side plotpane column.
-        # `Detach` on any bt_show_app bubble moves the embed DOM into the
-        # popup (or plotpane, if that was the last location); close → restore
-        # to bubble. Drag the popup title bar over the plotpane → docks.
-        # Geometry + location persist per chat to disk. Built BEFORE
-        # unified_main so the PlotPane handle can be passed down to the chat
-        # panes (ChatPaneRef sets it on each per-session ChatModel view).
-        popup, plotpane, popup_controller_js, pane =
-            install_popup!(session, view, current_view)
+        # The window's PlotPane handle wraps a BonitoWidgets.Workspace. Created
+        # BEFORE unified_main so it can be passed down to the chat panes
+        # (ChatPaneRef sets it on each per-session ChatModel view); the Workspace
+        # itself is built AFTER, with the chat panel as its first member.
+        pane = PlotPane()
         main_panel = unified_main(session, view, current_view, ls, pane)
-        # `.bt-stage` holds the centered chat column AND the plotpane side by side,
-        # filling the whole viewport-minus-sidebar. The plotpane being a sibling of
-        # `.bt-main` (not nested inside it) is what lets it grow into the right
-        # whitespace while `.bt-main` stays capped + centered.
-        stage = DOM.div(
-            DOM.div(main_panel; class = "bt-main"),
-            plotpane;
-            class = "bt-stage")
+        # The whole stage is the Workspace: the chat/dashboard is the "chat"
+        # panel; opened files and detached `bt_show_app` embeds become more
+        # panels the user can tab / split / float (VSCode-style).
+        stage, controller_js, _ =
+            install_workspace!(session, view, current_view, pane, main_panel)
         shell = DOM.div(
             # MarkdownCSS FIRST: it's the base sheet our styles override.
             # Stylesheet order breaks specificity ties — with MarkdownCSS
@@ -1130,18 +1154,15 @@ function unified_app(state::ServerState)
             DashboardStyles,
             ChatStyles,
             SidebarStyles,
-            PopupStyles,
+            WorkspaceStageStyles,
             Bonito.ConnectionIndicator(),
             sidebar,
-            stage,
-            popup;
+            stage;
             class = "bt-shell")
-        # Construct the PopupController once the shell is in the DOM: its
-        # interpolated nodes (mounts, dropzone) and the per-tool
-        # #bt-slot-<id> / #bt-embed-<id> pairs it moves between surfaces are
-        # all descendants of the shell, so they're guaranteed present by
-        # onload.
-        Bonito.onload(session, shell, popup_controller_js)
+        # Wire the bt_show_app detach controller once the shell is in the DOM:
+        # the per-tool #bt-slot-<id> / #bt-embed-<id> pairs it moves are all
+        # descendants of the shell, guaranteed present by onload.
+        Bonito.onload(session, shell, controller_js)
         # Favicon (SVG + PNG fallback) — injected into <head> on load.
         favicon_onload(session, shell)
         shell

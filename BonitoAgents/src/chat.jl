@@ -4569,19 +4569,21 @@ end
 """
     open_file!(pane::PlotPane, model::ChatModel, path)
 
-Open `path` (a worker-side file path) as a TAB in the window's plotpane —
-an editable Monaco, VSCode-style next to any other open files / a docked
-app. Re-opening a path activates its existing tab (the cached editor keeps
-cursor/scroll/unsaved edits). Fetches the file to the server mirror first
-(from the worker if needed); failures land as an error card in the tab
-instead of a silent log line — the user clicked a link and must see
+Open `path` (a worker-side file path) as a PANEL in the window's
+[`Workspace`](@ref BonitoWidgets.Workspace) — an editable Monaco the user can
+tab / split / float next to the chat and any other open files. Re-opening a path
+activates its existing panel (the editor keeps cursor/scroll/unsaved edits — the
+Workspace renders it once and only ever moves its node). Fetches the file to the
+server mirror first (from the worker if needed); failures land as an error card
+in the panel instead of a silent log line — the user clicked a link and must see
 SOMETHING happen.
 """
 function open_file!(pane::PlotPane, model::ChatModel, path::AbstractString)
+    ws = pane.workspace[]
+    ws === nothing && return nothing
     id = file_tab_id(path)
-    if haskey(pane.editors, id)
-        # Already open — just activate. ONE atomic tabs update.
-        pane.tabs[] = activate_tab(pane.tabs[], id)
+    if any(p -> p.id == id, ws.panels[])
+        BonitoWidgets.activate_panel!(ws, id)   # already open — focus it
         return nothing
     end
     Base.errormonitor(@async begin
@@ -4597,10 +4599,8 @@ function open_file!(pane::PlotPane, model::ChatModel, path::AbstractString)
             DOM.div("couldn't open $(path): $(sprint(showerror, e))";
                     class = "bt-tool-error")
         end
-        # Cache BEFORE the tabs update (the KeyedList items derivation reads
-        # `pane.editors` when `tabs` notifies), then one atomic upsert.
-        pane.editors[id] = elem
-        pane.tabs[] = upsert_tab(pane.tabs[], PaneTab(id, basename(path), :file))
+        BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, elem;
+            label = basename(path), closable = true))
     end)
     return nothing
 end

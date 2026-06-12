@@ -9,6 +9,7 @@ Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 BonitoBook = "b416d416-7a6e-4336-8c1a-1f8a8cd59518"
 BonitoMCP = "4a1c91af-1c90-46a4-8594-a3846516869d"
+BonitoWidgets = "62a4b9e4-7ee6-4bfa-b661-80bcb0a47665"
 BonitoWorker = "98909ed9-6989-4829-81af-73688ee23085"
 CommonMark = "a80b9123-70ca-4bc0-993e-6e3bcb318db6"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
@@ -31,6 +32,7 @@ AgentClientProtocol = {path = "../AgentClientProtocol"}
 Bonito = {rev = "sd/remote-app", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
 BonitoMCP = {path = "../BonitoMCP"}
+BonitoWidgets = {path = "../../BonitoWidgets"}
 BonitoWorker = {path = "../BonitoWorker"}
 RemoteSync = {path = "../RemoteSync"}
 

@@ -89,45 +89,29 @@ mutable struct ChatModel
     # broadcast observables reach every tab via the parent→child bridges.
     parent::Union{ChatModel,Nothing}
 
-    # In-RAM cache of every live tool's most-recent content. `render_tool_body`
-    # reads here first, falls back to `tools/<id>.json` on disk only if absent
-    # (history reload after a server restart; the cache only holds tools whose
-    # updates we processed in this server's lifetime). Eliminates the
-    # "no body — tool details not persisted" race where an early expand hit
-    # the disk before `persist_tool_content!` had skipped-or-flushed an empty
-    # initial snap. Shared across per-session views (same `Dict` reference).
-    tool_content_cache::Dict{String, Vector}
+    # Tool content cache: tool_id => raw content (JSON-parsed or text).
+    # Populated on demand from persistence (tools/<id>.json) by
+    # `cache_tool_content!`. Per-chat (NOT shared) — each session view has
+    # its own cache so concurrent renders don't race.
+    tool_content_cache::Dict{String,Vector}
 
-    # The window's right-hand pane (file editor / docked apps). Set on the
-    # PER-SESSION view by ChatPaneRef when the chat mounts inside a window —
-    # the pane is window-scoped, so the shared parent (and any view rendered
-    # outside the unified shell, e.g. in tests) carries `nothing` and the
-    # pane-driving handlers degrade to no-ops.
-    plotpane::Union{Nothing,PlotPane}
+    # PlotPane handle (window-scoped; set per session view, not shared).
+    plotpane::Any
 
-    # The LIVE todo list (taskbar-only; see `process_todo!`). `Any`-typed Ref
-    # because TodoListMsg is defined below ChatModel; shared across session
-    # views (same Ref) — the turn loop on the shared parent owns it.
-    live_todo::Base.RefValue{Any}
+    # Live todo list for the taskbar (shared via parent).
+    live_todo::Ref{Any}
 
-    # The pin-board state (see taskbar.jl): ONE Julia-owned list of pinned
-    # items, mutated only via pin_task!/unpin_task! on the shared parent.
-    # Per-session views get a bridged child so each tab's TaskBar renders
-    # independently. This is the single source of truth — the JS side never
-    # derives taskbar state from the (virtually scrolled) chat DOM.
+    # TaskBar items for the pin-board (shared observable across session views).
     taskbar_items::Observable{Vector{TaskbarItem}}
 
-    # Monotonic turn counter (shared). Each run_turn! bumps it and ships it
-    # to the client; a stop-click sends it back so a cancel only ever
-    # applies to the turn the user was LOOKING AT — a stale click buffered
-    # behind a finished turn must not murder the next one.
-    turn_seq::Base.RefValue{Int}
+    # Turn sequence counter — bumped at the start of each prompt turn; used to
+    # detect stale stream events from a previous turn (see `drain_turn!`).
+    turn_seq::Ref{Int}
 
-    # Number of prompt turns currently in flight (shared). More than one is
-    # a real state: a prompt sent while another runs is claude-agent-acp's
-    # steering/handoff mechanism (see run_chat!). End-of-turn cleanup
-    # (orphan sweep, todo zombie-finalize) only runs when this drops to 0.
-    turns_active::Base.RefValue{Int}
+    # Count of active `prompt!` turns (normally 0 or 1). Two turns are only
+    # possible when a restart races an in-flight prompt — bounded by the CAS
+    # guard in `restart_chat_session!`.
+    turns_active::Ref{Int}
 
     # `time()` of the last inbound stream activity (shared). With a live
     # background shell the SDK holds the prompt open even after the agent
@@ -143,17 +127,22 @@ mutable struct ChatModel
     # poller. `taskbar_clock_on` guards the single timer.
     taskbar_clock::Observable{Float64}
     taskbar_clock_on::Base.RefValue{Bool}
+
+    # Current agent provider for this chat (ClaudeCode or MiMoCode).
+    # Observable so the UI can react to provider changes.
+    provider::Observable{AgentProvider}
 end
 
 function ChatModel(state::ServerState, cwd::AbstractString;
     project_id::AbstractString="",
     mcp_servers=AgentClientProtocol.MCPServer[],
-    transport::Union{ChatTransport,Nothing}=nothing)
+    transport::Union{ChatTransport,Nothing}=nothing,
+    provider::AgentProvider=ClaudeCode)
     chat_dir = chat_storage_dir(state, project_id, cwd)
     chat_session = load_session(chat_dir, cwd)
     msgs_store = load_history(chat_session)
     actual_transport = transport === nothing ?
-                       LocalTransport(cwd; mcp_servers=collect(AgentClientProtocol.MCPServer, mcp_servers)) :
+                       LocalTransport(cwd; mcp_servers=collect(AgentClientProtocol.MCPServer, mcp_servers), provider=provider) :
                        transport
     busy_active = Observable(false)
     # Wire busy_active → sidebar status LED: a prompt going in-flight (or
@@ -188,6 +177,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Ref(0.0),                   # last_stream_at
         Observable(time()),         # taskbar_clock (ticked by a Julia Timer)
         Ref(false),                 # taskbar_clock_on
+        Observable(provider),       # provider: the current agent backend
     )
 end
 
@@ -221,6 +211,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.last_stream_at,          # shared timestamp
             map(identity, session, m.taskbar_clock),   # per-tab clock bridge
             m.taskbar_clock_on,        # shared guard
+            map(identity, session, m.provider),  # per-tab provider bridge
         )
     end
 end
@@ -3789,12 +3780,56 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         end
     end
 
+    # ── Provider switcher ──────────────────────────────────────────────────
+    # Dropdown to switch between Claude Code, MiMo Code, and OpenCode per chat.
+    # Changing the provider restarts the session with the new backend.
+    # Wiring follows the restart button above: the DOM event notifies a plain
+    # Observable, Julia reacts via `on(session, …)` (a DOM node itself is not
+    # observable — `on(session, ::Node)` has no method). The `value` binding
+    # to `model.provider` keeps the select in sync when the provider changes
+    # from another tab (or programmatically).
+    provider_status = Observable("")
+    provider_choice = Observable("")
+    provider_select = DOM.select(
+        DOM.option("Claude Code"; value="ClaudeCode"),
+        DOM.option("MiMo Code"; value="MiMoCode"),
+        DOM.option("OpenCode"; value="OpenCode");
+        class = "bt-header-provider-select",
+        title = "Switch AI agent backend",
+        value = map(string, session, model.provider),
+        onchange = js"event => $(provider_choice).notify(event.target.value)")
+    on(session, provider_choice) do val
+        isempty(val) && return
+        new_provider = if val == "MiMoCode"
+            MiMoCode
+        elseif val == "OpenCode"
+            OpenCode
+        else
+            ClaudeCode
+        end
+        current = model.provider[]
+        new_provider == current && return
+        provider_status[] = "Switching…"
+        @async begin
+            try
+                switch_provider!(model, new_provider)
+            catch e
+                @warn "provider switch failed" exception=(e, catch_backtrace())
+                safe_set!(provider_status, "switch failed")
+            finally
+                safe_set!(provider_status, "")
+            end
+        end
+    end
+
     # No back arrow — the unified app's sidebar Home icon is the way home.
     # The session-config meta line renders as a second row BELOW the main one.
     DOM.div(
         DOM.div(
             status_dot,
             title_node,
+            provider_select,
+            provider_status,
             xsync_control,
             sync_button,
             restart_button;
@@ -3805,6 +3840,48 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
         # `comm`. Replaces the old per-tool filter toolbar.
         DOM.div(class="bt-lens-bar");
         class="bt-header")
+end
+
+# ── Provider switching ────────────────────────────────────────────────────────
+
+"""
+    switch_provider!(model::ChatModel, new_provider::AgentProvider)
+
+Switch the agent backend for a chat. This:
+1. Updates the provider observable
+2. Creates a new transport with the correct binary
+3. Restarts the session with the new backend
+
+The provider choice is NOT persisted across server restarts — it resets
+to ClaudeCode on construction. This is by design: providers may not be
+available on all machines, so a hard-coded preference would break.
+"""
+function switch_provider!(model::ChatModel, new_provider::AgentProvider)
+    s = shared(model)
+    s.provider[] = new_provider
+
+    # Resolve the binary for the new provider
+    new_bin = find_provider_bin(new_provider)
+
+    # Create a new transport with the correct binary
+    # For LocalTransport, swap the agent_bin. For WorkerTransport, we need
+    # to close the current session and let it reopen with the new provider.
+    old_transport = s.transport
+    if old_transport isa LocalTransport
+        s.transport = LocalTransport(
+            old_transport.cwd;
+            mcp_servers = old_transport.mcp_servers,
+            agent_bin = new_bin,
+            agent_env = old_transport.agent_env,
+            provider = new_provider)
+    elseif old_transport isa WorkerTransport
+        # WorkerTransport: update the provider field and let restart handle it
+        old_transport.provider = new_provider
+    end
+
+    # Restart the session with the new provider
+    restart_chat_session!(model)
+    return nothing
 end
 
 # Icons live as standalone SVG files under assets/icons/ and ship as

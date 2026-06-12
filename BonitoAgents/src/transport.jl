@@ -9,6 +9,87 @@
 
 const ACP = AgentClientProtocol
 
+# ── Agent provider abstraction ────────────────────────────────────────────────
+
+"""
+    AgentProvider
+
+Supported ACP agent backends. Each provider has its own binary and may
+require different environment variables or arguments.
+
+  * `ClaudeCode` — Anthropic's `claude-agent-acp` (Node.js CLI)
+  * `MiMoCode` — Xiaomi's `mimo acp` (Node.js CLI)
+  * `OpenCode` — OpenCode's `opencode acp` (Go CLI)
+"""
+@enum AgentProvider ClaudeCode MiMoCode OpenCode
+
+"""
+    provider_label(p::AgentProvider) -> String
+
+Human-readable label for the provider, used in UI elements.
+"""
+function provider_label(p::AgentProvider)
+    p == ClaudeCode && return "Claude Code"
+    p == MiMoCode && return "MiMo Code"
+    p == OpenCode && return "OpenCode"
+    return "Unknown"
+end
+
+"""
+    provider_icon(p::AgentProvider) -> String
+
+CSS class or icon identifier for the provider, used in UI badges.
+"""
+function provider_icon(p::AgentProvider)
+    p == ClaudeCode && return "bt-provider-claude"
+    p == MiMoCode && return "bt-provider-mimo"
+    p == OpenCode && return "bt-provider-opencode"
+    return "bt-provider-unknown"
+end
+
+"""
+    find_provider_bin(p::AgentProvider) -> String
+
+Discover the binary path for the given agent provider. Checks the
+provider-specific environment variable first, then PATH.
+"""
+function find_provider_bin(p::AgentProvider)
+    if p == ClaudeCode
+        explicit = get(ENV, "CLAUDE_AGENT_ACP", "")
+        !isempty(explicit) && return explicit
+        bin = Sys.which("claude-agent-acp")
+        bin !== nothing && return bin
+        return "claude-agent-acp"
+    elseif p == MiMoCode
+        explicit = get(ENV, "MIMO_AGENT_ACP", "")
+        !isempty(explicit) && return explicit
+        bin = Sys.which("mimo")
+        bin !== nothing && return bin
+        home = first(splitdir(homedir()))
+        mimo_path = joinpath(home, ".mimocode", "bin", "mimo")
+        isfile(mimo_path) && return mimo_path
+        return "mimo"
+    elseif p == OpenCode
+        explicit = get(ENV, "OPENCODE_AGENT_ACP", "")
+        !isempty(explicit) && return explicit
+        bin = Sys.which("opencode")
+        bin !== nothing && return bin
+        home = first(splitdir(homedir()))
+        opencode_path = joinpath(home, ".opencode", "bin", "opencode")
+        isfile(opencode_path) && return opencode_path
+        return "opencode"
+    else
+        error("Unknown provider: $p")
+    end
+end
+
+"""
+    find_agent_bin(p::AgentProvider = ClaudeCode) -> String
+
+Backward-compatible entry point: defaults to ClaudeCode.
+"""
+find_agent_bin(p::AgentProvider = ClaudeCode) = find_provider_bin(p)
+
 """
     abstract type ChatTransport <: ACP.Transport
 
@@ -40,6 +121,7 @@ mutable struct LocalTransport <: ChatTransport
     mcp_servers  :: Vector{ACP.MCPServer}
     agent_bin    :: String
     agent_env    :: Dict{String,String}
+    provider     :: AgentProvider
     # Lazily populated by start_session (set to the spawned process'
     # subprocess transport so send/recv/close can delegate).
     inner        :: Ref{Union{ACP.SubprocessTransport,Nothing}}
@@ -48,9 +130,10 @@ end
 LocalTransport(cwd::AbstractString;
                mcp_servers = ACP.MCPServer[],
                agent_bin   = ACP.find_agent_bin(),
-               agent_env   = Dict{String,String}()) =
+               agent_env   = Dict{String,String}(),
+               provider    = ClaudeCode) =
     LocalTransport(String(cwd), collect(ACP.MCPServer, mcp_servers),
-                    String(agent_bin), agent_env,
+                    String(agent_bin), agent_env, provider,
                     Ref{Union{ACP.SubprocessTransport,Nothing}}(nothing))
 
 ACP.send(t::LocalTransport, line::AbstractString) = ACP.send(t.inner[], line)
@@ -66,6 +149,7 @@ mutable struct WorkerTransport <: ChatTransport
     worker_path        :: String
     mcp_servers        :: Vector{ACP.MCPServer}
     resume_session_id  :: Union{String,Nothing}
+    provider           :: AgentProvider
     # Set by start_session once the worker dials back the ACP WS.
     ws                 :: Ref{Any}
 end
@@ -73,10 +157,11 @@ end
 WorkerTransport(state::ServerState, worker_id::AbstractString,
                 worker_path::AbstractString;
                 mcp_servers = ACP.MCPServer[],
-                resume_session_id::Union{String,Nothing} = nothing) =
+                resume_session_id::Union{String,Nothing} = nothing,
+                provider = ClaudeCode) =
     WorkerTransport(state, String(worker_id), String(worker_path),
                      collect(ACP.MCPServer, mcp_servers),
-                     resume_session_id, Ref{Any}(nothing))
+                     resume_session_id, provider, Ref{Any}(nothing))
 
 function ACP.send(t::WorkerTransport, line::AbstractString)
     ws = t.ws[]
@@ -193,13 +278,20 @@ end
 # (rather than per-transport state) keeps the tap per-session: a restart
 # builds a fresh Connection and re-arms the tap with it.
 
-# 1. Local: spawn claude-agent-acp, then drive initialize + session/new.
+# 1. Local: spawn claude-agent-acp or mimo acp, then drive initialize + session/new.
 function start_session(t::LocalTransport, handler::ACP.Handler;
                        on_frame::Union{Function,Nothing} = nothing)
-    isfile(t.agent_bin) || error("claude-agent-acp not found at: $(t.agent_bin)")
+    isfile(t.agent_bin) || error("Agent binary not found at: $(t.agent_bin)")
+    # Provider-specific environment: Claude uses CLAUDE_* vars, MiMo/OpenCode use their own.
+    provider_env = if t.provider == ClaudeCode
+        Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
+             "CLAUDE_MAX_TURNS"        => "100")
+    else
+        # MiMo and OpenCode don't need CLAUDE_* env vars
+        Dict{String,String}()
+    end
     env = merge(Dict(k => v for (k,v) in ENV),
-                Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
-                     "CLAUDE_MAX_TURNS"        => "100"),
+                provider_env,
                 t.agent_env)
     proc = open(Cmd(`$(t.agent_bin)`; env, dir = t.cwd), "r+")
     t.inner[] = ACP.SubprocessTransport(proc)
@@ -217,10 +309,18 @@ function start_session(t::LocalTransport, handler::ACP.Handler;
             "elicitation" => Dict("form" => true)),
         "clientInfo"         => Dict("name"    => "BonitoAgents.LocalTransport",
                                       "version" => "0.1.0")))
-    result = ACP.send_request(conn, "session/new",
-                              Dict("cwd" => t.cwd,
-                                   "mcpServers" => mcp_list_payload(t.mcp_servers)))
     # Local sessions are always fresh (`session/new`) — no resume, no replay.
+    # The raw result rides on the Client (session config: models/modes/…).
+    # For MiMo/OpenCode, skip the system_prompt_meta since they don't use
+    # Claude's `_meta.systemPrompt.preset` format.
+    session_params = if t.provider == ClaudeCode
+        merge(Dict("cwd" => t.cwd,
+                   "mcpServers" => mcp_list_payload(t.mcp_servers)),
+              system_prompt_meta(global_agents_md(t.state)))
+    else
+        Dict("cwd" => t.cwd, "mcpServers" => mcp_list_payload(t.mcp_servers))
+    end
+    result = ACP.send_request(conn, "session/new", session_params)
     # The raw result rides on the Client (session config: models/modes/…).
     return ACP.Client(conn, result["sessionId"], t.cwd, ACP._result_dict(result)),
            ACP.Message[]
@@ -251,6 +351,7 @@ function start_session(t::WorkerTransport, handler::ACP.Handler;
         "cwd"        => t.worker_path,
         "env"        => Dict{String,String}(),
         "mcpServers" => mcp_list,
+        "provider"   => string(t.provider),
     ))
 
     # Bounded wait for the worker's /worker-acp upgrade.
@@ -275,9 +376,13 @@ function start_session(t::WorkerTransport, handler::ACP.Handler;
     # history as session/update notifications; `replay_history` captures them.
     # Fresh → `session/new`, no replay. Either way the response carries the
     # session-config blocks (models/modes/configOptions) — keep it raw on the
-    # Client for typed views downstream. Both carry the server-global
-    # AGENTS.md as an appended system prompt (see `system_prompt_meta`).
-    prompt_meta = system_prompt_meta(global_agents_md(t.state))
+    # Client for typed views downstream. For MiMo/OpenCode, skip the
+    # system_prompt_meta since they don't use Claude's `_meta.systemPrompt.preset` format.
+    prompt_meta = if t.provider == ClaudeCode
+        system_prompt_meta(global_agents_md(t.state))
+    else
+        Dict{String,Any}()
+    end
     session_id, replay, result = if t.resume_session_id !== nothing
         @info "ACP: resuming session" cwd=t.worker_path resume=t.resume_session_id
         msgs, load_result = ACP.replay_history(conn, merge(Dict(

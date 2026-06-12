@@ -60,7 +60,7 @@ jobs:
       - uses: julia-actions/cache@v2
 
       - name: Instantiate AppBundler (meta env)
-        run: julia --project=BonitoAgentsApp/meta -e 'using Pkg; Pkg.instantiate()'
+        run: julia --project=BonitoAgentsApp/meta -e 'using Pkg; Pkg.instantiate(); Pkg.build()'
 
       - name: Instantiate app project
         run: julia --project=BonitoAgentsApp -e 'using Pkg; Pkg.instantiate()'

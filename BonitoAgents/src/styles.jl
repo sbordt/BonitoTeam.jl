@@ -180,6 +180,24 @@ const ChatStyles = Bonito.Styles(
     CSS("@keyframes bt-restart-pulse",
         CSS("0%, 100%", "box-shadow" => "0 0 0 0 rgba(220,38,38,0.0)"),
         CSS("50%",      "box-shadow" => "0 0 0 6px rgba(220,38,38,0.15)")),
+    # ── Provider switcher ──────────────────────────────────────────────────
+    # Dropdown to switch between Claude Code and MiMo Code. Styled as a
+    # compact pill similar to the restart button.
+    CSS(".bt-header-provider-select",
+        "appearance" => "none",
+        "border" => "1px solid var(--bt-border)",
+        "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text)",
+        "font-size" => "12px", "padding" => "4px 10px",
+        "border-radius" => "6px",
+        "cursor" => "pointer",
+        "white-space" => "nowrap",
+        "transition" => "background 80ms"),
+    CSS(".bt-header-provider-select:hover",
+        "background" => "var(--bt-surface-2)"),
+    CSS(".bt-header-provider-select:focus",
+        "outline" => "2px solid var(--bt-accent)",
+        "outline-offset" => "1px"),
     # ── Session-config meta line (model / mode / effort — `header_meta_line`).
     # Plain muted text below the title row; items joined with " · ", full
     # descriptions in the per-item tooltip.

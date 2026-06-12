@@ -758,6 +758,48 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
                           Dict{String,String}(get(cmd, "env", Dict{String,String}())))
     isempty(sid) && (@error "open_session missing sid"; return)
 
+    # Handle provider selection: the server may request a specific agent
+    # provider (e.g. "ClaudeCode", "MiMoCode", or "OpenCode"). If specified,
+    # resolve the correct binary for that provider; otherwise use the worker's
+    # default agent_bin.
+    provider_str = String(get(cmd, "provider", ""))
+    resolved_agent_bin = if !isempty(provider_str)
+        if provider_str == "MiMoCode"
+            mimo_bin = get(ENV, "MIMO_AGENT_ACP", "")
+            if isempty(mimo_bin)
+                mimo_bin_path = which_executable("mimo")
+                if mimo_bin_path === nothing
+                    home = first(splitdir(homedir()))
+                    mimo_path = joinpath(home, ".mimocode", "bin", "mimo")
+                    mimo_bin = isfile(mimo_path) ? mimo_path : "mimo"
+                else
+                    mimo_bin = mimo_bin_path
+                end
+            end
+            mimo_bin
+        elseif provider_str == "OpenCode"
+            oc_bin = get(ENV, "OPENCODE_AGENT_ACP", "")
+            if isempty(oc_bin)
+                oc_bin_path = which_executable("opencode")
+                if oc_bin_path === nothing
+                    home = first(splitdir(homedir()))
+                    oc_path = joinpath(home, ".opencode", "bin", "opencode")
+                    oc_bin = isfile(oc_path) ? oc_path : "opencode"
+                else
+                    oc_bin = oc_bin_path
+                end
+            end
+            oc_bin
+        elseif provider_str == "ClaudeCode"
+            agent_bin
+        else
+            @warn "BonitoWorker: unknown provider '$provider_str', falling back to default" sid
+            agent_bin
+        end
+    else
+        agent_bin
+    end
+
     # Create the working dir if missing. A failure here (permissions, a file in
     # the way) is fatal for this session — narrow the catch to filesystem errors,
     # report it to the server, and bail instead of silently swallowing it and
@@ -779,19 +821,26 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
     # reachable. The server cannot reliably guess its own outward URL (see
     # `Bonito.online_url` behavior under `proxy_url="."`), so it stays out of
     # the URL-naming business.
+    # Provider-specific env: Claude uses CLAUDE_* vars, MiMo/OpenCode use their own.
+    provider_env = if provider_str == "ClaudeCode"
+        Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
+             "CLAUDE_MAX_TURNS"       => "100")
+    else
+        # MiMo and OpenCode don't need CLAUDE_* env vars
+        Dict{String,String}()
+    end
     env = merge(Dict(string(k) => string(v) for (k, v) in ENV),
-                Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
-                     "CLAUDE_MAX_TURNS"       => "100",
-                     "BONITOAGENTS_SERVER_URL"  => server_url),
+                provider_env,
+                Dict("BONITOAGENTS_SERVER_URL"  => server_url),
                 env_overrides)
 
     proc = try
-        open(Cmd(`$agent_bin`; env, dir = cwd), "r+")
+        open(Cmd(`$resolved_agent_bin`; env, dir = cwd), "r+")
     catch e
         return report_open_session_failed(ws, sid,
-            "failed to spawn agent ($agent_bin): $(sprint(showerror, e))")
+            "failed to spawn agent ($resolved_agent_bin): $(sprint(showerror, e))")
     end
-    @info "BonitoWorker: ACP session started" sid cwd pid=getpid()
+    @info "BonitoWorker: ACP session started" sid cwd pid=getpid() provider=provider_str
 
     acp_url = ws_url(server_url, "/worker-acp")
     # Outer try/finally guarantees the agent process is reaped on EVERY exit

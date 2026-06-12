@@ -146,7 +146,7 @@ end
 
 # SIGINT every in-flight eval matching `env_path` and arm the worker-kill
 # fallback for each (see `finalize_cancelled_eval!`). Shared by the MCP
-# `notifications/cancelled` path and the BonitoTeam control channel's
+# `notifications/cancelled` path and the BonitoAgents control channel's
 # `interrupt_eval` op (ctrl_ws.jl). Returns the number of evals interrupted.
 #
 # `env_path === nothing` means "every in-flight eval" — this process serves
@@ -224,7 +224,7 @@ function run_stdio(; in::IO = stdin, out::IO = stdout)
     log_info("$(SERVER_NAME) v$(SERVER_VERSION) listening on stdio (protocol $(PROTOCOL_VERSION))")
     log_info("Registered $(length(TOOLS)) tool(s): " *
              join((t.name for t in TOOLS), ", "))
-    # BonitoTeam-hosted runs get a control dial-back so the chat UI can
+    # BonitoAgents-hosted runs get a control dial-back so the chat UI can
     # interrupt in-flight evals per tool (no-op standalone; see ctrl_ws.jl).
     start_ctrl_dialback!()
     for line in eachline(in)

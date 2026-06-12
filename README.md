@@ -1,25 +1,25 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="BonitoTeam/assets/logo/bonitoteam-dark.svg">
-    <img src="BonitoTeam/assets/logo/bonitoteam-light.svg" alt="BonitoTeam" width="160">
+    <source media="(prefers-color-scheme: dark)" srcset="BonitoAgents/assets/logo/bonitoagents-dark.svg">
+    <img src="BonitoAgents/assets/logo/bonitoagents-light.svg" alt="BonitoAgents" width="160">
   </picture>
 </p>
 
-# BonitoTeam
+# BonitoAgents
 
 Self-hosted multi-host orchestrator for agentic coding sessions. Architecture:
-[../BonitoTeam-Design.md](../BonitoTeam-Design.md). Conventions:
+[../BonitoAgents-Design.md](../BonitoAgents-Design.md). Conventions:
 [../CONVENTIONS.md](../CONVENTIONS.md). External SDK / MCP specs:
 [../docs/external/](../docs/external/).
 
 ## Layout
 
 ```
-BonitoTeam/
+BonitoAgents/
 ├── Project.toml                # Package deps
 ├── README.md                   # this file
 ├── src/
-│   ├── BonitoTeam.jl           # umbrella module
+│   ├── BonitoAgents.jl           # umbrella module
 │   └── MCP/                    # Julia stdio MCP server
 │       ├── MCP.jl
 │       ├── server.jl           # JSON-RPC 2.0 dispatch loop
@@ -36,7 +36,7 @@ later milestones (see Design doc).
 ## First-time setup
 
 ```bash
-cd /sim/Programmieren/ClaudeExperiments/BonitoTeam
+cd /sim/Programmieren/ClaudeExperiments/BonitoAgents
 julia --project=. -e 'import Pkg; Pkg.instantiate()'
 ```
 
@@ -50,9 +50,9 @@ After `Pkg.instantiate`, add this to Claude Code's MCP config (e.g. project-leve
 ```json
 {
   "mcpServers": {
-    "bonitoteam": {
+    "bonitoagents": {
       "command": "julia",
-      "args": ["--project=@bonito-team", "--startup-file=no",
+      "args": ["--project=@bonito-agents", "--startup-file=no",
                "-e", "using BonitoMCP; BonitoMCP.run_stdio()"]
     }
   }
@@ -87,8 +87,8 @@ Or interactively from this project's root via julia_eval:
 
 ```julia
 import Pkg; Pkg.activate("/sim/Programmieren/ClaudeExperiments")
-include("/sim/Programmieren/ClaudeExperiments/BonitoTeam/src/MCP/MCP.jl")
-# in-process tests work without instantiating BonitoTeam env
+include("/sim/Programmieren/ClaudeExperiments/BonitoAgents/src/MCP/MCP.jl")
+# in-process tests work without instantiating BonitoAgents env
 ```
 
 The 9 in-process tests in [test/smoke_mcp.jl](test/smoke_mcp.jl) cover:
@@ -96,6 +96,41 @@ initialize handshake, tools/list, simple eval, state persistence, stdout
 capture, error handling, output truncation, full_output bypass, large-container
 summarization. The subprocess test additionally drives the binary end-to-end
 over real stdio.
+
+## Desktop app (BonitoAgentsApp)
+
+[BonitoAgentsApp/](BonitoAgentsApp/) is the AppBundler-packaged desktop app:
+one process that starts the BonitoAgents server on loopback, registers this
+machine as a local worker, and opens the dashboard in an
+[ElectronCall](https://github.com/JuliaWeb/ElectronCall.jl) window. Closing
+the window shuts everything down. State persists across launches under the
+platform data dir (`~/.local/share/BonitoAgents` on Linux).
+
+Run from source:
+
+```bash
+julia --project=BonitoAgentsApp -m BonitoAgentsApp            # Electron window
+julia --project=BonitoAgentsApp -m BonitoAgentsApp --no-window # server only
+```
+
+The package carries a `PrecompileTools.@compile_workload` that boots the
+server, renders the dashboard through a real HTTP request and performs a
+worker handshake, so most of the first-launch latency is precompiled into the
+bundle.
+
+## Release bundles (CI)
+
+[.github/workflows/build-app.yml](.github/workflows/build-app.yml) builds the
+app with [AppBundler](https://github.com/PeaceFounder/AppBundler.jl) for
+Linux (snap, x86_64 + aarch64), macOS (dmg, x86_64 + aarch64) and Windows
+(msix, x86_64):
+
+- every push to `main` → bundles as workflow artifacts
+- every `v*` tag → a GitHub release is created for the tag and the bundles
+  are attached to it
+
+Local build: `julia --project=BonitoAgentsApp/meta -m AppBundler build
+BonitoAgentsApp --build-dir=build`.
 
 ## Output discipline (enforced server-side)
 

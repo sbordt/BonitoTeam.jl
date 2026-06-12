@@ -1,6 +1,6 @@
 # A `running` checkpoint must return the SAME block shape as a `completed`
 # response — fenced ```julia code echo first, then a `stdout:`-prefixed
-# console block — so the BonitoTeam chat renders both via `render_eval_body`
+# console block — so the BonitoAgents chat renders both via `render_eval_body`
 # (Code + Output collapsibles, RichText for ANSI/stdout). The earlier shape
 # was a single `status: running…\n\n…` text block that fell through to
 # `Markdown.parse`, italicizing tool names like `bt_julia_continue` and

@@ -231,13 +231,31 @@ function relay_writer(eb::EvalBridge, outbound::Channel{Vector{UInt8}})
     return nothing
 end
 
+# A short, non-reversible fingerprint of a secret — lets two log lines be
+# compared ("worker sent <x>, server expects <y>") without ever printing the
+# secret itself. Matches the sha8 form the diagnosing agent expected.
+secret_fingerprint(s::AbstractString) = isempty(s) ? "<empty>" : bytes2hex(SHA.sha256(s))[1:8]
+
 function handle_eval_ws(state::ServerState, ws)
-    line = try; String(HTTP.WebSockets.receive(ws)); catch; return; end
+    line = try; String(HTTP.WebSockets.receive(ws)); catch e
+        @warn "eval dial-back rejected: handshake never arrived" exception=e; return
+    end
     parts = split(strip(line), ' '; limit = 3)
-    if length(parts) != 3 || parts[1] != state.worker_secret
-        @warn "eval dial-back: bad handshake"; return
+    # Self-diagnosing: split the lumped "bad handshake" into the real reason so a
+    # rejection is one log line, not a detective hunt. Expected: "secret project_id prefix".
+    if length(parts) != 3
+        @warn "eval dial-back rejected: malformed handshake (expected 3 fields 'secret project_id prefix')" got_fields=length(parts) project_id=(length(parts) ≥ 2 ? String(parts[2]) : "") has_prefix=(length(parts) ≥ 3 && !isempty(parts[3]))
+        return
+    end
+    if parts[1] != state.worker_secret
+        @warn "eval dial-back rejected: secret MISMATCH — worker dialed with a different secret than the server expects (stale env / server restarted with a new secret / port reused)" worker_secret=secret_fingerprint(parts[1]) server_secret=secret_fingerprint(state.worker_secret) project_id=String(parts[2])
+        return
     end
     project_id = String(parts[2]); prefix = String(parts[3])
+    if isempty(prefix)
+        @warn "eval dial-back rejected: empty bridge prefix (worker RemoteProxy bridge setup failed)" project_id
+        return
+    end
     if state.srv === nothing
         @warn "eval dial-back with no live server — cannot proxy assets"; return
     end
@@ -390,8 +408,12 @@ mcp_ctrl_for(state::ServerState, project_id::AbstractString) =
 function handle_mcp_ctrl_ws(state::ServerState, ws)
     line = try; String(HTTP.WebSockets.receive(ws)); catch; return; end
     parts = split(strip(line), ' '; limit = 2)
-    if length(parts) != 2 || parts[1] != state.worker_secret
-        @warn "mcp ctrl dial-back: bad handshake"
+    if length(parts) != 2
+        @warn "mcp ctrl dial-back rejected: malformed handshake (expected 2 fields 'secret project_id')" got_fields=length(parts)
+        return
+    end
+    if parts[1] != state.worker_secret
+        @warn "mcp ctrl dial-back rejected: secret MISMATCH" worker_secret=secret_fingerprint(parts[1]) server_secret=secret_fingerprint(state.worker_secret) project_id=String(parts[2])
         return
     end
     project_id = String(parts[2])

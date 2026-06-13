@@ -167,10 +167,21 @@ function julia_show_app_handler(args::AbstractDict)
     catch
         false
     end
-    bridge_live || return Dict{String,Any}(
-        "content" => [Dict("type"=>"text",
-            "text"=>"error: eval-ws bridge not connected — the worker could not dial back to the BonitoAgents server. Common causes: server restarted while the worker session was running (the worker keeps a stale dial state); BONITOAGENTS_SERVER_URL not set in the MCP env; BONITOAGENTS_SECRET mismatch. Try bt_julia_restart to rebuild the worker process, or restart the BonitoAgents server cleanly.")],
-        "isError" => true)
+    if !bridge_live
+        # Surface the REAL captured failure (set in ensure_eval_dialed!) instead
+        # of a generic guess — e.g. `UndefVarError: proxy_send` when the eval env
+        # resolved a Bonito without the remote-app API, or the actual dial reason.
+        detail = isempty(s.dial_error) ?
+            "no specific worker-side error was captured (the bridge build returned but the dial never connected)." :
+            s.dial_error
+        return Dict{String,Any}(
+            "content" => [Dict("type"=>"text",
+                "text"=> "error: bt_show_app could not connect the live-app bridge to the BonitoAgents server.\n\n" *
+                         "Worker-side cause:\n" * detail * "\n\n" *
+                         "Hints: if the cause mentions a missing Bonito symbol (e.g. `proxy_send`), the eval env loaded a different Bonito than the server — open this chat in a project that pins the same Bonito, or run bt_julia_restart. " *
+                         "If it mentions the dial/URL, the BonitoAgents server may have restarted or BONITOAGENTS_SERVER_URL/SECRET isn't set in the MCP env.")],
+            "isError" => true)
+    end
     id = string(rand(UInt64); base = 16)
     try
         Malt.remote_eval_fetch(s.worker, quote

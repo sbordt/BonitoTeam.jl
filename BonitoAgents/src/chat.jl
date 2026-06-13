@@ -3823,21 +3823,21 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     end
 
     # No back arrow — the unified app's sidebar Home icon is the way home.
-    # The session-config meta line renders as a second row BELOW the main one.
+    # One compact control row (title + the session-config "model" picks + the
+    # provider/sync/restart buttons), then the always-on lens search bar.
     DOM.div(
         DOM.div(
             status_dot,
             title_node,
+            meta_line,
             provider_select,
             provider_status,
             xsync_control,
             sync_button,
             restart_button;
             class="bt-header-row"),
-        meta_line,
-        # Lens search bar — under the title. JS (`_setupLens`) builds the
-        # input + autocomplete + saved-lens chips inside it and wires it to
-        # `comm`. Replaces the old per-tool filter toolbar.
+        # Lens search bar — always visible. JS (`_setupLens`) builds the input
+        # + autocomplete + saved-lens chips inside it and wires it to `comm`.
         DOM.div(class="bt-lens-bar");
         class="bt-header")
 end

@@ -98,15 +98,20 @@ function sidebar_entry(label::AbstractString, icon::Bonito.Node,
                         status::Union{Symbol,Nothing} = nothing)
     # The icon now carries the worker initials (project_icon does the
     # styling); the title span only needs the chat title text.
-    kids = Any[icon, DOM.span(label; class = "bt-side-name")]
-    # Status LED (green pulse / yellow / red). Rendered as a small absolutely
-    # positioned dot anchored to the icon — `data-status` lets the CSS
-    # pick the colour + animation. The 1Hz `recompute_status_dom!` JS
-    # updates this attr in place so the LED reactivity doesn't require a
-    # body re-render. Home entry has no LED (status === nothing).
-    status === nothing || push!(kids, DOM.span(""; class = "bt-side-led",
-                                                title = string(status),
-                                                dataStatus = string(status)))
+    # Status LED (green pulse / yellow / red) nestled as a presence badge on the
+    # icon's bottom-right corner (anchored to the icon, so it stays put whether
+    # the rail is expanded or collapsed to icons). `data-status` lets the CSS
+    # pick the colour + animation; the 1Hz `recompute_status_dom!` JS updates the
+    # attr in place. Home entry has no LED (status === nothing).
+    icon_node = if status === nothing
+        icon
+    else
+        DOM.div(icon,
+                DOM.span(""; class = "bt-side-led", title = string(status),
+                         dataStatus = string(status));
+                class = "bt-side-icon-wrap")
+    end
+    kids = Any[icon_node, DOM.span(label; class = "bt-side-name")]
     # A ✕ to close (stop) an active chat. Plain markup — the delegated
     # handler on the aside reads `.bt-side-close` and routes to close_trigger
     # rather than current_view, so no per-entry Observable is interpolated
@@ -305,16 +310,24 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # VSCode-style collapse toggle: shrinks the sidebar to an icons-only rail
     # (more room for the workspace). State persists in localStorage and is
     # restored on the aside's onload below. Pure-JS toggle — no server hop.
-    collapse_btn = DOM.div(
-        DOM.span("«"; class = "bt-side-collapse-glyph");
-        class = "bt-side-collapse", title = "Collapse / expand sidebar",
+    panel_icon = Bonito.SVG.svg(
+        Bonito.SVG.rect(x = "2.5", y = "3", width = "11", height = "10", rx = "1.5"),
+        Bonito.SVG.line(x1 = "6.5", y1 = "3", x2 = "6.5", y2 = "13");
+        viewBox = "0 0 16 16", width = "16", height = "16", fill = "none",
+        stroke = "currentColor", var"stroke-width" = "1.4",
+        var"stroke-linecap" = "round", var"stroke-linejoin" = "round",
+        var"aria-hidden" = "true")
+    collapse_btn = DOM.button(
+        panel_icon;
+        class = "bt-side-collapse", title = "Toggle sidebar (Ctrl/⌘+B)",
         onclick = js"""event => {
-            const aside = event.target.closest('.bt-sidebar');
+            const aside = event.currentTarget.closest('.bt-sidebar');
             const collapsed = aside.classList.toggle('bt-collapsed');
             try { localStorage.setItem('bt-sidebar-collapsed', collapsed ? '1' : '0'); } catch (_) {}
         }""")
+    header = DOM.div(collapse_btn; class = "bt-side-header")
 
-    aside = DOM.aside(collapse_btn, body; class = "bt-sidebar", dataBootId = server_boot_id())
+    aside = DOM.aside(header, body; class = "bt-sidebar", dataBootId = server_boot_id())
 
     # Delegated click handler: one listener on the aside. A click on a
     # `.bt-side-close` ✕ routes to `close_trigger`; anything else on a
@@ -449,23 +462,27 @@ const SidebarStyles = Bonito.Styles(
         "padding" => "10px 0"),
     CSS(".bt-side-list",
         "display" => "flex", "flex-direction" => "column", "gap" => "2px"),
-    # VSCode-style collapse toggle (top of the rail) + the collapsed rail itself.
-    CSS(".bt-side-collapse",
+    # Header rail: holds the VSCode-style sidebar toggle. Right-aligned when
+    # expanded, centered when collapsed.
+    CSS(".bt-side-header",
         "display" => "flex", "align-items" => "center", "justify-content" => "flex-end",
-        "padding" => "0 12px 8px", "cursor" => "pointer",
-        "color" => "var(--bt-text-muted)", "user-select" => "none",
-        "font-size" => "15px", "line-height" => "1"),
-    CSS(".bt-side-collapse:hover", "color" => "var(--bt-text)"),
-    CSS(".bt-side-collapse-glyph",
-        "display" => "inline-block",
-        "transition" => "transform 120ms ease"),
+        "padding" => "0 8px 6px", "flex-shrink" => "0"),
+    CSS(".bt-side-collapse",
+        "display" => "inline-flex", "align-items" => "center", "justify-content" => "center",
+        "width" => "28px", "height" => "28px", "padding" => "0",
+        "background" => "transparent", "border" => "none",
+        "border-radius" => "var(--bt-radius-sm)",
+        "color" => "var(--bt-text-muted)", "cursor" => "pointer",
+        "transition" => "background 80ms, color 80ms",
+        "-webkit-tap-highlight-color" => "transparent"),
+    CSS(".bt-side-collapse:hover",
+        "background" => "var(--bt-surface-2)", "color" => "var(--bt-text)"),
     CSS(".bt-sidebar.bt-collapsed", "width" => "56px"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-name", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-item", "justify-content" => "center"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-section", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-empty", "display" => "none"),
-    CSS(".bt-sidebar.bt-collapsed .bt-side-collapse", "justify-content" => "center"),
-    CSS(".bt-sidebar.bt-collapsed .bt-side-collapse-glyph", "transform" => "rotate(180deg)"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-header", "justify-content" => "center", "padding" => "0 0 6px"),
     CSS(".bt-side-item",
         # `align-items: flex-start` keeps the icon at the top of two-line
         # titles instead of jumping down to vertical-center the row.
@@ -486,11 +503,18 @@ const SidebarStyles = Bonito.Styles(
     # Position is relative to the entry so the LED follows the icon when
     # the entry wraps over two lines on a narrow column.
     CSS(".bt-side-item", "position" => "relative"),
+    # Icon + presence-badge wrapper: the LED nestles on the icon's corner and
+    # rides with it whether the rail is expanded or collapsed.
+    CSS(".bt-side-icon-wrap",
+        "position" => "relative", "flex-shrink" => "0",
+        "display" => "flex", "line-height" => "0"),
     CSS(".bt-side-led",
         "position" => "absolute",
-        "top" => "30px", "left" => "33px",
-        "width" => "6px", "height" => "6px",
+        "right" => "-2px", "bottom" => "-2px",
+        "width" => "10px", "height" => "10px",
         "border-radius" => "50%",
+        "border" => "2px solid var(--bt-surface)",
+        "box-sizing" => "border-box",
         "background" => "var(--bt-text-faint)",
         "transition" => "background 120ms"),
     CSS(".bt-side-led[data-status=\"offline\"]",
@@ -761,10 +785,16 @@ function project_loading_view(state::ServerState, pid::String,
     # Node, not an Observable{Node}. Returning the bare `map(state.workers)`
     # threw `MethodError: Cannot convert Observable{Node} to Node` and the
     # loading view never appeared while the bring-up ran.
+    # The spinner is a STABLE sibling, rendered once OUTSIDE the reactive `body`
+    # below. If it lived inside the `map`, every `state.workers` notify during
+    # bring-up would recreate the element and restart its CSS rotation from 0° —
+    # the classic "the spinner doesn't spin". Offline/error branches tag their
+    # content `.bt-loading-msg`, and CSS (`:has`) hides the spinner for them.
+    spinner = DOM.div(class = "bt-loading-spinner")
     body = map(state.workers) do workers
         p = get(state.projects[], pid, nothing)
         p === nothing && return DOM.div("Unknown project: $pid";
-                                        class = "bt-empty",
+                                        class = "bt-empty bt-loading-msg",
                                         style = Styles("padding" => "40px"))
         w      = get(workers, p.worker_id, nothing)
         wname  = w === nothing ? p.worker_id : w.name
@@ -776,7 +806,7 @@ function project_loading_view(state::ServerState, pid::String,
                 DOM.div("$(p.name) lives on $(wname), which isn't connected " *
                         "right now. Start that worker to open this chat.";
                         class = "bt-loading-sub");
-                class = "bt-loading")
+                class = "bt-loading-msg")
         end
         if haskey(ls.errors, pid)
             return DOM.div(
@@ -787,7 +817,7 @@ function project_loading_view(state::ServerState, pid::String,
                         class   = "bt-btn bt-btn-secondary",
                         style   = Styles("margin-top" => "6px"),
                         onclick = js"() => $(ls.retry).notify($(pid))");
-                class = "bt-loading")
+                class = "bt-loading-msg")
         end
         # Gate the bring-up on the chat still being the one on screen (T5). This
         # `map(state.workers)` body is NOT session-scoped, so it survives the
@@ -813,13 +843,12 @@ function project_loading_view(state::ServerState, pid::String,
             end
         end
         DOM.div(
-            DOM.div(class = "bt-loading-spinner"),
             DOM.div("Opening $(p.name)…"; class = "bt-loading-title"),
             DOM.div("Connecting to $(wname) and restoring the conversation…";
                     class = "bt-loading-sub");
-            class = "bt-loading")
+            class = "bt-loading-text")
     end
-    return DOM.div(body; class = "bt-loading-wrap")
+    return DOM.div(DOM.div(spinner, body; class = "bt-loading"); class = "bt-loading-wrap")
 end
 
 # Phases 2+3 of the load screen: the card for a chat whose ChatModel IS

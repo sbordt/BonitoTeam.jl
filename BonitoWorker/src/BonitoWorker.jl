@@ -1628,6 +1628,11 @@ end
 function entry_from_jsonl(jsonl::AbstractString, pid_map::Dict{String,Int})
     cwd, preview = scan_jsonl_metadata(jsonl)
     cwd === nothing && return nothing
+    # Drop sessions whose project folder no longer exists. Claude keeps the
+    # session jsonl under ~/.claude/projects forever, so deleted folders
+    # (throwaway temp dirs especially) would otherwise linger in the list with
+    # nothing to resume into.
+    isdir(String(cwd)) || return nothing
     sid = first(splitext(basename(jsonl)))
     is_subagent = occursin("/subagents/", replace(jsonl, '\\' => '/'))
     agent_type        = nothing

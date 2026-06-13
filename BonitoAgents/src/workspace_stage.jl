@@ -25,7 +25,12 @@ function install_workspace!(session::Bonito.Session,
                             chat_content)
     chat_panel = Panel("chat", DOM.div(chat_content; class = "bt-main");
                        label = "Chat", closable = false)
-    ws = Workspace(chat_panel; style = Bonito.Styles("min-height" => "0"))
+    # `hide_single_tab`: with only the chat open there's nothing to manage, so
+    # the workspace drops its tab bar and the chat goes full-bleed (like a plain
+    # app). The bar appears the moment a second panel (a file / detached app)
+    # joins or the user splits.
+    ws = Workspace(chat_panel; hide_single_tab = true,
+                   style = Bonito.Styles("min-height" => "0"))
     pane.workspace[] = ws
 
     # The floating "app" panel's mount: detached `bt_show_app` embeds are moved

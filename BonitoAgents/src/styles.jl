@@ -81,6 +81,7 @@ const ChatStyles = Bonito.Styles(
         "width" => "100%"),
 
     # ── Lens search bar (header) ─────────────────────────────────────────────
+    # Always visible, directly under the control row.
     CSS(".bt-lens-bar",
         "display" => "flex", "flex-direction" => "column", "gap" => "6px",
         "margin-top" => "8px", "width" => "100%"),
@@ -316,10 +317,14 @@ const ChatStyles = Bonito.Styles(
     # ── Session-config meta line (model / mode / effort — `header_meta_line`).
     # Plain muted text below the title row; items joined with " · ", full
     # descriptions in the per-item tooltip.
+    # Sits inline in the control row (the session-config "model" picks). Shrinks
+    # and ellipsizes before the fixed buttons do; pushed to the right by the
+    # title's flex-grow.
     CSS(".bt-header-meta",
         "font-size" => "12px",
         "color" => "var(--bt-text-muted)",
-        "margin-top" => "2px",
+        "flex" => "0 1 auto", "min-width" => "0",
+        "margin-left" => "auto",
         "white-space" => "nowrap",
         "overflow" => "hidden",
         "text-overflow" => "ellipsis"),
@@ -1591,7 +1596,11 @@ const ChatStyles = Bonito.Styles(
         "animation" => "bt-spin 0.7s linear infinite",
         "flex-shrink" => "0",
         "display" => "inline-block"),
-    CSS("@keyframes bt-spin", CSS("to", "transform" => "rotate(360deg)")),
+    # Explicit `from` so it's an angle interpolation (0°→360°); `to` alone
+    # interpolates matrix→identity and never turns. See dashboard.jl bt-spin.
+    CSS("@keyframes bt-spin",
+        CSS("from", "transform" => "rotate(0deg)"),
+        CSS("to", "transform" => "rotate(360deg)")),
 
     # ── Responsive ───────────────────────────────────────────────────────────
     CSS("@media (max-width: 480px)",

@@ -3029,6 +3029,18 @@ function start_chat_client!(model::ChatModel)
         AgentClientProtocol.FSRequestHandler(agent_cwd(model.transport)),
         shared(model))
 
+    # For MockTransport: create a fresh instance before start_session so the
+    # old connection's reader_loop.finally (which calls close(conn.transport))
+    # can't close the NEW channels. The old reader_loop closes the OLD
+    # MockTransport's channels (harmless — nobody references them anymore);
+    # the fresh instance carries the new channels start_session will use.
+    if model.transport isa MockTransport
+        old_t = model.transport
+        model.transport = MockTransport(old_t.on_setup;
+                                       cwd = old_t.cwd,
+                                       capacity = old_t.capacity)
+    end
+
     # Capture the recorded session id BEFORE start_session so we can detect
     # "fresh session, not a resume". A mismatch means claude has no memory of
     # `msgs_store` (e.g. project synced to a different worker), so we arm a
@@ -3793,7 +3805,8 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     provider_select = DOM.select(
         DOM.option("Claude Code"; value="ClaudeCode"),
         DOM.option("MiMo Code"; value="MiMoCode"),
-        DOM.option("OpenCode"; value="OpenCode");
+        DOM.option("OpenCode"; value="OpenCode"),
+        DOM.option("Mock Agent"; value="MockCode");
         class = "bt-header-provider-select",
         title = "Switch AI agent backend",
         value = map(string, session, model.provider),
@@ -3804,6 +3817,8 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
             MiMoCode
         elseif val == "OpenCode"
             OpenCode
+        elseif val == "MockCode"
+            MockCode
         else
             ClaudeCode
         end

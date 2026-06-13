@@ -133,6 +133,8 @@ include("test_acp_log.jl")
 
 include("test_session_config.jl")
 
+include("test_provider_switch.jl")
+
 # ── Remote-app proxy bridge (BonitoMCP RemoteProxy ↔ BonitoAgents EvalBridge) ──
 # Server-side EvalBridge unit test — disconnect fast-fail, fail_pending!, reply
 # routing. Pure headless (a bare HTTPAssetServer stands in for the asset host).
@@ -173,3 +175,9 @@ include("test_real_lens_e2e.jl")
 # null.bonitoKeyedList), per-chat floating/plotpane/divider-width residence, and
 # interactivity surviving a hide/show. Self-gates on BT_RUN_E2E.
 include("test_resident_layout.jl")
+
+# Real-browser provider-switch e2e: opens a chat, sends a message, switches
+# providers via the UI dropdown (MockCode <-> ClaudeCode, MockCode <-> MiMoCode),
+# verifies the session restarts correctly and messages still work. Self-gates on
+# BT_RUN_E2E.
+include("test_provider_switch_e2e.jl")

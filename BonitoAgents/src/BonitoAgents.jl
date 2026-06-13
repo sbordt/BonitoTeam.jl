@@ -56,7 +56,7 @@ include("server.jl")           # serve()
 include("dev.jl")              # dev_server() — self-contained dev rig
 
 export serve, dev_server
-export AgentProvider, ClaudeCode, MiMoCode, OpenCode
+export AgentProvider, ClaudeCode, MiMoCode, OpenCode, MockCode
 export provider_label, provider_icon, find_provider_bin, switch_provider!
 
 end # module BonitoAgents

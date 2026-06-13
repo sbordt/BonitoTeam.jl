@@ -20,8 +20,9 @@ require different environment variables or arguments.
   * `ClaudeCode` — Anthropic's `claude-agent-acp` (Node.js CLI)
   * `MiMoCode` — Xiaomi's `mimo acp` (Node.js CLI)
   * `OpenCode` — OpenCode's `opencode acp` (Go CLI)
+  * `MockCode` — Test-only mock agent (Julia script, for e2e testing)
 """
-@enum AgentProvider ClaudeCode MiMoCode OpenCode
+@enum AgentProvider ClaudeCode MiMoCode OpenCode MockCode
 
 """
     provider_label(p::AgentProvider) -> String
@@ -32,6 +33,7 @@ function provider_label(p::AgentProvider)
     p == ClaudeCode && return "Claude Code"
     p == MiMoCode && return "MiMo Code"
     p == OpenCode && return "OpenCode"
+    p == MockCode && return "Mock Agent"
     return "Unknown"
 end
 
@@ -44,6 +46,7 @@ function provider_icon(p::AgentProvider)
     p == ClaudeCode && return "bt-provider-claude"
     p == MiMoCode && return "bt-provider-mimo"
     p == OpenCode && return "bt-provider-opencode"
+    p == MockCode && return "bt-provider-mock"
     return "bt-provider-unknown"
 end
 
@@ -78,6 +81,14 @@ function find_provider_bin(p::AgentProvider)
         opencode_path = joinpath(home, ".opencode", "bin", "opencode")
         isfile(opencode_path) && return opencode_path
         return "opencode"
+    elseif p == MockCode
+        explicit = get(ENV, "MOCK_AGENT_ACP", "")
+        !isempty(explicit) && return explicit
+        # Resolve relative to the BonitoAgents package root (src/..)
+        pkg_root = dirname(@__DIR__)
+        mock_bin = joinpath(pkg_root, "test", "mocks", "mock_claude_agent_acp")
+        isfile(mock_bin) && return mock_bin
+        return "mock_claude_agent_acp"
     else
         error("Unknown provider: $p")
     end

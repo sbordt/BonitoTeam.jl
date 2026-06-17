@@ -50,6 +50,7 @@ export TestServer, dev_server, add_worker!,
        diff_block, text_block, error_reply, end_turn, bt_eval, bt_show_app,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
        send_message, switch_agent, set_window_size, click, click_until, click_text, set_input,
+       exit_success,
        screenshot, eval_js, wait_for, current_chat_id
 
 # ── Event DSL ──────────────────────────────────────────────────────────────
@@ -451,6 +452,21 @@ function Base.close(s::TestServer)
     isopen(s.dispatcher_sock) && close(s.dispatcher_sock)
     close(s.h)
     return s
+end
+
+"""
+    exit_success()
+
+Force-terminate the test process with code 0, bypassing Julia's atexit/thread
+join. Call as the LAST line of an e2e script: the @testset has already printed
+its result (a failing one throws first, so reaching here means it passed), but a
+degraded headless Electron / wedged Reseau poller thread can stall Julia's
+normal shutdown so the process never exits on its own. `_exit` sidesteps that.
+"""
+function exit_success()
+    flush(stdout)
+    flush(stderr)
+    ccall(:_exit, Cvoid, (Cint,), Cint(0))
 end
 
 # ── DISPLAY/XAUTHORITY plumbing ────────────────────────────────────────────

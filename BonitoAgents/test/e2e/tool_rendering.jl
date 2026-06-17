@@ -137,3 +137,8 @@ try
 finally
     close(server)
 end
+
+# Suite passed if we reach here (a failing @testset throws first); force-terminate.
+# A degraded headless Electron / wedged poller thread can otherwise stall Julia's
+# normal exit until the CI step timeout. See TestKit.exit_success.
+TK.exit_success()

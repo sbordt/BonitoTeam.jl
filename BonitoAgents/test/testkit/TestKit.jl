@@ -628,13 +628,20 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     leaf = json(basename(rstrip(String(cwd), '/')))   # last path segment, for the gate
     to_dashboard(s)
     click_text(s, "+ New project")
-    # Form open once the name field is visible.
+    # Form open once the name field is visible. Generous timeouts here: the
+    # FIRST new_chat against a fresh server compiles the whole new-project /
+    # folder-picker UI server-side, which is slow cold on a CI runner (warm
+    # it's instant). These waits gate on real DOM, so a true hang still fails.
     wait_for(s, "new-project form",
         "[...document.querySelectorAll('input')].some(e => e.offsetParent && (e.placeholder||'') === 'e.g. my-project')";
-        timeout = 8)
+        timeout = 30)
+    # Wait for the breadcrumb address-icon button to render BEFORE clicking it —
+    # clicking before it exists silently no-ops and the path field never opens.
+    wait_for(s, "address-icon button",
+        "[...document.querySelectorAll('.bt-addr-icon-btn')].some($VIS)"; timeout = 30)
     # Flip the breadcrumb to a text field and type the path.
     eval_js(s, "(() => { const b=[...document.querySelectorAll('.bt-addr-icon-btn')].filter($VIS)[0]; if(b)b.click(); return true; })()")
-    wait_for(s, "path field", "[...document.querySelectorAll('.bt-addr-input')].some($VIS)"; timeout = 8)
+    wait_for(s, "path field", "[...document.querySelectorAll('.bt-addr-input')].some($VIS)"; timeout = 30)
     ok = eval_js(s, """(() => {
         const inp = [...document.querySelectorAll('.bt-addr-input')].filter($VIS)[0];
         if (!inp) return false;
@@ -650,7 +657,7 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     # otherwise Choose captures the old location and Create fails.
     wait_for(s, "path committed",
         "[...document.querySelectorAll('.bt-addr-bar')].some(b => b.offsetParent && (b.innerText||'').includes($leaf))";
-        timeout = 12)
+        timeout = 30)
     click_text(s, "Choose")
     set_input(s, "input", name; placeholder = "e.g. my-project")
     click_text(s, "Create")

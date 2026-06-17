@@ -49,7 +49,7 @@ export TestServer, dev_server, add_worker!,
        text, thought, edit, bash, todo, delay, tool, tool_update,
        diff_block, text_block, error_reply, end_turn, bt_eval, bt_show_app,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
-       send_message, switch_agent, set_window_size, click, click_text, set_input,
+       send_message, switch_agent, set_window_size, click, click_until, click_text, set_input,
        screenshot, eval_js, wait_for, current_chat_id
 
 # ── Event DSL ──────────────────────────────────────────────────────────────
@@ -546,6 +546,20 @@ function click(s::TestServer, selector::AbstractString)
     return s
 end
 
+# Click the first visible `selector` repeatedly until `predicate` holds — rides
+# out the race where a framework wires the click handler after the element
+# mounts (so a lone synthetic click is dropped). Delegates to the ElectronCall
+# primitive; errors if the state never appears.
+function click_until(s::TestServer, selector::AbstractString, predicate::AbstractString;
+                     timeout::Real = 15, interval::Real = 0.3)
+    ctx = s.browser[]
+    ctx === nothing && error("open_browser first")
+    ECT.click_until(ctx, String(selector), String(predicate);
+                    timeout = Float64(timeout), interval = Float64(interval)) ||
+        error("click_until: '$selector' did not produce the expected state within $(timeout)s")
+    return s
+end
+
 """
     navigate(s, route)
 
@@ -635,13 +649,11 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     wait_for(s, "new-project form",
         "[...document.querySelectorAll('input')].some(e => e.offsetParent && (e.placeholder||'') === 'e.g. my-project')";
         timeout = 30)
-    # Wait for the breadcrumb address-icon button to render BEFORE clicking it —
-    # clicking before it exists silently no-ops and the path field never opens.
-    wait_for(s, "address-icon button",
-        "[...document.querySelectorAll('.bt-addr-icon-btn')].some($VIS)"; timeout = 30)
-    # Flip the breadcrumb to a text field and type the path.
-    eval_js(s, "(() => { const b=[...document.querySelectorAll('.bt-addr-icon-btn')].filter($VIS)[0]; if(b)b.click(); return true; })()")
-    wait_for(s, "path field", "[...document.querySelectorAll('.bt-addr-input')].some($VIS)"; timeout = 30)
+    # Flip the breadcrumb to a text field. The ✎ button's onclick (notify
+    # `editing=true`) is wired by Bonito only after the element mounts, so on a
+    # cold/slow runner a single synthetic click can land before the handler
+    # attaches and be lost. `click_until` re-clicks until the input appears.
+    click_until(s, ".bt-addr-icon-btn", "[...document.querySelectorAll('.bt-addr-input')].some($VIS)"; timeout = 30)
     ok = eval_js(s, """(() => {
         const inp = [...document.querySelectorAll('.bt-addr-input')].filter($VIS)[0];
         if (!inp) return false;

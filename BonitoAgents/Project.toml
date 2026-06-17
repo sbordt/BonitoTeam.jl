@@ -32,7 +32,7 @@ AgentClientProtocol = {path = "../AgentClientProtocol"}
 Bonito = {rev = "sd/remote-app", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
 BonitoMCP = {path = "../BonitoMCP"}
-BonitoWidgets = {path = "../../BonitoWidgets"}
+BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "sd/improvements"}
 BonitoWorker = {path = "../BonitoWorker"}
 RemoteSync = {path = "../RemoteSync"}
 

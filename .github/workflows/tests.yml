@@ -46,7 +46,10 @@ jobs:
             libxss1 libxtst6 libatk-bridge2.0-0 libdrm2
 
       - name: Instantiate (pulls the [sources] forks)
-        run: julia --project=BonitoAgents -e 'using Pkg; Pkg.instantiate()'
+        # Update the git-pinned forks to their branch HEADs: a restored cache can
+        # otherwise keep a stale tree even after a fork branch moves (Pkg relabels
+        # the rev but reuses the cached commit). This guarantees the latest fork code.
+        run: julia --project=BonitoAgents -e 'using Pkg; Pkg.instantiate(); Pkg.update(["ElectronCall", "Bonito", "BonitoWidgets", "BonitoBook"])'
 
       - name: "Instantiate the mock-agent env (tiny JSON + Sockets)"
         run: julia --project=BonitoAgents/test/mocks -e 'using Pkg; Pkg.instantiate()'

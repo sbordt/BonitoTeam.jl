@@ -20,7 +20,7 @@ Bonito = {rev = "sd/remote-app", url = "https://github.com/SimonDanisch/Bonito.j
 BonitoAgents = {path = "../BonitoAgents"}
 BonitoMCP = {path = "../BonitoMCP"}
 BonitoWorker = {path = "../BonitoWorker"}
-ElectronCall = {url = "https://github.com/JuliaWeb/ElectronCall.jl.git", rev = "main"}
+ElectronCall = {url = "https://github.com/IanButterworth/ElectronCall.jl.git", rev = "sd/testsuite"}
 # Makie stack pinned together on the ElectronCall-integration branch (monorepo
 # subdirs). git-url (not path) so CI, which clones only the BonitoAgents repo,
 # can fetch them too.

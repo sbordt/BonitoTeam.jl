@@ -41,12 +41,16 @@ module TestKit
 using JSON, Sockets, Base64
 import BonitoAgents as BT
 import BonitoMCP
-import Electron: Application, Window, URI, run as erun
+import BonitoWorker
+import ElectronCall
+const ECT = ElectronCall.Testing   # browser driving: open_window/eval_js/wait_for/screenshot
 
-export TestServer, dev_server,
-       text, thought, edit, bash, end_turn, bt_eval, bt_show_app,
-       open_browser, navigate, new_chat, send_message,
-       click, screenshot, eval_js, wait_for, current_chat_id
+export TestServer, dev_server, add_worker!,
+       text, thought, edit, bash, todo, delay, tool, tool_update,
+       diff_block, text_block, error_reply, end_turn, bt_eval, bt_show_app,
+       open_browser, navigate, to_dashboard, new_chat, open_chat,
+       send_message, switch_agent, set_window_size, click, click_text, set_input,
+       screenshot, eval_js, wait_for, current_chat_id
 
 # ── Event DSL ──────────────────────────────────────────────────────────────
 # Each constructor returns a small `Dict` carrying the event type + payload.
@@ -98,6 +102,79 @@ bt_show_app(code; env_path = nothing, id = nothing) = begin
     d
 end
 
+# Content-block specs for the generic `tool` event. `diff_block` renders as a
+# Monaco DiffEditor; `text_block` as a tool text block (grep-style lines render
+# as search rows; `"<label>:\n<body>"` with label in stdout/result/error/stderr
+# renders as a bt_julia_eval section).
+diff_block(path, old, new) = Dict("type" => "diff", "path" => String(path),
+                                  "old" => String(old), "new" => String(new))
+text_block(s::AbstractString) = Dict("type" => "text", "text" => String(s))
+
+"""
+    tool(; kind, title, status, content, tool_name, id, complete, open_status) -> Dict
+
+Agent event for a generic tool call of any `kind` ("edit", "search",
+"execute", "other"). `content` is a vector of `diff_block` / `text_block`.
+Pass `complete = false` to leave the bubble live (open) for follow-up
+`tool_update`s; `open_status` sets the opening status (default "in_progress").
+"""
+tool(; kind = "other", title = "tool", status = "completed", content = Any[],
+       tool_name = nothing, id = nothing, complete = true,
+       open_status = "in_progress") = begin
+    d = Dict{String,Any}("type" => "tool", "kind" => String(kind),
+                         "title" => String(title), "status" => String(status),
+                         "content" => content, "complete" => complete,
+                         "open_status" => String(open_status))
+    id        === nothing || (d["id"]        = String(id))
+    tool_name === nothing || (d["tool_name"] = String(tool_name))
+    d
+end
+
+"""
+    tool_update(id; status, content) -> Dict
+
+Agent event that updates an already-open tool (matched by `id`) — flip its
+status and/or ship more content, without restating its identity.
+"""
+tool_update(id; status = nothing, content = nothing) = begin
+    d = Dict{String,Any}("type" => "tool_update", "id" => String(id))
+    status  === nothing || (d["status"]  = String(status))
+    content === nothing || (d["content"] = content)
+    d
+end
+
+"""
+    todo(entries) -> Dict
+
+Agent event that emits a `plan` SessionUpdate (the channel real
+claude-agent-acp uses for todos). `entries` is a vector of NamedTuples with
+`content`, `status` ("pending" | "in_progress" | "completed") and an optional
+`priority` ("high" | "medium" | "low", default "medium"). Re-emitting mutates
+the one live list in the taskbar; pair with `delay` to hold the turn open
+while asserting against the live panel.
+"""
+todo(entries::AbstractVector) = Dict("type" => "todo",
+    "entries" => [Dict("content"  => String(e.content),
+                       "status"    => String(e.status),
+                       "priority"  => String(get(e, :priority, "medium"))) for e in entries])
+
+"""
+    delay(ms) -> Dict
+
+Agent event that sleeps `ms` milliseconds in the mock WITHOUT ending the
+turn, so frames already emitted (a pinned todo, an in-progress tool) stay
+live while the test asserts against them.
+"""
+delay(ms::Real) = Dict("type" => "delay", "ms" => Float64(ms))
+
+"""
+    error_reply(message) -> Dict
+
+Agent event: answer the prompt with a JSON-RPC error (the agent is alive but
+failed). The chat renders an inline `[error: <message>]` bubble.
+"""
+error_reply(message::AbstractString) = Dict("type" => "error_reply", "message" => String(message))
+
 end_turn(; stopReason = "end_turn")  = Dict("type" => "end", "stopReason" => String(stopReason))
 
 # Normalise whatever the agent function returned into a Vector{Dict}. The
@@ -130,8 +207,7 @@ mutable struct TestServer
     dispatcher_task::Task
     # Browser handle, lazily opened by `open_browser` so headless server
     # tests (no GUI) don't pay the Electron cost.
-    browser_app::Ref{Any}              # Electron.Application | nothing
-    browser_win::Ref{Any}              # Electron.Window | nothing
+    browser::Ref{Any}                  # ElectronCall.Testing.TestContext | nothing
     closed::Ref{Bool}
 end
 
@@ -178,10 +254,11 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     isfile(mock) || error("mock_claude_agent_acp not found at $mock")
     Sys.iswindows() || chmod(mock, 0o755)                  # idempotent perm fix
     # The mock binary's wrapper activates `BT_MOCK_PROJECT` for the Julia
-    # subprocess; default to the user's root project (the test runs from
-    # there and that env has every package the mock needs: JSON, Sockets,
-    # …). Honoured the convention "always use the root project."
-    mock_project = abspath(get(ENV, "BT_MOCK_PROJECT_OVERRIDE", pwd()))
+    # subprocess. Point it at the tiny `test/mocks` env (just JSON + Sockets):
+    # a small manifest keeps each mock-agent cold start fast, so the chat
+    # session binds quickly instead of waiting out a full-manifest startup.
+    mock_project = abspath(get(ENV, "BT_MOCK_PROJECT_OVERRIDE",
+                               joinpath(@__DIR__, "..", "mocks")))
 
     agent_env = Dict{String,String}(
         "BT_MOCK_ACP_SCENARIO"   => "dispatcher",
@@ -197,7 +274,7 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     SERVER_CONTEXT[] = (url = h.url, secret = h.secret, project_id = Ref(""))
 
     return TestServer(h, agent_ref, sock, disp_port, dispatcher_task,
-                       Ref{Any}(nothing), Ref{Any}(nothing), Ref(false))
+                       Ref{Any}(nothing), Ref(false))
 end
 
 # Dispatcher loop per mock-agent connection. Reads one `{"prompt": "..."}`
@@ -218,7 +295,9 @@ function handle_client(client, agent_ref::Ref{Function})
             msg = JSON.parse(line)
             prompt = String(get(msg, "prompt", ""))
             response = try
-                normalise(agent_ref[](prompt))
+                # invokelatest so tests can swap `agent_fn` mid-run (the
+                # dispatcher task is spawned before those closures exist).
+                normalise(Base.invokelatest(agent_ref[], prompt))
             catch e
                 # Surface the test's agent-fn crash in the chat as a
                 # synthetic agent message, so the test still sees something
@@ -342,13 +421,35 @@ function invoke_bt_show_app(client, ev::AbstractDict)
     println(client, JSON.json(out)); flush(client)
 end
 
+"""
+    add_worker!(s; name = "worker-extra") -> Base.Process
+
+Spawn an ADDITIONAL worker process against the same dev server (its own config
+dir + projects root, same server url + secret), exactly as a second machine
+running the installer would. Returns the worker process so the test can later
+`kill` it to simulate that machine going offline.
+"""
+function add_worker!(s::TestServer; name::AbstractString = "worker-extra")
+    cfg  = mktempdir(prefix = "bonitoagents-test-wcfg2-")
+    root = mktempdir(prefix = "bonitoagents-test-w2root-")
+    prev = get(ENV, "BONITOAGENTS_CONFIG_DIR", nothing)
+    ENV["BONITOAGENTS_CONFIG_DIR"] = cfg
+    # A distinct, pinned worker id so it registers as a separate worker.
+    write(joinpath(cfg, "worker_id"), "test-" * String(name) * "-" * string(rand(UInt32); base = 16))
+    BonitoWorker.write_config!(; server_url = s.h.url, secret = s.h.secret,
+                                 projects_root = root, name = String(name))
+    proc, _ = BonitoWorker.spawn_worker()
+    prev === nothing ? delete!(ENV, "BONITOAGENTS_CONFIG_DIR") : (ENV["BONITOAGENTS_CONFIG_DIR"] = prev)
+    return proc
+end
+
 function Base.close(s::TestServer)
     s.closed[] && return s
     s.closed[] = true
-    try close(s.browser_win[]) catch end
-    try close(s.browser_app[]) catch end
-    try close(s.dispatcher_sock) catch end
-    try close(s.h) catch end
+    ctx = s.browser[]
+    ctx === nothing || close(ctx)                 # ECT.close is itself best-effort
+    isopen(s.dispatcher_sock) && close(s.dispatcher_sock)
+    close(s.h)
     return s
 end
 
@@ -384,26 +485,16 @@ second call closes the prior window and opens a fresh one.
 function open_browser(s::TestServer; width::Int = 1280, height::Int = 820,
                        route::AbstractString = "/")
     ensure_display!()
-    s.browser_win[] === nothing || (try close(s.browser_win[]) catch end)
-    s.browser_app[] === nothing || (try close(s.browser_app[]) catch end)
+    old = s.browser[]
+    old === nothing || close(old)
     url = "http://127.0.0.1:$(s.h.state.srv.port)$(route)"
-    app = Application(; additional_electron_args = String["--enable-logging", "--v=0"])
-    # `paintWhenInitiallyHidden: true` is the documented Electron default but
-    # has been seen as `false` in some configurations — making it explicit
-    # so `capturePage` always sees a fresh framebuffer on the headless
-    # window. `backgroundThrottling: false` disables Chromium's
-    # off-screen render throttling for the same reason: without it, Monaco
-    # repaints can get coalesced and a `capturePage` between them returns
-    # stale pixels.
-    win = Window(app, URI(url);
-                 options = Dict{String,Any}(
-                     "show" => false, "focusOnWebView" => false,
-                     "paintWhenInitiallyHidden" => true,
-                     "width" => width, "height" => height,
-                     "webPreferences" => Dict("backgroundThrottling" => false)))
-    s.browser_app[] = app
-    s.browser_win[] = win
-    sleep(3.0)   # let the dashboard mount + the chat session boot
+    # ElectronCall.Testing.open_window already forces --ozone-platform=x11 and
+    # sets backgroundThrottling=false + paintWhenInitiallyHidden=true, so
+    # capturePage on the headless (show=false) window stays fresh.
+    ctx = ECT.open_window(url; width = width, height = height, show = false)
+    s.browser[] = ctx
+    ECT.install_error_sink(ctx)   # window.__errs for "no JS errors" assertions
+    sleep(3.0)                     # let the dashboard mount + the chat session boot
     return s
 end
 
@@ -415,9 +506,9 @@ returned to Julia (via Electron's JSON bridge). Long-running JS should
 return primitive types only — no DOM refs.
 """
 function eval_js(s::TestServer, code::AbstractString)
-    win = s.browser_win[]
-    win === nothing && error("open_browser first")
-    return erun(win, String(code))
+    ctx = s.browser[]
+    ctx === nothing && error("open_browser first")
+    return ECT.eval_js(ctx, String(code))
 end
 
 """
@@ -468,88 +559,190 @@ For routes that aren't direct URLs, prefer the high-level helpers
 (`new_chat`, `open_project`) below.
 """
 function navigate(s::TestServer, route::AbstractString)
-    win = s.browser_win[]
-    win === nothing && error("open_browser first")
     base = "http://127.0.0.1:$(s.h.state.srv.port)"
-    erun(win, "location.href = $(json(base * String(route)))")
+    eval_js(s, "location.href = $(json(base * String(route)))")  # errors if no browser
     sleep(2.0)
     return s
 end
 
-"""
-    new_chat(s; cwd = mktempdir()) -> String
+# ── UI action primitives ───────────────────────────────────────────────────
+# Everything below drives the real UI (clicks, typing) instead of poking
+# server-side models, so the tests exercise the same path a user does.
 
-Programmatically create a fresh chat backed by the test agent. Returns
-the project id. Equivalent to "click 'New chat' on the dashboard and pick
-a folder" — but driven server-side so the test doesn't need to fight the
-folder picker. The dispatcher routes every prompt through the agent fn.
-"""
-function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
-                                   title::AbstractString = "Test chat")
-    state = s.h.state
-    wid = first(keys(state.workers[]))
-    proj = BT.create_project_from_worker!(state, wid, String(cwd);
-                                           name = basename(String(cwd)),
-                                           start_session = true)
-    pid = proj.id
-    # Backfill a title up front: the sidebar's `open_chat_projects` filters
-    # on `title !== nothing || resume_session_id !== nothing`, so a chat with
-    # neither (the just-created one) would be invisible until the first user
-    # message lands. For tests we want it immediately visible so `click` can
-    # find its sidebar entry. `notify_chats!` bumps `chat_signal` to drive a
-    # sidebar re-render.
-    lock(state.lock) do
-        state.projects[][pid].title = String(title)
-    end
-    BT.notify_chats!(state)
-    # Wait until the per-project ChatModel is registered + its ACP session
-    # has bound (start_chat_client! is async).
-    t0 = time()
-    while time() - t0 < 15
-        lock(state.lock) do
-            haskey(state.chat_models, pid)
-        end && lock(state.lock) do
-            state.chat_models[pid].client[] !== nothing
-        end && break
-        sleep(0.1)
-    end
-    # Publish this chat's pid so the bt_show_app dispatcher can override
-    # BONITOAGENTS_PROJECT_ID when invoking the BonitoMCP handler — the
-    # eval-WS bridge keys on that env var for `EVAL_WORKERS` lookup.
-    # Without this the bridge dials back under whatever pid the OUTER
-    # context (e.g. a parent bt_julia_eval session running these tests)
-    # set, and the chat finds no bridge under its own pid.
-    ctx = SERVER_CONTEXT[]
-    ctx === nothing || (ctx.project_id[] = String(pid))
-    return String(pid)
+# Visible-only filter: skip elements that are display:none / detached. The
+# dashboard keeps several pickers in the DOM at once; only one is shown.
+const VIS = "el => el && el.offsetParent !== null"
+
+"Click the first *visible* button whose trimmed text equals `label`."
+function click_text(s::TestServer, label::AbstractString)
+    ok = eval_js(s, """(() => {
+        const b = [...document.querySelectorAll('button')].filter($VIS)
+            .find(b => (b.innerText||'').trim() === $(json(String(label))));
+        if (!b) return false; b.click(); return true; })()""")
+    ok === true || error("click_text: no visible button labelled $(repr(label))")
+    return s
 end
 
 """
-    send_message(s, text; pid = current_chat_id(s))
+    set_input(s, selector, value; placeholder = nothing)
 
-Send `text` to the chat as a user message. Equivalent to typing into the
-input box + clicking send. Goes through the same `send_message!` the UI
-does, so it exercises the same code path.
+Set the first *visible* input/textarea matching `selector` (optionally narrowed
+to one whose placeholder equals `placeholder`) and fire an `input` event so
+Bonito handlers run.
 """
-function send_message(s::TestServer, txt::AbstractString;
-                       pid::AbstractString = current_chat_id(s))
-    state = s.h.state
-    model = lock(state.lock) do; state.chat_models[String(pid)]; end
-    BT.send_message!(model, BT.UserMsg(String(txt)))
+function set_input(s::TestServer, selector::AbstractString, value::AbstractString;
+                   placeholder::Union{Nothing,AbstractString} = nothing)
+    narrow = placeholder === nothing ? "" :
+        "els = els.filter(e => (e.placeholder||'') === $(json(String(placeholder))));"
+    ok = eval_js(s, """(() => {
+        let els = [...document.querySelectorAll($(json(String(selector))))].filter($VIS);
+        $narrow
+        const el = els[0]; if (!el) return false;
+        el.focus();
+        const set = Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value').set;
+        set.call(el, $(json(String(value))));
+        el.dispatchEvent(new Event('input', {bubbles: true}));
+        return true; })()""")
+    ok === true || error("set_input: no visible element for $(repr(selector))")
+    return s
+end
+
+"Go to the dashboard by clicking the Home entry in the sidebar."
+function to_dashboard(s::TestServer)
+    eval_js(s, """(() => { const h = [...document.querySelectorAll('.bt-side-item')]
+        .find(e => (e.innerText||'').trim().startsWith('Home')); if (h) h.click(); return true; })()""")
+    sleep(0.6)
+    return s
+end
+
+"""
+    new_chat(s; cwd = mktempdir(), title = basename(cwd)) -> String
+
+Create a fresh chat the way a user does: from the dashboard, "+ New project",
+type `cwd` into the folder picker, name it, and hit Create. Blocks until the
+chat view is open. Returns the new chat's project id.
+"""
+function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
+                                   title::AbstractString = "")
+    name = isempty(title) ? basename(rstrip(String(cwd), '/')) : String(title)
+    leaf = json(basename(rstrip(String(cwd), '/')))   # last path segment, for the gate
+    to_dashboard(s)
+    click_text(s, "+ New project")
+    # Form open once the name field is visible.
+    wait_for(s, "new-project form",
+        "[...document.querySelectorAll('input')].some(e => e.offsetParent && (e.placeholder||'') === 'e.g. my-project')";
+        timeout = 8)
+    # Flip the breadcrumb to a text field and type the path.
+    eval_js(s, "(() => { const b=[...document.querySelectorAll('.bt-addr-icon-btn')].filter($VIS)[0]; if(b)b.click(); return true; })()")
+    wait_for(s, "path field", "[...document.querySelectorAll('.bt-addr-input')].some($VIS)"; timeout = 8)
+    ok = eval_js(s, """(() => {
+        const inp = [...document.querySelectorAll('.bt-addr-input')].filter($VIS)[0];
+        if (!inp) return false;
+        inp.focus();
+        const set = Object.getOwnPropertyDescriptor(inp.constructor.prototype, 'value').set;
+        set.call(inp, $(json(String(cwd))));
+        inp.dispatchEvent(new Event('input', {bubbles: true}));
+        inp.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13, bubbles: true}));
+        return true; })()""")
+    ok === true || error("new_chat: folder path field (.bt-addr-input) not found")
+    # Enter commits the path to the picker via an async round-trip. Gate on the
+    # breadcrumb actually showing the target folder before "Choose" reads it —
+    # otherwise Choose captures the old location and Create fails.
+    wait_for(s, "path committed",
+        "[...document.querySelectorAll('.bt-addr-bar')].some(b => b.offsetParent && (b.innerText||'').includes($leaf))";
+        timeout = 12)
+    click_text(s, "Choose")
+    set_input(s, "input", name; placeholder = "e.g. my-project")
+    click_text(s, "Create")
+    # The chat view renders only after the ACP session binds, which spawns a
+    # fresh mock-agent subprocess — its cold start can take the better part of a
+    # minute, so wait generously here.
+    wait_for(s, "chat view opened",
+             "!!document.querySelector('.bt-text-input') && !!document.querySelector('.bt-chatpane')";
+             timeout = 90)
+    sleep(0.5)
+    pid = current_chat_id(s)
+    ctx = SERVER_CONTEXT[]
+    ctx === nothing || (ctx.project_id[] = pid)
+    return pid
+end
+
+"""
+    open_chat(s, pid_or_title)
+
+Open an existing chat by clicking its sidebar entry, matched by project id
+(`data-project-id`) or by a substring of its title.
+"""
+function open_chat(s::TestServer, key::AbstractString)
+    k = json(String(key))
+    ok = eval_js(s, """(() => {
+        const items = [...document.querySelectorAll('.bt-side-item')];
+        let el = items.find(e => e.getAttribute('data-project-id') === $k);
+        if (!el) el = items.find(e => (e.innerText||'').includes($k));
+        if (!el) return false; el.click(); return true; })()""")
+    ok === true || error("open_chat: no sidebar entry for $(repr(key))")
+    wait_for(s, "chat view", "!!document.querySelector('.bt-text-input')"; timeout = 10)
+    return s
+end
+
+"""
+    switch_agent(s, label)
+
+Switch the chat's agent/provider via the header dropdown, e.g. "Mock Agent",
+"Claude Code", "MiMo Code", "OpenCode". The chat must be open.
+"""
+function switch_agent(s::TestServer, label::AbstractString)
+    l = json(String(label))
+    ok = eval_js(s, """(() => {
+        const sel = document.querySelector('.bt-header-provider-select');
+        if (!sel) return false;
+        const opt = [...sel.options].find(o => (o.textContent||'').trim() === $l || o.value === $l);
+        if (!opt) return false;
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event('input', {bubbles: true}));
+        sel.dispatchEvent(new Event('change', {bubbles: true}));
+        return true; })()""")
+    ok === true || error("switch_agent: provider option $(repr(label)) not found")
+    return s
+end
+
+"""
+    set_window_size(s, w, h)
+
+Resize the renderer viewport via Chromium device emulation (more reliable than
+`BrowserWindow.setSize` on headless Linux). Drives the CSS `@media` breakpoints
+the responsive layout reads.
+"""
+function set_window_size(s::TestServer, w::Integer, h::Integer)
+    ctx = s.browser[]
+    ctx === nothing && error("open_browser first")
+    ECT.set_window_size(ctx, Int(w), Int(h))
+    return s
+end
+
+"""
+    send_message(s, text)
+
+Type `text` into the chat composer and click send, the same path a user takes.
+A chat must be open (see [`new_chat`](@ref) / [`open_chat`](@ref)).
+"""
+function send_message(s::TestServer, txt::AbstractString)
+    set_input(s, ".bt-text-input", String(txt))
+    ok = eval_js(s, "(() => { const b=document.querySelector('.bt-send-btn'); if(!b)return false; b.click(); return true; })()")
+    ok === true || error("send_message: send button (.bt-send-btn) not found — is a chat open?")
     return s
 end
 
 """
     current_chat_id(s) -> String
 
-The most recently created project id (the one `new_chat` returned). If
-there's only one chat, that's it; otherwise pick the most recent.
+Project id of the chat currently open in the browser, read from the active
+sidebar entry (`.bt-side-item.bt-side-active`). Empty string on the dashboard.
 """
 function current_chat_id(s::TestServer)
-    state = s.h.state
-    pids = lock(state.lock) do; collect(keys(state.chat_models)); end
-    isempty(pids) && error("no chat created yet — call new_chat first")
-    return last(pids)
+    pid = eval_js(s, """(() => { const a=document.querySelector('.bt-side-item.bt-side-active');
+        return a ? (a.getAttribute('data-project-id') || '') : ''; })()""")
+    return String(pid === nothing ? "" : pid)
 end
 
 """
@@ -559,35 +752,13 @@ Save a PNG of the current Electron window. Synchronous: blocks until the
 file lands on disk so the next `Read` call sees it.
 """
 function screenshot(s::TestServer, path::AbstractString; timeout::Real = 8)
-    win = s.browser_win[]
-    win === nothing && error("open_browser first")
+    ctx = s.browser[]
+    ctx === nothing && error("open_browser first")
     path = abspath(String(path))
     mkpath(dirname(path))
-    flag = path * ".done"
-    isfile(flag) && rm(flag; force = true)
-    isfile(path) && rm(path; force = true)
-    # `capturePage` on a `show:false` window can hand back a stale
-    # composited buffer if the renderer was throttled between paints.
-    # `invalidate()` forces a fresh paint pass; double-RAF in the page
-    # then guarantees the layout/paint we want has actually landed before
-    # capturePage grabs pixels. `null` at the end so erun returns
-    # immediately (the promise hasn't resolved yet).
-    erun(s.browser_app[], """
-        const w = electron.BrowserWindow.fromId($(win.id));
-        w.webContents.invalidate();
-        w.webContents.executeJavaScript(
-            'new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))'
-        ).then(() => w.webContents.capturePage()).then(img => {
-            require('fs').writeFileSync($(json(path)), img.toPNG());
-            require('fs').writeFileSync($(json(flag)), '1');
-        });
-        null
-    """)
-    t = time()
-    while !isfile(flag) && time() - t < timeout; sleep(0.05); end
-    isfile(path) || error("screenshot timed out: $path")
-    rm(flag; force = true)
-    return path
+    # ECT.screenshot drives the main-process capturePage and writes the PNG
+    # synchronously before returning.
+    return ECT.screenshot(ctx; path = path)
 end
 
 # Tiny JSON-encode helper (no JSON3 dep in the test module).

@@ -314,6 +314,17 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-header-provider-select:focus",
         "outline" => "2px solid var(--bt-accent)",
         "outline-offset" => "1px"),
+    # Transient provider-switch status ("Switching…"/"switch failed"). Lives in
+    # the flexible left area (before the auto-margin), capped + ellipsized so it
+    # never reflows the control cluster.
+    CSS(".bt-header-status",
+        "font-size" => "12px",
+        "color" => "var(--bt-text-muted)",
+        "white-space" => "nowrap",
+        "flex" => "0 0 auto",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis",
+        "max-width" => "220px"),
     # ── Session-config meta line (model / mode / effort — `header_meta_line`).
     # Plain muted text below the title row; items joined with " · ", full
     # descriptions in the per-item tooltip.
@@ -323,11 +334,21 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-header-meta",
         "font-size" => "12px",
         "color" => "var(--bt-text-muted)",
-        "flex" => "0 1 auto", "min-width" => "0",
-        "margin-left" => "auto",
+        # Sits left (after the title), content-width, growing rightward into the
+        # gap before the right-anchored `.bt-header-actions`. Min-width keeps the
+        # empty state (during a switch) from collapsing the layout; max-width
+        # ellipsizes a very long model name instead of squeezing the title.
+        "flex" => "0 1 auto", "min-width" => "0", "max-width" => "260px",
         "white-space" => "nowrap",
         "overflow" => "hidden",
         "text-overflow" => "ellipsis"),
+    # The right-anchored control cluster (provider switcher · sync · restart).
+    # `margin-left:auto` pushes it to the right edge; because the model pill and
+    # status text live OUTSIDE it (to its left), their width changes are absorbed
+    # by the gap and never move these buttons.
+    CSS(".bt-header-actions",
+        "display" => "flex", "align-items" => "center", "gap" => "10px",
+        "margin-left" => "auto", "flex" => "0 0 auto"),
     CSS(".bt-header-meta-item",
         "cursor" => "default"),
 

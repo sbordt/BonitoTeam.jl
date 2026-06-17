@@ -68,8 +68,7 @@ function find_provider_bin(p::AgentProvider)
         !isempty(explicit) && return explicit
         bin = Sys.which("mimo")
         bin !== nothing && return bin
-        home = first(splitdir(homedir()))
-        mimo_path = joinpath(home, ".mimocode", "bin", "mimo")
+        mimo_path = joinpath(homedir(), ".mimocode", "bin", "mimo")
         isfile(mimo_path) && return mimo_path
         return "mimo"
     elseif p == OpenCode
@@ -77,8 +76,7 @@ function find_provider_bin(p::AgentProvider)
         !isempty(explicit) && return explicit
         bin = Sys.which("opencode")
         bin !== nothing && return bin
-        home = first(splitdir(homedir()))
-        opencode_path = joinpath(home, ".opencode", "bin", "opencode")
+        opencode_path = joinpath(homedir(), ".opencode", "bin", "opencode")
         isfile(opencode_path) && return opencode_path
         return "opencode"
     elseif p == MockCode
@@ -100,6 +98,31 @@ end
 Backward-compatible entry point: defaults to ClaudeCode.
 """
 find_agent_bin(p::AgentProvider = ClaudeCode) = find_provider_bin(p)
+
+"""
+    provider_args(p::AgentProvider) -> Vector{String}
+
+Extra CLI arguments needed to launch the provider's **ACP server**.
+
+Claude's `claude-agent-acp` binary speaks ACP directly, so it takes no
+arguments. `mimo` and `opencode` are multi-command CLIs whose ACP server
+lives under an `acp` subcommand — running the bare binary launches their
+interactive TUI instead (which never speaks ACP, so the `initialize`
+handshake hangs forever). The mock agent also speaks ACP directly.
+"""
+function provider_args(p::AgentProvider)
+    (p == MiMoCode || p == OpenCode) && return String["acp"]
+    return String[]
+end
+
+# `clientCapabilities.elicitation.form`: claude-agent-acp and MiMo accept the
+# boolean `true`; OpenCode validates the schema strictly (zod) and REQUIRES an
+# object — `form: true` fails initialize with `-32602 Invalid params`
+# ("expected object, received boolean"). Send the object shape for OpenCode,
+# the boolean for the others (unchanged / known-good).
+client_elicitation(p::AgentProvider) =
+    p == OpenCode ? Dict{String,Any}("form" => Dict{String,Any}()) :
+                    Dict{String,Any}("form" => true)
 
 """
     abstract type ChatTransport <: ACP.Transport
@@ -304,7 +327,7 @@ function start_session(t::LocalTransport, handler::ACP.Handler;
     env = merge(Dict(k => v for (k,v) in ENV),
                 provider_env,
                 t.agent_env)
-    proc = open(Cmd(`$(t.agent_bin)`; env, dir = t.cwd), "r+")
+    proc = open(Cmd(`$(t.agent_bin) $(provider_args(t.provider))`; env, dir = t.cwd), "r+")
     t.inner[] = ACP.SubprocessTransport(proc)
 
     conn = ACP.Connection(t, handler; on_frame)
@@ -317,7 +340,7 @@ function start_session(t::LocalTransport, handler::ACP.Handler;
             # elicitation (otherwise it launches claude with
             # `--disallowedTools AskUserQuestion`). The chat renders these
             # as interactive question cards — see `handle_elicitation_request`.
-            "elicitation" => Dict("form" => true)),
+            "elicitation" => client_elicitation(t.provider)),
         "clientInfo"         => Dict("name"    => "BonitoAgents.LocalTransport",
                                       "version" => "0.1.0")))
     # Local sessions are always fresh (`session/new`) — no resume, no replay.
@@ -379,7 +402,7 @@ function start_session(t::WorkerTransport, handler::ACP.Handler;
             # elicitation (otherwise it launches claude with
             # `--disallowedTools AskUserQuestion`). The chat renders these
             # as interactive question cards — see `handle_elicitation_request`.
-            "elicitation" => Dict("form" => true)),
+            "elicitation" => client_elicitation(t.provider)),
         "clientInfo"         => Dict("name"    => "BonitoAgents.WorkerTransport",
                                       "version" => "0.1.0")))
 

@@ -1,0 +1,113 @@
+# End-to-end workflow tests, driven ONLY through the UI via TestKit
+# (ElectronCall.Testing under the hood). No test reaches into ServerState /
+# ChatModel / msgs_store: every action is a real click or keystroke, and every
+# assertion reads the rendered DOM. The server side (real dev_server, real
+# worker, real ACP over stdio) runs unchanged; only the agent binary is the
+# mock, scripted by `agent_script`.
+#
+# A single chat is reused across the conversation testsets: creating a chat
+# spawns a fresh mock-agent subprocess (slow cold start), but once its session
+# is bound, further turns in the same chat are fast.
+#
+# Run:  julia --project=. test/e2e/workflows.jl
+
+using Test
+include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+using .TestKit
+const TK = TestKit
+
+# One scripted agent: branches on the prompt so each testset gets the events it
+# needs by wording its message.
+function agent_script(prompt::AbstractString)
+    p = lowercase(prompt)
+    if occursin("edit", p)
+        return [TK.text("I'll edit that file."),
+                TK.edit("/tmp/foo.jl", "old contents", "new contents"),
+                TK.text("Done.")]
+    elseif occursin("bash", p)
+        return [TK.bash("ls -la", "total 0\nfile_a.jl\nfile_b.jl"),
+                TK.text("That's the listing.")]
+    elseif occursin("think", p)
+        return [TK.thought("Let me reason about this first."),
+                TK.text("Here is the answer.")]
+    else
+        return [TK.text("Echo: $(prompt)")]
+    end
+end
+
+# Send a message, then let the (fast) mock turn settle before the next one.
+function turn(server, msg)
+    TK.send_message(server, msg)
+    sleep(2.5)
+end
+
+server = TK.dev_server(agent = agent_script)
+try
+    TK.open_browser(server)
+
+    @testset "BonitoAgents e2e (UI-only)" begin
+
+        @testset "dev server + dashboard" begin
+            TK.to_dashboard(server)
+            @test TK.wait_for(server, "dashboard", "!!document.querySelector('.bt-dash')"; timeout = 10) == true
+            @test TK.eval_js(server, "document.querySelectorAll('.bt-card').length") >= 1
+            @test TK.eval_js(server, "document.body.innerText.includes('workers online')") == true
+        end
+
+        # One chat for the whole conversation.
+        pid = TK.new_chat(server; title = "Workflows")
+
+        @testset "open a project (new chat via folder picker)" begin
+            @test !isempty(pid)
+            @test TK.current_chat_id(server) == pid
+            @test TK.eval_js(server, "!!document.querySelector('.bt-text-input')") == true
+            @test TK.eval_js(server, "[...document.querySelectorAll('.bt-side-item')].some(e => (e.innerText||'').includes('Workflows'))") == true
+        end
+
+        @testset "chatting: user message + agent reply" begin
+            turn(server, "hello there")
+            @test TK.wait_for(server, "agent reply",
+                "document.querySelectorAll('.bt-agent-msg').length >= 1"; timeout = 30) == true
+            txt = TK.eval_js(server, "document.querySelector('.bt-messages').innerText")
+            @test occursin("hello there", txt)
+            @test occursin("Echo: hello there", txt)
+        end
+
+        @testset "tool call rendering: edit" begin
+            turn(server, "please edit the config")
+            @test TK.wait_for(server, "edit tool",
+                "[...document.querySelectorAll('.bt-tool-title')].some(e => (e.innerText||'').includes('foo.jl'))"; timeout = 30) == true
+            # expand the most recent tool to reveal the diff body
+            TK.eval_js(server, "(() => { const h=[...document.querySelectorAll('.bt-tool-header')].pop(); if(h)h.click(); return true; })()")
+            @test TK.wait_for(server, "diff body",
+                "!!document.querySelector('.bt-diff-block, .bt-edit-tool-body, .bt-tool-body')"; timeout = 8) == true
+        end
+
+        @testset "tool call rendering: bash" begin
+            turn(server, "run a bash command")
+            @test TK.wait_for(server, "bash tool",
+                "[...document.querySelectorAll('.bt-tool-title')].some(e => (e.innerText||'').trim() === 'Bash')"; timeout = 30) == true
+            # expand the bash tool; its command/output shows in the body
+            TK.eval_js(server, "(() => { const h=[...document.querySelectorAll('.bt-tool-header')].pop(); if(h)h.click(); return true; })()")
+            @test TK.wait_for(server, "bash output",
+                "(() => { const m=document.querySelector('.bt-messages'); return !!m && (m.innerText.includes('file_a.jl') || m.innerText.includes('ls -la')); })()"; timeout = 8) == true
+        end
+
+        @testset "thinking / reasoning render" begin
+            turn(server, "think about this")
+            @test TK.wait_for(server, "thinking",
+                "!!document.querySelector('.bt-thinking, [class*=thinking]')"; timeout = 30) == true
+        end
+
+        @testset "switching agents (provider dropdown)" begin
+            opts = TK.eval_js(server, "(() => { const s=document.querySelector('.bt-header-provider-select'); return s ? [...s.options].map(o => o.textContent.trim()) : []; })()")
+            @test "Mock Agent" in opts
+            TK.switch_agent(server, "Mock Agent")
+            @test TK.wait_for(server, "provider = Mock Agent",
+                "(() => { const s=document.querySelector('.bt-header-provider-select'); return !!s && s.selectedOptions[0].textContent.trim() === 'Mock Agent'; })()";
+                timeout = 8) == true
+        end
+    end
+finally
+    close(server)
+end

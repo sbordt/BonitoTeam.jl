@@ -1,0 +1,105 @@
+# Unit + end-to-end tests for BonitoAgents.
+#
+# The e2e suite (test/e2e/workflows.jl) drives the real app through a headless
+# Electron window via ElectronCall.Testing, so it needs a display (Xvfb) and the
+# Electron runtime libraries. Everything else (dev server, worker, ACP over
+# stdio, mock agent) runs for real. The fork pins live in BonitoAgents/[sources]
+# (ElectronCall#sd/testsuite, Bonito#sd/remote-app, WGLMakie#sd/electroncall,
+# HTTP@v2, ...), so `Pkg.instantiate()` fetches them; CI clones only this repo.
+name: Tests
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  test:
+    name: unit + e2e (Julia ${{ matrix.version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.12']
+    env:
+      DISPLAY: ":99"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+
+      - uses: julia-actions/cache@v2
+
+      - name: Install Xvfb + Electron runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb dbus libgtk-3-0 libnss3 libasound2t64 libgbm1 \
+            libxss1 libxtst6 libatk-bridge2.0-0 libdrm2
+
+      - name: Instantiate (pulls the [sources] forks)
+        run: julia --project=BonitoAgents -e 'using Pkg; Pkg.instantiate()'
+
+      - name: "Instantiate the mock-agent env (tiny JSON + Sockets)"
+        run: julia --project=BonitoAgents/test/mocks -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Unit tests (path/JS-escaping regressions)
+        run: julia --project=BonitoAgents BonitoAgents/test/runtests.jl
+
+      - name: E2E — core workflows (UI-only, via ElectronCall.Testing)
+        run: |
+          xvfb-run -a -s "-screen 0 1280x900x24" \
+            julia --project=BonitoAgents BonitoAgents/test/e2e/workflows.jl
+
+      - name: E2E — chat features (streaming, markdown, responsive, multi-chat)
+        run: |
+          xvfb-run -a -s "-screen 0 1280x900x24" \
+            julia --project=BonitoAgents BonitoAgents/test/e2e/chat_features.jl
+
+      - name: E2E — embedded Bonito app (bt_show_app dial-back bridge)
+        run: |
+          xvfb-run -a -s "-screen 0 1280x900x24" \
+            julia --project=BonitoAgents BonitoAgents/test/e2e/embedded_app.jl
+
+      - name: E2E — scroll + persistence (follow-to-bottom, reconnect history)
+        run: |
+          xvfb-run -a -s "-screen 0 1280x900x24" \
+            julia --project=BonitoAgents BonitoAgents/test/e2e/scroll_persist.jl
+
+      - name: E2E — error rendering (inline [error:] bubble, busy clears)
+        run: |
+          xvfb-run -a -s "-screen 0 1280x900x24" \
+            julia --project=BonitoAgents BonitoAgents/test/e2e/errors.jl
+
+      - name: E2E — lens search (bar, vocab, autocomplete, filter, save/clear)
+        run: |
+          xvfb-run -a -s "-screen 0 1280x900x24" \
+            julia --project=BonitoAgents BonitoAgents/test/e2e/lens.jl
+
+      - name: E2E — tool rendering (edit/search/eval/read/move/fetch/execute)
+        run: |
+          xvfb-run -a -s "-screen 0 1280x900x24" \
+            julia --project=BonitoAgents BonitoAgents/test/e2e/tool_rendering.jl
+
+      - name: E2E — todo taskbar (live pinned plan, mutate in place, finalize)
+        run: |
+          xvfb-run -a -s "-screen 0 1280x900x24" \
+            julia --project=BonitoAgents BonitoAgents/test/e2e/todo_taskbar.jl
+
+      - name: E2E — worker lifecycle (online -> killed -> offline on dashboard)
+        run: |
+          xvfb-run -a -s "-screen 0 1280x900x24" \
+            julia --project=BonitoAgents BonitoAgents/test/e2e/worker_lifecycle.jl
+
+      - name: E2E — cross-worker (second worker registers, 2 online, kill -> 1)
+        run: |
+          xvfb-run -a -s "-screen 0 1280x900x24" \
+            julia --project=BonitoAgents BonitoAgents/test/e2e/cross_worker.jl

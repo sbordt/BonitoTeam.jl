@@ -72,7 +72,7 @@ end
     upd(t) = JSON.json(Dict("jsonrpc" => "2.0", "method" => "session/update",
         "params" => Dict("sessionId" => "s",
             "update" => Dict("sessionUpdate" => "agent_message_chunk",
-                             "content" => Dict("type" => "text", "text" => t))))))
+                             "content" => Dict("type" => "text", "text" => t)))))
     r(id, res) = JSON.json(Dict("jsonrpc" => "2.0", "id" => id, "result" => res))
 
     on_setup = (out::Channel{String}, inc::Channel{String}) -> begin
@@ -116,7 +116,7 @@ end
     upd(t) = JSON.json(Dict("jsonrpc" => "2.0", "method" => "session/update",
         "params" => Dict("sessionId" => "s",
             "update" => Dict("sessionUpdate" => "agent_message_chunk",
-                             "content" => Dict("type" => "text", "text" => t))))))
+                             "content" => Dict("type" => "text", "text" => t)))))
     r(id, res) = JSON.json(Dict("jsonrpc" => "2.0", "id" => id, "result" => res))
 
     on_setup = (out::Channel{String}, inc::Channel{String}) -> begin

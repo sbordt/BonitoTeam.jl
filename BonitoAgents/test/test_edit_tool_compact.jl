@@ -17,7 +17,7 @@
 #      DiffEditor's `max_height` Observable (Monaco's own height API), so
 #      the Collapsable can swap compact ↔ full without re-mounting Monaco.
 
-using Test, BonitoAgents, Bonito, Dates, Observables, Hyperscript
+using Test, BonitoAgents, Bonito, Dates, Hyperscript
 import BonitoAgents.AgentClientProtocol as ACP
 const BT = BonitoAgents
 

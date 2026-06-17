@@ -148,6 +148,11 @@ arrive as the `Channel{Message}` returned by `ACP.prompt!` per turn.
 """
 abstract type ChatTransport <: ACP.Transport end
 
+# The agent provider a transport runs, or `nothing` for transports that have no
+# provider notion (e.g. MockTransport in tests). Lets `ChatModel` derive its
+# `provider` observable from the transport it was handed (the source of truth).
+transport_provider(::ChatTransport) = nothing
+
 # ── 1. Local subprocess ────────────────────────────────────────────────────
 
 mutable struct LocalTransport <: ChatTransport
@@ -274,6 +279,11 @@ ACP.recv(t::MockTransport)                       = take!(t.incoming)
 # Channel.close is idempotent in Base, so no wrapper is needed.
 Base.close(t::MockTransport) = (close(t.outgoing); close(t.incoming); nothing)
 
+# Transports that run a real agent carry the provider; MockTransport keeps the
+# `ChatTransport` fallback (`nothing`).
+transport_provider(t::LocalTransport)  = t.provider
+transport_provider(t::WorkerTransport) = t.provider
+
 # The path the *agent* sees as its working directory. The chat layer uses
 # this when constructing the ACP `FSRequestHandler` so server-side fs RPCs
 # resolve paths against the right root (server cwd locally, worker path
@@ -344,16 +354,10 @@ function start_session(t::LocalTransport, handler::ACP.Handler;
         "clientInfo"         => Dict("name"    => "BonitoAgents.LocalTransport",
                                       "version" => "0.1.0")))
     # Local sessions are always fresh (`session/new`) — no resume, no replay.
-    # The raw result rides on the Client (session config: models/modes/…).
-    # For MiMo/OpenCode, skip the system_prompt_meta since they don't use
-    # Claude's `_meta.systemPrompt.preset` format.
-    session_params = if t.provider == ClaudeCode
-        merge(Dict("cwd" => t.cwd,
-                   "mcpServers" => mcp_list_payload(t.mcp_servers)),
-              system_prompt_meta(global_agents_md(t.state)))
-    else
-        Dict("cwd" => t.cwd, "mcpServers" => mcp_list_payload(t.mcp_servers))
-    end
+    # A LocalTransport has no ServerState, so there is no server-wide AGENTS.md
+    # to append (that's a WorkerTransport concept). This matches the worker path
+    # when no AGENTS.md exists, which sends no system-prompt meta either.
+    session_params = Dict("cwd" => t.cwd, "mcpServers" => mcp_list_payload(t.mcp_servers))
     result = ACP.send_request(conn, "session/new", session_params)
     # The raw result rides on the Client (session config: models/modes/…).
     return ACP.Client(conn, result["sessionId"], t.cwd, ACP._result_dict(result)),

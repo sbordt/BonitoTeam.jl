@@ -177,7 +177,11 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Ref(0.0),                   # last_stream_at
         Observable(time()),         # taskbar_clock (ticked by a Julia Timer)
         Ref(false),                 # taskbar_clock_on
-        Observable(provider),       # provider: the current agent backend
+        # Provider observable tracks the transport (the source of truth): a
+        # caller may pass a transport whose provider differs from the `provider`
+        # kw default, and the two must not disagree. Transports without a
+        # provider notion (MockTransport) fall back to the `provider` kw.
+        Observable(something(transport_provider(actual_transport), provider)),
     )
 end
 

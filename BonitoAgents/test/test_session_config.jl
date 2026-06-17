@@ -140,7 +140,9 @@ option_by_id(opts, id) = opts[findfirst(o -> o.id == id, opts)]
         # Future meta kinds default to visible, joined with the separator.
         line2 = string(BT.header_meta_line(Any[option_by_id(opts, "model"), "v2.1"]))
         @test occursin(" · ", line2) && occursin("v2.1", line2)
-        @test string(BT.header_meta_line(Any[])) == string(BT.DOM.span())
+        # Empty meta still renders the `.bt-header-meta` element (keeps its
+        # margin-left:auto so the header controls don't jump during a switch).
+        @test string(BT.header_meta_line(Any[])) == string(BT.DOM.div(; class = "bt-header-meta"))
     end
 
     @testset "e2e: bring-up populates session_meta; mid-turn update patches it" begin

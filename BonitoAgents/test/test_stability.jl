@@ -291,17 +291,9 @@ end
         @test BT.is_busy_idle(busy[])
     end
 
-    # ── T19: popup state load/save tolerate an evicted chat model ────────────
-    # The geometry loader/saver must use `get` (no KeyError) when the model was
-    # evicted. We assert load/save are no-ops (don't throw) for an unknown pid.
-    @testset "T19 popup geometry load/save no-op on missing model" begin
-        # load_popup_state on a dir with no file returns nothing, not an error.
-        @test BT.load_popup_state(mktempdir()) === nothing
-        # save_popup_state writes atomically and round-trips.
-        d = mktempdir()
-        BT.save_popup_state(d; x = 1, y = 2, width = 3, height = 4)
-        st = BT.load_popup_state(d)
-        @test st !== nothing && Int(st["x"]) == 1 && Int(st["height"]) == 4
-    end
+    # T19 (popup geometry load/save) was removed: the popup/floating-window
+    # subsystem (popup.jl, floating_window.jl, load_popup_state/save_popup_state)
+    # was moved out of BonitoAgents into the BonitoWidgets Workspace in the
+    # monorepo refactor. The geometry is now the Workspace's concern.
 
 end

@@ -56,50 +56,50 @@ jobs:
 
       - name: E2E — core workflows (UI-only, via ElectronCall.Testing)
         run: |
-          xvfb-run -a -s "-screen 0 1280x900x24" \
+          timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
             julia --project=BonitoAgents BonitoAgents/test/e2e/workflows.jl
 
       - name: E2E — chat features (streaming, markdown, responsive, multi-chat)
         run: |
-          xvfb-run -a -s "-screen 0 1280x900x24" \
+          timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
             julia --project=BonitoAgents BonitoAgents/test/e2e/chat_features.jl
 
       - name: E2E — embedded Bonito app (bt_show_app dial-back bridge)
         run: |
-          xvfb-run -a -s "-screen 0 1280x900x24" \
+          timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
             julia --project=BonitoAgents BonitoAgents/test/e2e/embedded_app.jl
 
       - name: E2E — scroll + persistence (follow-to-bottom, reconnect history)
         run: |
-          xvfb-run -a -s "-screen 0 1280x900x24" \
+          timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
             julia --project=BonitoAgents BonitoAgents/test/e2e/scroll_persist.jl
 
       - name: E2E — error rendering (inline [error:] bubble, busy clears)
         run: |
-          xvfb-run -a -s "-screen 0 1280x900x24" \
+          timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
             julia --project=BonitoAgents BonitoAgents/test/e2e/errors.jl
 
       - name: E2E — lens search (bar, vocab, autocomplete, filter, save/clear)
         run: |
-          xvfb-run -a -s "-screen 0 1280x900x24" \
+          timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
             julia --project=BonitoAgents BonitoAgents/test/e2e/lens.jl
 
       - name: E2E — tool rendering (edit/search/eval/read/move/fetch/execute)
         run: |
-          xvfb-run -a -s "-screen 0 1280x900x24" \
+          timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
             julia --project=BonitoAgents BonitoAgents/test/e2e/tool_rendering.jl
 
       - name: E2E — todo taskbar (live pinned plan, mutate in place, finalize)
         run: |
-          xvfb-run -a -s "-screen 0 1280x900x24" \
+          timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
             julia --project=BonitoAgents BonitoAgents/test/e2e/todo_taskbar.jl
 
       - name: E2E — worker lifecycle (online -> killed -> offline on dashboard)
         run: |
-          xvfb-run -a -s "-screen 0 1280x900x24" \
+          timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
             julia --project=BonitoAgents BonitoAgents/test/e2e/worker_lifecycle.jl
 
       - name: E2E — cross-worker (second worker registers, 2 online, kill -> 1)
         run: |
-          xvfb-run -a -s "-screen 0 1280x900x24" \
+          timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
             julia --project=BonitoAgents BonitoAgents/test/e2e/cross_worker.jl

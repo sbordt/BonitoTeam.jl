@@ -45,30 +45,16 @@ mutable struct AppHandle
     url           :: String
     state         :: BonitoAgents.ServerState
     worker_id     :: String
-    worker_task   :: Task
+    worker_proc   :: Base.Process   # the local worker runs as a SEPARATE process (`bonitoagents worker`)
     closed        :: Threads.Atomic{Bool}
-end
-
-# Server-side disconnect of a worker's control WS. The in-process worker task
-# is parked in the WS receive loop; closing the socket from the server side is
-# the only clean way to end it (there is no out-of-band stop flag). Crucially
-# this must happen BEFORE `close(state.srv)`: the server's close drains live
-# WS handlers, and a still-connected worker would deadlock that drain (the
-# worker only disconnects when the server goes away — a circular wait).
-function close_worker_ws(state::BonitoAgents.ServerState, worker_id::String)
-    ws = lock(state.lock) do
-        get(state.worker_control_ws, worker_id, nothing)
-    end
-    ws === nothing && return
-    close(ws)
-    return
 end
 
 """
     start_app(; port = nothing) -> AppHandle
 
-Start the BonitoAgents server on loopback and register an in-process local
-worker against it. State persists under [`data_root`](@ref) across launches:
+Start the BonitoAgents server on loopback and launch a local worker process
+(`bonitoagents worker`) against it. State persists under [`data_root`](@ref)
+across launches:
 
   - `state/`         workers.json / projects.json + chat persistence
   - `working/`       canonical project copies (server side)
@@ -76,7 +62,7 @@ worker against it. State persists under [`data_root`](@ref) across launches:
   - `worker-config/` stable worker identity (`worker_id`)
 
 `port = nothing` picks a free ephemeral port. Returns an [`AppHandle`](@ref);
-`close(handle)` stops the server (the worker task ends with the process).
+`close(handle)` kills the worker process, then stops the server.
 """
 # In an AppBundler bundle, AppEnv configures the package environment by
 # mutating THIS process's LOAD_PATH/DEPOT_PATH arrays only. Child julia
@@ -86,8 +72,45 @@ worker against it. State persists under [`data_root`](@ref) across launches:
 # in a plain dev run this is a no-op-ish reaffirmation of the same paths.
 function export_julia_env!()
     sep = Sys.iswindows() ? ';' : ':'
-    ENV["JULIA_LOAD_PATH"]  = join(LOAD_PATH, sep)
+    # `Base.load_path()` — the RESOLVED absolute project paths — not the raw
+    # `LOAD_PATH` tokens. A child that inherits `JULIA_LOAD_PATH="@:@v#.#:@stdlib"`
+    # but sets no `--project` resolves `@` to *its own* (empty) active project and
+    # can't find our packages — exactly what broke the spawned worker
+    # (`-m BonitoAgentsApp worker` → "Package BonitoAgentsApp not found"). The
+    # expanded paths resolve identically in any child.
+    ENV["JULIA_LOAD_PATH"]  = join(Base.load_path(), sep)
     ENV["JULIA_DEPOT_PATH"] = join(DEPOT_PATH, sep)
+    return
+end
+
+# Command that re-execs THIS process as `bonitoagents worker`. `Base.julia_cmd()`
+# carries the same interpreter + sysimage (`-J`), so in a bundle the worker reuses
+# the app's baked-in precompilation instead of compiling from scratch; LOAD_PATH/
+# DEPOT_PATH are exported into ENV by `export_julia_env!` and inherited by the
+# child, so `-m BonitoAgentsApp` resolves to the same code. One binary, two roles.
+function worker_command(; server_url, secret, worker_id, projects_root, data_dir)
+    return `$(Base.julia_cmd()) --startup-file=no -m BonitoAgentsApp worker
+            --server-url=$server_url --secret=$secret --worker-id=$worker_id
+            --projects-root=$projects_root --data-dir=$data_dir`
+end
+
+# Stop the worker subprocess: SIGTERM, a short grace, then SIGKILL. A worker
+# parked in its control-WS receive loop acts on a queued SIGTERM only sluggishly
+# (like the production install), so escalate once the grace lapses. IOError from
+# kill = it already exited, which is the goal; anything else surfaces.
+function stop_worker_proc!(proc::Base.Process; grace_s::Real = 1.5)
+    process_exited(proc) && return
+    try; kill(proc); catch e; e isa Base.IOError || rethrow(); end
+    for _ in 1:ceil(Int, grace_s / 0.05)
+        process_exited(proc) && return
+        sleep(0.05)
+    end
+    try; kill(proc, Base.SIGKILL); catch e; e isa Base.IOError || rethrow(); end
+    for _ in 1:40
+        process_exited(proc) && return
+        sleep(0.05)
+    end
+    process_exited(proc) || @warn "BonitoAgents app: worker still alive after SIGKILL" pid = getpid(proc)
     return
 end
 
@@ -113,25 +136,35 @@ function start_app(; port::Union{Int,Nothing} = nothing)
     # so the dashboard recognises this machine across launches.
     ENV["BONITOAGENTS_CONFIG_DIR"] = worker_cfg
     worker_id = BonitoWorker.load_or_generate_worker_id()
-    worker_task = Base.errormonitor(@async BonitoWorker.connect_and_serve(;
-        server_url    = url,
-        secret        = secret,
-        worker_id     = worker_id,
-        projects_root = projects))
+    # Launch the worker as a SEPARATE process (`bonitoagents worker`), not an
+    # in-process task: a worker crash / wedge can't take down the dashboard, and
+    # it mirrors the production install (the worker is always its own process).
+    # Reuses this bundle's binary + sysimage via `worker_command`, so there's no
+    # extra compilation and `./bonitoagents` is still the single command to run.
+    # Worker output → its own log under the data root (not interleaved with the
+    # desktop's stdout), mirroring the production install's worker.log.
+    worker_log = joinpath(worker_cfg, "worker.log")
+    worker_cmd = worker_command(; server_url = url, secret = secret,
+                                  worker_id = worker_id,
+                                  projects_root = projects, data_dir = root)
+    worker_proc = run(pipeline(worker_cmd; stdout = worker_log, stderr = worker_log,
+                               append = true); wait = false)
+    @info "BonitoAgents app: worker process started" pid = getpid(worker_proc) log = worker_log
 
-    return AppHandle(url, state, worker_id, worker_task, Threads.Atomic{Bool}(false))
+    return AppHandle(url, state, worker_id, worker_proc, Threads.Atomic{Bool}(false))
 end
 
 # Idempotent: first close stops the Bonito server (bounded drain, mirroring
-# dev_server's close); the in-process worker task ends when the process exits.
+# dev_server's close); the worker subprocess is killed in close() above.
 function Base.close(h::AppHandle)
     prev = Threads.atomic_cas!(h.closed, false, true)
     prev && return h
     @info "BonitoAgents app: shutting down" url = h.url
-    # Disconnect the local worker FIRST (see close_worker_ws) so the server
-    # close below can drain its WS handlers. The worker task's reconnect loop
-    # keeps retrying against the closing server; it dies with the process.
-    close_worker_ws(h.state, h.worker_id)
+    # Kill the worker process FIRST: its control WS then drops so the server
+    # close below can drain its WS handlers (a still-connected worker would
+    # deadlock that drain — the worker only disconnects when the server goes
+    # away), and its reconnect loop stops retrying against the closing server.
+    stop_worker_proc!(h.worker_proc)
     close_task = Base.errormonitor(@async close(h.state.srv))
     for _ in 1:200
         istaskdone(close_task) && break

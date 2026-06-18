@@ -193,8 +193,6 @@ function chat_status(state::ServerState, p::ProjectInfo)
     return m.busy_active[] ? :active : :online
 end
 
-const HOME_ICON = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "icons", "home.svg"))
-
 # Per-PROCESS boot id scoping the sidebar's localStorage last-route memory:
 # a route saved by one server process must not navigate a fresh one. Lazy
 # (Ref filled on first use) — a `const x = uuid4()` would be baked into the
@@ -231,7 +229,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
     # 32px slot so it visually reads as "go home" instead of competing
     # with the colored project tiles below it.
     home_icon = DOM.div(
-        DOM.img(src = HOME_ICON, alt = "Home", draggable = "false",
+        DOM.img(src = bonito_asset("icons", "home.svg"), alt = "Home", draggable = "false",
                 style = Styles("width" => "18px", "height" => "18px",
                                "display" => "block", "pointer-events" => "none"));
         class = "bt-side-home-icon",
@@ -1109,17 +1107,17 @@ end
 # BonitoAgents logo family (see bonito-logos/README.md for the design notes).
 # The SVG doubles as the favicon — every evergreen browser accepts
 # `<link rel="icon" type="image/svg+xml">`; the 32px PNG is the fallback.
-const LOGO_SVG     = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "logo", "bonitoagents-light.svg"))
-const FAVICON_SVG  = LOGO_SVG
-const FAVICON_PNG  = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "logo", "bonitoagents-light-32.png"))
+logo_svg()    = bonito_asset("logo", "bonitoagents-light.svg")
+favicon_svg() = logo_svg()
+favicon_png() = bonito_asset("logo", "bonitoagents-light-32.png")
 
 # Bonito has no first-class favicon hook on App, so inject the <link> tags
 # into <head> on document load. The assets are served by the same hashed
 # asset machinery as everything else — resolved to URL STRINGS here because
 # a raw `Asset` has no msgpack mapping inside interpolated JS.
 function favicon_onload(session::Bonito.Session, node)
-    svg_url = Bonito.url(session, FAVICON_SVG)
-    png_url = Bonito.url(session, FAVICON_PNG)
+    svg_url = Bonito.url(session, favicon_svg())
+    png_url = Bonito.url(session, favicon_png())
     Bonito.onload(session, node, js"""(el) => {
         const ensure = (rel, type, href) => {
             let link = document.querySelector(`link[rel="${rel}"]`);

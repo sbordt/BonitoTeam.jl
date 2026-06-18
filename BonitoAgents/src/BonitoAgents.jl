@@ -34,6 +34,11 @@ import BonitoMCP        # shipped to workers, also used by the bundle build
 import BonitoWorker     # ditto
 using BonitoWidgets     # Workspace / Panel / FloatingWindow — the VSCode-style layout
 
+# Asset under `assets/`, path resolved at RUNTIME via pkgdir — NOT @__DIR__,
+# which bakes the precompile-time path and 404s in a relocated app bundle.
+bonito_asset(parts::AbstractString...) =
+    Bonito.Asset(joinpath(pkgdir(@__MODULE__)::String, "assets", parts...))
+
 include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
 include("progress.jl")         # notify_progress / format_progress_string — shared by sync + import
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP

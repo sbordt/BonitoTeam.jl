@@ -2541,7 +2541,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         busy_card,
         DOM.div(
             DOM.h1(
-                DOM.img(src = LOGO_SVG, alt = "", class = "bt-logo",
+                DOM.img(src = logo_svg(), alt = "", class = "bt-logo",
                         draggable = "false"),
                 "BonitoAgents"),
             DOM.div("Multi-host orchestrator for agentic coding sessions";

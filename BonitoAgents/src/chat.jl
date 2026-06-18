@@ -4000,8 +4000,8 @@ end
 # Icons live as standalone SVG files under assets/icons/ and ship as
 # Bonito.Asset (hashed URL, served by the same machinery as bonitoagents.js).
 # Colors are baked into the SVGs since <img> doesn't inherit currentColor.
-const SEND_ICON = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "icons", "send.svg"))
-const STOP_ICON = Bonito.Asset(joinpath(@__DIR__, "..", "assets", "icons", "stop.svg"))
+send_icon() = bonito_asset("icons", "send.svg")
+stop_icon() = bonito_asset("icons", "stop.svg")
 icon_img(asset, alt) = DOM.img(src=asset, alt=alt, draggable="false",
     style=Styles("pointer-events" => "none",
         "user-select" => "none"))
@@ -4024,9 +4024,9 @@ function chat_input_area(::Session, ::ChatModel)
             event.target.style.height = 'auto';
             event.target.style.height = Math.min(event.target.scrollHeight, 120) + 'px';
         }""")
-    send_btn = DOM.button(icon_img(SEND_ICON, "Send"); type="button",
+    send_btn = DOM.button(icon_img(send_icon(), "Send"); type="button",
         class="bt-send-btn", title="Send (Enter)")
-    stop_btn = DOM.button(icon_img(STOP_ICON, "Stop"); type="button",
+    stop_btn = DOM.button(icon_img(stop_icon(), "Stop"); type="button",
         class="bt-stop-btn", title="Stop generation")
     DOM.div(DOM.div(text_input, send_btn, stop_btn, class="bt-input-row");
         class="bt-input-area")

@@ -23,7 +23,8 @@ using Malt
 using Dates: format, now
 import Pkg
 
-const HELPER_PATH = abspath(joinpath(@__DIR__, "helper_payload.jl"))
+# Runtime (pkgdir), not @__DIR__ — see remote_proxy_path; survives bundle reloc.
+helper_payload_path() = joinpath(pkgdir(@__MODULE__)::String, "src", "helper_payload.jl")
 const PKG_PATTERN = r"\bPkg\."
 const DEFAULT_TIMEOUT = 30.0
 const BONITO_UUID = Base.UUID("824d6782-a2ef-11e9-3a09-e5662e0c26f8")
@@ -239,7 +240,7 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
             # module's last def ⇒ its presence means a complete load; otherwise
             # re-include, which re-throws the REAL load error if the env is wrong.
             if !(isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :render_embed))
-                include($(REMOTE_PROXY_PATH))
+                include($(remote_proxy_path()))
             end
             Main.RemoteProxy.ensure_bridge!()
         end)
@@ -343,7 +344,7 @@ function start!(s::JuliaSession)
     # `; nothing` is load-bearing: include() returns the module object and
     # Malt can't serialise a `Module` reference back to the parent.
     Malt.remote_eval_fetch(s.worker, :(try; using Revise; catch; end; nothing))
-    Malt.remote_eval_fetch(s.worker, :(include($HELPER_PATH); nothing))
+    Malt.remote_eval_fetch(s.worker, :(include($(helper_payload_path())); nothing))
 
     # Interactive-app dial-back is lazy (ensure_eval_dialed! from bt_show_app),
     # so non-Bonito eval sessions don't pay for it.

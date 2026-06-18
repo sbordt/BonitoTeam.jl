@@ -41,6 +41,8 @@ include("tools/show.jl")       # bt_show — rich MIME render, audience-tagged
 # `RemoteProxy.jl` is NOT included here — it references `Bonito.*` types and
 # BonitoMCP intentionally has no Bonito dep (cf. `eval_ws.jl`). The worker
 # `include`s it from `session.jl`'s `ensure_eval_dialed!` after `using Bonito`.
-const REMOTE_PROXY_PATH = abspath(joinpath(@__DIR__, "RemoteProxy.jl"))
+# Runtime (pkgdir), not @__DIR__: @__DIR__ bakes the precompile-time path, gone
+# in a relocated app bundle (built in a staging dir, run from elsewhere).
+remote_proxy_path() = joinpath(pkgdir(@__MODULE__)::String, "src", "RemoteProxy.jl")
 
 end # module BonitoMCP

@@ -3276,6 +3276,11 @@ function send_message!(model::ChatModel, msg::UserMsg;
     bubble = UserMsg(model, msg.text)
     bubble.queued = s.busy_active[]
     close(send!(model, bubble))   # send! pushes + emits wire_new; close persists
+    # Refresh the lens vocabulary NOW that a user message exists, rather than
+    # waiting for end-of-turn (drain_turn!'s emit_lens_vocab). Otherwise the
+    # `/user_message` key isn't suggestable until the agent's reply lands — the
+    # user can't lens-filter their own just-sent message mid-turn.
+    emit_lens_vocab(model)
     put!(s.user_messages,
         UserMessage(msg.text, collect(AgentClientProtocol.ImageAttachment, images)))
     backfill_project_title!(model, msg.text)

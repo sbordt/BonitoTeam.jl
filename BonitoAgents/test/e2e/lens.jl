@@ -46,8 +46,14 @@ try
         @testset "the lens bar and its vocabulary are present" begin
             @test TK.eval_js(server, "!!document.querySelector('.bt-header .bt-lens-bar')") == true
             @test TK.eval_js(server, "!!document.querySelector('.bt-lens-input')") == true
-            @test TK.wait_for(server, "vocabulary arrived",
-                "$(chat_state("lensVocab")).length > 0"; timeout = 8) == true
+            # The vocabulary is chat-DERIVED: `lens_vocabulary` always offers
+            # `all`, but the message-type keys (`user_message`, …) only arrive
+            # once the messages they describe exist and the server re-emits
+            # `lens.vocab`. Gate on the real key the autocomplete test below
+            # needs — `length > 0` is satisfied by the trivial `["all"]` seed
+            # and would let the next testset race the actual vocab push.
+            @test TK.wait_for(server, "message-derived vocabulary arrived",
+                "$(chat_state("lensVocab")).includes('user_message')"; timeout = 8) == true
         end
 
         @testset "typing a partial token offers autocomplete" begin

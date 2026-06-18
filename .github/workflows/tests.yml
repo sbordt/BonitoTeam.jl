@@ -31,6 +31,9 @@ env:
   # Project.toml set (Manifest is gitignored/regenerated); run_id pins it to
   # this run so the precompiled images match what setup produced.
   DEPOT_KEY_PREFIX: julia-depot-v1
+  # Suppress post-instantiate auto-precompile everywhere; the setup job's
+  # explicit Pkg.precompile() still runs (it's not the auto pass).
+  JULIA_PKG_PRECOMPILE_AUTO: '0'
 
 jobs:
   # ── Compile once ──────────────────────────────────────────────────────────

@@ -24,6 +24,16 @@ concurrency:
   group: build-app-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
+# Don't eagerly auto-precompile on instantiate. The meta env would otherwise
+# precompile Conda/PyCall BEFORE Pkg.build() sets up the conda env (that pass
+# fails and is thrown away), and the app stack would be compiled into ~/.julia
+# only for AppBundler to recompile it into the bundle's own depot. With this off,
+# AppBundler compiles lazily on load and the app compiles once, in the bundle.
+# (Explicit precompile / load-time precompile still happen — this only suppresses
+# the post-instantiate auto pass.)
+env:
+  JULIA_PKG_PRECOMPILE_AUTO: '0'
+
 jobs:
   build:
     name: Build ${{ matrix.os }}-${{ matrix.arch }}

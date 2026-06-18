@@ -81,6 +81,7 @@ const ChatStyles = Bonito.Styles(
         "width" => "100%"),
 
     # ── Lens search bar (header) ─────────────────────────────────────────────
+    # Always visible, directly under the control row.
     CSS(".bt-lens-bar",
         "display" => "flex", "flex-direction" => "column", "gap" => "6px",
         "margin-top" => "8px", "width" => "100%"),
@@ -313,16 +314,41 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-header-provider-select:focus",
         "outline" => "2px solid var(--bt-accent)",
         "outline-offset" => "1px"),
+    # Transient provider-switch status ("Switching…"/"switch failed"). Lives in
+    # the flexible left area (before the auto-margin), capped + ellipsized so it
+    # never reflows the control cluster.
+    CSS(".bt-header-status",
+        "font-size" => "12px",
+        "color" => "var(--bt-text-muted)",
+        "white-space" => "nowrap",
+        "flex" => "0 0 auto",
+        "overflow" => "hidden",
+        "text-overflow" => "ellipsis",
+        "max-width" => "220px"),
     # ── Session-config meta line (model / mode / effort — `header_meta_line`).
     # Plain muted text below the title row; items joined with " · ", full
     # descriptions in the per-item tooltip.
+    # Sits inline in the control row (the session-config "model" picks). Shrinks
+    # and ellipsizes before the fixed buttons do; pushed to the right by the
+    # title's flex-grow.
     CSS(".bt-header-meta",
         "font-size" => "12px",
         "color" => "var(--bt-text-muted)",
-        "margin-top" => "2px",
+        # Sits left (after the title), content-width, growing rightward into the
+        # gap before the right-anchored `.bt-header-actions`. Min-width keeps the
+        # empty state (during a switch) from collapsing the layout; max-width
+        # ellipsizes a very long model name instead of squeezing the title.
+        "flex" => "0 1 auto", "min-width" => "0", "max-width" => "260px",
         "white-space" => "nowrap",
         "overflow" => "hidden",
         "text-overflow" => "ellipsis"),
+    # The right-anchored control cluster (provider switcher · sync · restart).
+    # `margin-left:auto` pushes it to the right edge; because the model pill and
+    # status text live OUTSIDE it (to its left), their width changes are absorbed
+    # by the gap and never move these buttons.
+    CSS(".bt-header-actions",
+        "display" => "flex", "align-items" => "center", "gap" => "10px",
+        "margin-left" => "auto", "flex" => "0 0 auto"),
     CSS(".bt-header-meta-item",
         "cursor" => "default"),
 
@@ -1591,7 +1617,19 @@ const ChatStyles = Bonito.Styles(
         "animation" => "bt-spin 0.7s linear infinite",
         "flex-shrink" => "0",
         "display" => "inline-block"),
-    CSS("@keyframes bt-spin", CSS("to", "transform" => "rotate(360deg)")),
+    # Explicit `from` so it's an angle interpolation (0°→360°); `to` alone
+    # interpolates matrix→identity and never turns. See dashboard.jl bt-spin.
+    CSS("@keyframes bt-spin",
+        CSS("from", "transform" => "rotate(0deg)"),
+        CSS("to", "transform" => "rotate(360deg)")),
+
+    # Placeholder shown in a file editor panel while its content is fetched from
+    # the worker (open_file!). Centers the spinner + "Opening <file>…" so the
+    # click has immediate feedback during a slow remote transfer.
+    CSS(".bt-file-loading",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "justify-content" => "center", "height" => "100%",
+        "color" => "var(--bt-text-faint)", "font-size" => "13px"),
 
     # ── Responsive ───────────────────────────────────────────────────────────
     CSS("@media (max-width: 480px)",

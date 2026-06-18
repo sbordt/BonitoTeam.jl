@@ -1,0 +1,176 @@
+# Unit + end-to-end tests for BonitoAgents.
+#
+# Structure: one `setup` job instantiates + updates the git-pinned forks +
+# PRECOMPILES the whole stack ONCE, then `unit` and a fan-out `e2e` matrix run
+# in PARALLEL, each reusing setup's compiled depot. The forks (ElectronCall,
+# Bonito, …) live in BonitoAgents/[sources]; setup pins them to their branch
+# HEADs and shares the resolved Manifest so the downstream jobs compile nothing.
+#
+# Why a run-scoped cache key (`…-${{ github.run_id }}`): setup `Pkg.update`s the
+# forks to moving branch HEADs, so the precompiled images are only guaranteed
+# valid within THIS run. The `restore-keys` fallback still warm-starts package
+# downloads/artifacts from a prior run; only the (fast, incremental) precompile
+# re-runs in setup. The downstream jobs restore setup's exact cache, so they
+# skip compilation entirely.
+name: Tests
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  JULIA_VERSION: '1.12'
+  # The depot we cache + share across jobs. Keyed on the lockfile-independent
+  # Project.toml set (Manifest is gitignored/regenerated); run_id pins it to
+  # this run so the precompiled images match what setup produced.
+  DEPOT_KEY_PREFIX: julia-depot-v1
+
+jobs:
+  # ── Compile once ──────────────────────────────────────────────────────────
+  setup:
+    name: setup (instantiate + precompile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ env.JULIA_VERSION }}
+
+      # Save the depot under a run-scoped key; warm-start from any prior run's
+      # depot via restore-keys so package tarballs/artifacts aren't re-downloaded.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.julia
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/mocks/Project.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/mocks/Project.toml') }}-
+            ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-
+
+      - name: Instantiate + refresh the git-pinned forks, then precompile
+        # Update the forks to their branch HEADs (a restored cache can otherwise
+        # keep a stale tree even after a fork branch moves) and precompile the
+        # whole stack so the downstream jobs compile nothing.
+        run: |
+          julia --project=BonitoAgents -e '
+            using Pkg
+            Pkg.instantiate()
+            Pkg.update(["ElectronCall", "Bonito", "BonitoWidgets", "BonitoBook"])
+            Pkg.precompile()'
+
+      - name: Instantiate + precompile the mock-agent env (tiny JSON + Sockets)
+        run: julia --project=BonitoAgents/test/mocks -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+
+      # The downstream jobs MUST reuse this exact Manifest (the forks moved in
+      # the update above) or they'd re-resolve to other commits and miss the
+      # precompile cache. Manifest.toml is gitignored, so share it as an artifact.
+      - name: Share the resolved Manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifests
+          path: |
+            BonitoAgents/Manifest.toml
+            BonitoAgents/test/mocks/Manifest.toml
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── Unit tests (path/JS-escaping regressions) ─────────────────────────────
+  unit:
+    name: unit tests
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ env.JULIA_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: manifests
+          path: manifests-dl
+      - name: Restore the shared Manifests
+        run: |
+          cp manifests-dl/Manifest.toml BonitoAgents/Manifest.toml
+          cp manifests-dl/test/mocks/Manifest.toml BonitoAgents/test/mocks/Manifest.toml
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.julia
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/mocks/Project.toml') }}-${{ github.run_id }}
+      - name: Instantiate (no-op against the cached depot)
+        run: julia --project=BonitoAgents -e 'using Pkg; Pkg.instantiate()'
+      - name: Unit tests
+        run: julia --project=BonitoAgents BonitoAgents/test/runtests.jl
+
+      - name: RemoteSync transfer tests (incl. close-vs-tail stress)
+        # RemoteSync is a path [source] of BonitoAgents, so its deps (HTTP,
+        # librsync_jll, …) are already in this env — run its suite here rather
+        # than spin up a separate project. Guards the single-file + directory
+        # close-vs-tail race regressions that production file-open relies on.
+        run: julia --project=BonitoAgents RemoteSync/test/runtests.jl
+
+  # ── E2E suite — one parallel job per scenario ─────────────────────────────
+  e2e:
+    name: 'E2E — ${{ matrix.suite }}'
+    needs: setup
+    runs-on: ubuntu-latest
+    env:
+      DISPLAY: ":99"
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - workflows
+          - chat_features
+          - embedded_app
+          - scroll_persist
+          - errors
+          - lens
+          - file_open
+          - tool_rendering
+          - todo_taskbar
+          - worker_lifecycle
+          - cross_worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ env.JULIA_VERSION }}
+      - name: Install Xvfb + Electron runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb dbus libgtk-3-0 libnss3 libasound2t64 libgbm1 \
+            libxss1 libxtst6 libatk-bridge2.0-0 libdrm2
+      - uses: actions/download-artifact@v4
+        with:
+          name: manifests
+          path: manifests-dl
+      - name: Restore the shared Manifests
+        run: |
+          cp manifests-dl/Manifest.toml BonitoAgents/Manifest.toml
+          cp manifests-dl/test/mocks/Manifest.toml BonitoAgents/test/mocks/Manifest.toml
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.julia
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/mocks/Project.toml') }}-${{ github.run_id }}
+      - name: Instantiate (no-op against the cached depot)
+        run: julia --project=BonitoAgents -e 'using Pkg; Pkg.instantiate()'
+      - name: 'E2E — ${{ matrix.suite }}'
+        run: |
+          timeout 420 xvfb-run -a -s "-screen 0 1280x900x24" \
+            julia --project=BonitoAgents BonitoAgents/test/e2e/${{ matrix.suite }}.jl
+
+  # ── Single required check for branch protection ───────────────────────────
+  all-green:
+    name: all tests green
+    needs: [unit, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "unit + all e2e suites passed"

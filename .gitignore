@@ -8,3 +8,6 @@
 .idea/
 node_modules/
 Manifest.toml
+
+# AppBundler local build output (CI uploads it as an artifact)
+build/

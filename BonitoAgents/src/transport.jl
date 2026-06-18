@@ -20,8 +20,9 @@ require different environment variables or arguments.
   * `ClaudeCode` — Anthropic's `claude-agent-acp` (Node.js CLI)
   * `MiMoCode` — Xiaomi's `mimo acp` (Node.js CLI)
   * `OpenCode` — OpenCode's `opencode acp` (Go CLI)
+  * `MockCode` — Test-only mock agent (Julia script, for e2e testing)
 """
-@enum AgentProvider ClaudeCode MiMoCode OpenCode
+@enum AgentProvider ClaudeCode MiMoCode OpenCode MockCode
 
 """
     provider_label(p::AgentProvider) -> String
@@ -32,6 +33,7 @@ function provider_label(p::AgentProvider)
     p == ClaudeCode && return "Claude Code"
     p == MiMoCode && return "MiMo Code"
     p == OpenCode && return "OpenCode"
+    p == MockCode && return "Mock Agent"
     return "Unknown"
 end
 
@@ -44,6 +46,7 @@ function provider_icon(p::AgentProvider)
     p == ClaudeCode && return "bt-provider-claude"
     p == MiMoCode && return "bt-provider-mimo"
     p == OpenCode && return "bt-provider-opencode"
+    p == MockCode && return "bt-provider-mock"
     return "bt-provider-unknown"
 end
 
@@ -65,8 +68,7 @@ function find_provider_bin(p::AgentProvider)
         !isempty(explicit) && return explicit
         bin = Sys.which("mimo")
         bin !== nothing && return bin
-        home = first(splitdir(homedir()))
-        mimo_path = joinpath(home, ".mimocode", "bin", "mimo")
+        mimo_path = joinpath(homedir(), ".mimocode", "bin", "mimo")
         isfile(mimo_path) && return mimo_path
         return "mimo"
     elseif p == OpenCode
@@ -74,10 +76,17 @@ function find_provider_bin(p::AgentProvider)
         !isempty(explicit) && return explicit
         bin = Sys.which("opencode")
         bin !== nothing && return bin
-        home = first(splitdir(homedir()))
-        opencode_path = joinpath(home, ".opencode", "bin", "opencode")
+        opencode_path = joinpath(homedir(), ".opencode", "bin", "opencode")
         isfile(opencode_path) && return opencode_path
         return "opencode"
+    elseif p == MockCode
+        explicit = get(ENV, "MOCK_AGENT_ACP", "")
+        !isempty(explicit) && return explicit
+        # Resolve relative to the BonitoAgents package root (src/..)
+        pkg_root = dirname(@__DIR__)
+        mock_bin = joinpath(pkg_root, "test", "mocks", "mock_claude_agent_acp")
+        isfile(mock_bin) && return mock_bin
+        return "mock_claude_agent_acp"
     else
         error("Unknown provider: $p")
     end
@@ -89,6 +98,31 @@ end
 Backward-compatible entry point: defaults to ClaudeCode.
 """
 find_agent_bin(p::AgentProvider = ClaudeCode) = find_provider_bin(p)
+
+"""
+    provider_args(p::AgentProvider) -> Vector{String}
+
+Extra CLI arguments needed to launch the provider's **ACP server**.
+
+Claude's `claude-agent-acp` binary speaks ACP directly, so it takes no
+arguments. `mimo` and `opencode` are multi-command CLIs whose ACP server
+lives under an `acp` subcommand — running the bare binary launches their
+interactive TUI instead (which never speaks ACP, so the `initialize`
+handshake hangs forever). The mock agent also speaks ACP directly.
+"""
+function provider_args(p::AgentProvider)
+    (p == MiMoCode || p == OpenCode) && return String["acp"]
+    return String[]
+end
+
+# `clientCapabilities.elicitation.form`: claude-agent-acp and MiMo accept the
+# boolean `true`; OpenCode validates the schema strictly (zod) and REQUIRES an
+# object — `form: true` fails initialize with `-32602 Invalid params`
+# ("expected object, received boolean"). Send the object shape for OpenCode,
+# the boolean for the others (unchanged / known-good).
+client_elicitation(p::AgentProvider) =
+    p == OpenCode ? Dict{String,Any}("form" => Dict{String,Any}()) :
+                    Dict{String,Any}("form" => true)
 
 """
     abstract type ChatTransport <: ACP.Transport
@@ -113,6 +147,11 @@ agent→client `fs/*` RPCs. Session updates are NOT handled here; they
 arrive as the `Channel{Message}` returned by `ACP.prompt!` per turn.
 """
 abstract type ChatTransport <: ACP.Transport end
+
+# The agent provider a transport runs, or `nothing` for transports that have no
+# provider notion (e.g. MockTransport in tests). Lets `ChatModel` derive its
+# `provider` observable from the transport it was handed (the source of truth).
+transport_provider(::ChatTransport) = nothing
 
 # ── 1. Local subprocess ────────────────────────────────────────────────────
 
@@ -240,6 +279,11 @@ ACP.recv(t::MockTransport)                       = take!(t.incoming)
 # Channel.close is idempotent in Base, so no wrapper is needed.
 Base.close(t::MockTransport) = (close(t.outgoing); close(t.incoming); nothing)
 
+# Transports that run a real agent carry the provider; MockTransport keeps the
+# `ChatTransport` fallback (`nothing`).
+transport_provider(t::LocalTransport)  = t.provider
+transport_provider(t::WorkerTransport) = t.provider
+
 # The path the *agent* sees as its working directory. The chat layer uses
 # this when constructing the ACP `FSRequestHandler` so server-side fs RPCs
 # resolve paths against the right root (server cwd locally, worker path
@@ -293,7 +337,7 @@ function start_session(t::LocalTransport, handler::ACP.Handler;
     env = merge(Dict(k => v for (k,v) in ENV),
                 provider_env,
                 t.agent_env)
-    proc = open(Cmd(`$(t.agent_bin)`; env, dir = t.cwd), "r+")
+    proc = open(Cmd(`$(t.agent_bin) $(provider_args(t.provider))`; env, dir = t.cwd), "r+")
     t.inner[] = ACP.SubprocessTransport(proc)
 
     conn = ACP.Connection(t, handler; on_frame)
@@ -306,20 +350,14 @@ function start_session(t::LocalTransport, handler::ACP.Handler;
             # elicitation (otherwise it launches claude with
             # `--disallowedTools AskUserQuestion`). The chat renders these
             # as interactive question cards — see `handle_elicitation_request`.
-            "elicitation" => Dict("form" => true)),
+            "elicitation" => client_elicitation(t.provider)),
         "clientInfo"         => Dict("name"    => "BonitoAgents.LocalTransport",
                                       "version" => "0.1.0")))
     # Local sessions are always fresh (`session/new`) — no resume, no replay.
-    # The raw result rides on the Client (session config: models/modes/…).
-    # For MiMo/OpenCode, skip the system_prompt_meta since they don't use
-    # Claude's `_meta.systemPrompt.preset` format.
-    session_params = if t.provider == ClaudeCode
-        merge(Dict("cwd" => t.cwd,
-                   "mcpServers" => mcp_list_payload(t.mcp_servers)),
-              system_prompt_meta(global_agents_md(t.state)))
-    else
-        Dict("cwd" => t.cwd, "mcpServers" => mcp_list_payload(t.mcp_servers))
-    end
+    # A LocalTransport has no ServerState, so there is no server-wide AGENTS.md
+    # to append (that's a WorkerTransport concept). This matches the worker path
+    # when no AGENTS.md exists, which sends no system-prompt meta either.
+    session_params = Dict("cwd" => t.cwd, "mcpServers" => mcp_list_payload(t.mcp_servers))
     result = ACP.send_request(conn, "session/new", session_params)
     # The raw result rides on the Client (session config: models/modes/…).
     return ACP.Client(conn, result["sessionId"], t.cwd, ACP._result_dict(result)),
@@ -368,7 +406,7 @@ function start_session(t::WorkerTransport, handler::ACP.Handler;
             # elicitation (otherwise it launches claude with
             # `--disallowedTools AskUserQuestion`). The chat renders these
             # as interactive question cards — see `handle_elicitation_request`.
-            "elicitation" => Dict("form" => true)),
+            "elicitation" => client_elicitation(t.provider)),
         "clientInfo"         => Dict("name"    => "BonitoAgents.WorkerTransport",
                                       "version" => "0.1.0")))
 

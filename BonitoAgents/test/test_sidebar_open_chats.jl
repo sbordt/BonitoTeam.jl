@@ -11,7 +11,8 @@
 #   :online  — worker up, no agent turn in flight (resumable OR idle live chat)
 #   :active  — busy_active==true on a live ChatModel (claude is thinking)
 
-using Test, BonitoAgents, Dates, Observables
+using Test, BonitoAgents, Dates
+using BonitoAgents.Bonito.Observables: on, off
 using BonitoAgents: ProjectInfo, WorkerInfo, ServerState, ChatModel, MockTransport,
                    open_chat_projects, chat_status, now, UTC
 

@@ -84,6 +84,30 @@ function seed_temp_env_with_bonito!(env_dir::AbstractString)
     end
 end
 
+# A shared env that pins the SAME Bonito the host runs (the proxy-aware dev
+# Bonito with `proxy_send` / `id_prefix`). Stacked onto every eval worker's
+# LOAD_PATH (see `start!`) so a Malt worker's `using Bonito` resolves to it for
+# the bt_show_app bridge even when the PROJECT env doesn't pin Bonito — without
+# it, `using Bonito` falls through to a *registered* Bonito in the global depot
+# that lacks the remote-app API, so `RemoteProxy.ensure_bridge!` throws
+# `UndefVarError: proxy_send` and the embed shows "(eval session not connected)".
+# Inserted AFTER the active project, so a project that DOES pin its own Bonito
+# still wins; this only beats the global-depot fallback. Created once, lazily.
+const BRIDGE_BONITO_ENV = Ref{Union{String,Nothing}}(nothing)
+const BRIDGE_BONITO_LOCK = ReentrantLock()
+
+function bridge_bonito_env()
+    @lock BRIDGE_BONITO_LOCK begin
+        BRIDGE_BONITO_ENV[] === nothing || return BRIDGE_BONITO_ENV[]
+        bonito_path = _find_bonito_path()
+        bonito_path === nothing && return nothing
+        env_dir = mktempdir(prefix = "bonitoagents-bridge-bonito-")
+        seed_temp_env_with_bonito!(env_dir) || return nothing
+        BRIDGE_BONITO_ENV[] = env_dir
+        return env_dir
+    end
+end
+
 # ── JuliaSession ────────────────────────────────────────────────────────────
 mutable struct JuliaSession
     env_path::Union{String,Nothing}
@@ -101,6 +125,7 @@ mutable struct JuliaSession
     lock::ReentrantLock                 # serialises eval/continue/interrupt
     log_path::Union{String,Nothing}
     dialed_back::Bool                   # `ensure_eval_dialed!` dedupes against this; flipped under `lock`
+    dial_error::String                  # last eval-bridge setup/connect failure, surfaced by bt_show_app
     closed::Bool                        # terminal: set by kill_session!; start! refuses to resurrect
 end
 
@@ -113,7 +138,7 @@ function JuliaSession(env_path;
                         nothing, IOBuffer(), ReentrantLock(),
                         nothing, nothing,
                         nothing, "", 0.0,
-                        ReentrantLock(), log_path, false, false)
+                        ReentrantLock(), log_path, false, "", false)
 end
 
 is_alive(s::JuliaSession) = s.worker !== nothing && Malt.isrunning(s.worker)
@@ -186,13 +211,14 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
         catch
             false
         end
-        worker_ws_live() && return s
+        if worker_ws_live(); s.dial_error = ""; return s; end
         @info "BonitoMCP: eval-ws bridge currently disconnected — waiting for dial_loop to reconnect"
         for _ in 1:40   # ~10s budget, covers max_backoff (8s) plus reconnect
-            worker_ws_live() && return s
+            if worker_ws_live(); s.dial_error = ""; return s; end
             sleep(0.25)
         end
-        @warn "BonitoMCP: eval-ws bridge stayed disconnected; will not double-dial. Use bt_julia_restart to rebuild the worker if the issue persists."
+        s.dial_error = "the eval-ws bridge was connected earlier but is currently down and the worker's dial_loop hasn't reconnected within ~10s — the BonitoAgents server may be unreachable at $wsurl (server restarted / wrong URL)."
+        @warn "BonitoMCP: eval-ws bridge stayed disconnected; will not double-dial. Use bt_julia_restart to rebuild the worker if the issue persists." wsurl
         return s
     end
     try
@@ -243,10 +269,24 @@ function ensure_eval_dialed_locked!(s::JuliaSession, wsurl::AbstractString)
             end
             sleep(0.25)
         end
-        ready || @warn "BonitoMCP: bridge dial not connected 30s after setup" wsurl
+        if ready
+            s.dial_error = ""
+        else
+            s.dial_error = "the RemoteProxy bridge was built on the worker but never connected to $wsurl within 30s — the eval worker couldn't reach the BonitoAgents server (wrong/unreachable BONITOAGENTS_SERVER_URL, server gone, or the dial_loop crashed). Check the worker log for a 'dial loop crashed' / 'dial failed' warning."
+            @warn "BonitoMCP: bridge dial not connected 30s after setup" wsurl
+        end
+        # The bridge IS set up and dial_loop is spawned (it self-reconnects), so
+        # keep dialed_back=true regardless of `ready` — re-running setup would
+        # spawn a duplicate dial_loop. The skip-path above surfaces dial_error on
+        # the next call if it's still not connected.
         s.dialed_back = true
     catch e
         s.dialed_back = false   # allow retry on the next call
+        # Capture the REAL worker-side setup error (e.g. a `using Bonito` that
+        # resolved a Bonito without the remote-app API → `UndefVarError:
+        # proxy_send` while including RemoteProxy) so bt_show_app can surface it
+        # to the agent instead of a generic "bridge not connected".
+        s.dial_error = sprint(showerror, e, catch_backtrace())
         @warn "BonitoMCP: eval dial-back setup failed" exception = (e, catch_backtrace())
     end
     return s
@@ -273,6 +313,31 @@ function start!(s::JuliaSession)
     # same buffer — same UX as a normal REPL.
     s.stdout_pump = Threads.@spawn pump_pipe!(s, s.worker.stdout)
     s.stderr_pump = Threads.@spawn pump_pipe!(s, s.worker.stderr)
+
+    # Stack the host's proxy-aware Bonito onto the worker's LOAD_PATH as a
+    # FALLBACK only — inserted AFTER the active project but BEFORE the global
+    # depot. A project that declares its OWN Bonito (position 1) always wins, so
+    # plain `bt_julia_eval` keeps using the project's Bonito exactly as the
+    # user's env dictates; we never override it. The fallback ONLY kicks in when
+    # the project declares no Bonito — there `using Bonito` would otherwise
+    # resolve a *registered* depot Bonito that lacks the remote-app API
+    # (`proxy_send`) and breaks bt_show_app; the bridge env (same source as the
+    # server, freshly resolved) is the right thing to use instead. Only
+    # `using Bonito` is affected (the env declares no other deps).
+    #
+    # NOTE: a project that DOES pin Bonito but with a STALE Manifest (e.g.
+    # "Bonito does not have PrecompileTools in its dependencies") still wins and
+    # still fails — by design, we don't silently swap the project's pinned
+    # Bonito. That precompile error now surfaces via bt_show_app's dial_error;
+    # the fix is to re-resolve the project (`Pkg.resolve()`), since plain eval
+    # `using Bonito` is broken there too.
+    let be = bridge_bonito_env()
+        be === nothing || try
+            Malt.remote_eval_fetch(s.worker, :(insert!(LOAD_PATH, min(2, length(LOAD_PATH)+1), $be); nothing))
+        catch e
+            @warn "start!: could not stack the proxy Bonito env on the worker LOAD_PATH" exception = e
+        end
+    end
 
     # Auto-Revise (best-effort) + load our format helper. The trailing
     # `; nothing` is load-bearing: include() returns the module object and

@@ -1210,17 +1210,27 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-spinner-row",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "color" => "var(--bt-text-muted)", "font-size" => "13px"),
+    # Per-side borders so the accent arc shows (the `border` shorthand was
+    # overriding `border-top-color` → uniform grey ring, invisible rotation).
     CSS(".bt-spinner",
         "width" => "14px", "height" => "14px",
-        "border-radius" => "50%",
-        "border" => "2px solid var(--bt-border)",
-        "border-top-color" => "var(--bt-accent)",
+        "border-radius" => "50%", "box-sizing" => "border-box",
+        "border-top" => "2px solid var(--bt-accent)",
+        "border-right" => "2px solid var(--bt-border)",
+        "border-bottom" => "2px solid var(--bt-border)",
+        "border-left" => "2px solid var(--bt-border)",
         "will-change" => "transform",   # compositor-driven; survives main-thread jank
         "animation" => "bt-spin 0.7s linear infinite",
         "flex-shrink" => "0"),
     CSS(".bt-spinner-sm",
         "width" => "11px", "height" => "11px", "border-width" => "1.5px"),
-    CSS("@keyframes bt-spin", CSS("to", "transform" => "rotate(360deg)")),
+    # MUST have an explicit `from`: with only `to { rotate(360deg) }` the
+    # browser interpolates from the element's base transform (a matrix) to
+    # rotate(360deg) — which is the identity matrix — so it never visibly turns.
+    # Both keyframes using rotate() makes it an ANGLE interpolation (0°→360°).
+    CSS("@keyframes bt-spin",
+        CSS("from", "transform" => "rotate(0deg)"),
+        CSS("to", "transform" => "rotate(360deg)")),
 
     # ── Chat loading screen (project_loading_view) ───────────────────────────
     # Centered in the main panel while a chat's ACP session is brought up, or
@@ -1236,13 +1246,29 @@ const DashboardStyles = Bonito.Styles(
     # Monaco bundle eval, virtual-scroll measuring). Without the promotion
     # the animation runs on the main thread and freezes for seconds at a
     # time — "the spinner doesn't spin".
+    # Per-side borders (not the `border` shorthand + `border-top-color`) so the
+    # accent arc never depends on property emission order — the shorthand was
+    # overriding the top colour, leaving a uniform grey ring with no visible
+    # arc. `will-change: transform` keeps the rotation on the compositor while
+    # the main thread is busy during bring-up.
     CSS(".bt-loading-spinner",
         "width" => "30px", "height" => "30px",
         "border-radius" => "50%",
-        "border" => "3px solid var(--bt-border)",
-        "border-top-color" => "var(--bt-accent)",
+        "box-sizing" => "border-box",
+        "border-top" => "3px solid var(--bt-accent)",
+        "border-right" => "3px solid var(--bt-border)",
+        "border-bottom" => "3px solid var(--bt-border)",
+        "border-left" => "3px solid var(--bt-border)",
+        "flex-shrink" => "0",
         "will-change" => "transform",
         "animation" => "bt-spin 0.7s linear infinite"),
+    # Stacked text under the spinner (loading state) / standalone message
+    # (offline / error). Both centre their own contents; the message variant
+    # brings its own ⚠ glyph, so the shared spinner is hidden for it.
+    CSS(".bt-loading-text, .bt-loading-msg",
+        "display" => "flex", "flex-direction" => "column",
+        "align-items" => "center", "gap" => "8px", "text-align" => "center"),
+    CSS(".bt-loading:has(.bt-loading-msg) .bt-loading-spinner", "display" => "none"),
     CSS(".bt-loading-glyph", "font-size" => "28px", "opacity" => "0.7"),
     CSS(".bt-loading-title",
         "font-size" => "15px", "font-weight" => "600",
@@ -2391,13 +2417,24 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         isempty(workers) ? "No workers connected yet. Run on each agent machine:" :
                            "Add another worker — run on the agent machine:"
     end
-    install_block = DOM.div(
+    # The install snippets are secondary once a worker is connected, so they
+    # live behind a disclosure (collapsed by default) and stop dominating the
+    # Workers card. During onboarding (no workers yet) it starts open so the
+    # commands are right there.
+    install_body = DOM.div(
         DOM.div(install_headline;
                 style = Styles("color" => "var(--bt-text-muted)",
-                                "font-size" => "13px")),
+                                "font-size" => "13px",
+                                "margin-bottom" => "4px")),
         install_row("Linux / macOS", install_unix),
         install_row("Windows (PowerShell)", install_win);
         class = "bt-install-block")
+    install_summary = DOM.summary(
+        DOM.span("Add another worker"; class = "bt-discover-title");
+        class = "bt-discover-header")
+    install_block = isempty(state.workers[]) ?
+        DOM.details(install_summary, install_body; class = "bt-card bt-install-details", open = true) :
+        DOM.details(install_summary, install_body; class = "bt-card bt-install-details")
     # ── Global agent instructions (AGENTS.md) ────────────────────────────────
     # A server-wide system-prompt appendix every agent session gets, across
     # all workers (state_dir/AGENTS.md; see `system_prompt_meta`). Read at
@@ -2449,9 +2486,11 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     end
     worker_keyed_list = KeyedList(worker_widgets_obs;
                                     key = c -> c.worker_id)
+    # Connected workers first (the real content), then the "add another"
+    # disclosure beneath them.
     worker_list = DOM.div(
-        DOM.div(install_block; class = "bt-install-wrap"),
-        DOM.div(worker_keyed_list; class = "bt-cards"))
+        DOM.div(worker_keyed_list; class = "bt-cards"),
+        DOM.div(install_block; class = "bt-install-wrap"))
 
     # ── Project list ────────────────────────────────────────────────────────
     # The standalone dashboard "Projects" card list was removed: it duplicated

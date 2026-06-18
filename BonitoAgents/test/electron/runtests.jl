@@ -29,21 +29,15 @@ empty!(TH.TIER_RESULTS)
 # Order: layout/navigation first (cheap, fail fast), then chat features,
 # then dashboard, then real-I/O at the end so it doesn't tie up sockets
 # during the chat tests.
+# NOTE: this is the LEGACY harness (TH wraps `unified_app(state)` directly —
+# an internal API). It is being retired in favour of the real-stack,
+# UI-only suite under ../e2e (driven by ElectronCall.Testing through the
+# mock ACP binary, no internal-API calls). Each behaviour is deleted from
+# here once ../e2e covers it; what remains below is the backlog still to
+# port. See ../e2e/COVERAGE.md for the full map. Not run in CI.
 const FILES = [
-    # Layout / nav
-    "test_layout.jl",
-    "test_mobile.jl",
-    "test_responsive_pane.jl",
-    # Chat input + streaming + message variants
-    "test_chat_input.jl",
-    "test_chat_streaming.jl",
-    "test_chat_messages.jl",
-    "test_tool_variants.jl",
-    "test_tool_kinds_extra.jl",
+    # Chat tool/message variants still to port
     "test_streamed_tool_input.jl",
-    "test_todo_taskbar.jl",
-    "test_lens.jl",
-    "test_markdown.jl",
     "test_virtual_scroll.jl",
     "test_chat_controls.jl",
     "test_cross_worker_sync_ui.jl",
@@ -62,15 +56,9 @@ const FILES = [
     "test_scroll_stress.jl",
     "test_follow_pill.jl",
     "test_keyed_list.jl",
-    # Dashboard
-    "test_dashboard.jl",
     "test_folder_threads.jl",
-    # Persistence (no UI)
-    "test_persistence.jl",
     # Real I/O at the end so it doesn't tie up sockets during the chat tests
     "test_remotesync.jl",
-    "test_worker_handshake.jl",
-    "test_worker_disconnect.jl",
     "test_worker_move.jl",
     "test_cross_worker_sync.jl",
 ]

@@ -32,19 +32,19 @@ import CommonMark as CM
 import BonitoBook       # MonacoEditor / DiffEditor / Collapsible for tool rendering
 import BonitoMCP        # shipped to workers, also used by the bundle build
 import BonitoWorker     # ditto
+using BonitoWidgets     # Workspace / Panel / FloatingWindow — the VSCode-style layout
 
 include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
 include("progress.jl")         # notify_progress / format_progress_string — shared by sync + import
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
 include("transport.jl")        # ChatTransport + LocalTransport / WorkerTransport / MockTransport
 include("styles.jl")
-include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_popup!)
+include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_workspace!)
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
 include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("lens.jl")             # lens search: parse + fuzzy filter + saved lenses
 include("remote_app.jl")       # embed_remote_app — interactive worker Bonito apps in the browser
-include("floating_window.jl")  # draggable/resizable position:fixed panel — used by popup.jl
-include("popup.jl")            # chat-global FloatingWindow for detaching bt_show_app
+include("workspace_stage.jl")  # BonitoWidgets.Workspace stage + bt_show_app detach controller
 include("persistence.jl")
 include("dashboard.jl")        # dashboard_app
 include("worker_widget.jl")    # WorkerCard widget (stable per worker_id, used by KeyedList)
@@ -56,7 +56,7 @@ include("server.jl")           # serve()
 include("dev.jl")              # dev_server() — self-contained dev rig
 
 export serve, dev_server
-export AgentProvider, ClaudeCode, MiMoCode, OpenCode
-export provider_label, provider_icon, find_provider_bin, switch_provider!
+export AgentProvider, ClaudeCode, MiMoCode, OpenCode, MockCode
+export provider_label, provider_icon, find_provider_bin, provider_args, switch_provider!
 
 end # module BonitoAgents

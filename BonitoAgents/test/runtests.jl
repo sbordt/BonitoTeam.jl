@@ -133,6 +133,8 @@ include("test_acp_log.jl")
 
 include("test_session_config.jl")
 
+include("test_provider_switch.jl")
+
 # ── Remote-app proxy bridge (BonitoMCP RemoteProxy ↔ BonitoAgents EvalBridge) ──
 # Server-side EvalBridge unit test — disconnect fast-fail, fail_pending!, reply
 # routing. Pure headless (a bare HTTPAssetServer stands in for the asset host).
@@ -145,31 +147,8 @@ include("test_eval_bridge.jl")
 # refactor would touch.
 include(joinpath(@__DIR__, "..", "..", "BonitoMCP", "test", "test_remote_proxy.jl"))
 
-# Full live e2e: real dev_server + bt_show_app MCP handler + eval-worker dial-back
-# + embed + browser round-trip + asset lifecycle/teardown. Heavy (~30s) and needs
-# a worker that can dial back, so it's opt-in.
-if get(ENV, "BT_RUN_E2E", "") == "1"
-    include("test_real_e2e.jl")
-    # discover → Resume → chat: a resumable worker session opens a chat and its
-    # discover row disappears (no stuck "Resuming…"). Needs worker + Electron.
-    include("test_resume_discover_e2e.jl")
-else
-    @info "runtests: skipping test_real_e2e.jl + test_resume_discover_e2e.jl (set BT_RUN_E2E=1 to run the live worker-dial-back e2e)"
-end
-
-# Real-browser fake-agent churn test: WGLMakie apps + open/collapse in Electron —
-# guards the bt_show_app open/collapse trashing (relay head-of-line blocking). Self-
-# gates on BT_RUN_E2E (needs a worker + Electron).
-include("test_bonito_app_churn.jl")
-
-# Real-wire lens search + scroll e2e via the mock-claude-agent-acp BINARY
-# (TestKit): real dev_server + worker + WorkerTransport + ACP dispatcher +
-# Electron, scripted agent responses over the real wire. Self-gates on
-# BT_RUN_E2E.
-include("test_real_lens_e2e.jl")
-
-# Real-browser resident-layout test: plotpane-fills-whitespace + two-stage resize,
-# keep-alive DOM preservation across navigation (no re-delegate / no
-# null.bonitoKeyedList), per-chat floating/plotpane/divider-width residence, and
-# interactivity surviving a hide/show. Self-gates on BT_RUN_E2E.
-include("test_resident_layout.jl")
+# Browser end-to-end tests live in test/e2e/ and run through ElectronCall.Testing
+# under xvfb (see .github/workflows/tests.yml), NOT here. This file is the
+# headless unit suite: no browser, no Electron, no live worker. The legacy
+# Electron.jl-based real-browser tests (churn, resident-layout, …) were retired
+# with that migration — their behaviours are covered by the e2e/ suite.

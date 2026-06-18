@@ -86,6 +86,20 @@ todo_write(entries::Vector; id = "todo1", status = "completed") = upd("tool_call
          "title"      => "TodoWrite", "status" => status,
          "content"    => todo_write_content(entries)))
 
+# Pack the dispatcher's content specs into ACP content blocks. A `diff` spec
+# becomes a DiffContent; everything else a text block in the `type:"content"`
+# envelope (TextContent). Used by the generic `tool` / `tool_update` events.
+pack_tool_content(items) = Any[
+    let t = String(get(c, "type", "text"))
+        t == "diff" ?
+            Dict{String,Any}("type" => "diff", "path" => String(c["path"]),
+                             "oldText" => String(get(c, "old", "")),
+                             "newText" => String(get(c, "new", ""))) :
+            Dict{String,Any}("type" => "content",
+                             "content" => Dict("type" => "text",
+                                               "text" => String(c["text"])))
+    end for c in items]
+
 resp(id, result) =
     emit(Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
 
@@ -363,6 +377,50 @@ function run_dispatcher_prompt(prompt_id)
                 "toolCallId" => tid,
                 "status" => Bool(get(ev, "is_error", false)) ? "failed" : "completed",
                 "content" => packed))
+        elseif et == "tool"
+            # Generic tool call of any kind (edit/search/execute/other). Opens
+            # the bubble, then (unless complete=false) ships content + a final
+            # status. Set complete=false to leave it live for `tool_update`s.
+            tid = String(get(ev, "id", "tool-$(next_tool_id)")); next_tool_id += 1
+            open = Dict{String,Any}(
+                "toolCallId" => tid, "kind" => String(get(ev, "kind", "other")),
+                "title" => String(get(ev, "title", "tool")),
+                "status" => String(get(ev, "open_status", "in_progress")))
+            haskey(ev, "tool_name") &&
+                (open["_meta"] = Dict("claudeCode" => Dict("toolName" => String(ev["tool_name"]))))
+            haskey(ev, "raw_input") && (open["rawInput"] = ev["raw_input"])
+            upd("tool_call", open)
+            if Bool(get(ev, "complete", true))
+                upd("tool_call_update", Dict{String,Any}(
+                    "toolCallId" => tid, "status" => String(get(ev, "status", "completed")),
+                    "content" => pack_tool_content(get(ev, "content", Any[]))))
+            end
+        elseif et == "tool_update"
+            fields = Dict{String,Any}("toolCallId" => String(ev["id"]))
+            haskey(ev, "status")  && (fields["status"]  = String(ev["status"]))
+            haskey(ev, "content") && (fields["content"] = pack_tool_content(ev["content"]))
+            upd("tool_call_update", fields)
+        elseif et == "todo"
+            # Live plan/todo list. Real claude-agent-acp reports todos as
+            # `plan` SessionUpdates (NOT TodoWrite tool_calls — that path is
+            # inert on the chat side), so emit a `plan` update. Re-emitting
+            # with the same set mutates the one live list in place; the chat
+            # pins it to the taskbar until the turn ends or all items finish.
+            upd("plan", Dict("entries" => get(ev, "entries", Any[])))
+        elseif et == "delay"
+            # Pace the stream WITHOUT ending the turn — the frames already
+            # emitted stay live (e.g. the pinned todo panel) while the test
+            # asserts against them. The prompt response is only sent after the
+            # `end` event, so the turn is held open for this whole sleep.
+            sleep(Float64(get(ev, "ms", 0)) / 1000)
+        elseif et == "error_reply"
+            # Agent is alive but answers the prompt with a JSON-RPC error — the
+            # chat shows an inline `[error: ...]` bubble. Reply here and skip
+            # the normal `resp` below.
+            emit(Dict("jsonrpc" => "2.0", "id" => prompt_id,
+                      "error" => Dict("code" => -32603,
+                                      "message" => String(get(ev, "message", "error")))))
+            return
         elseif et == "end"
             stop_reason = String(get(ev, "stopReason", "end_turn"))
             break

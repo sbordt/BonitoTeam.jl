@@ -769,8 +769,7 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
             if isempty(mimo_bin)
                 mimo_bin_path = which_executable("mimo")
                 if mimo_bin_path === nothing
-                    home = first(splitdir(homedir()))
-                    mimo_path = joinpath(home, ".mimocode", "bin", "mimo")
+                    mimo_path = joinpath(homedir(), ".mimocode", "bin", "mimo")
                     mimo_bin = isfile(mimo_path) ? mimo_path : "mimo"
                 else
                     mimo_bin = mimo_bin_path
@@ -782,8 +781,7 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
             if isempty(oc_bin)
                 oc_bin_path = which_executable("opencode")
                 if oc_bin_path === nothing
-                    home = first(splitdir(homedir()))
-                    oc_path = joinpath(home, ".opencode", "bin", "opencode")
+                    oc_path = joinpath(homedir(), ".opencode", "bin", "opencode")
                     oc_bin = isfile(oc_path) ? oc_path : "opencode"
                 else
                     oc_bin = oc_bin_path
@@ -834,11 +832,17 @@ function handle_open_session(ws, server_url::String, secret::String, agent_bin::
                 Dict("BONITOAGENTS_SERVER_URL"  => server_url),
                 env_overrides)
 
+    # `mimo`/`opencode` are multi-command CLIs whose ACP server lives under the
+    # `acp` subcommand; the bare binary launches their TUI and never speaks ACP
+    # (the `initialize` handshake would hang). `claude-agent-acp` speaks ACP
+    # directly, so it takes no subcommand.
+    agent_args = (provider_str == "MiMoCode" || provider_str == "OpenCode") ?
+        String["acp"] : String[]
     proc = try
-        open(Cmd(`$resolved_agent_bin`; env, dir = cwd), "r+")
+        open(Cmd(`$resolved_agent_bin $agent_args`; env, dir = cwd), "r+")
     catch e
         return report_open_session_failed(ws, sid,
-            "failed to spawn agent ($resolved_agent_bin): $(sprint(showerror, e))")
+            "failed to spawn agent ($resolved_agent_bin $(join(agent_args, ' '))): $(sprint(showerror, e))")
     end
     @info "BonitoWorker: ACP session started" sid cwd pid=getpid() provider=provider_str
 
@@ -1338,6 +1342,10 @@ function handle_open_transfer(server_url::String, secret::String,
                 src = String(cmd["src_path"])
                 isfile(src) || error("src_path is not a file: $src")
                 RemoteSync.send_file(src, wsio)
+                # Wait for the server (receiver) to drain + close first; closing
+                # this WS before it has the tail truncates the last frame(s) and
+                # EOFs its receive_file (the "file won't open" flakiness).
+                RemoteSync.wait_peer_close(wsio)
                 @info "BonitoWorker: file transfer complete" src
             elseif direction == "file_to_worker"
                 # Server pushes a single file. We receive into `dst_path`,
@@ -1628,6 +1636,11 @@ end
 function entry_from_jsonl(jsonl::AbstractString, pid_map::Dict{String,Int})
     cwd, preview = scan_jsonl_metadata(jsonl)
     cwd === nothing && return nothing
+    # Drop sessions whose project folder no longer exists. Claude keeps the
+    # session jsonl under ~/.claude/projects forever, so deleted folders
+    # (throwaway temp dirs especially) would otherwise linger in the list with
+    # nothing to resume into.
+    isdir(String(cwd)) || return nothing
     sid = first(splitext(basename(jsonl)))
     is_subagent = occursin("/subagents/", replace(jsonl, '\\' => '/'))
     agent_type        = nothing

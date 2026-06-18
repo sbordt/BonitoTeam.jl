@@ -245,6 +245,104 @@ end
     end
 end
 
+# ── Regression: single-file transfer must not lose its tail on sender close ──
+# A sender that closes the WS the instant `send_file` returns races HTTP.jl's
+# close against the frames the receiver hasn't drained yet — the receiver EOFs
+# mid-file (observed ~90% under load; surfaced as "the file won't open" in the
+# editor). `wait_peer_close` makes the sender wait for the receiver to finish +
+# close FIRST. This drives many back-to-back transfers through one server and
+# asserts every one arrives intact.
+@testset "single-file WS transfer survives immediate sender close" begin
+    using HTTP, HTTP.WebSockets
+    src = tempname()
+    write(src, "the quick brown fox\n" ^ 64)   # small file = worst case for the race
+    want = read(src, String)
+    port = rand(45000:59000)
+    results = Channel{Any}(64)
+    got     = Channel{String}(64)
+    server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
+        try
+            dst = tempname()
+            receive_file(dst, WebSocketIO(ws))   # receiver returns → handler closes FIRST
+            put!(got, read(dst, String))
+            put!(results, :ok)
+        catch e
+            put!(results, e)
+        end
+    end
+    try
+        sleep(0.3)
+        n = 40
+        for _ in 1:n
+            HTTP.WebSockets.open("ws://127.0.0.1:$port") do ws
+                wsio = WebSocketIO(ws)
+                send_file(src, wsio)
+                wait_peer_close(wsio)            # ← the fix: don't close before the receiver drained
+            end
+        end
+        oks = 0; contents = String[]
+        for _ in 1:n
+            r = nothing
+            for _ in 1:300; isready(results) && (r = take!(results); break); sleep(0.01); end
+            r === :ok && (oks += 1)
+            isready(got) && push!(contents, take!(got))
+        end
+        @test oks == n                                   # every transfer completed
+        @test all(==(want), contents)                    # …and arrived byte-for-byte intact
+    finally
+        rm(src; force = true)
+        close(server)
+    end
+end
+
+# ── Stress: directory sync must survive immediate sender close, repeatedly ───
+# Companion to the single-file regression above. A directory sender also writes
+# its final frame (TAG_DONE) and then closes — the same close-vs-tail shape that
+# truncates single-file transfers. It DOESN'T truncate here because the protocol
+# is lockstep (the sender blocks on each per-file TAG_OK, so it never runs ahead
+# of the receiver and the receiver is already parked in `read_frame` when DONE
+# arrives). This test pins that property: many back-to-back transfers through one
+# server, sender closing the instant `send_directory` returns, every one intact.
+# If a future change breaks the lockstep pacing, this goes red instead of the bug
+# surfacing as a flaky "sync truncated" in production.
+@testset "directory sync survives immediate sender close (stress)" begin
+    using HTTP, HTTP.WebSockets
+    src = mktempdir()
+    for k in 1:8; write(joinpath(src, "f$k.txt"), "file $k payload " ^ 16); end
+    write(joinpath(src, "blob.bin"), make_blob(80_000; seed = UInt64(7)))
+    mkpath(joinpath(src, "sub")); write(joinpath(src, "sub", "n.bin"),
+                                        make_blob(20_000; seed = UInt64(8)))
+    port = rand(45000:59000)
+    results = Channel{Any}(64)
+    server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
+        try
+            stats = receive_directory(mktempdir(), WebSocketIO(ws))
+            put!(results, stats)
+        catch e
+            put!(results, e)
+        end
+    end
+    try
+        sleep(0.3)
+        n = 30
+        for _ in 1:n
+            HTTP.WebSockets.open("ws://127.0.0.1:$port") do ws
+                send_directory(src, WebSocketIO(ws))   # close fires the instant this returns
+            end
+        end
+        oks = 0
+        for _ in 1:n
+            r = nothing
+            for _ in 1:400; isready(results) && (r = take!(results); break); sleep(0.01); end
+            r isa NamedTuple && r.written == 10 && (oks += 1)
+        end
+        @test oks == n
+    finally
+        rm(src; recursive = true, force = true)
+        close(server)
+    end
+end
+
 @testset "directory sync" begin
     @testset "fresh sync (empty dst)" begin
         src = mktempdir(); dst = mktempdir()

@@ -177,7 +177,11 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Ref(0.0),                   # last_stream_at
         Observable(time()),         # taskbar_clock (ticked by a Julia Timer)
         Ref(false),                 # taskbar_clock_on
-        Observable(provider),       # provider: the current agent backend
+        # Provider observable tracks the transport (the source of truth): a
+        # caller may pass a transport whose provider differs from the `provider`
+        # kw default, and the two must not disagree. Transports without a
+        # provider notion (MockTransport) fall back to the `provider` kw.
+        Observable(something(transport_provider(actual_transport), provider)),
     )
 end
 
@@ -2673,6 +2677,12 @@ function drain_turn!(chat::ChatModel, turn)
     # this turn (e.g. the agent reacting to the shell finishing) flips it
     # back on (every inbound frame bumps `last_stream_at` via the wire tap).
     turn_done = Ref(false)
+    # Track whether the turn produced ANY visible message, so a turn that ends
+    # with nothing (e.g. a freshly-switched provider that isn't authenticated
+    # and returns an empty `end_turn`) doesn't leave the user staring at
+    # silence — we surface a hint below instead.
+    nstore0 = lock(() -> length(s.msgs_store), s.lock)
+    errored = false
     Base.errormonitor(@async while !turn_done[]
         update_busy!(chat)
         sleep(2)
@@ -2688,6 +2698,7 @@ function drain_turn!(chat::ChatModel, turn)
             s.last_stream_at[] = time()
         end
     catch e
+        errored = true
         # `prompt!` runs the turn's producer in a bound task, so a dead session
         # surfaces as a TaskFailedException wrapping the real cause — unwrap it
         # before classifying.
@@ -2740,6 +2751,21 @@ function drain_turn!(chat::ChatModel, turn)
             # the chat history; the taskbar slot drops.
             let t = s.live_todo[]
                 t isa TodoListMsg && finalize_todo!(chat, t)
+            end
+            # Empty turn: the agent resolved without emitting any message (no
+            # text, tool, or thought) and it wasn't an error or a user cancel.
+            # The common cause is a just-switched provider that isn't
+            # authenticated (its prompts return an empty `end_turn`). Surface a
+            # hint rather than leave the user staring at silence.
+            cli = chat.client[]
+            cancelled = cli !== nothing && (@atomic cli.conn.cancelling)
+            if !errored && !cancelled &&
+               lock(() -> length(s.msgs_store), s.lock) == nstore0
+                close(send!(chat, AgentMsg(chat,
+                    "_The agent ended the turn without a reply. The selected " *
+                    "model may be unavailable on your plan, or the provider may " *
+                    "need authentication — try picking a different model, or " *
+                    "check the provider's login/credentials._")))
             end
         end
     end
@@ -3029,6 +3055,18 @@ function start_chat_client!(model::ChatModel)
         AgentClientProtocol.FSRequestHandler(agent_cwd(model.transport)),
         shared(model))
 
+    # For MockTransport: create a fresh instance before start_session so the
+    # old connection's reader_loop.finally (which calls close(conn.transport))
+    # can't close the NEW channels. The old reader_loop closes the OLD
+    # MockTransport's channels (harmless — nobody references them anymore);
+    # the fresh instance carries the new channels start_session will use.
+    if model.transport isa MockTransport
+        old_t = model.transport
+        model.transport = MockTransport(old_t.on_setup;
+                                       cwd = old_t.cwd,
+                                       capacity = old_t.capacity)
+    end
+
     # Capture the recorded session id BEFORE start_session so we can detect
     # "fresh session, not a resume". A mismatch means claude has no memory of
     # `msgs_store` (e.g. project synced to a different worker), so we arm a
@@ -3111,91 +3149,112 @@ end
 # guards the dict itself across the read-test-set sequence.
 const RESTART_LOCK   = ReentrantLock()
 const RESTART_INFLIGHT = IdDict{ChatModel,Bool}()
+# Monotonic "restart requested" counter per shared model. Every
+# `restart_chat_session!` call bumps it; the single in-flight worker re-runs the
+# bring-up until it has satisfied the LATEST request. This is what makes rapid
+# provider switches correct: a switch that lands while an earlier switch's
+# restart is still running used to be COALESCED AWAY (the old code just waited
+# for the in-flight one and returned), so the session came up on the *previous*
+# provider while the header showed the new one — e.g. OpenCode selected but
+# MiMo's models in the picker. Now the worker loops and brings up the latest
+# `transport.provider`, so the final session always matches the last switch.
+const RESTART_GEN = IdDict{ChatModel,Int}()
+
+# One bring-up cycle: tear the old client down and spin a fresh one from the
+# CURRENT `model.transport` (so it reflects the latest provider). Errors are
+# caught + recorded on `last_error` (the session is left dead, not crashed) so
+# the worker loop in `restart_chat_session!` can keep going.
+function bring_up_once!(model::ChatModel)
+    s = shared(model)
+    try
+        old = model.client[]
+        # close is idempotent + total: stdin EOF / WS peer close makes the
+        # agent exit cleanly and cascades through the Connection teardown, so
+        # any in-flight `prompt!` errors out (its turn loop ends) without stale
+        # updates leaking into the new session.
+        if old !== nothing
+            close(old)
+            # Wait for the in-flight turn (if any) to actually exit so its
+            # try/catch/finally in `run_turn!` runs to completion BEFORE we
+            # boot a fresh client (it emits the trailing `thinking=false`, runs
+            # `sweep_turn_orphans!`, clears `busy_active`). Racing past it lets
+            # the new client emit chunks against the same comm while the old
+            # finally is still running — undefined wire ordering. Bounded so a
+            # wedged consumer can't block us forever.
+            deadline = time() + 2.0
+            while s.busy_active[] && time() < deadline
+                sleep(0.02)
+            end
+        end
+        s.busy_active[] = false
+        chat_emit(s, Dict{String,Any}("type" => "thinking", "active" => false))
+        sweep_turn_orphans!(s)
+        # JS-side reset: drop any UI state attached to the dead session before
+        # the new client can emit against it.
+        chat_emit(s, Dict{String,Any}("type" => "session_reset"))
+
+        start_chat_client!(model)      # brings up a fresh client[]; consumer keeps running
+        s.session_alive[] = true
+        s.last_error[] = ""
+        chat_emit(s, Dict{String,Any}(
+            "type" => "msgs.count", "n" => length(s.msgs_store)))
+    catch e
+        s.session_alive[] = false
+        s.last_error[] = "restart failed: $(sprint(showerror, e))"
+        @error "restart_chat_session! failed" exception=(e, catch_backtrace())
+    end
+    return nothing
+end
 
 function restart_chat_session!(model::ChatModel)
     s = shared(model)
-    # Compare-and-swap the in-flight flag. If another restart is already
-    # running for this shared model, wait for it to clear and then return:
-    # whatever the user wanted to achieve (a fresh, alive session) is
-    # what that restart is delivering — we don't need to redo it. The
-    # bounded wait caps a misbehaving in-flight restart at 10 s so we
-    # can't wedge the caller indefinitely.
-    already = lock(RESTART_LOCK) do
+    # Register this request (bump the generation) and decide who runs the work.
+    # If a worker is already in flight we just leave our bumped generation for it
+    # — it will loop and bring up the LATEST `transport.provider` before
+    # finishing — and wait (bounded) for it to settle. Otherwise WE are the
+    # worker. Concurrent restarts must never both `close(old)`/`start_chat_client!`
+    # (lost client / consumer-lock deadlock), so exactly one worker runs at a time.
+    iam_worker = lock(RESTART_LOCK) do
+        RESTART_GEN[s] = get(RESTART_GEN, s, 0) + 1
         if get(RESTART_INFLIGHT, s, false)
-            true
+            false
         else
             RESTART_INFLIGHT[s] = true
-            false
+            true
         end
     end
-    if already
-        deadline = time() + 10.0
-        while time() < deadline &&
-              lock(RESTART_LOCK) do; get(RESTART_INFLIGHT, s, false); end
+    if !iam_worker
+        deadline = time() + 20.0
+        while time() < deadline && lock(RESTART_LOCK) do; get(RESTART_INFLIGHT, s, false); end
             sleep(0.02)
         end
         return nothing
     end
     try
-        try
-            old = model.client[]
-            # close is idempotent + total: stdin EOF / WS peer close makes the
-            # agent exit cleanly and cascades through the Connection teardown, so
-            # any in-flight `prompt!` errors out (its turn loop ends) without stale
-            # updates leaking into the new session.
-            if old !== nothing
-                close(old)
-                # Wait for the in-flight turn (if any) to actually exit so its
-                # try/catch/finally in `run_turn!` runs to completion BEFORE we
-                # boot a fresh client. That finally is what:
-                #   • emits the trailing `thinking=false`
-                #   • runs `sweep_turn_orphans!` (finalises half-streamed
-                #     AgentMsg / ThoughtMsg, fails open ToolMsg pills)
-                #   • clears `busy_active`
-                # If we raced past it the new client could start emitting
-                # chunks against the same comm while the old finally was still
-                # running — undefined ordering on the wire. Bounded wait so a
-                # wedged consumer can't block us forever; the explicit cleanup
-                # below covers any state that didn't settle in time.
-                deadline = time() + 2.0
-                while s.busy_active[] && time() < deadline
-                    sleep(0.02)
+        # Loop until we've satisfied the newest request: if another restart was
+        # requested (generation bumped) while we were bringing one up, go again
+        # so the FINAL session reflects the last switch's provider.
+        while true
+            target = lock(RESTART_LOCK) do; RESTART_GEN[s]; end
+            bring_up_once!(model)
+            done = lock(RESTART_LOCK) do
+                if RESTART_GEN[s] == target
+                    delete!(RESTART_INFLIGHT, s)
+                    true
+                else
+                    false   # a newer request arrived mid-restart — run again
                 end
             end
-            # Force-clean defensively even if the wait timed out / there was no
-            # in-flight turn to begin with.
-            s.busy_active[] = false
-            chat_emit(s, Dict{String,Any}("type" => "thinking", "active" => false))
-            sweep_turn_orphans!(s)
-            # ── JS-side reset ───────────────────────────────────────────────
-            # Single event the browser handler treats as "drop any UI state
-            # attached to the dead session" — clears `bt-thinking-active`,
-            # `bt-busy-active`, cancels any pending chase rAF, strips
-            # `bt-stream-active` from leftover streaming nodes. Emitted BEFORE
-            # the new client so a chunk from the fresh session can't be applied
-            # to a node that hasn't been cleared yet. Bubbles whose final-form
-            # HTML changed during the orphan sweep are updated by the sweep's
-            # own per-id `agent_final` / `thought_final` / `tool_update`
-            # events (the JS node cache skips already-cached indices on range
-            # fetches, so a count re-broadcast alone would NOT refresh them).
-            # The followup `msgs.count` below only re-syncs the total.
-            chat_emit(s, Dict{String,Any}("type" => "session_reset"))
-
-            start_chat_client!(model)      # brings up a fresh client[]; consumer keeps running
-            # Broadcast recovery to every connected tab via the shared parent.
-            s.session_alive[] = true
-            s.last_error[] = ""
-            chat_emit(s, Dict{String,Any}(
-                "type" => "msgs.count", "n" => length(s.msgs_store)))
-        catch e
-            s.last_error[] = "restart failed: $(sprint(showerror, e))"
-            @error "restart_chat_session! failed" exception=(e, catch_backtrace())
+            done && break
         end
-    finally
-        lock(RESTART_LOCK) do
-            delete!(RESTART_INFLIGHT, s)
-        end
+    catch
+        # Defensive: never leave the in-flight flag stuck (would wedge all future
+        # restarts). bring_up_once! already swallows bring-up errors, so this only
+        # fires on something truly unexpected.
+        lock(RESTART_LOCK) do; delete!(RESTART_INFLIGHT, s); end
+        rethrow()
     end
+    return nothing
 end
 
 # Single-entry "user submitted a message" path. Every call site (input area,
@@ -3217,6 +3276,11 @@ function send_message!(model::ChatModel, msg::UserMsg;
     bubble = UserMsg(model, msg.text)
     bubble.queued = s.busy_active[]
     close(send!(model, bubble))   # send! pushes + emits wire_new; close persists
+    # Refresh the lens vocabulary NOW that a user message exists, rather than
+    # waiting for end-of-turn (drain_turn!'s emit_lens_vocab). Otherwise the
+    # `/user_message` key isn't suggestable until the agent's reply lands — the
+    # user can't lens-filter their own just-sent message mid-turn.
+    emit_lens_vocab(model)
     put!(s.user_messages,
         UserMessage(msg.text, collect(AgentClientProtocol.ImageAttachment, images)))
     backfill_project_title!(model, msg.text)
@@ -3601,7 +3665,12 @@ meta_order(x) = x isa AgentClientProtocol.ConfigOption && x.category == "model" 
 
 function header_meta_line(items, pick::Union{Observable,Nothing} = nothing)
     shown = sort(filter(show_in_header, collect(Any, items)); by = meta_order)
-    isempty(shown) && return DOM.span()
+    # Keep the `.bt-header-meta` element (and its `margin-left:auto`) even when
+    # empty — e.g. while a provider switch has cleared `session_meta`. A bare,
+    # class-less span here drops the auto-margin, so the whole control cluster
+    # (provider/sync/restart) collapses leftward and snaps back when the new
+    # model loads — a jarring header jump on every switch.
+    isempty(shown) && return DOM.div(; class = "bt-header-meta")
     parts = Any[]
     for (i, x) in enumerate(shown)
         i > 1 && push!(parts, " · ")
@@ -3673,9 +3742,17 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # handler below sends `session/set_config_option` and optimistically
     # patches `session_meta` so the new choice is reflected immediately
     # (the agent's follow-up `config_option_update` reconciles).
-    config_pick = Observable(Tuple{String,String}(("", "")))
+    # The model <select>'s JS posts `[configId, value]` as a JSON array, which
+    # arrives over the wire as a `Vector{Any}`. A `Observable{Tuple{String,String}}`
+    # REJECTS that ("Cannot convert Vector{Any} to Tuple{String,String}") and the
+    # pick is dropped on the floor — the agent's model never changes, so the
+    # session stays on whatever it defaulted to (e.g. a paid model that returns
+    # empty turns). Hold the raw payload and normalize in the handler.
+    config_pick = Observable{Any}(["", ""])
     meta_line = map(items -> header_meta_line(items, config_pick), model.session_meta)
-    on(session, config_pick) do (cfg_id, value)
+    on(session, config_pick) do pick
+        (pick isa AbstractVector || pick isa Tuple) && length(pick) == 2 || return
+        cfg_id, value = String(pick[1]), String(pick[2])
         isempty(cfg_id) && return
         apply_config_pick!(model, cfg_id, value)
     end
@@ -3785,59 +3862,82 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # Changing the provider restarts the session with the new backend.
     # Wiring follows the restart button above: the DOM event notifies a plain
     # Observable, Julia reacts via `on(session, …)` (a DOM node itself is not
-    # observable — `on(session, ::Node)` has no method). The `value` binding
-    # to `model.provider` keeps the select in sync when the provider changes
-    # from another tab (or programmatically).
+    # observable — `on(session, ::Node)` has no method).
+    #
+    # A reactive `value=` binding does NOT work on a native <select> (it sticks
+    # on the first option — "Claude Code" — regardless of the real provider, so
+    # the header lied about the backend). Instead mark the current provider's
+    # <option selected> and rebuild the select when `model.provider` changes —
+    # the same proven pattern as `model_select_pill`. The `selected` kwarg is
+    # splatted in only on the current option (Bonito renders `selected=nothing`
+    # as a bare, always-on attribute, which would select every option).
     provider_status = Observable("")
     provider_choice = Observable("")
-    provider_select = DOM.select(
-        DOM.option("Claude Code"; value="ClaudeCode"),
-        DOM.option("MiMo Code"; value="MiMoCode"),
-        DOM.option("OpenCode"; value="OpenCode");
-        class = "bt-header-provider-select",
-        title = "Switch AI agent backend",
-        value = map(string, session, model.provider),
-        onchange = js"event => $(provider_choice).notify(event.target.value)")
+    provider_opt(p, cur) = DOM.option(provider_label(p);
+        (p === cur ? (; value = string(p), selected = true) : (; value = string(p)))...)
+    provider_select = map(session, model.provider) do cur
+        DOM.select(
+            (provider_opt(p, cur) for p in (ClaudeCode, MiMoCode, OpenCode, MockCode))...;
+            class = "bt-header-provider-select",
+            title = "Switch AI agent backend",
+            onchange = js"event => $(provider_choice).notify(event.target.value)")
+    end
     on(session, provider_choice) do val
         isempty(val) && return
         new_provider = if val == "MiMoCode"
             MiMoCode
         elseif val == "OpenCode"
             OpenCode
+        elseif val == "MockCode"
+            MockCode
         else
             ClaudeCode
         end
         current = model.provider[]
         new_provider == current && return
-        provider_status[] = "Switching…"
+        provider_status[] = "Switching to $(provider_label(new_provider))…"
         @async begin
             try
                 switch_provider!(model, new_provider)
+                # `switch_provider!` → `restart_chat_session!` swallows bring-up
+                # errors (sets `last_error`, keeps the chat object alive), so a
+                # failed switch returns normally. Surface it from the resulting
+                # session state instead of relying on an exception.
+                safe_set!(provider_status,
+                    model.session_alive[] ? "" : "switch failed")
             catch e
                 @warn "provider switch failed" exception=(e, catch_backtrace())
                 safe_set!(provider_status, "switch failed")
-            finally
-                safe_set!(provider_status, "")
             end
         end
     end
 
     # No back arrow — the unified app's sidebar Home icon is the way home.
-    # The session-config meta line renders as a second row BELOW the main one.
+    # One compact control row (title + the session-config "model" picks + the
+    # provider/sync/restart buttons), then the always-on lens search bar.
     DOM.div(
         DOM.div(
             status_dot,
             title_node,
-            provider_select,
-            provider_status,
-            xsync_control,
-            sync_button,
-            restart_button;
+            # The transient "Switching…" text sits LEFT (in the flexible area),
+            # absorbed by the gap so it never shoves the controls. The agent
+            # controls — model pill · provider · sync · restart — are ONE
+            # right-anchored group (`margin-left:auto` on `.bt-header-actions`),
+            # so the model and provider pickers stay together. The model pill is
+            # the group's leftmost item: when its label changes width (or clears
+            # mid-switch) only its own left edge moves into the gap — the
+            # provider/sync/restart buttons never reflow.
+            DOM.span(provider_status; class="bt-header-status"),
+            DOM.div(
+                meta_line,
+                provider_select,
+                xsync_control,
+                sync_button,
+                restart_button;
+                class="bt-header-actions"),
             class="bt-header-row"),
-        meta_line,
-        # Lens search bar — under the title. JS (`_setupLens`) builds the
-        # input + autocomplete + saved-lens chips inside it and wires it to
-        # `comm`. Replaces the old per-tool filter toolbar.
+        # Lens search bar — always visible. JS (`_setupLens`) builds the input
+        # + autocomplete + saved-lens chips inside it and wires it to `comm`.
         DOM.div(class="bt-lens-bar");
         class="bt-header")
 end
@@ -3859,6 +3959,11 @@ available on all machines, so a hard-coded preference would break.
 function switch_provider!(model::ChatModel, new_provider::AgentProvider)
     s = shared(model)
     s.provider[] = new_provider
+    # Drop the previous provider's session config (model/mode pills) right away:
+    # otherwise the header keeps showing e.g. Claude's model list while we bring
+    # up MiMo, which reads as "switched, but the model picker is still Claude's".
+    # `start_chat_client!` repopulates it from the new session's config.
+    s.session_meta[] = Any[]
 
     # Resolve the binary for the new provider
     new_bin = find_provider_bin(new_provider)
@@ -3875,8 +3980,16 @@ function switch_provider!(model::ChatModel, new_provider::AgentProvider)
             agent_env = old_transport.agent_env,
             provider = new_provider)
     elseif old_transport isa WorkerTransport
-        # WorkerTransport: update the provider field and let restart handle it
+        # WorkerTransport: update the provider field and let restart handle it.
         old_transport.provider = new_provider
+        # A switch must start a FRESH session: `resume_session_id` is the OLD
+        # provider's session id (e.g. a claude-agent-acp UUID). Asking MiMo to
+        # `session/load` a session it never created errors ("Internal error")
+        # and the restart fails — leaving the chat dead with no model picker.
+        # Clearing it routes start_session through `session/new`; the chat's
+        # history is fed forward to the new agent as a one-shot prelude (see
+        # `arm_history_replay!` in start_chat_client!).
+        old_transport.resume_session_id = nothing
     end
 
     # Restart the session with the new provider
@@ -4556,6 +4669,23 @@ function handle_command!(model::ChatModel, session::Session, cmd::EditFileComman
     open_file!(pane, model, path)
 end
 
+# Render the FileEditor for `path` (server already resolved), or an error card if
+# the fetch/open fails. Pulled out of `open_file!` so the synchronous-panel path
+# and any future caller share one definition.
+function file_panel_content(model::ChatModel, path::AbstractString)
+    try
+        st = ShowTool(model.state, model.project_id, model.cwd, path)
+        server_file = fetch_show_file(st)
+        proj = get(model.state.projects[], model.project_id, nothing)
+        worker_abs = proj === nothing ? "" :
+            (isabspath(path) ? String(path) : joinpath(proj.worker_path, path))
+        FileEditor(model.state, model.project_id, server_file, worker_abs)
+    catch e
+        @warn "file editor open failed" path exception = e
+        DOM.div("couldn't open $(path): $(sprint(showerror, e))"; class = "bt-tool-error")
+    end
+end
+
 function handle_command!(model::ChatModel, ::Session, cmd::DetachAppCommand)
     pane = model.plotpane
     if pane === nothing
@@ -4569,38 +4699,40 @@ end
 """
     open_file!(pane::PlotPane, model::ChatModel, path)
 
-Open `path` (a worker-side file path) as a TAB in the window's plotpane —
-an editable Monaco, VSCode-style next to any other open files / a docked
-app. Re-opening a path activates its existing tab (the cached editor keeps
-cursor/scroll/unsaved edits). Fetches the file to the server mirror first
-(from the worker if needed); failures land as an error card in the tab
-instead of a silent log line — the user clicked a link and must see
+Open `path` (a worker-side file path) as a PANEL in the window's
+[`Workspace`](@ref BonitoWidgets.Workspace) — an editable Monaco the user can
+tab / split / float next to the chat and any other open files. Re-opening a path
+activates its existing panel (the editor keeps cursor/scroll/unsaved edits — the
+Workspace renders it once and only ever moves its node). Fetches the file to the
+server mirror first (from the worker if needed); failures land as an error card
+in the panel instead of a silent log line — the user clicked a link and must see
 SOMETHING happen.
 """
 function open_file!(pane::PlotPane, model::ChatModel, path::AbstractString)
+    ws = pane.workspace[]
+    ws === nothing && return nothing
     id = file_tab_id(path)
-    if haskey(pane.editors, id)
-        # Already open — just activate. ONE atomic tabs update.
-        pane.tabs[] = activate_tab(pane.tabs[], id)
+    if any(p -> p.id == id, ws.panels[])
+        BonitoWidgets.activate_panel!(ws, id)   # already open — focus it
         return nothing
     end
+    # Add the panel SYNCHRONOUSLY with a loading placeholder, THEN fetch + fill.
+    # The fetch blocks for the worker transfer — seconds when the file lives on a
+    # remote worker — so doing it before adding the panel meant a click produced
+    # NO feedback until it finished, and impatient re-clicks (the panel id not yet
+    # reserved) each kicked off another transfer. Reserving the id now makes a
+    # second click hit the `any(...)` guard above and just activate this panel.
+    content = Observable{Any}(DOM.div(
+        DOM.div(; class = "bt-spinner"),
+        DOM.span("Opening $(basename(path))…");
+        class = "bt-file-loading"))
+    BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id,
+        DOM.div(content; class = "bt-file-panel");
+        label = basename(path), closable = true))
     Base.errormonitor(@async begin
-        elem = try
-            st = ShowTool(model.state, model.project_id, model.cwd, path)
-            server_file = fetch_show_file(st)
-            proj = get(model.state.projects[], model.project_id, nothing)
-            worker_abs = proj === nothing ? "" :
-                (isabspath(path) ? String(path) : joinpath(proj.worker_path, path))
-            FileEditor(model.state, model.project_id, server_file, worker_abs)
-        catch e
-            @warn "file editor open failed" path exception = e
-            DOM.div("couldn't open $(path): $(sprint(showerror, e))";
-                    class = "bt-tool-error")
-        end
-        # Cache BEFORE the tabs update (the KeyedList items derivation reads
-        # `pane.editors` when `tabs` notifies), then one atomic upsert.
-        pane.editors[id] = elem
-        pane.tabs[] = upsert_tab(pane.tabs[], PaneTab(id, basename(path), :file))
+        elem = file_panel_content(model, path)
+        # The user may have closed the tab while we fetched — don't resurrect it.
+        any(p -> p.id == id, ws.panels[]) && (content[] = elem)
     end)
     return nothing
 end

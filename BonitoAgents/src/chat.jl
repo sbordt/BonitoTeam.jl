@@ -4669,6 +4669,23 @@ function handle_command!(model::ChatModel, session::Session, cmd::EditFileComman
     open_file!(pane, model, path)
 end
 
+# Render the FileEditor for `path` (server already resolved), or an error card if
+# the fetch/open fails. Pulled out of `open_file!` so the synchronous-panel path
+# and any future caller share one definition.
+function file_panel_content(model::ChatModel, path::AbstractString)
+    try
+        st = ShowTool(model.state, model.project_id, model.cwd, path)
+        server_file = fetch_show_file(st)
+        proj = get(model.state.projects[], model.project_id, nothing)
+        worker_abs = proj === nothing ? "" :
+            (isabspath(path) ? String(path) : joinpath(proj.worker_path, path))
+        FileEditor(model.state, model.project_id, server_file, worker_abs)
+    catch e
+        @warn "file editor open failed" path exception = e
+        DOM.div("couldn't open $(path): $(sprint(showerror, e))"; class = "bt-tool-error")
+    end
+end
+
 function handle_command!(model::ChatModel, ::Session, cmd::DetachAppCommand)
     pane = model.plotpane
     if pane === nothing
@@ -4699,21 +4716,23 @@ function open_file!(pane::PlotPane, model::ChatModel, path::AbstractString)
         BonitoWidgets.activate_panel!(ws, id)   # already open — focus it
         return nothing
     end
+    # Add the panel SYNCHRONOUSLY with a loading placeholder, THEN fetch + fill.
+    # The fetch blocks for the worker transfer — seconds when the file lives on a
+    # remote worker — so doing it before adding the panel meant a click produced
+    # NO feedback until it finished, and impatient re-clicks (the panel id not yet
+    # reserved) each kicked off another transfer. Reserving the id now makes a
+    # second click hit the `any(...)` guard above and just activate this panel.
+    content = Observable{Any}(DOM.div(
+        DOM.div(; class = "bt-spinner"),
+        DOM.span("Opening $(basename(path))…");
+        class = "bt-file-loading"))
+    BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id,
+        DOM.div(content; class = "bt-file-panel");
+        label = basename(path), closable = true))
     Base.errormonitor(@async begin
-        elem = try
-            st = ShowTool(model.state, model.project_id, model.cwd, path)
-            server_file = fetch_show_file(st)
-            proj = get(model.state.projects[], model.project_id, nothing)
-            worker_abs = proj === nothing ? "" :
-                (isabspath(path) ? String(path) : joinpath(proj.worker_path, path))
-            FileEditor(model.state, model.project_id, server_file, worker_abs)
-        catch e
-            @warn "file editor open failed" path exception = e
-            DOM.div("couldn't open $(path): $(sprint(showerror, e))";
-                    class = "bt-tool-error")
-        end
-        BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, elem;
-            label = basename(path), closable = true))
+        elem = file_panel_content(model, path)
+        # The user may have closed the tab while we fetched — don't resurrect it.
+        any(p -> p.id == id, ws.panels[]) && (content[] = elem)
     end)
     return nothing
 end

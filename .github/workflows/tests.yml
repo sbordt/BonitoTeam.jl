@@ -125,6 +125,7 @@ jobs:
           - scroll_persist
           - errors
           - lens
+          - file_open
           - tool_rendering
           - todo_taskbar
           - worker_lifecycle

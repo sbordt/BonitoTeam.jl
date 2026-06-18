@@ -295,6 +295,54 @@ end
     end
 end
 
+# ── Stress: directory sync must survive immediate sender close, repeatedly ───
+# Companion to the single-file regression above. A directory sender also writes
+# its final frame (TAG_DONE) and then closes — the same close-vs-tail shape that
+# truncates single-file transfers. It DOESN'T truncate here because the protocol
+# is lockstep (the sender blocks on each per-file TAG_OK, so it never runs ahead
+# of the receiver and the receiver is already parked in `read_frame` when DONE
+# arrives). This test pins that property: many back-to-back transfers through one
+# server, sender closing the instant `send_directory` returns, every one intact.
+# If a future change breaks the lockstep pacing, this goes red instead of the bug
+# surfacing as a flaky "sync truncated" in production.
+@testset "directory sync survives immediate sender close (stress)" begin
+    using HTTP, HTTP.WebSockets
+    src = mktempdir()
+    for k in 1:8; write(joinpath(src, "f$k.txt"), "file $k payload " ^ 16); end
+    write(joinpath(src, "blob.bin"), make_blob(80_000; seed = UInt64(7)))
+    mkpath(joinpath(src, "sub")); write(joinpath(src, "sub", "n.bin"),
+                                        make_blob(20_000; seed = UInt64(8)))
+    port = rand(45000:59000)
+    results = Channel{Any}(64)
+    server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
+        try
+            stats = receive_directory(mktempdir(), WebSocketIO(ws))
+            put!(results, stats)
+        catch e
+            put!(results, e)
+        end
+    end
+    try
+        sleep(0.3)
+        n = 30
+        for _ in 1:n
+            HTTP.WebSockets.open("ws://127.0.0.1:$port") do ws
+                send_directory(src, WebSocketIO(ws))   # close fires the instant this returns
+            end
+        end
+        oks = 0
+        for _ in 1:n
+            r = nothing
+            for _ in 1:400; isready(results) && (r = take!(results); break); sleep(0.01); end
+            r isa NamedTuple && r.written == 10 && (oks += 1)
+        end
+        @test oks == n
+    finally
+        rm(src; recursive = true, force = true)
+        close(server)
+    end
+end
+
 @testset "directory sync" begin
     @testset "fresh sync (empty dst)" begin
         src = mktempdir(); dst = mktempdir()

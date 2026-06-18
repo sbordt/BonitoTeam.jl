@@ -108,6 +108,13 @@ jobs:
       - name: Unit tests
         run: julia --project=BonitoAgents BonitoAgents/test/runtests.jl
 
+      - name: RemoteSync transfer tests (incl. close-vs-tail stress)
+        # RemoteSync is a path [source] of BonitoAgents, so its deps (HTTP,
+        # librsync_jll, …) are already in this env — run its suite here rather
+        # than spin up a separate project. Guards the single-file + directory
+        # close-vs-tail race regressions that production file-open relies on.
+        run: julia --project=BonitoAgents RemoteSync/test/runtests.jl
+
   # ── E2E suite — one parallel job per scenario ─────────────────────────────
   e2e:
     name: 'E2E — ${{ matrix.suite }}'

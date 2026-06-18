@@ -134,6 +134,25 @@ function Base.close(io::WebSocketIO)
     return nothing
 end
 
+# Block until the PEER closes its end of the connection. A sender calls this
+# after writing its last frame instead of closing immediately: closing an
+# HTTP.WebSocket can truncate frames the peer hasn't drained yet (proven flaky —
+# a small file transfer EOFs the receiver ~90% of the time under load). The
+# receiver knows when it has everything and closes first; the sender waits here
+# so its own close can't race the tail. Any stray frame the peer sends is
+# discarded. Returns when the peer is gone (clean EOF / close errors only).
+function wait_peer_close(io::WebSocketIO)
+    try
+        while !eof(io)                        # blocks in _refill! until a frame or close
+            io.inpos = length(io.inbuf) + 1   # discard it (the file protocol sends nothing here)
+        end
+    catch e
+        (e isa EOFError || e isa Base.IOError ||
+         e isa HTTP.WebSockets.WebSocketError) || rethrow()
+    end
+    return nothing
+end
+
 # Close the underlying transport. Generic stub for non-HTTP transports; the
 # HTTP.WebSocket impl follows.
 function close_ws! end

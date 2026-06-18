@@ -1131,6 +1131,9 @@ function send_file_to_worker!(state::ServerState, worker_name::String,
     try
         wsio = RemoteSync.WebSocketIO(ws)
         RemoteSync.send_file(String(src_path), wsio; on_progress)
+        # Wait for the worker (receiver) to drain + close first — closing before
+        # it has the tail truncates the last frame(s) and EOFs its receive_file.
+        RemoteSync.wait_peer_close(wsio)
     finally
         close_ws_safe(ws)
     end

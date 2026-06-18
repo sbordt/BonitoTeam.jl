@@ -245,6 +245,56 @@ end
     end
 end
 
+# ── Regression: single-file transfer must not lose its tail on sender close ──
+# A sender that closes the WS the instant `send_file` returns races HTTP.jl's
+# close against the frames the receiver hasn't drained yet — the receiver EOFs
+# mid-file (observed ~90% under load; surfaced as "the file won't open" in the
+# editor). `wait_peer_close` makes the sender wait for the receiver to finish +
+# close FIRST. This drives many back-to-back transfers through one server and
+# asserts every one arrives intact.
+@testset "single-file WS transfer survives immediate sender close" begin
+    using HTTP, HTTP.WebSockets
+    src = tempname()
+    write(src, "the quick brown fox\n" ^ 64)   # small file = worst case for the race
+    want = read(src, String)
+    port = rand(45000:59000)
+    results = Channel{Any}(64)
+    got     = Channel{String}(64)
+    server = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
+        try
+            dst = tempname()
+            receive_file(dst, WebSocketIO(ws))   # receiver returns → handler closes FIRST
+            put!(got, read(dst, String))
+            put!(results, :ok)
+        catch e
+            put!(results, e)
+        end
+    end
+    try
+        sleep(0.3)
+        n = 40
+        for _ in 1:n
+            HTTP.WebSockets.open("ws://127.0.0.1:$port") do ws
+                wsio = WebSocketIO(ws)
+                send_file(src, wsio)
+                wait_peer_close(wsio)            # ← the fix: don't close before the receiver drained
+            end
+        end
+        oks = 0; contents = String[]
+        for _ in 1:n
+            r = nothing
+            for _ in 1:300; isready(results) && (r = take!(results); break); sleep(0.01); end
+            r === :ok && (oks += 1)
+            isready(got) && push!(contents, take!(got))
+        end
+        @test oks == n                                   # every transfer completed
+        @test all(==(want), contents)                    # …and arrived byte-for-byte intact
+    finally
+        rm(src; force = true)
+        close(server)
+    end
+end
+
 @testset "directory sync" begin
     @testset "fresh sync (empty dst)" begin
         src = mktempdir(); dst = mktempdir()

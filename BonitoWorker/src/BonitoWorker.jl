@@ -1342,6 +1342,10 @@ function handle_open_transfer(server_url::String, secret::String,
                 src = String(cmd["src_path"])
                 isfile(src) || error("src_path is not a file: $src")
                 RemoteSync.send_file(src, wsio)
+                # Wait for the server (receiver) to drain + close first; closing
+                # this WS before it has the tail truncates the last frame(s) and
+                # EOFs its receive_file (the "file won't open" flakiness).
+                RemoteSync.wait_peer_close(wsio)
                 @info "BonitoWorker: file transfer complete" src
             elseif direction == "file_to_worker"
                 # Server pushes a single file. We receive into `dst_path`,

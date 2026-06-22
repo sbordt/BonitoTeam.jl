@@ -10,6 +10,39 @@ directly (an internal API). Each `../electron/` test is deleted once a suite
 here covers its behaviour; what is still listed in `../electron/runtests.jl`
 is the remaining backlog.
 
+## Runner guarantees (`run_all.jl`)
+
+- ONE dev server + browser + mock agent for ALL suites (a soak; state accumulates
+  by design). Each `run_suite(server)` swaps the shared agent callback and drives
+  the one DOM page.
+- **No-JS-errors gate**: after every suite the runner samples the error sink
+  (`window.onerror` + `unhandledrejection`, installed in `open_browser`) and
+  asserts it empty, attributed to that suite, then clears it. Driving the real DOM
+  is only worth it if we also notice when the DOM throws.
+- **Un-hangable**: every bridge round-trip (`eval_js`, `js_errors`,
+  `clear_js_errors`) is watchdog-bounded and throws a typed `BridgeTimeout`;
+  `wait_for` treats a busy poll as "not yet" and retries within its own budget. A
+  pegged renderer can never hang the run.
+- **Resilient**: a suite that fails is recorded and the soak CONTINUES — the leak
+  audit still runs, and the failure is re-surfaced as a final failing testset.
+- **Leak audit** at the end asserts server-side bounds (models / pollers /
+  mock subprocs / worker-ws / pending) and logs the counts.
+
+## Known product bug surfaced by the soak
+
+`streaming_flood.jl` runs EARLY (2nd) on purpose. A large message burst paints in
+~1–2s on the first chats but the renderer WEDGES by ~chat #3 once many messages are
+mounted (cost ≈ mounted × streamed — a client-side cross-chat accumulation, not a
+deadlock and not server-side). Running the flood early isolates its real target
+(the `deliver_update!` deadlock regression) from this separate, still-open bug.
+
+Closing an INACTIVE app tab loses the embed. A bt_show_app docked as a tab can be
+closed fine when it's the ACTIVE tab (embed returns to its bubble), but closing it
+while it's an INACTIVE tab destroys the live embed — `render()` in
+BonitoWidgets.js prunes the dropped panel (and the adopted embed with it) before
+the restore glue rescues it. `app_tabs.jl` always activates a tab before closing
+it, so it covers the working path; the inactive-close fix is still open.
+
 ## Suites
 
 | File                  | Covers                                                                 |
@@ -17,6 +50,10 @@ is the remaining backlog.
 | `workflows.jl`        | dashboard, new-project folder picker, chat reply, edit tool + diff expand, bash tool, thinking, agent switch |
 | `chat_features.jl`    | streaming accumulation, markdown (h1/ul/pre/strong/a), responsive layout (480/1280), multi-chat switching |
 | `embedded_app.jl`     | `bt_show_app` dial-back eval bridge + embedded frame render            |
+| `app_stress.jl`       | bt_show_app moved bubble↔float 100×, chat-switch round-trips, asserting the SAME live node survives every move via a preserved counter; no orphan nodes, no JS errors |
+| `app_interactive.jl`  | TWO live bt_show_apps at once; clicking each runs its Julia `map` in the worker (output = 7×clicks / 100+clicks, never computed in JS) and the DOM reflects the round-tripped value; the two apps stay independent |
+| `app_multi.jl`        | THREE live apps: detach all into their own windows at once, drive EACH while floating (each its own Julia round-trip, others frozen), switch chats and back (all three windows + state survive), then close the windows one-by-one (each embed returns to its OWN bubble, others stay floating/live) |
+| `app_tabs.jl`         | THREE apps docked into ONE window as TABS (via the float's ⤢ dock button): switch between tabs (active app visible, others hidden), each stays LIVE as a tab (Julia round-trip), then close the tabs (active-tab close → embed back to its bubble). KNOWN BUG (see below): closing an INACTIVE app tab loses the embed — the suite always activates a tab before closing it (the working + natural path) |
 | `scroll_persist.jl`   | new content follows to bottom (followMode), overflow, history survives a browser reconnect |
 | `worker_lifecycle.jl` | worker online on dashboard, killed process → offline                   |
 | `cross_worker.jl`     | a second worker registers (2 online), kill → 1                         |

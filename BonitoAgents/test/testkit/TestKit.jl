@@ -51,7 +51,8 @@ export TestServer, dev_server, add_worker!,
        open_browser, navigate, to_dashboard, new_chat, open_chat,
        send_message, switch_agent, set_window_size, click, click_until, click_text, set_input,
        exit_success,
-       screenshot, eval_js, wait_for, current_chat_id
+       screenshot, eval_js, wait_for, current_chat_id,
+       js_errors, clear_js_errors
 
 # ── Event DSL ──────────────────────────────────────────────────────────────
 # Each constructor returns a small `Dict` carrying the event type + payload.
@@ -511,6 +512,50 @@ function open_browser(s::TestServer; width::Int = 1280, height::Int = 820,
     s.browser[] = ctx
     ECT.install_error_sink(ctx)   # window.__errs for "no JS errors" assertions
     sleep(3.0)                     # let the dashboard mount + the chat session boot
+    install_pane_scope!(s)
+    return s
+end
+
+# Under the shared runner the chat-pane KeyedList keeps ONE `.bt-chatpane` per
+# opened chat in the DOM (only the active one visible) — that's the product's
+# fast-switch design. But the suites read message state via global selectors
+# like `document.querySelector('.bt-messages')`, which would grab the FIRST
+# (often a hidden, stale) pane once more than one chat has been opened.
+#
+# This shim makes the global `document.querySelector(All)` resolve chat-MESSAGE
+# selectors (`.bt-messages`, `.bt-agent-msg`, `.bt-user-msg`, `.bt-tool-*`,
+# `.bt-plan-msg`, `.bt-taskbar-*`, `.bt-thinking`, …) within the VISIBLE chat
+# pane — i.e. the rendered DOM the user actually sees, which is exactly the
+# contract ("scope to its OWN chat"). It falls through to native for every other
+# selector, and the app's own JS already scopes `.bt-messages` per-pane
+# (`pane.querySelector`), so this never perturbs the product runtime. Installed
+# fresh on every `open_browser` (so a reconnect re-arms it).
+function install_pane_scope!(s::TestServer)
+    eval_js(s, raw"""(() => {
+        if (window.__btPaneScopeInstalled) return true;
+        window.__btPaneScopeInstalled = true;
+        // NB: deliberately NOT scoping `.bt-embed`, `.bw-ws-panel`, `.bt-slot`
+        // (app_detach moves embeds OUT of the chat pane into workspace panels —
+        // scoping those would hide a detached embed), nor sidebar/dashboard/lens
+        // header selectors (single, not per-pane).
+        const MSG = /(^|[\s,>])\.bt-(messages|agent-msg|user-msg|tool-msg|tool-title|tool-header|tool-body|tool-status|tool-summary|plan-msg|taskbar|thinking|diff-block|search-row|eval-section|section-label|multi-diff|busy|text-input|send-btn|lens|header-provider)/;
+        const visiblePane = () => {
+            const panes = [...document.querySelectorAll('.bt-view-chats .bt-chatpane, .bt-chatpane')];
+            return panes.find(p => p.offsetParent !== null) || null;
+        };
+        const wrap = (orig, all) => function(sel) {
+            try {
+                if (typeof sel === 'string' && MSG.test(sel)) {
+                    const p = visiblePane();
+                    if (p) return all ? p.querySelectorAll(sel) : p.querySelector(sel);
+                }
+            } catch (e) {}
+            return orig.call(this, sel);
+        };
+        document.querySelector    = wrap(Document.prototype.querySelector,    false);
+        document.querySelectorAll = wrap(Document.prototype.querySelectorAll, true);
+        return true;
+    })()""")
     return s
 end
 
@@ -521,10 +566,97 @@ Run JavaScript in the browser; the value of the last expression is
 returned to Julia (via Electron's JSON bridge). Long-running JS should
 return primitive types only — no DOM refs.
 """
-function eval_js(s::TestServer, code::AbstractString)
+# Thrown when the Electron bridge doesn't answer within the per-call watchdog.
+# TYPED so `wait_for` can tell "bridge was busy for THIS poll" (retry within its
+# own budget) apart from a real JS/bridge error (rethrow). A bare `error()` would
+# force string-matching at the catch site.
+struct BridgeTimeout <: Exception
+    secs::Float64
+    code::String
+end
+Base.showerror(io::IO, e::BridgeTimeout) =
+    print(io, "eval_js timed out after $(e.secs)s (Electron bridge wedged?): ",
+          first(replace(e.code, r"\s+" => " "), 90))
+
+function eval_js(s::TestServer, code::AbstractString; timeout::Real = 20)
     ctx = s.browser[]
     ctx === nothing && error("open_browser first")
-    return ECT.eval_js(ctx, String(code))
+    # Hard-bound the bridge round-trip: a wedged/overloaded Electron renderer (e.g.
+    # right after a 500-message flood) must NEVER hang the harness. If the bridge
+    # doesn't answer in `timeout`s we throw — the caller fails fast instead of the
+    # whole run deadlocking. (This is the foundation that makes `wait_for` — and
+    # therefore every suite — impossible to deadlock.)
+    res = Ref{Any}(nothing); ex = Ref{Any}(nothing); done = Ref(false)
+    # @async (thread 1, cooperative): the ECT bridge waits on an IPC response which
+    # yields, so this outer watchdog loop still gets scheduled and can time out.
+    @async begin
+        try; res[] = ECT.eval_js(ctx, String(code)); catch e; ex[] = e; finally; done[] = true; end
+    end
+    t0 = time()
+    while !done[] && time() - t0 < timeout; sleep(0.02); end
+    done[] || throw(BridgeTimeout(Float64(timeout), String(code)))
+    ex[] === nothing || throw(ex[])
+    return res[]
+end
+
+"""
+    js_errors(s) -> Vector
+
+JavaScript errors captured by the sink installed in `open_browser`
+(`window.onerror` + `unhandledrejection`), since the last `clear_js_errors`.
+Each entry has `type`/`message` (and maybe `filename`/`lineno`). A non-empty
+result means the UI threw during the run — a real bug, not test noise. The
+runner gates every suite on this being empty.
+"""
+function js_errors(s::TestServer)
+    s.browser[] === nothing && return Any[]
+    # Route through the WATCHDOG eval_js, not ECT.js_errors (whose eval is
+    # unbounded): the gate runs right after a suite, and a suite that pegged the
+    # renderer (e.g. the 500-row flood) would otherwise hang the gate — and thus
+    # the whole runner — waiting for the paint to finish. Bounded: a pegged
+    # renderer makes this throw BridgeTimeout, which the runner treats as
+    # "couldn't sample, renderer busy" rather than a hang.
+    v = eval_js(s, "window.__errs || []"; timeout = 10)
+    return v === nothing ? Any[] : v
+end
+
+"""
+    clear_js_errors(s)
+
+Reset the JS error sink. The runner calls this between suites so an error is
+attributed to the suite that actually caused it.
+"""
+function clear_js_errors(s::TestServer)
+    s.browser[] === nothing && return nothing
+    # Bounded + best-effort (same reasoning as js_errors): if the renderer is
+    # pegged the sink simply clears once it frees; never hang the runner on it.
+    try
+        eval_js(s, "window.__errs = []; true"; timeout = 10)
+    catch e
+        e isa BridgeTimeout || rethrow()
+    end
+    return nothing
+end
+
+"""
+    refresh_eval_session!(env_path)
+
+Drop the per-`env_path` eval session so the NEXT `bt_show_app` re-dials the bridge
+for ITS OWN project. The eval worker is shared per env and dials back ONCE (bound
+to the first project that used it); a `bt_show_app` from a SECOND chat sharing the
+env reuses that stale dial-back and the embed never renders. An e2e suite that
+embeds an app calls this at its start so it gets a fresh per-project dial-back —
+order-independent under the shared-server soak. (The robust product fix is to
+re-dial per project in BonitoMCP's `ensure_eval_dialed!`; this is the test-side
+stand-in until then.)
+"""
+function refresh_eval_session!(env_path::AbstractString)
+    try
+        BonitoMCP.restart!(BonitoMCP.manager(), String(env_path))
+    catch e
+        @warn "refresh_eval_session! failed (continuing)" exception = e
+    end
+    return nothing
 end
 
 """
@@ -537,8 +669,21 @@ function wait_for(s::TestServer, label::AbstractString, predicate::AbstractStrin
                    timeout::Real = 8, interval::Real = 0.1)
     t0 = time()
     code = "(() => { try { return " * String(predicate) * "; } catch (e) { return false; } })()"
+    # Per-poll bound is SHORT (≤5s): if the renderer is momentarily pinned (e.g.
+    # synchronously rendering a 500-row flood) THIS poll's round-trip is abandoned
+    # and we retry within `timeout`, instead of one 20s round-trip eating the whole
+    # budget — or worse, throwing and aborting the suite. A genuinely dead bridge
+    # makes every poll BridgeTimeout, so we still exhaust `timeout` and throw below
+    # (bounded detector intact). Only the bridge-timeout is swallowed; a real
+    # eval/bridge error rethrows.
+    poll = min(Float64(timeout), 5.0)
     while time() - t0 < timeout
-        v = eval_js(s, code)
+        v = try
+            eval_js(s, code; timeout = poll)
+        catch e
+            e isa BridgeTimeout || rethrow()
+            nothing
+        end
         v in (false, nothing) || return v
         sleep(interval)
     end
@@ -694,6 +839,17 @@ function new_chat(s::TestServer; cwd::AbstractString = mktempdir(),
     # minute, so wait generously here.
     wait_for(s, "chat view opened",
              "!!document.querySelector('.bt-text-input') && !!document.querySelector('.bt-chatpane')";
+             timeout = 90)
+    # The ACP session binds asynchronously; until it does, the sidebar hasn't
+    # marked the new chat active and a re-render can briefly drop `.bt-text-input`.
+    # Gate on the new chat actually being SELECTED (non-empty active pid) AND its
+    # input being visible — otherwise `new_chat` can return mid-bind and the next
+    # `send_message` races a flicker. This matters most under the shared runner,
+    # where a populated sidebar makes the bind lag longer.
+    wait_for(s, "new chat selected + input live",
+             "(() => { const a=document.querySelector('.bt-side-item.bt-side-active'); " *
+             "return !!a && !!(a.getAttribute('data-project-id')) && " *
+             "[...document.querySelectorAll('.bt-text-input')].some(e=>e.offsetParent!==null); })()";
              timeout = 90)
     sleep(0.5)
     pid = current_chat_id(s)

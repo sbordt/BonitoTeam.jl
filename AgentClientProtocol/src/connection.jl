@@ -59,7 +59,19 @@ transport_eof(::Transport) = false
 # guard against the throw conditions, so no try/catch is needed.
 function Base.close(t::SubprocessTransport)
     isopen(t.proc.in) && close(t.proc.in)
-    process_running(t.proc) && kill(t.proc)
+    if process_running(t.proc)
+        kill(t.proc)   # SIGTERM: lets a well-behaved agent exit + reap its children
+        # Escalate to SIGKILL if it doesn't die. An agent that ignores SIGTERM (or
+        # a child parked in `sleep`/mid-JIT) would otherwise leak — and keep its
+        # stdout open, parking the reader loop forever (turns_active never settles).
+        # Detached so `close` stays non-blocking; a well-behaved child has already
+        # exited well before the grace window.
+        Base.errormonitor(@async begin
+            if timedwait(() -> !process_running(t.proc), 2.0) !== :ok
+                process_running(t.proc) && kill(t.proc, Base.SIGKILL)
+            end
+        end)
+    end
     return nothing
 end
 
@@ -523,6 +535,13 @@ function reader_loop(conn::Connection)
                 # connection down on a real EOF; otherwise skip and keep reading
                 # (A4) so one blank line can't kill a live session.
                 transport_eof(conn.transport) && break
+                # Defense-in-depth: if a transport's `recv` returns "" WITHOUT
+                # blocking and its `transport_eof` is (wrongly) false, this skip
+                # path is a hot loop. `reader_loop` runs on a sticky `@async`
+                # task, so without a yield it would monopolize thread 1 and
+                # livelock the whole process (every other server `@async` handler
+                # starves). The yield turns that into a recoverable busy loop.
+                yield()
                 continue
             end
             local msg
@@ -537,9 +556,12 @@ function reader_loop(conn::Connection)
         end
     catch e
         # EOFError / IOError = subprocess or socket EOF; InvalidStateException =
-        # a channel-based transport (MockTransport) closed under us. All three
-        # are clean teardown signals, not failures.
-        if !(e isa EOFError || e isa Base.IOError || e isa InvalidStateException)
+        # a channel-based transport closed under us. And `conn.closed` means WE
+        # initiated the teardown (close(conn)), so ANY reader error here — incl. a
+        # WebSocket 1006 abnormal-close as the socket drops — is expected teardown,
+        # not a failure. Only warn when the connection was supposed to be live (a
+        # genuine crash: protocol error / unexpected drop while open).
+        if !conn.closed && !(e isa EOFError || e isa Base.IOError || e isa InvalidStateException)
             @warn "ACP reader failed" exception=e
         end
     finally

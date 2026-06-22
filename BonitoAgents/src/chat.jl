@@ -44,10 +44,10 @@ mutable struct ChatModel
     chat_session::Any                    # ChatSession from persistence.jl
     msgs_store::Vector{ChatMsg}
 
-    # ACP client + the typed Transport that knows how to (re)build it.
-    client::Ref{Union{AgentClientProtocol.Client,Nothing}}
+    # The agent IS the session: how to spawn/dial + the live ACP client once
+    # started (see agents.jl). Read the live client via `client(model.agent)`.
+    agent::AgentProvider
     mcp_servers::Vector{AgentClientProtocol.MCPServer}
-    transport::ChatTransport
 
     # The user's turns. The browser send handler `put!`s a `UserMessage`; the
     # `run_chat!` task is the SOLE consumer (one turn at a time). Shared across
@@ -83,6 +83,23 @@ mutable struct ChatModel
     # `start_chat_client!`; survives `restart_chat_session!` (which only swaps
     # the ACP client, not the consumer). Shared across per-session views.
     consumer_task::Ref{Union{Task,Nothing}}
+
+    # The per-chat background-output poller task (the taskbar's server-side
+    # bookkeeping loop — walks this chat's live bg items every second). A FIELD,
+    # not a global registry: its lifetime is the chat's, so a closed/dropped chat
+    # takes it with it. There is no global IdDict to leak (the old design pinned
+    # every chat alive and had to be hand-drained on each teardown path).
+    poller_task::Ref{Union{Task,Nothing}}
+
+    # Restart coordination, per shared chat. Fields, not `IdDict{ChatModel}`
+    # globals: `restart_gen` (the old global was bumped per restart and NEVER
+    # deleted → it pinned every restarted chat's model forever) and
+    # `restart_inflight` (one bring-up worker at a time) live and die with the
+    # chat. `restart_lock` guards the brief read-test-set (held only there, never
+    # across the seconds-long bring-up). See `restart_chat_session!`.
+    restart_inflight::Base.RefValue{Bool}
+    restart_gen::Base.RefValue{Int}
+    restart_lock::ReentrantLock
 
     # Backreference for per-session copies. `nothing` for the shared parent;
     # points back to it for any `copy(model, session)` view so writes to the
@@ -128,22 +145,30 @@ mutable struct ChatModel
     taskbar_clock::Observable{Float64}
     taskbar_clock_on::Base.RefValue{Bool}
 
-    # Current agent provider for this chat (ClaudeCode or MiMoCode).
-    # Observable so the UI can react to provider changes.
-    provider::Observable{AgentProvider}
+    # Current agent KIND for this chat (a concrete BinAgent type, e.g.
+    # `ClaudeCodeAgent`). Observable so the UI provider-switcher can react. For
+    # a `WorkerAgent` this is `agent.kind`; for a `BinAgent` it's `typeof(agent)`.
+    provider::Observable{Any}
 end
+
+# The agent KIND tracked by the `provider` observable: for a worker session
+# it's the provider the worker spawns, for a local one it's the agent's own type.
+agent_kind(a::WorkerAgent) = a.kind
+agent_kind(a::BinAgent)    = typeof(a)
 
 function ChatModel(state::ServerState, cwd::AbstractString;
     project_id::AbstractString="",
     mcp_servers=AgentClientProtocol.MCPServer[],
-    transport::Union{ChatTransport,Nothing}=nothing,
-    provider::AgentProvider=ClaudeCode)
+    agent::Union{AgentProvider,Nothing}=nothing)
     chat_dir = chat_storage_dir(state, project_id, cwd)
     chat_session = load_session(chat_dir, cwd)
     msgs_store = load_history(chat_session)
-    actual_transport = transport === nothing ?
-                       LocalTransport(cwd; mcp_servers=collect(AgentClientProtocol.MCPServer, mcp_servers), provider=provider) :
-                       transport
+    # Default: a local Claude agent spawned on the server box. A caller (the
+    # dashboard) hands a `WorkerAgent` for remote sessions.
+    actual_agent = agent === nothing ?
+                   ClaudeCodeAgent(; cwd = String(cwd),
+                                   mcp = collect(AgentClientProtocol.MCPServer, mcp_servers)) :
+                   agent
     busy_active = Observable(false)
     # Wire busy_active → sidebar status LED: a prompt going in-flight (or
     # finishing) flips chat_status, which the sidebar wants to know about
@@ -156,9 +181,8 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         state, String(cwd), String(project_id),
         chat_dir,
         chat_session, msgs_store,
-        Ref{Union{AgentClientProtocol.Client,Nothing}}(nothing),
+        actual_agent,
         collect(AgentClientProtocol.MCPServer, mcp_servers),
-        actual_transport,
         Channel{UserMessage}(64),
         Ref(""),                    # pending_history_replay
         Observable(Dict{String,Any}()),
@@ -167,6 +191,10 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         busy_active,
         Observable(Any[]),          # session_meta
         Ref{Union{Task,Nothing}}(nothing),   # consumer_task
+        Ref{Union{Task,Nothing}}(nothing),   # poller_task
+        Ref(false),                 # restart_inflight
+        Ref(0),                     # restart_gen
+        ReentrantLock(),            # restart_lock
         nothing,                    # parent: this is the shared instance itself
         Dict{String,Vector}(),      # tool_content_cache
         nothing,                    # plotpane: window-scoped, set per session view
@@ -177,11 +205,9 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Ref(0.0),                   # last_stream_at
         Observable(time()),         # taskbar_clock (ticked by a Julia Timer)
         Ref(false),                 # taskbar_clock_on
-        # Provider observable tracks the transport (the source of truth): a
-        # caller may pass a transport whose provider differs from the `provider`
-        # kw default, and the two must not disagree. Transports without a
-        # provider notion (MockTransport) fall back to the `provider` kw.
-        Observable(something(transport_provider(actual_transport), provider)),
+        # Provider observable tracks the AGENT (the source of truth): the kind
+        # the worker spawns for a WorkerAgent, the agent's own type locally.
+        Observable{Any}(agent_kind(actual_agent)),
     )
 end
 
@@ -196,7 +222,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.state, m.cwd, m.project_id,
             m.chat_dir,
             m.chat_session, m.msgs_store,
-            m.client, m.mcp_servers, m.transport,
+            m.agent, m.mcp_servers,
             m.user_messages,           # shared queue → all sessions feed one consumer
             m.pending_history_replay,
             map(identity, session, m.comm),
@@ -205,6 +231,10 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.busy_active),
             map(identity, session, m.session_meta),
             m.consumer_task,           # shared → only the parent runs the loop
+            m.poller_task,             # shared → one poller per chat
+            m.restart_inflight,        # shared → one restart coordinator per chat
+            m.restart_gen,
+            m.restart_lock,
             m,    # parent → the shared instance we copied from
             m.tool_content_cache,      # shared Dict; per-tab views see same RAM cache
             nothing,                   # plotpane: per WINDOW — ChatPaneRef sets it
@@ -1730,7 +1760,7 @@ function Base.append!(m::AgentMsg, t::AbstractString)
         m.text *= t
         m.html = ""
     end
-    c = m.chat === nothing ? nothing : m.chat.client[]
+    c = m.chat === nothing ? nothing : client(m.chat.agent)
     (c !== nothing && (@atomic c.conn.cancelling)) || chat_emit(m.chat, wire_chunk(m, t))
     return m
 end
@@ -1914,7 +1944,7 @@ function process!(chat::ChatModel, m::AgentClientProtocol.Thought)
     # channel, so the running chunk count is the only real-time proof that the
     # model is still churning. Shipped next to the "reasoning…" indicator.
     n = 0
-    c = chat.client[]
+    c = client(chat.agent)
     last_emit = 0.0
     try
         for delta in m.updates
@@ -1975,8 +2005,8 @@ end
 # so a slow agent can't freeze the click handler; failures log + revert.
 function apply_config_pick!(model::ChatModel, cfg_id::AbstractString,
                             value::AbstractString)
-    client = model.client[]
-    client === nothing && return nothing
+    cli = client(model.agent)
+    cli === nothing && return nothing
 
     # Optimistic patch: swap `current_value` on the matching ConfigOption.
     s = shared(model)
@@ -1992,7 +2022,7 @@ function apply_config_pick!(model::ChatModel, cfg_id::AbstractString,
     end...]
 
     @async try
-        AgentClientProtocol.set_config_option!(client, cfg_id, value)
+        AgentClientProtocol.set_config_option!(cli, cfg_id, value)
     catch e
         @warn "set_config_option failed; reverting" cfg_id value exception = e
         prev === nothing && return
@@ -2339,26 +2369,18 @@ const BG_QUIESCE_SECS = 20.0
 # global cadence constant — the 1 s sleep is inline, the task's
 # lifetime is the chat's, and a closed chat takes its poller with it.
 #
-# We use an IdDict keyed on the shared model rather than a field so the
-# struct layout stays stable (= no precompile rebuild). Lookups are
-# O(1) and the dict only ever has one entry per live chat.
-const BG_POLLERS         = IdDict{ChatModel,Task}()
-const BG_POLLERS_GC_LOCK = ReentrantLock()
-
+# The poller lives on `shared(model).poller_task` (a field), so its lifetime is
+# the chat's — no global registry pinning every chat alive and no per-teardown
+# hand-draining. Idempotent: a still-running poller is left alone; a finished one
+# (the chat closed and `background_poll_loop`'s `while isopen(user_messages)`
+# guard exited) is replaced. The check-and-set runs under the model lock so two
+# concurrent `start_chat_client!`s can't spawn two pollers.
 function start_background_poller!(state::ServerState, model::ChatModel)
     s = shared(model)
-    lock(BG_POLLERS_GC_LOCK) do
-        existing = get(BG_POLLERS, s, nothing)
+    lock(s.lock) do
+        existing = s.poller_task[]
         existing === nothing || istaskdone(existing) || return  # already live
-        BG_POLLERS[s] = Base.errormonitor(@async begin
-            try
-                background_poll_loop(state, s)
-            finally
-                lock(BG_POLLERS_GC_LOCK) do
-                    delete!(BG_POLLERS, s)
-                end
-            end
-        end)
+        s.poller_task[] = Base.errormonitor(@async background_poll_loop(state, s))
         return nothing
     end
     return nothing
@@ -2610,10 +2632,10 @@ end
 # Tear a ChatModel's long-lived tasks down (T4). Closing `user_messages` ends
 # the `run_chat!` consumer (its `for … in chat.user_messages` loop exits on a
 # closed channel) AND signals `background_poll_loop` to exit (its
-# `while isopen(model.user_messages)` guard) — so the 1 Hz poller stops and
-# `start_background_poller!`'s `finally` drops the `BG_POLLERS` entry, releasing
-# the last strong ref to the ChatModel. We resolve to the shared parent so a
-# per-session view never half-closes the real model.
+# `while isopen(model.user_messages)` guard) — so the 1 Hz poller stops and its
+# `model.poller_task` finishes, releasing the running task's ref to the model.
+# We resolve to the shared parent so a per-session view never half-closes the
+# real model.
 #
 # Idempotent: closing an already-closed channel is a no-op (we guard `isopen`),
 # and `stop_session!` may run more than once for the same project.
@@ -2637,8 +2659,8 @@ end
 # for `drain_turn!`, or `nothing` when there's no client.
 function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     promote_queued_user_bubble!(chat)
-    client = chat.client[]
-    client === nothing && return nothing
+    cli = client(chat.agent)
+    cli === nothing && return nothing
     s = shared(chat)
     lock(() -> s.turns_active[] += 1, s.lock)
     s.last_stream_at[] = time()
@@ -2648,7 +2670,7 @@ function begin_turn!(chat::ChatModel, user_msg::UserMessage)
     seq = (s.turn_seq[] += 1)
     chat_emit(chat, Dict{String,Any}("type" => "turn_begin", "seq" => seq))
     try
-        return AgentClientProtocol.prompt!(client, with_prelude(chat, user_msg.text);
+        return AgentClientProtocol.prompt!(cli, with_prelude(chat, user_msg.text);
             images=user_msg.images)
     catch e
         # Failed to even send: release the slot we claimed; surface the error
@@ -2757,7 +2779,7 @@ function drain_turn!(chat::ChatModel, turn)
             # The common cause is a just-switched provider that isn't
             # authenticated (its prompts return an empty `end_turn`). Surface a
             # hint rather than leave the user staring at silence.
-            cli = chat.client[]
+            cli = client(chat.agent)
             cancelled = cli !== nothing && (@atomic cli.conn.cancelling)
             if !errored && !cancelled &&
                lock(() -> length(s.msgs_store), s.lock) == nstore0
@@ -3049,55 +3071,44 @@ end
 function start_chat_client!(model::ChatModel)
     # fs/* RPCs delegate to the stock FSRequestHandler; permission requests
     # render as interactive cards (see ChatPermissionHandler above).
-    # `agent_cwd` is the path the agent sees (cwd locally, worker_path
-    # remotely) so fs reads resolve against the right root.
+    # `agent_cwd(agent)` is the path the agent sees (cwd locally, worker_path
+    # remotely) so fs reads resolve against the right root. Install the handler
+    # on the agent so `start!` wires it into the Connection.
     handler = ChatPermissionHandler(
-        AgentClientProtocol.FSRequestHandler(agent_cwd(model.transport)),
+        AgentClientProtocol.FSRequestHandler(agent_cwd(model.agent)),
         shared(model))
+    model.agent.handler = handler
 
-    # For MockTransport: create a fresh instance before start_session so the
-    # old connection's reader_loop.finally (which calls close(conn.transport))
-    # can't close the NEW channels. The old reader_loop closes the OLD
-    # MockTransport's channels (harmless — nobody references them anymore);
-    # the fresh instance carries the new channels start_session will use.
-    if model.transport isa MockTransport
-        old_t = model.transport
-        model.transport = MockTransport(old_t.on_setup;
-                                       cwd = old_t.cwd,
-                                       capacity = old_t.capacity)
-    end
-
-    # Capture the recorded session id BEFORE start_session so we can detect
+    # Capture the recorded session id BEFORE start! so we can detect
     # "fresh session, not a resume". A mismatch means claude has no memory of
     # `msgs_store` (e.g. project synced to a different worker), so we arm a
     # one-shot history prelude that the next prompt consumes (`with_prelude`).
     prev_session_id = model.chat_session.session_id
     # `on_frame` taps every raw ACP frame (both directions) into
     # chat_dir/acp.jsonl — inspectable live via GET /acp-log/<project_id>.
-    client, replay = start_session(model.transport, handler;
-                                   on_frame = let logger = acp_frame_logger(model.chat_dir),
-                                                  s = shared(model)
-                                       (dir, msg) -> begin
-                                           # Every inbound frame counts as stream
-                                           # activity — the busy heuristic
-                                           # (`update_busy!`) keys off this, and a
-                                           # minutes-long streaming reply must not
-                                           # read as "quiet" just because the turn
-                                           # loop sits inside one message.
-                                           dir === :in && (s.last_stream_at[] = time())
-                                           logger(dir, msg)
-                                       end
-                                   end)
+    start!(model.agent;
+           on_frame = let logger = acp_frame_logger(model.chat_dir),
+                          s = shared(model)
+               (dir, msg) -> begin
+                   # Every inbound frame counts as stream activity — the busy
+                   # heuristic (`update_busy!`) keys off this, and a minutes-long
+                   # streaming reply must not read as "quiet" just because the
+                   # turn loop sits inside one message.
+                   dir === :in && (s.last_stream_at[] = time())
+                   logger(dir, msg)
+               end
+           end)
+    cli = client(model.agent)
+    replay_msgs = replay(model.agent)
     # Header metadata: typed views over the raw session-setup result. A future
     # agent kind extends this line with additional parsers over the same dict.
     # (What the header SHOWS is a separate, display-side decision — see
     # `show_in_header`.)
     shared(model).session_meta[] =
-        Any[AgentClientProtocol.parse_config_options(client.session_result)...]
-    model.client[] = client
-    new_session_id = client.session_id
-    if isempty(replay)
-        # No replay (fresh session/new, or a transport without resume). If WE
+        Any[AgentClientProtocol.parse_config_options(cli.session_result)...]
+    new_session_id = cli.session_id
+    if isempty(replay_msgs)
+        # No replay (fresh session/new, or an agent without resume). If WE
         # have history but claude doesn't (the session changed under us), feed
         # ours forward as a one-shot text prelude on the next prompt.
         if !isempty(model.msgs_store) && prev_session_id != new_session_id
@@ -3108,7 +3119,7 @@ function start_chat_client!(model::ChatModel)
         # (keep ours canonical, adopt only what we're missing). Mutually
         # exclusive with the prelude: claude HAS memory here, so we never
         # double-feed it ours.
-        reconcile_replay!(model, replay)
+        reconcile_replay!(model, replay_msgs)
     end
     update_session_id!(model.chat_session, new_session_id)
 
@@ -3128,7 +3139,7 @@ function start_chat_client!(model::ChatModel)
     # Cache the live model so the sidebar can swap to this chat instantly and
     # test rigs can drive prompts via state.chat_models[pid] without the UI.
     if !isempty(model.project_id)
-        @info "registering chat model" project_id = model.project_id session_id = model.client[].session_id
+        @info "registering chat model" project_id = model.project_id session_id = client(model.agent).session_id
         lock(model.state.lock) do
             model.state.chat_models[model.project_id] = model
         end
@@ -3137,43 +3148,33 @@ function start_chat_client!(model::ChatModel)
     return nothing
 end
 
-# Serializer for `restart_chat_session!` — keyed on the SHARED parent
-# ChatModel (so per-session views funnel to one gate). Two concurrent
-# restart calls would otherwise both close(old_client), both wait, both
-# call start_chat_client! — at best one of them losing its newly-spawned
-# client into the wind, at worst deadlocking because each blocks the
-# consumer task's `sweep_turn_orphans!` from acquiring `model.lock`. The
-# module-level IdDict avoids adding a struct field — restart is rare
-# (user click) so an IdDict lookup per call is fine; the entry lifetime
-# is one restart so no GC pressure either. The companion `RESTART_LOCK`
-# guards the dict itself across the read-test-set sequence.
-const RESTART_LOCK   = ReentrantLock()
-const RESTART_INFLIGHT = IdDict{ChatModel,Bool}()
-# Monotonic "restart requested" counter per shared model. Every
-# `restart_chat_session!` call bumps it; the single in-flight worker re-runs the
-# bring-up until it has satisfied the LATEST request. This is what makes rapid
-# provider switches correct: a switch that lands while an earlier switch's
-# restart is still running used to be COALESCED AWAY (the old code just waited
-# for the in-flight one and returned), so the session came up on the *previous*
-# provider while the header showed the new one — e.g. OpenCode selected but
-# MiMo's models in the picker. Now the worker loops and brings up the latest
-# `transport.provider`, so the final session always matches the last switch.
-const RESTART_GEN = IdDict{ChatModel,Int}()
+# Restart coordination lives on the shared ChatModel (`restart_inflight`,
+# `restart_gen`, `restart_lock` fields), so per-session views funnel to one gate
+# and the state dies with the chat. Two concurrent restart calls would otherwise
+# both close(old_client), both wait, both call start_chat_client! — at best one
+# losing its newly-spawned client, at worst deadlocking because each blocks the
+# consumer task's `sweep_turn_orphans!` from acquiring `model.lock`. `restart_lock`
+# guards the brief read-test-set; `restart_inflight` elects the single worker; and
+# `restart_gen` is the monotonic "restart requested" counter — every call bumps it
+# and the in-flight worker re-runs the bring-up until it has satisfied the LATEST
+# request, so a rapid provider switch can't be coalesced away (which used to bring
+# the session up on the *previous* provider while the header showed the new one).
 
 # One bring-up cycle: tear the old client down and spin a fresh one from the
-# CURRENT `model.transport` (so it reflects the latest provider). Errors are
+# CURRENT `model.agent` (so it reflects the latest provider). Errors are
 # caught + recorded on `last_error` (the session is left dead, not crashed) so
 # the worker loop in `restart_chat_session!` can keep going.
 function bring_up_once!(model::ChatModel)
     s = shared(model)
     try
-        old = model.client[]
-        # close is idempotent + total: stdin EOF / WS peer close makes the
+        old = client(model.agent)
+        # stop! is idempotent + total: stdin EOF / WS peer close makes the
         # agent exit cleanly and cascades through the Connection teardown, so
         # any in-flight `prompt!` errors out (its turn loop ends) without stale
-        # updates leaking into the new session.
+        # updates leaking into the new session. The agent owns its own
+        # subprocess/ws, so a fresh `start!` can't clobber the old session.
         if old !== nothing
-            close(old)
+            stop!(model.agent)
             # Wait for the in-flight turn (if any) to actually exit so its
             # try/catch/finally in `run_turn!` runs to completion BEFORE we
             # boot a fresh client (it emits the trailing `thinking=false`, runs
@@ -3214,18 +3215,18 @@ function restart_chat_session!(model::ChatModel)
     # finishing — and wait (bounded) for it to settle. Otherwise WE are the
     # worker. Concurrent restarts must never both `close(old)`/`start_chat_client!`
     # (lost client / consumer-lock deadlock), so exactly one worker runs at a time.
-    iam_worker = lock(RESTART_LOCK) do
-        RESTART_GEN[s] = get(RESTART_GEN, s, 0) + 1
-        if get(RESTART_INFLIGHT, s, false)
+    iam_worker = lock(s.restart_lock) do
+        s.restart_gen[] += 1
+        if s.restart_inflight[]
             false
         else
-            RESTART_INFLIGHT[s] = true
+            s.restart_inflight[] = true
             true
         end
     end
     if !iam_worker
         deadline = time() + 20.0
-        while time() < deadline && lock(RESTART_LOCK) do; get(RESTART_INFLIGHT, s, false); end
+        while time() < deadline && lock(() -> s.restart_inflight[], s.restart_lock)
             sleep(0.02)
         end
         return nothing
@@ -3235,11 +3236,11 @@ function restart_chat_session!(model::ChatModel)
         # requested (generation bumped) while we were bringing one up, go again
         # so the FINAL session reflects the last switch's provider.
         while true
-            target = lock(RESTART_LOCK) do; RESTART_GEN[s]; end
+            target = lock(() -> s.restart_gen[], s.restart_lock)
             bring_up_once!(model)
-            done = lock(RESTART_LOCK) do
-                if RESTART_GEN[s] == target
-                    delete!(RESTART_INFLIGHT, s)
+            done = lock(s.restart_lock) do
+                if s.restart_gen[] == target
+                    s.restart_inflight[] = false
                     true
                 else
                     false   # a newer request arrived mid-restart — run again
@@ -3251,7 +3252,7 @@ function restart_chat_session!(model::ChatModel)
         # Defensive: never leave the in-flight flag stuck (would wedge all future
         # restarts). bring_up_once! already swallows bring-up errors, so this only
         # fires on something truly unexpected.
-        lock(RESTART_LOCK) do; delete!(RESTART_INFLIGHT, s); end
+        lock(() -> (s.restart_inflight[] = false), s.restart_lock)
         rethrow()
     end
     return nothing
@@ -3873,32 +3874,32 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # as a bare, always-on attribute, which would select every option).
     provider_status = Observable("")
     provider_choice = Observable("")
-    provider_opt(p, cur) = DOM.option(provider_label(p);
-        (p === cur ? (; value = string(p), selected = true) : (; value = string(p)))...)
+    # Each menu entry is an agent KIND (a concrete BinAgent type). The <option>
+    # value is its stable `provider_name` ("ClaudeCode", …); the label is its
+    # `label`. `cur` is the current kind type held by `model.provider`.
+    provider_opt(kind, cur) = DOM.option(label(kind());
+        (kind === cur ? (; value = provider_name(kind()), selected = true) :
+                        (; value = provider_name(kind())))...)
     provider_select = map(session, model.provider) do cur
         DOM.select(
-            (provider_opt(p, cur) for p in (ClaudeCode, MiMoCode, OpenCode, MockCode))...;
+            (provider_opt(kind, cur) for kind in AGENT_KINDS)...;
             class = "bt-header-provider-select",
             title = "Switch AI agent backend",
             onchange = js"event => $(provider_choice).notify(event.target.value)")
     end
     on(session, provider_choice) do val
         isempty(val) && return
-        new_provider = if val == "MiMoCode"
-            MiMoCode
-        elseif val == "OpenCode"
-            OpenCode
-        elseif val == "MockCode"
-            MockCode
-        else
-            ClaudeCode
-        end
+        # Resolve the wire name back to the agent kind (default Claude).
+        new_kind = something(
+            findfirst(k -> provider_name(k()) == val, AGENT_KINDS),
+            nothing)
+        new_kind = new_kind === nothing ? ClaudeCodeAgent : AGENT_KINDS[new_kind]
         current = model.provider[]
-        new_provider == current && return
-        provider_status[] = "Switching to $(provider_label(new_provider))…"
+        new_kind === current && return
+        provider_status[] = "Switching to $(label(new_kind()))…"
         @async begin
             try
-                switch_provider!(model, new_provider)
+                switch_provider!(model, new_kind)
                 # `switch_provider!` → `restart_chat_session!` swallows bring-up
                 # errors (sets `last_error`, keeps the chat object alive), so a
                 # failed switch returns normally. Surface it from the resulting
@@ -3945,51 +3946,50 @@ end
 # ── Provider switching ────────────────────────────────────────────────────────
 
 """
-    switch_provider!(model::ChatModel, new_provider::AgentProvider)
+    switch_provider!(model::ChatModel, new_kind::Type{<:BinAgent})
 
 Switch the agent backend for a chat. This:
 1. Updates the provider observable
-2. Creates a new transport with the correct binary
+2. Swaps the live agent INSTANCE to one running `new_kind` (preserving the
+   chat's cwd / handler / mcp / project context)
 3. Restarts the session with the new backend
 
 The provider choice is NOT persisted across server restarts — it resets
 to ClaudeCode on construction. This is by design: providers may not be
 available on all machines, so a hard-coded preference would break.
 """
-function switch_provider!(model::ChatModel, new_provider::AgentProvider)
+function switch_provider!(model::ChatModel, new_kind::Type{<:BinAgent})
     s = shared(model)
-    s.provider[] = new_provider
+    s.provider[] = new_kind
     # Drop the previous provider's session config (model/mode pills) right away:
     # otherwise the header keeps showing e.g. Claude's model list while we bring
     # up MiMo, which reads as "switched, but the model picker is still Claude's".
     # `start_chat_client!` repopulates it from the new session's config.
     s.session_meta[] = Any[]
 
-    # Resolve the binary for the new provider
-    new_bin = find_provider_bin(new_provider)
-
-    # Create a new transport with the correct binary
-    # For LocalTransport, swap the agent_bin. For WorkerTransport, we need
-    # to close the current session and let it reopen with the new provider.
-    old_transport = s.transport
-    if old_transport isa LocalTransport
-        s.transport = LocalTransport(
-            old_transport.cwd;
-            mcp_servers = old_transport.mcp_servers,
-            agent_bin = new_bin,
-            agent_env = old_transport.agent_env,
-            provider = new_provider)
-    elseif old_transport isa WorkerTransport
-        # WorkerTransport: update the provider field and let restart handle it.
-        old_transport.provider = new_provider
-        # A switch must start a FRESH session: `resume_session_id` is the OLD
-        # provider's session id (e.g. a claude-agent-acp UUID). Asking MiMo to
-        # `session/load` a session it never created errors ("Internal error")
-        # and the restart fails — leaving the chat dead with no model picker.
-        # Clearing it routes start_session through `session/new`; the chat's
-        # history is fed forward to the new agent as a one-shot prelude (see
-        # `arm_history_replay!` in start_chat_client!).
-        old_transport.resume_session_id = nothing
+    old = s.agent
+    if old isa WorkerAgent
+        # WorkerAgent: keep the worker wiring, change only WHICH provider it
+        # spawns. A switch must start a FRESH session: `resume_session_id` is the
+        # OLD provider's session id (e.g. a claude-agent-acp UUID). Asking MiMo to
+        # `session/load` a session it never created errors ("Internal error") and
+        # the restart fails — leaving the chat dead with no model picker. Clearing
+        # it routes start! through `session/new`; the chat's history is fed
+        # forward to the new agent as a one-shot prelude (see `arm_history_replay!`
+        # in start_chat_client!).
+        old.kind = new_kind
+        old.resume_session_id = nothing
+    else
+        # Local agent: a switch builds a FRESH instance of the new kind, so the
+        # old agent is orphaned — `restart_chat_session!` below `stop!`s the NEW
+        # `model.agent`, never `old`. Tear the old session down explicitly first or
+        # its subprocess leaks. `stop!` is idempotent + total; its config fields
+        # (`cwd`/`handler`) stay readable afterward.
+        stop!(old)
+        s.agent = new_agent(new_kind;
+            cwd = agent_cwd(old),
+            handler = old.handler,
+            mcp = s.mcp_servers)
     end
 
     # Restart the session with the new provider
@@ -4459,9 +4459,9 @@ const CANCEL_ESCALATE_WAIT = 20.0
 function handle_command!(model::ChatModel, ::Any, cmd::CancelCommand)
     # Off-band, instant: cancel is a lone ACP notification, not a chat-state
     # mutation, so it never goes through the `run_chat!` consumer. Reading
-    # `model.client[]` is a single-Ref read. (Session arg is unused here — typed
-    # `::Any` so the cancel path is unit-testable without a live Bonito.Session.)
-    c = model.client[]
+    # `client(model.agent)` is a single-field read. (Session arg is unused here —
+    # typed `::Any` so the cancel path is unit-testable without a Bonito.Session.)
+    c = client(model.agent)
     c === nothing && return nothing
     s = shared(model)
     # Turn-scoped: a cancel aimed at a turn that already ended is DROPPED —

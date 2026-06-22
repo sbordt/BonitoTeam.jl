@@ -143,7 +143,7 @@ definition between rescans).
 function open_chat_projects(projects::AbstractDict{<:AbstractString,ProjectInfo})
     out = ProjectInfo[]
     for (_, p) in projects
-        (p.title !== nothing || p.resume_session_id !== nothing) || continue
+        chat_in_sidebar(p) || continue
         push!(out, p)
     end
     return out
@@ -167,7 +167,11 @@ function open_chat_projects(state::ServerState,
     for id in live
         id in have && continue
         p = get(projects, id, nothing)
-        p === nothing || push!(out, p)
+        # A dismissed chat that still has a live model (the ✕ tears the model
+        # down, so this is only a brief race) must not be re-added by the
+        # live-model path — honour the close.
+        (p === nothing || p.dismissed) && continue
+        push!(out, p)
     end
     return out
 end
@@ -243,6 +247,14 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         isempty(pid) && return
         p = get(state.projects[], pid, nothing)
         p === nothing && return
+        # Mark the chat closed FIRST so it drops out of the "Open chats" list the
+        # moment `notify_chats!` / `state.projects` fans out — `dismissed` is what
+        # makes the ✕ actually remove the entry (a titled / session-bound chat is
+        # otherwise persistently "open"). Persisted so the close survives a
+        # restart; reopening from the dashboard clears it (bring_up_project_session!).
+        p.dismissed = true
+        lock(state.lock) do; save_projects!(state); end
+        safe_notify!(state.projects)
         # Flip the view away FIRST, then tear the session down off the event
         # task (T21). `stop_session!` closes the transport (network I/O) and the
         # ChatModel, which can block for seconds — running it inline froze the
@@ -413,8 +425,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         # persisted-interacted OR carrying a live ChatModel.
         pairs = lock(state.lock) do
             [(pid, p) for (pid, p) in state.projects[]
-             if p.title !== nothing || p.resume_session_id !== nothing ||
-                haskey(state.chat_models, pid)]
+             if chat_in_sidebar(p) || (!p.dismissed && haskey(state.chat_models, pid))]
         end
         new = Dict{String,String}()
         for (pid, p) in pairs

@@ -39,6 +39,7 @@ const SUITES = [
     "streaming_flood.jl",    # EARLY (near-empty session) — see note above
     "workflows.jl",
     "chat_features.jl",
+    "chat_close_rename.jl",  # closes chats from the homebar + reopens — non-destructive
     "tool_rendering.jl",
     "todo_taskbar.jl",
     "errors.jl",

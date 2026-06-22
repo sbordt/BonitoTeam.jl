@@ -49,6 +49,7 @@ it, so it covers the working path; the inactive-close fix is still open.
 |-----------------------|------------------------------------------------------------------------|
 | `workflows.jl`        | dashboard, new-project folder picker, chat reply, edit tool + diff expand, bash tool, thinking, agent switch |
 | `chat_features.jl`    | streaming accumulation, markdown (h1/ul/pre/strong/a), responsive layout (480/1280), multi-chat switching |
+| `chat_close_rename.jl`| homebar ✕ closes a chat (leaves the list, back to dashboard, model torn down, `dismissed` persisted); closing one leaves the others; header rename is consistent in homebar + header and persists across a chat switch; a fresh chat binds its claude session id (the "name reverts to first message" root fix); reopening a closed chat restores it under its title |
 | `embedded_app.jl`     | `bt_show_app` dial-back eval bridge + embedded frame render            |
 | `app_stress.jl`       | bt_show_app moved bubble↔float 100×, chat-switch round-trips, asserting the SAME live node survives every move via a preserved counter; no orphan nodes, no JS errors |
 | `app_interactive.jl`  | TWO live bt_show_apps at once; clicking each runs its Julia `map` in the worker (output = 7×clicks / 100+clicks, never computed in JS) and the DOM reflects the round-tripped value; the two apps stay independent |

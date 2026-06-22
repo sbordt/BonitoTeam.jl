@@ -299,15 +299,17 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
         get(d, wid, Dict{String,Any}[])
     end
 
-    # Session ids that are ALREADY imported as a project on this worker (a
-    # project whose `resume_session_id` matches). Such a session is now an open
-    # chat — we drop it from the discover list below so its row disappears once
-    # resumed, instead of lingering with a stale optimistic "Resuming…" label.
-    # Session-scoped (`map(session, …)`) so the listener deregisters with the
-    # browser session rather than leaking onto the long-lived `state.projects`.
+    # Session ids that are an OPEN chat in the homebar on this worker (a project
+    # whose `resume_session_id` matches AND that `chat_in_sidebar` shows). Such a
+    # session already has a sidebar entry, so we drop its row from the discover
+    # list to avoid showing the same chat twice. A ✕-closed (`dismissed`) chat is
+    # NOT in the sidebar, so it intentionally REAPPEARS here — that's how the user
+    # reopens it (resuming clears `dismissed` and restores its title). Session-
+    # scoped (`map(session, …)`) so the listener deregisters with the browser
+    # session rather than leaking onto the long-lived `state.projects`.
     imported_sids = map(session, c.state.projects) do projects
         Set(String(p.resume_session_id) for p in values(projects)
-            if p.resume_session_id !== nothing && p.worker_id == wid)
+            if p.resume_session_id !== nothing && p.worker_id == wid && chat_in_sidebar(p))
     end
 
     display_name_obs = map(c.state.workers) do workers

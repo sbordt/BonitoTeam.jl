@@ -3122,6 +3122,18 @@ function start_chat_client!(model::ChatModel)
         reconcile_replay!(model, replay_msgs)
     end
     update_session_id!(model.chat_session, new_session_id)
+    # Bind the claude session id onto the project. A fresh `session/new` chat
+    # gets its real session id only HERE (the agent assigned it); without writing
+    # it back, `ProjectInfo.resume_session_id` stayed `nothing` forever, so:
+    #   * the SAME open chat appeared in BOTH the homebar (under its title) AND
+    #     the folder→threads browser (under its first message) — the dedup there
+    #     keys on resume_session_id and couldn't recognise it, and
+    #   * reopening it from that browser ran `find_thread` with the real id,
+    #     matched nothing, and spawned a DUPLICATE untitled project — "the name
+    #     reverted to the first message".
+    # Recording it makes the thread dedup/resume machinery (thread_dedup_key,
+    # find_thread, the browser's imported-session hide) all agree on one chat.
+    record_bound_session!(model, new_session_id)
 
     # Start the single consumer loop ONCE (it survives restarts, which only
     # swap `client[]`). Runs on the shared parent so all per-session views and
@@ -3351,6 +3363,34 @@ function backfill_project_title!(model::ChatModel, prompt::AbstractString)
         save_projects!(model.state)
     catch e
         @warn "backfill_project_title!: persist failed" exception=e
+    end
+    safe_notify!(model.state.projects)
+    return nothing
+end
+
+# Persist the agent-assigned claude session id onto the project so the thread
+# becomes resumable + dedupable (see the call site in `start_chat_client!`).
+# Idempotent: a no-op when the id is unchanged (a restart/resume re-binds the
+# same id) or empty, and when the project entry is gone. Notifies `projects` on
+# a real change so the folder→threads browser hides the now-tracked session.
+function record_bound_session!(model::ChatModel, session_id::AbstractString)
+    pid = model.project_id
+    (isempty(pid) || isempty(session_id)) && return
+    # Only persist a CLAUDE session id. The provider isn't persisted across server
+    # restarts (it resets to ClaudeCode by design), so recording e.g. a MiMo
+    # session id would make the next ClaudeCode bring-up `session/load` a session
+    # it never created — the exact error `switch_provider!` clears the id to
+    # avoid. Claude sessions are also the only ones the worker's discover scan
+    # surfaces, so this is exactly the set the thread dedup/resume needs.
+    agent_kind(model.agent) === ClaudeCodeAgent || return
+    haskey(model.state.projects[], pid) || return
+    p = model.state.projects[][pid]
+    p.resume_session_id == session_id && return
+    p.resume_session_id = String(session_id)
+    try
+        lock(model.state.lock) do; save_projects!(model.state); end
+    catch e
+        @warn "record_bound_session!: persist failed" exception=e
     end
     safe_notify!(model.state.projects)
     return nothing

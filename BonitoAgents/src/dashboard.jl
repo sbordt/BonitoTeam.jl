@@ -363,6 +363,17 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
         error("Worker '$(p.worker_id)' is not connected")
     w = state.workers[][p.worker_id]
 
+    # Opening a chat un-closes it: a previously ✕-dismissed thread is being
+    # brought back, so it must reappear in the homebar. Persist + notify so the
+    # sidebar re-adds the entry (every bring-up path is user-initiated open —
+    # worker reconnect does NOT auto-bring-up, so this never resurrects a chat
+    # the user closed).
+    if p.dismissed
+        p.dismissed = false
+        lock(state.lock) do; save_projects!(state); end
+        safe_notify!(state.projects)
+    end
+
     claim_project!(state, p, w.worker_id)
 
     # The worker reports its BonitoMCP launch as a `julia` binary (`mcp_path`)

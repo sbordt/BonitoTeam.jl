@@ -131,6 +131,7 @@ jobs:
         suite:
           - workflows
           - chat_features
+          - chat_close_rename
           - embedded_app
           - app_detach
           - scroll_persist

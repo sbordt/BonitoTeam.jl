@@ -77,11 +77,19 @@ mutable struct ProjectInfo
     # `send_message!` if it's still `nothing`; a user edit pins it. `nothing`
     # → the sidebar/card falls back to `name` (folder basename).
     title::Union{String,Nothing}
+    # Closed-from-the-homebar flag. The ✕ on a sidebar entry sets this true
+    # (and persists it); it drops the chat out of the "Open chats" list WITHOUT
+    # forgetting the thread — the conversation still lives on disk and reappears
+    # in the worker's folder→threads browser, where reopening it clears the flag.
+    # Without this, a chat with a title or a bound session id would stay pinned
+    # to the homebar forever (those markers are persistent), so ✕ looked broken.
+    dismissed::Bool
 end
 
 ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_id, server_path, worker_path, created,
-                nothing, nothing, :unsynced, nothing, nothing, nothing, nothing)
+                nothing, nothing, :unsynced, nothing, nothing, nothing, nothing,
+                false)
 
 # Back-compat positional WorkerInfo constructor — keeps the pre-`initials`
 # call shape working for tests / fixtures that build a WorkerInfo by hand.
@@ -299,6 +307,19 @@ worker_initials(w::WorkerInfo) =
 project_display_title(p::ProjectInfo) =
     p.title === nothing || isempty(p.title) ? p.name : p.title
 
+"""
+    chat_in_sidebar(p) -> Bool
+
+Whether `p` belongs in the homebar's "Open chats" list: the user has
+interacted with it (a backfilled/edited `title` or a bound `resume_session_id`)
+AND hasn't since closed it via the ✕ (`dismissed`). This is the single source
+of truth shared by the sidebar list, its per-entry LED status sweep, and the
+folder→threads browser's "already open, hide it" dedup — so all three agree on
+exactly which chats are open.
+"""
+chat_in_sidebar(p::ProjectInfo) =
+    !p.dismissed && (p.title !== nothing || p.resume_session_id !== nothing)
+
 # Setting an Observable propagates to the browser via Bonito's WebSocket;
 # if a session is broken (e.g. a stale tab whose hashed asset URLs went 404
 # after a redeploy), Bonito surfaces that as a JSException from the
@@ -498,7 +519,8 @@ function save_projects!(s::ServerState)
                      "last_sync_at"  => p.last_sync_at === nothing ? nothing : string(p.last_sync_at),
                      "resume_session_id" => p.resume_session_id,
                      "auto_prompt"   => p.auto_prompt,
-                     "title"         => p.title)
+                     "title"         => p.title,
+                     "dismissed"     => p.dismissed)
                 for p in values(s.projects[])]
         atomic_write_json(projects_file(s), data)
     end
@@ -530,6 +552,9 @@ function load_projects!(s::ServerState)
             ti = get(d, "title", nothing)
             p.title = (ti === nothing || (ti isa AbstractString && isempty(ti))) ?
                                        nothing : String(ti)
+            # Pre-`dismissed` projects.json entries default to shown (false), so
+            # an upgrade doesn't suddenly hide anyone's existing open chats.
+            p.dismissed = get(d, "dismissed", false) === true
             s.projects[][p.id] = p
         catch e
             @warn "skipping malformed project entry" entry=d exception=e

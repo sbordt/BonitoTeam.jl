@@ -48,6 +48,7 @@ const SUITES = [
     "scroll_persist.jl",
     "embedded_app.jl",       # heavy: Malt worker cold start + Bonito load
     "app_detach.jl",         # heavy: two embedded apps
+    "app_scroll.jl",         # moves preserve chat scroll + liveness; re-detach cycles
     "app_stress.jl",         # heavy: 100× detach/close/switch cycle on a live embed
     "app_interactive.jl",    # two live apps; clicks round-trip to Julia + independence
     "app_multi.jl",          # three apps: detach all, drive each while floating, close 1-by-1

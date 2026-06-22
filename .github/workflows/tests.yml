@@ -134,6 +134,7 @@ jobs:
           - chat_close_rename
           - embedded_app
           - app_detach
+          - app_scroll
           - scroll_persist
           - streaming_flood
           - errors

@@ -193,8 +193,15 @@ const WorkspaceStageStyles = Bonito.Styles(
         "display" => "inline"),
     # A detached app's panel content: the frame fills the panel and scrolls; the
     # adopted embed (moved in by `app_adopt_content`) fills the frame.
+    # `color` is load-bearing: the page's ambient text color is white (only the
+    # chat's own elements set a dark color explicitly), so a bt_show_app embed
+    # that relies on inherited text — readable inline in its dark-texted chat
+    # bubble — renders WHITE-ON-WHITE once moved into the light workspace panel.
+    # Re-establish the app's text/background context here so a docked app looks
+    # the same as inline.
     Bonito.CSS(".bt-app-frame",
         "width" => "100%", "height" => "100%",
+        "color" => "var(--bt-text)", "background" => "var(--bt-surface)",
         "display" => "flex", "flex-direction" => "column",
         "min-height" => "0", "overflow" => "auto"),
     Bonito.CSS(".bt-app-frame > .bt-embed",

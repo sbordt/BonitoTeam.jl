@@ -52,7 +52,10 @@ jobs:
             bundle: tarball
           - runner: macos-15-intel
             os: macos
-            arch: x64
+            # `x86_64`, NOT `x64`: `--target-arch` is passed straight to Julia's
+            # BinaryPlatforms.MacOS(arch), which only accepts `x86_64`/`aarch64`
+            # ("x64" is Julia's *download* label, not a platform arch).
+            arch: x86_64
             bundle: tarball
           - runner: ubuntu-latest
             os: linux

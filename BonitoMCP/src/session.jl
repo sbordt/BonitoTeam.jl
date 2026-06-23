@@ -591,15 +591,18 @@ end
 # ── SessionManager ──────────────────────────────────────────────────────────
 mutable struct SessionManager
     sessions::Dict{String,JuliaSession}
-    create_locks::Dict{String,ReentrantLock}
-    global_lock::ReentrantLock
+    # Single-flight creations: key -> the @async Task currently building that
+    # key's session. Removed the instant the build finishes (success OR failure),
+    # so it only ever holds the few in flight — no per-key lock registry to leak.
+    creating::Dict{String,Task}
+    lock::ReentrantLock                 # guards BOTH `sessions` and `creating`
     log_dir::String
 end
 
 function SessionManager()
     log_dir = mktempdir(; prefix = "bonitoagents-mcp-logs-")
     SessionManager(Dict{String,JuliaSession}(),
-                   Dict{String,ReentrantLock}(),
+                   Dict{String,Task}(),
                    ReentrantLock(), log_dir)
 end
 
@@ -614,41 +617,78 @@ function _log_path(m::SessionManager, key::String)
     return joinpath(m.log_dir, "$safe.log")
 end
 
+# Return the live Julia session for `env_path`, creating one if needed. Creation
+# is SINGLE-FLIGHT per key: concurrent callers for the same env_path share ONE
+# in-flight build instead of each spawning a duplicate worker. The slow part
+# (`build_session!` → `start!`, which spawns + dials a Malt worker) runs in the
+# build task OUTSIDE `m.lock`, so DIFFERENT projects still come up concurrently
+# while the SAME project funnels to one worker. Replaces the old per-key
+# `create_locks` registry (one ReentrantLock per env_path, never freed) — and
+# unifies `m.sessions` access onto the single `m.lock` the other accessors use.
 function get_or_create!(m::SessionManager, env_path::Union{String,Nothing};
                         julia_cmd::Union{String,Nothing} = nothing)
     key = _key(env_path)
-    if haskey(m.sessions, key) && is_alive(m.sessions[key]) &&
-       m.sessions[key].julia_cmd == julia_cmd
-        return m.sessions[key]
-    end
-    create_lock = @lock m.global_lock get!(m.create_locks, key, ReentrantLock())
-    @lock create_lock begin
-        if haskey(m.sessions, key) && is_alive(m.sessions[key]) &&
-           m.sessions[key].julia_cmd == julia_cmd
-            return m.sessions[key]
+    while true
+        task = @lock m.lock begin
+            existing = get(m.sessions, key, nothing)
+            # Live session matching the requested julia_cmd → done (common path).
+            existing !== nothing && is_alive(existing) && existing.julia_cmd == julia_cmd &&
+                return existing
+            # Else join the in-flight build for this key, or start one. The session
+            # we're superseding (dead / wrong julia_cmd, or nothing) is handed to
+            # the build task to reap.
+            t = get(m.creating, key, nothing)
+            if t === nothing
+                t = @async build_session!(m, key, env_path, julia_cmd, existing)
+                m.creating[key] = t
+            end
+            t
         end
-        haskey(m.sessions, key) && (kill_session!(m.sessions[key]); delete!(m.sessions, key))
+        # Await the build OUTSIDE the lock. A failed build rethrows here; the task
+        # already pruned `creating[key]`, so a later call retries cleanly.
+        s = fetch(task)::JuliaSession
+        # The build we joined may have been started for a different julia_cmd by a
+        # caller that asked first; if so, loop and start our own (replacing it).
+        is_alive(s) && s.julia_cmd == julia_cmd && return s
+    end
+end
+
+# The single-flight build body — runs as the `creating[key]` task. Reaps the
+# superseded session, builds + starts a fresh one, then publishes it and clears
+# the in-flight marker atomically. On failure it clears the marker (so a retry
+# starts clean) and tears down any half-started worker before rethrowing.
+function build_session!(m::SessionManager, key::String, env_path::Union{String,Nothing},
+                        julia_cmd::Union{String,Nothing}, stale::Union{JuliaSession,Nothing})
+    s = nothing
+    try
+        # Reap the session we're replacing (dead or julia_cmd-mismatch), off the
+        # lock — killing does I/O. `kill_session!` is idempotent, so racing a
+        # concurrent `restart!` on the same session is harmless.
+        stale === nothing || kill_session!(stale)
 
         is_temp = env_path === nothing
         env_dir = is_temp ? mktempdir(; prefix = "bonitoagents-mcp-") : abspath(env_path)
         # Temp envs are otherwise empty, so `using Bonito` on the Malt worker
-        # falls back to the user depot and resolves the REGISTERED Bonito —
-        # which doesn't have the remote-app proxy API (`id_prefix`, …) that
-        # RemoteProxy.jl needs. Pre-populate the temp env with a Bonito
-        # path-dep on whatever Bonito BonitoMCP's own active project uses, so
-        # the worker resolves to the *same* Bonito. Best-effort: if we can't
-        # locate Bonito (BonitoMCP installed standalone), bt_show_app will
-        # still fail loudly, but bt_julia_eval keeps working in the bare env.
+        # falls back to the user depot and resolves the REGISTERED Bonito — which
+        # lacks the remote-app proxy API (`id_prefix`, …) RemoteProxy.jl needs.
+        # Seed the temp env with a path-dep on BonitoMCP's own Bonito so the
+        # worker resolves the SAME one. Best-effort: if Bonito can't be located,
+        # bt_show_app fails loudly but bt_julia_eval still works in the bare env.
         is_temp && seed_temp_env_with_bonito!(env_dir)
         is_test = !is_temp && basename(rstrip(env_dir, '/')) == "test"
-
-        s = JuliaSession(env_dir;
-                         is_temp, is_test, julia_cmd,
+        s = JuliaSession(env_dir; is_temp, is_test, julia_cmd,
                          log_path = _log_path(m, key))
         start!(s)
-        m.sessions[key] = s
-        return s
+    catch
+        @lock m.lock delete!(m.creating, key)
+        s === nothing || (try kill_session!(s) catch end)
+        rethrow()
     end
+    @lock m.lock begin
+        m.sessions[key] = s
+        delete!(m.creating, key)
+    end
+    return s
 end
 
 # Pure lookup — never creates, replaces, or kills a session. `bt_julia_continue`
@@ -658,7 +698,7 @@ end
 # error "No eval in flight" (M5). Errors if the session is absent.
 function lookup_session(m::SessionManager, env_path::Union{String,Nothing})
     key = _key(env_path)
-    @lock m.global_lock begin
+    @lock m.lock begin
         haskey(m.sessions, key) || error(
             "No Julia session for $(env_path === nothing ? "<temp>" : env_path) — " *
             "nothing to continue/interrupt. Start one with bt_julia_eval.")
@@ -668,7 +708,7 @@ end
 
 function restart!(m::SessionManager, env_path::Union{String,Nothing})
     key = _key(env_path)
-    @lock m.global_lock begin
+    @lock m.lock begin
         haskey(m.sessions, key) || return nothing
         kill_session!(m.sessions[key])
         delete!(m.sessions, key)
@@ -676,7 +716,7 @@ function restart!(m::SessionManager, env_path::Union{String,Nothing})
     return nothing
 end
 
-list_sessions(m::SessionManager) = @lock m.global_lock begin
+list_sessions(m::SessionManager) = @lock m.lock begin
     [(env_path = s.env_path,
       alive    = is_alive(s),
       temp     = s.is_temp,
@@ -687,7 +727,7 @@ list_sessions(m::SessionManager) = @lock m.global_lock begin
 end
 
 function shutdown!(m::SessionManager)
-    @lock m.global_lock begin
+    @lock m.lock begin
         for s in values(m.sessions)
             try kill_session!(s) catch end
         end

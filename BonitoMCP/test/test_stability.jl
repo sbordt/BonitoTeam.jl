@@ -38,7 +38,7 @@ end
     m   = M.manager()
     s   = M.JuliaSession(nothing; is_temp = true)
     key = "test-m2-" * string(rand(UInt32))
-    lock(m.global_lock) do; m.sessions[key] = s; end
+    lock(m.lock) do; m.sessions[key] = s; end
     try
         # Print far more than the cap, then finish. The response stdout must be
         # bounded, not the multi-MB the worker actually emitted.
@@ -54,7 +54,7 @@ end
             @test sizeof(b["text"]) <= M.STDOUT_CAP_BYTES + 1_000
         end
     finally
-        lock(m.global_lock) do; delete!(m.sessions, key); end
+        lock(m.lock) do; delete!(m.sessions, key); end
         M.kill_session!(s)
     end
 end
@@ -103,7 +103,7 @@ end
     m   = M.manager()
     s   = M.JuliaSession(nothing; is_temp = true)
     key = "test-m4-" * string(rand(UInt32))
-    lock(m.global_lock) do; m.sessions[key] = s; end
+    lock(m.lock) do; m.sessions[key] = s; end
     try
         r1 = M.execute(s, "sleep(30); 1"; timeout = 2.0)
         @test r1.status == :running
@@ -121,7 +121,7 @@ end
         @test !(res isa MethodError)
         @test s.closed == true
     finally
-        lock(m.global_lock) do; delete!(m.sessions, key); end
+        lock(m.lock) do; delete!(m.sessions, key); end
         M.kill_session!(s)
     end
 end
@@ -133,7 +133,7 @@ end
     m   = M.manager()
     s   = M.JuliaSession(nothing; is_temp = true)
     key = "test-m3-" * string(rand(UInt32))
-    lock(m.global_lock) do; m.sessions[key] = s; end
+    lock(m.lock) do; m.sessions[key] = s; end
     try
         M.start!(s)
         # A task that is already DONE (the cancelled one). With CANCEL_KILL_GRACE
@@ -155,7 +155,7 @@ end
         # Let the finalizer finish (it sleeps the grace) without blocking the suite
         # unduly — it will no-op because in_flight !== done_task.
     finally
-        lock(m.global_lock) do; delete!(m.sessions, key); end
+        lock(m.lock) do; delete!(m.sessions, key); end
         M.kill_session!(s)
     end
 end
@@ -180,7 +180,7 @@ end
     m   = M.manager()
     s   = M.JuliaSession(nothing; is_temp = true)
     key = "test-m11-" * string(rand(UInt32))
-    lock(m.global_lock) do; m.sessions[key] = s; end
+    lock(m.lock) do; m.sessions[key] = s; end
     try
         # Print then immediately return — the println must show up in THIS result.
         r = M.execute(s, "println(\"TRAILING_MARKER_123\"); 7"; timeout = 20.0)
@@ -188,7 +188,7 @@ end
         joined = join(get(b, "text", "") for b in r.blocks)
         @test occursin("TRAILING_MARKER_123", joined)
     finally
-        lock(m.global_lock) do; delete!(m.sessions, key); end
+        lock(m.lock) do; delete!(m.sessions, key); end
         M.kill_session!(s)
     end
 end

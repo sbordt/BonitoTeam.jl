@@ -13,7 +13,7 @@ const M = BonitoMCP
     m   = M.manager()
     s   = M.JuliaSession(nothing; is_temp = true)
     key = "test-cancel-" * string(rand(UInt32))
-    lock(m.global_lock) do; m.sessions[key] = s; end
+    lock(m.lock) do; m.sessions[key] = s; end
     try
         r1 = M.execute(s, "sleep(60); 42"; timeout = 4.0)
         @test r1.status == :running
@@ -37,7 +37,7 @@ const M = BonitoMCP
         r3 = M.execute(s, "1 + 1"; timeout = 10.0)
         @test r3.status == :completed
     finally
-        lock(m.global_lock) do; delete!(m.sessions, key); end
+        lock(m.lock) do; delete!(m.sessions, key); end
         M.kill_session!(s)
     end
 end

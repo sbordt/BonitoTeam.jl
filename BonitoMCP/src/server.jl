@@ -159,7 +159,7 @@ end
 function interrupt_in_flight!(env_path::Union{String,Nothing}; scope_temp::Bool = false)
     m = manager()
     targets = Any[]
-    lock(m.global_lock) do
+    lock(m.lock) do
         for s in values(m.sessions)
             s.in_flight === nothing && continue
             if env_path === nothing && !scope_temp

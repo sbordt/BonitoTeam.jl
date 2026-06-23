@@ -19,7 +19,7 @@ URIs = "5c2747f8-b7ea-4ff2-ba2e-563bfd36b1d4"
 WGLMakie = "276b4fcb-3e11-5398-bf8b-a0c2d153d008"
 
 [sources]
-Bonito = {rev = "sd/v5", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
+Bonito = {rev = "master", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 BonitoAgents = {path = "../BonitoAgents"}
 BonitoMCP = {path = "../BonitoMCP"}
 BonitoWorker = {path = "../BonitoWorker"}

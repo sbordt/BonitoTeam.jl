@@ -33,6 +33,22 @@ mutable struct WorkerInfo
     last_check::DateTime
 end
 
+# Per-project searchable file index — a flat list of paths relative to the
+# project root, fetched from the worker (`list_project_files`) and cached here so
+# the sidebar tree's search box is instant. Runtime-only (NEVER persisted to
+# projects.json): it's derived from the worker filesystem and re-fetched on
+# demand. `lock` guards every field; `loaded_at === nothing` means "never
+# fetched". `refresh_task` single-flights the walk — concurrent openers share
+# the one running task and `wait` on it instead of each kicking a separate walk.
+mutable struct ProjectFileIndex
+    files::Vector{String}
+    loaded_at::Union{DateTime,Nothing}
+    truncated::Bool
+    lock::ReentrantLock
+    refresh_task::Union{Task,Nothing}
+end
+ProjectFileIndex() = ProjectFileIndex(String[], nothing, false, ReentrantLock(), nothing)
+
 mutable struct ProjectInfo
     id::String                         # short uuid
     name::String                       # display name + dir name (server + worker)
@@ -84,12 +100,14 @@ mutable struct ProjectInfo
     # Without this, a chat with a title or a bound session id would stay pinned
     # to the homebar forever (those markers are persistent), so ✕ looked broken.
     dismissed::Bool
+    # Searchable file index (worker-derived, runtime-only). See ProjectFileIndex.
+    file_index::ProjectFileIndex
 end
 
 ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
     ProjectInfo(id, name, worker_id, server_path, worker_path, created,
                 nothing, nothing, :unsynced, nothing, nothing, nothing, nothing,
-                false)
+                false, ProjectFileIndex())
 
 # Back-compat positional WorkerInfo constructor — keeps the pre-`initials`
 # call shape working for tests / fixtures that build a WorkerInfo by hand.

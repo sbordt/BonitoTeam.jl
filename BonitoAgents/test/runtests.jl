@@ -89,6 +89,10 @@ end
 # Electron / agent needed), so it's in the default suite.
 include("test_dev_server_worker.jl")
 
+# File-tree backend: search scorer (pure) + worker RPCs / open-guard / index
+# cache against a real worker subprocess. Browser-free; the UI is e2e/file_tree.jl.
+include("test_file_tree.jl")
+
 include("test_mcp_ctrl.jl")
 include("test_lens.jl")
 

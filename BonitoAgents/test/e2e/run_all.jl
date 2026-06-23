@@ -45,6 +45,7 @@ const SUITES = [
     "errors.jl",
     "lens.jl",
     "file_open.jl",
+    "file_tree.jl",          # per-chat sidebar file tree (lazy + search) + editor open-guard
     "scroll_persist.jl",
     "embedded_app.jl",       # heavy: Malt worker cold start + Bonito load
     "app_detach.jl",         # heavy: two embedded apps

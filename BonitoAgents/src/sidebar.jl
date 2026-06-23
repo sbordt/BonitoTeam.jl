@@ -228,7 +228,8 @@ torn down), it crosses the JS bridge once at initial render and stays
 in cache forever.
 """
 function project_sidebar(session::Bonito.Session, state::ServerState,
-                          current_view::Observable{String})
+                          current_view::Observable{String},
+                          pane::Union{Nothing,PlotPane} = nothing)
     # The home glyph isn't a project — it's nav. Renders as a borderless
     # 32px slot so it visually reads as "go home" instead of competing
     # with the colored project tiles below it.
@@ -306,10 +307,37 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             label = base_counts[b] > 1 ? "$b · $(thread_tag(p))" : b
             st = chat_status(state, p)
             tooltip = "[$t] $label · folder: $(p.name) · $(st)"
+            if pane === nothing
+                push!(entries,
+                      sidebar_entry(label, project_icon(p, t), p.id, tooltip;
+                                    active = active_pid == p.id, closeable = true,
+                                    status = st))
+                continue
+            end
+            # Per-chat file tree (collapsed by default). The affordance is a
+            # subtle chevron at the BOTTOM of the pill — NOT a leading arrow,
+            # which ate the title's width and forced it to wrap. Clicking it
+            # opens the tree INSIDE the pill (so it visibly belongs to the chat)
+            # and, on first open, flips `tree.active` for the lazy worker scan.
+            # stopPropagation keeps the click off the row's navigate handler.
+            tree = WorkerFileTree(state, p.id, pane)
+            hint = DOM.div("▾ files";
+                class = "bt-side-tree-hint", title = "Show project files",
+                onclick = js"""event => {
+                    event.stopPropagation();
+                    const chat = event.currentTarget.closest('.bt-side-chat');
+                    if (!chat) return;
+                    const open = chat.classList.toggle('bt-tree-open');
+                    event.currentTarget.textContent = open ? '▴ hide files' : '▾ files';
+                    event.currentTarget.title = open ? 'Hide project files' : 'Show project files';
+                    if (open) $(tree.active).notify(true);
+                }""")
+            item = sidebar_entry(label, project_icon(p, t), p.id, tooltip;
+                                 active = active_pid == p.id, closeable = true,
+                                 status = st)
             push!(entries,
-                  sidebar_entry(label, project_icon(p, t), p.id, tooltip;
-                                active = active_pid == p.id, closeable = true,
-                                status = st))
+                  DOM.div(item, DOM.div(tree; class = "bt-side-tree-wrap"), hint;
+                          class = "bt-side-chat"))
         end
         isempty(open_projs) && push!(entries,
             DOM.div("No open chats yet — open one from the dashboard.";
@@ -599,6 +627,75 @@ const SidebarStyles = Bonito.Styles(
         "padding" => "10px 12px", "font-size" => "12px",
         "color" => "var(--bt-text-muted)", "line-height" => "1.4"),
 
+    # ── Per-chat file tree ──────────────────────────────────────────────────
+    # The chat row and its file tree share ONE pill: opening flips
+    # `.bt-tree-open`, which tints the whole wrapper so the tree visibly belongs
+    # to the chat above it. `position: relative` anchors the bottom hint.
+    CSS(".bt-side-chat",
+        "display" => "flex", "flex-direction" => "column",
+        "position" => "relative",
+        "border-radius" => "var(--bt-radius-sm)",
+        "transition" => "background 80ms"),
+    CSS(".bt-side-chat.bt-tree-open",
+        "background" => "var(--bt-surface-2)", "padding-bottom" => "22px"),
+    # Expand/collapse affordance: a small "chip" button centered on the BOTTOM
+    # edge of the pill (absolute, so it never steals the title's width or reflows
+    # the list). Hidden until the chat is hovered; ALWAYS shown while open so the
+    # collapse control is obvious.
+    CSS(".bt-side-tree-hint",
+        "position" => "absolute", "left" => "50%", "bottom" => "3px",
+        "transform" => "translateX(-50%)",
+        "display" => "flex", "align-items" => "center", "gap" => "4px",
+        "padding" => "2px 9px",
+        "font-size" => "10px", "font-weight" => "500", "line-height" => "1.25",
+        "white-space" => "nowrap",
+        "color" => "var(--bt-text-muted)",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "10px",
+        "box-shadow" => "0 1px 3px rgba(15,23,42,0.12)",
+        "cursor" => "pointer", "user-select" => "none",
+        "opacity" => "0", "pointer-events" => "none",
+        "transition" => "opacity 100ms, color 100ms, border-color 100ms, background 100ms"),
+    CSS(".bt-side-chat:hover > .bt-side-tree-hint, .bt-side-chat.bt-tree-open > .bt-side-tree-hint",
+        "opacity" => "1", "pointer-events" => "auto"),
+    # Stronger feedback on the chip's own hover — accent border + text + tint.
+    CSS(".bt-side-tree-hint:hover",
+        "color" => "var(--bt-accent)", "border-color" => "var(--bt-accent)",
+        "background" => "var(--bt-surface-2)"),
+    # The tree itself — hidden until the chat carries `.bt-tree-open`.
+    CSS(".bt-side-tree-wrap", "display" => "none"),
+    CSS(".bt-side-chat.bt-tree-open > .bt-side-tree-wrap", "display" => "block"),
+    CSS(".bt-tree",
+        "display" => "flex", "flex-direction" => "column", "padding" => "2px 0 6px 0"),
+    CSS(".bt-tree-search",
+        "margin" => "2px 8px 6px 8px", "padding" => "4px 8px", "font-size" => "12px",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "5px",
+        "background" => "var(--bt-bg)", "color" => "var(--bt-text, #111827)",
+        "outline" => "none"),
+    CSS(".bt-tree-search:focus", "border-color" => "var(--bt-accent, #2563eb)"),
+    CSS(".bt-tree-scroll",
+        "max-height" => "42vh", "overflow-y" => "auto", "overflow-x" => "hidden"),
+    CSS(".bt-tree-rows", "display" => "flex", "flex-direction" => "column"),
+    CSS(".bt-tree-row",
+        "display" => "flex", "align-items" => "center", "gap" => "4px",
+        "padding" => "2px 8px 2px 4px", "font-size" => "12px", "line-height" => "1.5",
+        "cursor" => "pointer", "white-space" => "nowrap",
+        "color" => "var(--bt-text, #111827)"),
+    CSS(".bt-tree-row:hover", "background" => "var(--bt-hover, rgba(0,0,0,0.05))"),
+    CSS(".bt-tree-arrow",
+        "flex" => "0 0 auto", "width" => "10px", "font-size" => "8px",
+        "color" => "var(--bt-text-muted)", "text-align" => "center"),
+    CSS(".bt-tree-label", "overflow" => "hidden", "text-overflow" => "ellipsis"),
+    CSS(".bt-tree-dir > .bt-tree-label", "font-weight" => "500"),
+    CSS(".bt-tree-relpath",
+        "margin-left" => "6px", "font-size" => "11px", "color" => "var(--bt-text-muted)",
+        "overflow" => "hidden", "text-overflow" => "ellipsis"),
+    CSS(".bt-tree-empty",
+        "padding" => "4px 12px", "font-size" => "11px", "color" => "var(--bt-text-muted)"),
+    # No trees / hint in the collapsed icon rail.
+    CSS(".bt-sidebar.bt-collapsed .bt-side-tree-wrap", "display" => "none"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-tree-hint", "display" => "none"),
+
     # Mobile: collapse to icon-only sidebar.
     CSS("@media (max-width: 640px)",
         CSS(".bt-sidebar",  "width" => "56px"),
@@ -648,6 +745,24 @@ const UnifiedShellStyles = Bonito.Styles(
         "height"    => "100dvh",
         "display"   => "flex", "flex-direction" => "row",
         "background"   => "var(--bt-bg)"),
+    # Window-level toast — a transient notice (e.g. the editor open-guard's
+    # "can't open <file>"). Fixed, centered near the bottom; JS flips
+    # data-shown and clears it after ~3.2s (see plotpane_toast_layer).
+    CSS(".bt-toast",
+        "position" => "fixed",
+        "bottom" => "22px", "left" => "50%",
+        "transform" => "translateX(-50%) translateY(12px)",
+        "max-width" => "min(520px, 86vw)",
+        "background" => "#1f2937", "color" => "#f9fafb",
+        "padding" => "10px 16px", "border-radius" => "8px",
+        "font-size" => "13px", "line-height" => "1.4",
+        "box-shadow" => "0 6px 24px rgba(0,0,0,0.28)",
+        "z-index" => "9999",
+        "opacity" => "0", "pointer-events" => "none",
+        "transition" => "opacity 0.18s ease, transform 0.18s ease"),
+    CSS(".bt-toast[data-shown=\"true\"]",
+        "opacity" => "1",
+        "transform" => "translateX(-50%) translateY(0)"),
     # Everything to the right of the sidebar: the chat/dashboard column plus the
     # plotpane. Fills the viewport minus the sidebar; `.bt-main` centers within
     # whatever horizontal space the plotpane leaves it.
@@ -1170,12 +1285,13 @@ function unified_app(state::ServerState)
             delete!(ls.errors, retry_pid)
             safe_notify!(current_view)
         end
-        sidebar = project_sidebar(session, view, current_view)
         # The window's PlotPane handle wraps a BonitoWidgets.Workspace. Created
-        # BEFORE unified_main so it can be passed down to the chat panes
-        # (ChatPaneRef sets it on each per-session ChatModel view); the Workspace
-        # itself is built AFTER, with the chat panel as its first member.
+        # BEFORE the sidebar + unified_main so it can be passed down to the chat
+        # panes (ChatPaneRef sets it on each per-session ChatModel view) AND to
+        # the sidebar's per-chat file trees (which open files into it); the
+        # Workspace itself is built AFTER, with the chat panel as its first member.
         pane = PlotPane()
+        sidebar = project_sidebar(session, view, current_view, pane)
         main_panel = unified_main(session, view, current_view, ls, pane)
         # The whole stage is the Workspace: the chat/dashboard is the "chat"
         # panel; opened files and detached `bt_show_app` embeds become more
@@ -1195,7 +1311,10 @@ function unified_app(state::ServerState)
             WorkspaceStageStyles,
             Bonito.ConnectionIndicator(),
             sidebar,
-            stage;
+            stage,
+            # Window-level toast layer (position:fixed) — flashes "can't open …"
+            # from the editor open-guard. One per window, bound to pane.toast.
+            plotpane_toast_layer(session, pane);
             class = "bt-shell")
         # Wire the bt_show_app detach controller once the shell is in the DOM:
         # the per-tool #bt-slot-<id> / #bt-embed-<id> pairs it moves are all

@@ -4683,22 +4683,58 @@ function handle_command!(model::ChatModel, session::Session, cmd::EditFileComman
     open_file!(pane, model, path)
 end
 
-# Render the FileEditor for `path` (server already resolved), or an error card if
-# the fetch/open fails. Pulled out of `open_file!` so the synchronous-panel path
-# and any future caller share one definition.
-function file_panel_content(model::ChatModel, path::AbstractString)
-    try
-        st = ShowTool(model.state, model.project_id, model.cwd, path)
-        server_file = fetch_show_file(st)
-        proj = get(model.state.projects[], model.project_id, nothing)
-        worker_abs = proj === nothing ? "" :
-            (isabspath(path) ? String(path) : joinpath(proj.worker_path, path))
-        FileEditor(model.state, model.project_id, server_file, worker_abs)
-    catch e
-        @warn "file editor open failed" path exception = e
-        DOM.div("couldn't open $(path): $(sprint(showerror, e))"; class = "bt-tool-error")
-    end
+# Build the FileEditor for `path`: fetch the worker file to the server mirror
+# (may block on a transfer, may throw on an error), then construct the editor.
+# THROWS on failure — `open_file!` catches and flashes a toast rather than
+# leaving an empty/error panel behind (the user clicked a link; a dead panel
+# reads as "nothing happened").
+file_panel_content(model::ChatModel, path::AbstractString) =
+    file_panel_content(model.state, model.project_id, model.cwd, path)
+
+function file_panel_content(state::ServerState, project_id::AbstractString,
+                            server_cwd::AbstractString, path::AbstractString)
+    st = ShowTool(state, project_id, server_cwd, path)
+    server_file = fetch_show_file(st)
+    proj = get(state.projects[], project_id, nothing)
+    worker_abs = proj === nothing ? "" :
+        (isabspath(path) ? String(path) : joinpath(proj.worker_path, path))
+    return FileEditor(state, project_id, server_file, worker_abs)
 end
+
+# Ask the worker to stat the file BEFORE fetching — return a human-readable
+# refusal (shown as a toast) when it isn't an openable text file, else `nothing`.
+# Catches the cases that otherwise stream bytes only to show an empty editor: a
+# directory, a missing path, a binary/media extension, or a file too big for
+# Monaco (we already know the size, so we never fetch it). Parameterized by
+# (state, project_id) so the sidebar file-tree shares it without a ChatModel.
+open_guard_reject_reason(model::ChatModel, path::AbstractString) =
+    open_guard_reject_reason(model.state, model.project_id, path)
+
+function open_guard_reject_reason(state::ServerState, project_id::AbstractString,
+                                  path::AbstractString)
+    name = basename(String(path))
+    editor_openable(path) ||
+        return "Can't open $name — not a text file"
+    proj = get(state.projects[], project_id, nothing)
+    proj === nothing && return nothing      # no worker to stat → let the fetch try
+    worker_src = isabspath(path) ? String(path) : joinpath(proj.worker_path, path)
+    info = try
+        stat_worker_path(state, proj.worker_id, worker_src)
+    catch e
+        @warn "open-guard stat failed; allowing the fetch to try" path exception = e
+        return nothing                      # worker hiccup → don't block; fetch reports
+    end
+    info.exists || return "Can't open $name — not found on the worker"
+    info.isdir  && return "Can't open $name — it's a folder"
+    info.isfile || return "Can't open $name — not a regular file"
+    info.size > FILE_EDITOR_MAX_BYTES &&
+        return "Can't open $name — too large to edit ($(format_bytes(info.size)))"
+    return nothing
+end
+
+# Short one-line reason for a fetch/build failure toast.
+open_error_brief(e) = e isa EOFError ? "couldn't read the file" :
+                      first(split(sprint(showerror, e), '\n'))
 
 function handle_command!(model::ChatModel, ::Session, cmd::DetachAppCommand)
     pane = model.plotpane
@@ -4722,7 +4758,19 @@ server mirror first (from the worker if needed); failures land as an error card
 in the panel instead of a silent log line — the user clicked a link and must see
 SOMETHING happen.
 """
-function open_file!(pane::PlotPane, model::ChatModel, path::AbstractString)
+open_file!(pane::PlotPane, model::ChatModel, path::AbstractString) =
+    open_project_file!(pane, model.state, model.project_id, model.cwd, path)
+
+"""
+    open_project_file!(pane, state, project_id, server_cwd, path)
+
+Core of [`open_file!`](@ref), parameterized by `(state, project_id, server_cwd)`
+instead of a `ChatModel` so the sidebar file-tree can open files even when the
+chat's ACP session isn't up. Guards (worker stat) → fetches → adds the panel; a
+refusal or fetch failure flashes a toast and opens NO panel.
+"""
+function open_project_file!(pane::PlotPane, state::ServerState, project_id::AbstractString,
+                            server_cwd::AbstractString, path::AbstractString)
     ws = pane.workspace[]
     ws === nothing && return nothing
     id = file_tab_id(path)
@@ -4737,7 +4785,21 @@ function open_file!(pane::PlotPane, model::ChatModel, path::AbstractString)
     # chain (Monaco collapses to ~1px). `add_panel!` dedupes by id, so racing
     # re-clicks still land one panel.
     Base.errormonitor(@async begin
-        elem = file_panel_content(model, path)
+        # Pre-fetch guard: a folder / missing / binary / oversize file flashes a
+        # toast and opens NO panel, instead of streaming bytes into an empty
+        # editor (the worker stat is the gate — see open_guard_reject_reason).
+        reason = open_guard_reject_reason(state, project_id, path)
+        if reason !== nothing
+            show_toast!(pane, reason)
+            return
+        end
+        elem = try
+            file_panel_content(state, project_id, server_cwd, path)
+        catch e
+            @warn "file editor open failed" path exception = e
+            show_toast!(pane, "Can't open $(basename(String(path))) — $(open_error_brief(e))")
+            return
+        end
         BonitoWidgets.add_panel!(ws, BonitoWidgets.Panel(id, elem;
             label = basename(path), closable = true))
     end)

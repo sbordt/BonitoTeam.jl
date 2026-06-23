@@ -707,6 +707,10 @@ function run_control_session(; server_url, secret, worker_id, name, mcp_command,
                 @async handle_open_transfer(server_url, secret, cmd)
             elseif t == "list_dir"
                 @async handle_list_dir(ws, cmd)
+            elseif t == "stat_path"
+                @async handle_stat_path(ws, cmd)
+            elseif t == "list_project_files"
+                @async handle_list_project_files(ws, cmd)
             elseif t == "inspect_path"
                 @async handle_inspect_path(ws, cmd)
             elseif t == "tail_file"
@@ -922,7 +926,11 @@ function handle_list_dir(ws, cmd::AbstractDict)
         for name in sort!(readdir(path))
             startswith(name, ".") && continue
             full = joinpath(path, name)
-            push!(entries, Dict("name" => name, "dir" => isdir(full)))
+            # `isfile` follows symlinks and is false for a broken link, so
+            # `filesize` is only called on a real regular file (no throw).
+            isf = isfile(full)
+            push!(entries, Dict("name" => name, "dir" => isdir(full),
+                                "size" => isf ? filesize(full) : 0))
         end
         Dict("type"       => "list_dir_response",
              "request_id" => request_id,
@@ -937,6 +945,94 @@ function handle_list_dir(ws, cmd::AbstractDict)
         WebSockets.send(ws, JSON.json(response))
     catch e
         @warn "list_dir response failed" exception=e
+    end
+end
+
+# Single-file stat RPC — backs the editor open-guard. The server asks before
+# fetching so a directory / missing path / oversized or binary file never starts
+# a transfer that ends in an empty editor.
+#
+#     {type:"stat_path", request_id, path}
+#  -> {type:"stat_path_response", request_id, path, exists, isfile, isdir, size}
+#     {type:"stat_path_response", request_id, error:"..."}  on failure
+function handle_stat_path(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    raw_path   = String(get(cmd, "path", ""))
+
+    response = try
+        isempty(raw_path) && error("path is empty")
+        isf = isfile(raw_path)   # follows symlinks; false for dirs / broken links
+        Dict("type"       => "stat_path_response",
+             "request_id" => request_id,
+             "path"       => abspath(raw_path),
+             "exists"     => ispath(raw_path),
+             "isfile"     => isf,
+             "isdir"      => isdir(raw_path),
+             "size"       => isf ? filesize(raw_path) : 0)
+    catch e
+        Dict("type"       => "stat_path_response",
+             "request_id" => request_id,
+             "error"      => sprint(showerror, e))
+    end
+    try
+        WebSockets.send(ws, JSON.json(response))
+    catch e
+        @warn "stat_path response failed" exception=e
+    end
+end
+
+# Directories never worth indexing/recursing for the project file list — VCS
+# metadata, dependency/build caches, and our own scratch dirs. Pruned in-place
+# during the topdown walk (Julia's `walkdir` honours mutation of `dirs`).
+const PROJECT_INDEX_IGNORE_DIRS = Set([
+    ".git", "node_modules", ".julia", "__pycache__", ".venv", "venv",
+    "target", "build", "dist", ".next", ".cache", ".bonitoAgents", ".stage",
+    ".pytest_cache", ".mypy_cache", ".gradle", ".idea", ".vscode-test"])
+# Hard cap so a pathological tree can't produce a multi-MB index frame.
+const PROJECT_INDEX_MAX = 50_000
+
+# Flat, searchable file index for one project root — backs the sidebar tree's
+# search box (a VSCode-style fuzzy file list).
+#
+#     {type:"list_project_files", request_id, path}
+#  -> {type:"list_project_files_response", request_id, path, files:[rel…], truncated}
+#     {type:"list_project_files_response", request_id, error:"..."}  on failure
+function handle_list_project_files(ws, cmd::AbstractDict)
+    request_id = String(get(cmd, "request_id", ""))
+    raw_path   = String(get(cmd, "path", ""))
+
+    response = try
+        isempty(raw_path) && error("path is empty")
+        isdir(raw_path)   || error("not a directory: $raw_path")
+        root      = String(raw_path)
+        files     = String[]
+        truncated = false
+        for (dir, dirs, names) in walkdir(root; topdown = true, follow_symlinks = false)
+            filter!(d -> !(d in PROJECT_INDEX_IGNORE_DIRS), dirs)
+            for f in names
+                push!(files, relpath(joinpath(dir, f), root))
+                if length(files) >= PROJECT_INDEX_MAX
+                    truncated = true
+                    break
+                end
+            end
+            truncated && break
+        end
+        sort!(files)
+        Dict("type"       => "list_project_files_response",
+             "request_id" => request_id,
+             "path"       => abspath(root),
+             "files"      => files,
+             "truncated"  => truncated)
+    catch e
+        Dict("type"       => "list_project_files_response",
+             "request_id" => request_id,
+             "error"      => sprint(showerror, e))
+    end
+    try
+        WebSockets.send(ws, JSON.json(response))
+    catch e
+        @warn "list_project_files response failed" exception=e
     end
 end
 

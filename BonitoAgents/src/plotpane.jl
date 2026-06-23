@@ -28,9 +28,46 @@ struct PlotPane
     workspace  :: Base.RefValue{Any}
     # `bt_show_app` detach: a tool_id pulse → float (or focus) that embed's panel.
     detach_app  :: Observable{String}
+    # Transient window-level notice. Setting a non-empty string flashes a toast
+    # that auto-dismisses in JS — reachable from the editor open-guard via
+    # `model.plotpane` so a file we can't open says so instead of opening blank.
+    toast       :: Observable{String}
 end
 
-PlotPane() = PlotPane(Ref{Any}(nothing), Observable(""))
+PlotPane() = PlotPane(Ref{Any}(nothing), Observable(""), Observable(""))
+
+"""
+    show_toast!(pane::PlotPane, msg)
+
+Flash a transient notice in the window. No-op when `pane` is `nothing` (chat
+rendered outside the unified shell). Re-sends even if the text is unchanged so
+two identical failures still each blink.
+"""
+function show_toast!(pane::PlotPane, msg::AbstractString)
+    # notify=true forces a fire even when the string equals the current value,
+    # so clicking the same un-openable file twice re-shows the toast.
+    pane.toast[] = ""
+    pane.toast[] = String(msg)
+    return nothing
+end
+show_toast!(::Nothing, ::AbstractString) = nothing
+
+# Window-level toast layer — one transient bubble bound to `pane.toast`. A
+# non-empty value shows it for ~3.2s then fades; the JS owns the timer so the
+# server never has to schedule a clear. Mounted once in the window shell.
+function plotpane_toast_layer(session::Bonito.Session, pane::PlotPane)
+    node = DOM.div(DOM.span(pane.toast; class = "bt-toast-text");
+                   class = "bt-toast", dataShown = "false")
+    Bonito.onjs(session, pane.toast, js"""(msg) => {
+        const el = $(node);
+        if (!el) return;
+        if (!msg) { el.dataset.shown = 'false'; return; }
+        el.dataset.shown = 'true';
+        if (el.__btToastTimer) clearTimeout(el.__btToastTimer);
+        el.__btToastTimer = setTimeout(() => { el.dataset.shown = 'false'; }, 3200);
+    }""")
+    return node
+end
 
 file_tab_id(path::AbstractString) = "file:" * String(path)
 # Per-embed panel id. One panel per detached `bt_show_app`, keyed by its tool id

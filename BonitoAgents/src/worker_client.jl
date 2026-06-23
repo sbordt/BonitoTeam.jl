@@ -277,6 +277,10 @@ function handle_worker_control(state::ServerState, ws)
                     rid = String(get(cmd, "request_id", ""))
                     if t == "list_dir_response"
                         deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "stat_path_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
+                    elseif t == "list_project_files_response"
+                        deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                     elseif t == "scan_sessions_result"
                         sessions = [Dict{String,Any}(s)
                                     for s in get(cmd, "sessions", Any[])]
@@ -720,8 +724,126 @@ function list_worker_dir(state::ServerState, worker_name::String, path::Abstract
     resp isa AbstractDict || error("list_dir on '$worker_name': unexpected response shape")
     haskey(resp, "error") && error("list_dir on '$worker_name': $(resp["error"])")
     return (path = String(resp["path"]),
-            entries = [(name = String(e["name"]), dir = Bool(e["dir"]))
+            entries = [(name = String(e["name"]), dir = Bool(e["dir"]),
+                        size = Int(get(e, "size", 0)))
                        for e in resp["entries"]])
+end
+
+"""
+    stat_worker_path(state, worker_name, path; timeout=5.0)
+        -> (exists, isfile, isdir, size, path)
+
+Stat a single `path` on the worker (the editor open-guard asks before fetching).
+Throws if the worker is disconnected or the RPC errors.
+"""
+function stat_worker_path(state::ServerState, worker_name::String, path::AbstractString;
+                          timeout::Real = 5.0)
+    haskey(state.worker_control_ws, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_name, Dict(
+            "type"       => "stat_path",
+            "request_id" => rid,
+            "path"       => String(path),
+        ))
+        take_pending!(state, ch, rid, timeout, "stat_path on '$worker_name'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("stat_path on '$worker_name': unexpected response shape")
+    haskey(resp, "error") && error("stat_path on '$worker_name': $(resp["error"])")
+    return (exists = Bool(get(resp, "exists", false)),
+            isfile = Bool(get(resp, "isfile", false)),
+            isdir  = Bool(get(resp, "isdir", false)),
+            size   = Int(get(resp, "size", 0)),
+            path   = String(get(resp, "path", path)))
+end
+
+"""
+    list_worker_project_files(state, worker_name, root; timeout=20.0)
+        -> (path, files::Vector{String}, truncated::Bool)
+
+Ask the worker to walk `root` (skipping VCS / dependency / build dirs) and return
+a flat, sorted list of file paths relative to `root` — the searchable project
+file index. `timeout` is generous: a first scan of a large tree can take seconds.
+"""
+function list_worker_project_files(state::ServerState, worker_name::String,
+                                   root::AbstractString; timeout::Real = 20.0)
+    haskey(state.worker_control_ws, worker_name) ||
+        error("Worker '$worker_name' is not connected")
+
+    rid, ch = register_rpc!(state)
+    resp = try
+        send_command(state, worker_name, Dict(
+            "type"       => "list_project_files",
+            "request_id" => rid,
+            "path"       => String(root),
+        ))
+        take_pending!(state, ch, rid, timeout, "list_project_files on '$worker_name'")
+    finally
+        unregister_rpc!(state, rid)
+    end
+    resp isa AbstractDict || error("list_project_files on '$worker_name': unexpected response shape")
+    haskey(resp, "error") && error("list_project_files on '$worker_name': $(resp["error"])")
+    return (path = String(resp["path"]),
+            files = String[String(f) for f in get(resp, "files", Any[])],
+            truncated = Bool(get(resp, "truncated", false)))
+end
+
+const PROJECT_INDEX_TTL = 60.0   # seconds — re-walk the worker tree if older
+
+# Block-fetch the project file index into `proj.file_index`, replacing the cache.
+# Runs inside the shared single-flight task (see `ensure_project_file_index!`).
+function refresh_project_file_index!(state::ServerState, proj::ProjectInfo)
+    idx = proj.file_index
+    try
+        res = list_worker_project_files(state, proj.worker_id, proj.worker_path)
+        lock(idx.lock) do
+            idx.files     = res.files
+            idx.truncated = res.truncated
+            idx.loaded_at = now(UTC)
+        end
+    catch e
+        @warn "project file index refresh failed" project=proj.id exception=e
+        # Record the attempt so a dead worker isn't re-walked on every keystroke;
+        # keep whatever files we already had.
+        lock(idx.lock) do
+            idx.loaded_at = now(UTC)
+        end
+    end
+    return nothing
+end
+
+"""
+    ensure_project_file_index!(state, proj; ttl=PROJECT_INDEX_TTL, force=false) -> Task | nothing
+
+Single-flight refresh of `proj`'s file index. Returns the in-flight (or freshly
+started) refresh `Task` when the cache is missing/stale/forced — concurrent
+callers share that one walk and may `wait` on it — or `nothing` when the cache is
+already fresh (use [`project_index_files`](@ref) directly).
+"""
+function ensure_project_file_index!(state::ServerState, proj::ProjectInfo;
+                                    ttl::Real = PROJECT_INDEX_TTL, force::Bool = false)
+    idx = proj.file_index
+    return lock(idx.lock) do
+        if idx.refresh_task !== nothing && !istaskdone(idx.refresh_task)
+            return idx.refresh_task                    # a walk is already running
+        end
+        age = idx.loaded_at === nothing ? Inf :
+              (now(UTC) - idx.loaded_at).value / 1000
+        if force || age > ttl
+            idx.refresh_task = @async refresh_project_file_index!(state, proj)
+            return idx.refresh_task
+        end
+        return nothing                                 # cache is fresh
+    end
+end
+
+# Snapshot of the cached index (a copy, so callers can't mutate the shared vec).
+project_index_files(proj::ProjectInfo) = lock(proj.file_index.lock) do
+    copy(proj.file_index.files)
 end
 
 """

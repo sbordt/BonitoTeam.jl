@@ -141,6 +141,7 @@ jobs:
           - errors
           - lens
           - file_open
+          - file_tree
           - dashboard_layout
           - tool_rendering
           - todo_taskbar

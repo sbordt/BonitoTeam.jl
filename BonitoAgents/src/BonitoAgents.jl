@@ -56,6 +56,7 @@ include("dashboard.jl")        # dashboard_app
 include("worker_widget.jl")    # WorkerCard widget (stable per worker_id, used by KeyedList)
 include("session_widget.jl")   # SessionRow widget (one row per discovered Claude Code session)
 include("project_widget.jl")   # ProjectCard widget (stable per project_id, used by KeyedList)
+include("file_tree.jl")        # WorkerFileTree — lazy, searchable project file tree (sidebar)
 include("sidebar.jl")          # project_sidebar + auto-generated icons
 include("github.jl")           # "From GitHub" project template
 include("server.jl")           # serve()

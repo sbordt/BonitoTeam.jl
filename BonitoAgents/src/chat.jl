@@ -158,6 +158,11 @@ mutable struct ChatModel
     # drains it on teardown. Guarded by the shared `lock` (held only for the
     # brief dict op, never across the wait).
     pending_asks::Dict{String, Tuple{Channel, Any}}
+    # Write-recency order for `tool_content_cache` (most-recent LAST). Drives LRU
+    # eviction in `cache_tool_content!` so a very long chat's cache stays bounded
+    # (old tool bodies fall back to disk) without ever dropping the live / recent
+    # ones. Shared with the cache — same lifetime, same `lock`.
+    tool_cache_order::Vector{String}
 end
 
 # The agent KIND tracked by the `provider` observable: for a worker session
@@ -218,6 +223,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         # the worker spawns for a WorkerAgent, the agent's own type locally.
         Observable{Any}(agent_kind(actual_agent)),
         Dict{String, Tuple{Channel, Any}}(),   # pending_asks
+        String[],                              # tool_cache_order (LRU for the cache)
     )
 end
 
@@ -257,6 +263,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             m.taskbar_clock_on,        # shared guard
             map(identity, session, m.provider),  # per-tab provider bridge
             m.pending_asks,            # shared → asks resolve against the parent
+            m.tool_cache_order,        # shared with tool_content_cache (one LRU per chat)
         )
     end
 end
@@ -1320,6 +1327,13 @@ function tool_content_for_render(m::ToolMsg, chat_dir::AbstractString)
     return load_tool_content(chat_dir, m.id)
 end
 
+# Cap on how many tool bodies the in-RAM cache keeps. Every entry is also on
+# disk (`persist_tool_content!` runs paired with each cache write), so once a
+# chat blows past this the OLDEST non-empty bodies are evicted and re-read from
+# disk on demand — bounding RAM on a marathon session without dropping the live
+# or recently-touched tools. Generous so a normal chat never trips it.
+const TOOL_CONTENT_CACHE_CAP = 256
+
 # Record the latest snap's content into the in-RAM cache. Empty content is
 # stored verbatim so the cache reflects the live snap state. Write under the
 # chat's lock so readers (`tool_content_for_render`) never see a half-rehashed
@@ -1327,8 +1341,32 @@ end
 function cache_tool_content!(chat::Union{ChatModel,Nothing}, tool_id::AbstractString,
                               content::AbstractVector)
     chat === nothing && return nothing
+    key = String(tool_id)
     lock(chat.lock) do
-        chat.tool_content_cache[String(tool_id)] = Vector{Any}(content)
+        cache = chat.tool_content_cache
+        order = chat.tool_cache_order
+        cache[key] = Vector{Any}(content)
+        # Move `key` to most-recent in the LRU order.
+        i = findlast(==(key), order)
+        i === nothing || deleteat!(order, i)
+        push!(order, key)
+        # Evict oldest NON-EMPTY bodies until back under the cap. Skip empties:
+        # an empty cache entry is the authoritative "no content yet" marker for a
+        # live tool (see tool_content_for_render) — dropping it would let a render
+        # fall through to a stale/absent disk copy. Skip the just-written key too.
+        n = 1
+        while length(cache) > TOOL_CONTENT_CACHE_CAP && n <= length(order)
+            k = order[n]
+            v = get(cache, k, nothing)
+            if v === nothing
+                deleteat!(order, n)            # stale order entry — prune, no shift
+            elseif k == key || isempty(v)
+                n += 1                          # keep; advance
+            else
+                delete!(cache, k)
+                deleteat!(order, n)
+            end
+        end
     end
     return nothing
 end
@@ -1477,8 +1515,11 @@ end
 # fetch lands, re-checks isfile, and returns without a second transfer.
 # The per-destination lock registry lives on the SERVER (`state.show_fetch_inflight`,
 # server_dst => lock), not a module global — server-scoped, dies with the server.
-# Entries are kept (one small lock per distinct shown file) — dropping them would
-# re-open the two-writers window for a fetch that errors and retries.
+# It's pruned on SUCCESS (below): once the file is on disk every future caller
+# short-circuits on the top `isfile` check and never needs the lock, so keeping
+# it would just accumulate one ReentrantLock per distinct file ever shown. A
+# FAILED fetch keeps its lock so a retry still serializes against a concurrent
+# attempt (the two-writers-into-`<dst>.partial` race the lock exists to prevent).
 
 # Resolve `st.path` to a file on the SERVER's disk, fetching it from the worker
 # if we don't already have it. Blocks for the transfer (multi-GB videos take
@@ -1490,14 +1531,25 @@ function fetch_show_file(st::ShowTool)
     dst_lock = lock(st.state.lock) do
         get!(ReentrantLock, st.state.show_fetch_inflight, server_dst)
     end
-    lock(dst_lock) do
-        isfile(server_dst) && return server_dst    # the racer fetched it
-        proj = get(st.state.projects[], st.project_id, nothing)
-        proj === nothing && error("bt_show: file not on server and no worker to fetch from: $(st.path)")
-        worker_src = isabspath(st.path) ? st.path : joinpath(proj.worker_path, st.path)
-        mkpath(dirname(server_dst))
-        fetch_file_from_worker(st.state, proj.worker_id, worker_src, server_dst; handoff_timeout=60.0)
-        return server_dst
+    try
+        return lock(dst_lock) do
+            isfile(server_dst) && return server_dst    # the racer fetched it
+            proj = get(st.state.projects[], st.project_id, nothing)
+            proj === nothing && error("bt_show: file not on server and no worker to fetch from: $(st.path)")
+            worker_src = isabspath(st.path) ? st.path : joinpath(proj.worker_path, st.path)
+            mkpath(dirname(server_dst))
+            fetch_file_from_worker(st.state, proj.worker_id, worker_src, server_dst; handoff_timeout=60.0)
+            return server_dst
+        end
+    finally
+        # Prune the lock once the file is on disk. Waiters already captured
+        # `dst_lock`, so deleting the dict entry can't strand them; new callers
+        # short-circuit on `isfile` before ever reaching the registry.
+        if isfile(server_dst)
+            lock(st.state.lock) do
+                delete!(st.state.show_fetch_inflight, server_dst)
+            end
+        end
     end
 end
 

@@ -93,6 +93,9 @@ include("test_dev_server_worker.jl")
 # cache against a real worker subprocess. Browser-free; the UI is e2e/file_tree.jl.
 include("test_file_tree.jl")
 
+# RAM bounds: the per-chat tool-content cache is LRU-capped (pure unit test).
+include("test_ram_bounds.jl")
+
 include("test_mcp_ctrl.jl")
 include("test_lens.jl")
 

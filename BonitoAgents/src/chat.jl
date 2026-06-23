@@ -149,6 +149,15 @@ mutable struct ChatModel
     # `ClaudeCodeAgent`). Observable so the UI provider-switcher can react. For
     # a `WorkerAgent` this is `agent.kind`; for a `BinAgent` it's `typeof(agent)`.
     provider::Observable{Any}
+
+    # Pending permission / question asks for THIS chat: request key → (reply
+    # channel, default value to send on teardown). A FIELD, not a module Dict
+    # keyed by request id — the old `PENDING_PERMISSIONS` / `PENDING_QUESTIONS`
+    # globals stored the ChatModel itself, pinning every chat that ever prompted
+    # past its close. This lives and dies with the chat; `sweep_pending_asks!`
+    # drains it on teardown. Guarded by the shared `lock` (held only for the
+    # brief dict op, never across the wait).
+    pending_asks::Dict{String, Tuple{Channel, Any}}
 end
 
 # The agent KIND tracked by the `provider` observable: for a worker session
@@ -208,6 +217,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         # Provider observable tracks the AGENT (the source of truth): the kind
         # the worker spawns for a WorkerAgent, the agent's own type locally.
         Observable{Any}(agent_kind(actual_agent)),
+        Dict{String, Tuple{Channel, Any}}(),   # pending_asks
     )
 end
 
@@ -246,6 +256,7 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.taskbar_clock),   # per-tab clock bridge
             m.taskbar_clock_on,        # shared guard
             map(identity, session, m.provider),  # per-tab provider bridge
+            m.pending_asks,            # shared → asks resolve against the parent
         )
     end
 end
@@ -1464,10 +1475,10 @@ end
 # file (native-toggle spam, several tabs) would otherwise both stream into the
 # same `<dst>.partial` and corrupt it. The loser blocks until the winner's
 # fetch lands, re-checks isfile, and returns without a second transfer.
-# Entries are kept (one small lock per distinct shown file) — dropping them
-# would re-open the two-writers window for a fetch that errors and retries.
-const SHOW_FETCH_LOCKS = ReentrantLock()
-const SHOW_FETCH_INFLIGHT = Dict{String,ReentrantLock}()
+# The per-destination lock registry lives on the SERVER (`state.show_fetch_inflight`,
+# server_dst => lock), not a module global — server-scoped, dies with the server.
+# Entries are kept (one small lock per distinct shown file) — dropping them would
+# re-open the two-writers window for a fetch that errors and retries.
 
 # Resolve `st.path` to a file on the SERVER's disk, fetching it from the worker
 # if we don't already have it. Blocks for the transfer (multi-GB videos take
@@ -1476,8 +1487,8 @@ const SHOW_FETCH_INFLIGHT = Dict{String,ReentrantLock}()
 function fetch_show_file(st::ShowTool)
     server_dst = show_server_path(st)
     isfile(server_dst) && return server_dst        # already mirrored or cached
-    dst_lock = lock(SHOW_FETCH_LOCKS) do
-        get!(ReentrantLock, SHOW_FETCH_INFLIGHT, server_dst)
+    dst_lock = lock(st.state.lock) do
+        get!(ReentrantLock, st.state.show_fetch_inflight, server_dst)
     end
     lock(dst_lock) do
         isfile(server_dst) && return server_dst    # the racer fetched it
@@ -2827,36 +2838,19 @@ function update_busy!(chat::ChatModel)
     return nothing
 end
 
-# Resolve every pending permission ("") / question (:skip) belonging to
-# `chat`, scoped by the shared-parent identity recorded at registration so
-# other chats' pending requests are untouched. The blocked handlers then
-# run their own cleanup (dict delete + the *_done teardown broadcast).
+# Resolve every pending permission ("") / question (:skip) for `chat` by sending
+# each one its registered teardown default. The asks live on the shared model
+# (`pending_asks`), so this is just "drain my own dict" — no global scan, no
+# cross-chat identity filter. The blocked handlers then run their own cleanup
+# (the *_done teardown broadcast); the dict entry is already gone.
 function sweep_pending_asks!(chat::ChatModel)
     s = shared(chat)
-    perm = lock(PENDING_PERMISSIONS_LOCK) do
-        [k for (k, v) in PENDING_PERMISSIONS if v[1] === s]
+    asks = lock(s.lock) do
+        v = collect(values(s.pending_asks)); empty!(s.pending_asks); v
     end
-    for k in perm
-        entry = lock(PENDING_PERMISSIONS_LOCK) do
-            haskey(PENDING_PERMISSIONS, k) ? pop!(PENDING_PERMISSIONS, k) : nothing
-        end
-        entry === nothing && continue
+    for (ch, default) in asks
         try
-            put!(entry[2], "")
-        catch e
-            e isa InvalidStateException || rethrow()
-        end
-    end
-    qs = lock(PENDING_QUESTIONS_LOCK) do
-        [k for (k, v) in PENDING_QUESTIONS if v[1] === s]
-    end
-    for k in qs
-        entry = lock(PENDING_QUESTIONS_LOCK) do
-            haskey(PENDING_QUESTIONS, k) ? pop!(PENDING_QUESTIONS, k) : nothing
-        end
-        entry === nothing && continue
-        try
-            put!(entry[2], :skip)
+            put!(ch, default)
         catch e
             e isa InvalidStateException || rethrow()
         end
@@ -2901,11 +2895,9 @@ is_session_dead_error(::Exception) = false
 # real choices renders as an interactive card with buttons — the user's
 # click answers the RPC. Each pending request is one entry here, keyed by a
 # fresh uuid that round-trips through the wire events.
-# key → (shared chat, reply channel). The chat ref lets `sweep_pending_asks!`
-# resolve everything a cancelled turn left behind without touching other
-# chats' pending requests.
-const PENDING_PERMISSIONS      = Dict{String,Tuple{ChatModel,Channel{String}}}()
-const PENDING_PERMISSIONS_LOCK = ReentrantLock()
+# Each entry lives on the asking chat's `pending_asks` (key → (reply channel,
+# teardown default)), so a cancelled turn's `sweep_pending_asks!` drains only
+# that chat's requests and the model is never pinned by a global.
 # Generous: a question the user never answers should not wedge the agent
 # forever — after this we fall back to the old auto-allow default.
 const PERMISSION_TIMEOUT = 600.0
@@ -2959,9 +2951,7 @@ function handle_permission_request(chat::ChatModel, params)
     tc isa AbstractDict || (tc = Dict{String,Any}())
     key = string(uuid4())
     ch  = Channel{String}(1)
-    lock(PENDING_PERMISSIONS_LOCK) do
-        PENDING_PERMISSIONS[key] = (shared(chat), ch)
-    end
+    let s = shared(chat); lock(s.lock) do; s.pending_asks[key] = (ch, ""); end; end
     chat_emit(chat, Dict{String,Any}(
         "type"     => "permission",
         "key"      => key,
@@ -2970,9 +2960,7 @@ function handle_permission_request(chat::ChatModel, params)
     picked = try
         Base.timedwait(() -> isready(ch), PERMISSION_TIMEOUT) === :ok ? take!(ch) : ""
     finally
-        lock(PENDING_PERMISSIONS_LOCK) do
-            delete!(PENDING_PERMISSIONS, key)
-        end
+        let s = shared(chat); lock(s.lock) do; delete!(s.pending_asks, key); end; end
         # Tell every tab to drop the card (the one that answered already
         # swapped it to its chosen state locally).
         chat_emit(chat, Dict{String,Any}("type" => "permission_done", "key" => key))
@@ -2997,8 +2985,6 @@ end
 # {question_0: label, …, customAnswer?: text}}`. Decline = "the user
 # skipped" (the agent continues and decides itself) — the same fallback the
 # server applies when nobody answers within the timeout.
-const PENDING_QUESTIONS      = Dict{String,Tuple{ChatModel,Channel{Any}}}()
-const PENDING_QUESTIONS_LOCK = ReentrantLock()
 
 elicitation_options(raw) = Any[Dict{String,Any}(
         "value" => String(get(o, "const", get(o, "title", ""))),
@@ -3046,9 +3032,7 @@ function handle_elicitation_request(chat::ChatModel, params)
     isempty(fields) && return Dict("action" => "decline")
     key = string(uuid4())
     ch  = Channel{Any}(1)
-    lock(PENDING_QUESTIONS_LOCK) do
-        PENDING_QUESTIONS[key] = (shared(chat), ch)
-    end
+    let s = shared(chat); lock(s.lock) do; s.pending_asks[key] = (ch, :skip); end; end
     chat_emit(chat, Dict{String,Any}(
         "type"    => "question",
         "key"     => key,
@@ -3057,9 +3041,7 @@ function handle_elicitation_request(chat::ChatModel, params)
     answer = try
         Base.timedwait(() -> isready(ch), PERMISSION_TIMEOUT) === :ok ? take!(ch) : :skip
     finally
-        lock(PENDING_QUESTIONS_LOCK) do
-            delete!(PENDING_QUESTIONS, key)
-        end
+        let s = shared(chat); lock(s.lock) do; delete!(s.pending_asks, key); end; end
         chat_emit(chat, Dict{String,Any}("type" => "question_done", "key" => key))
     end
     answer isa AbstractDict ||
@@ -4554,37 +4536,29 @@ end
 # Resolve a pending permission/question request with the clicked option.
 # `put!` on a capacity-1 channel a blocked `handle_permission_request` owns;
 # a second click (another tab, double-click) finds the key gone — no-op.
-function handle_command!(::ChatModel, ::Any, cmd::PermissionAnswerCommand)
-    entry = lock(PENDING_PERMISSIONS_LOCK) do
-        haskey(PENDING_PERMISSIONS, cmd.key) ? pop!(PENDING_PERMISSIONS, cmd.key) : nothing
+# Deliver the answer to the request's reply channel on the SHARED model. The ask
+# lives on `model.pending_asks` (an entry is `(channel, teardown-default)`), so a
+# resolve is "pop my own dict + put!". A second click (another tab, double-click)
+# finds the key gone — no-op.
+function resolve_pending_ask!(model::ChatModel, key::AbstractString, value)
+    s = shared(model)
+    entry = lock(s.lock) do
+        pop!(s.pending_asks, String(key), nothing)
     end
     entry === nothing && return nothing
     try
-        put!(entry[2], cmd.option_id)
+        put!(entry[1], value)
     catch e
         e isa InvalidStateException || rethrow()
     end
     return nothing
 end
-
-# Same shape for form-elicitation answers (the blocked owner is
-# `handle_elicitation_request`); `:skip` flows through as a decline.
-function resolve_pending_question!(key::AbstractString, value)
-    entry = lock(PENDING_QUESTIONS_LOCK) do
-        haskey(PENDING_QUESTIONS, key) ? pop!(PENDING_QUESTIONS, key) : nothing
-    end
-    entry === nothing && return nothing
-    try
-        put!(entry[2], value)
-    catch e
-        e isa InvalidStateException || rethrow()
-    end
-    return nothing
-end
-handle_command!(::ChatModel, ::Any, cmd::QuestionAnswerCommand) =
-    resolve_pending_question!(cmd.key, cmd.content)
-handle_command!(::ChatModel, ::Any, cmd::QuestionSkipCommand) =
-    resolve_pending_question!(cmd.key, :skip)
+handle_command!(model::ChatModel, ::Any, cmd::PermissionAnswerCommand) =
+    resolve_pending_ask!(model, cmd.key, cmd.option_id)
+handle_command!(model::ChatModel, ::Any, cmd::QuestionAnswerCommand) =
+    resolve_pending_ask!(model, cmd.key, cmd.content)
+handle_command!(model::ChatModel, ::Any, cmd::QuestionSkipCommand) =
+    resolve_pending_ask!(model, cmd.key, :skip)
 
 function handle_command!(model::ChatModel, ::Any, cmd::StopToolCommand)
     isempty(cmd.tool_id) && return nothing

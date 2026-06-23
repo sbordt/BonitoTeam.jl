@@ -135,6 +135,7 @@ jobs:
           - embedded_app
           - app_detach
           - app_scroll
+          - leak_cycle
           - scroll_persist
           - streaming_flood
           - errors

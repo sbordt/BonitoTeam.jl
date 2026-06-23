@@ -56,7 +56,7 @@ end
         # Establish the dial-back bridge: a trivial bt_show_app makes the worker dial.
         @test BonitoMCP.julia_show_app_handler(
             Dict("code"=>"using Bonito; Bonito.App(s->Bonito.DOM.div(\"dial\"))", "env_path"=>ROOT))["isError"] == false
-        @test timedwait(()->haskey(BT.EVAL_WORKERS, pid), 30.0) === :ok
+        @test timedwait(()->haskey(h.state.eval_workers, pid), 30.0) === :ok
 
         # The real ChatModel, served BY THE DEV SERVER so the embed's init `.bin`
         # resolves against the same asset_host the bridge registered it on.

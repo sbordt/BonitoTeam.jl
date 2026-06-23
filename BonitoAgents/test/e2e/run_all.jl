@@ -53,6 +53,7 @@ const SUITES = [
     "app_interactive.jl",    # two live apps; clicks round-trip to Julia + independence
     "app_multi.jl",          # three apps: detach all, drive each while floating, close 1-by-1
     "app_tabs.jl",           # dock app floats into the chat group as TABS: switch + close
+    "leak_cycle.jl",         # open many chats + a flooded one, close all, assert freed
     "cross_worker.jl",       # kills a SECOND worker (main untouched) — safe here
     "worker_lifecycle.jl",   # DESTRUCTIVE: kills the MAIN worker — MUST be last
 ]

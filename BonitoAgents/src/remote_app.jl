@@ -33,6 +33,12 @@ mutable struct EvalBridge
     pending_lock::ReentrantLock
     reqid::Threads.Atomic{Int}
     root_conn::Base.RefValue{Any}        # current browser root connection (worker→browser target)
+    # Per-bridge host-side wiring. FIELDS, not module-global `BRIDGE_ATTACHED` /
+    # `MOUNTS` Dicts keyed by this bridge's prefix: this state belongs to ONE
+    # bridge and dies with it (`clear_bridge_wiring!` just empties these).
+    attached_roots::Set{String}          # root.id of every tab this bridge is wired to (attach-once guard)
+    mounts::Dict{String,String}          # "root.id|app_id" => current worker sub_id (supersede bookkeeping)
+    wire_lock::ReentrantLock             # guards attached_roots + mounts
 end
 
 # Reconnects compare prefix (== BRIDGE[].parent.id on the worker): same prefix
@@ -41,17 +47,16 @@ end
 make_eval_bridge(prefix::AbstractString, ws, host) = EvalBridge(
     String(prefix), ws, ReentrantLock(), host,
     Dict{Int,Channel{Any}}(), ReentrantLock(),
-    Threads.Atomic{Int}(0), Base.RefValue{Any}(nothing))
-
-const EVAL_WORKERS = Dict{String, EvalBridge}()    # project_id => EvalBridge
+    Threads.Atomic{Int}(0), Base.RefValue{Any}(nothing),
+    Set{String}(), Dict{String,String}(), ReentrantLock())
 
 # Read an eval bridge for `project_id` under `state.lock` (T11). Writers
-# (`handle_eval_ws`, `teardown_eval_bridge!`) mutate `EVAL_WORKERS` under the
-# same lock, so UI tasks that just `get(EVAL_WORKERS, …)` raced a concurrent
+# (`handle_eval_ws`, `teardown_eval_bridge!`) mutate `state.eval_workers` under the
+# same lock, so UI tasks that just `get(state.eval_workers, …)` raced a concurrent
 # insert/delete (Dict rehash). All reads go through here.
 eval_bridge_for(state::ServerState, project_id::AbstractString) =
     lock(state.lock) do
-        get(EVAL_WORKERS, String(project_id), nothing)
+        get(state.eval_workers, String(project_id), nothing)
     end
 
 # ── Raw frame transport to the worker ───────────────────────────────────────
@@ -272,20 +277,20 @@ function handle_eval_ws(state::ServerState, ws)
     # Different prefix ⇒ worker restarted ⇒ stale routes, hard-replace.
     #
     # The get-and-install is done under `state.lock` so it's atomic w.r.t.
-    # `teardown_eval_bridge!` (which mutates EVAL_WORKERS under the same lock) —
+    # `teardown_eval_bridge!` (which mutates state.eval_workers under the same lock) —
     # otherwise a concurrent teardown could delete the entry between our read and
     # write. The heavy cleanup (fail_pending, asset-host close, wiring clear) is
     # disjoint by prefix from the fresh bridge, so we do it AFTER releasing the
     # lock rather than holding it across those other locks.
     eb, to_fail, to_retire = lock(state.lock) do
-        existing = get(EVAL_WORKERS, project_id, nothing)
+        existing = get(state.eval_workers, project_id, nothing)
         if existing !== nothing && existing.prefix == prefix
             @info "eval worker reconnected" project_id prefix
             lock(existing.wlock) do; existing.ws = ws; end
             (existing, existing, nothing)          # fail its orphaned pending below
         else
             fresh = make_eval_bridge(prefix, ws, Bonito.HTTPAssetServer(state.srv))
-            EVAL_WORKERS[project_id] = fresh
+            state.eval_workers[project_id] = fresh
             @info "eval worker dialed back (ws) — raw bridge installed" project_id prefix
             (fresh, nothing, existing)             # retire the old (different-prefix) bridge below
         end
@@ -302,7 +307,7 @@ function handle_eval_ws(state::ServerState, ws)
         catch e
             @warn "eval bridge: asset_host close failed during worker-replace" exception = (e, catch_backtrace()) prefix = to_retire.prefix
         end
-        clear_bridge_wiring!(to_retire.prefix)
+        clear_bridge_wiring!(to_retire)
     end
 
     # Worker→browser writes are DECOUPLED from this relay loop. The loop also
@@ -348,21 +353,15 @@ function handle_eval_ws(state::ServerState, ws)
     return
 end
 
-# Clear the host-side wiring registered under a bridge prefix: the
-# `attach_bridge_host!` guard tags and the per-mount subsession bookkeeping — so a
-# later bridge (same prefix, or the same still-open tab) re-attaches cleanly
-# instead of short-circuiting on a stale `BRIDGE_ATTACHED` tag. (MOUNTS subs are
-# already dead once the worker session is gone, so we just drop the entries.)
-function clear_bridge_wiring!(prefix::AbstractString)
-    lock(BRIDGE_ATTACH_LOCK) do
-        for tag in collect(BRIDGE_ATTACHED)
-            startswith(tag, string(prefix, '|')) && delete!(BRIDGE_ATTACHED, tag)
-        end
-    end
-    lock(MOUNTS_LOCK) do
-        for k in collect(keys(MOUNTS))
-            occursin(string('|', prefix, '|'), k) && delete!(MOUNTS, k)
-        end
+# Clear a bridge's host-side wiring: its `attach_bridge_host!` attach-once guard
+# and per-mount subsession bookkeeping — so a later bridge (same tab) re-attaches
+# cleanly instead of short-circuiting on a stale attach tag. The wiring lives on
+# the bridge now, so this just empties it. (The mounted subs are already dead once
+# the worker session is gone, so we just drop the entries.)
+function clear_bridge_wiring!(eb::EvalBridge)
+    lock(eb.wire_lock) do
+        empty!(eb.attached_roots)
+        empty!(eb.mounts)
     end
     return nothing
 end
@@ -371,11 +370,11 @@ end
 # NOT to its dial-back socket (a WS drop just awaits redial; see handle_eval_ws's
 # finally). Called from the normal project/worker teardown (`stop_session!`,
 # worker disconnect): releases the proxied asset host, fails in-flight control
-# requests, drops host-side wiring, and evicts from EVAL_WORKERS. Idempotent.
+# requests, drops host-side wiring, and evicts from state.eval_workers. Idempotent.
 function teardown_eval_bridge!(state::ServerState, project_id::AbstractString)
     eb = lock(state.lock) do
-        e = get(EVAL_WORKERS, project_id, nothing)
-        e === nothing || delete!(EVAL_WORKERS, project_id)
+        e = get(state.eval_workers, project_id, nothing)
+        e === nothing || delete!(state.eval_workers, project_id)
         e
     end
     eb === nothing && return nothing
@@ -388,7 +387,7 @@ function teardown_eval_bridge!(state::ServerState, project_id::AbstractString)
     catch e
         @warn "eval bridge: asset_host close failed during teardown" exception = (e, catch_backtrace()) prefix = eb.prefix
     end
-    clear_bridge_wiring!(eb.prefix)
+    clear_bridge_wiring!(eb)
     @info "eval bridge torn down with worker session" project_id prefix = eb.prefix
     return nothing
 end
@@ -404,11 +403,10 @@ end
 #   server → mcp:  {"op": "interrupt_eval", "request_id", "env_path"?}
 #   mcp → server:  {"type": "interrupt_result", "request_id", "interrupted": n}
 # Replies route through the same `pending_rpcs` machinery as worker RPCs.
-const MCP_CTRL = Dict{String,Any}()    # project_id => live ctrl WS
 
 mcp_ctrl_for(state::ServerState, project_id::AbstractString) =
     lock(state.lock) do
-        get(MCP_CTRL, String(project_id), nothing)
+        get(state.mcp_ctrl, String(project_id), nothing)
     end
 
 function handle_mcp_ctrl_ws(state::ServerState, ws)
@@ -424,7 +422,7 @@ function handle_mcp_ctrl_ws(state::ServerState, ws)
     end
     project_id = String(parts[2])
     lock(state.lock) do
-        MCP_CTRL[project_id] = ws
+        state.mcp_ctrl[project_id] = ws
     end
     @info "MCP control channel connected" project_id
     try
@@ -446,7 +444,7 @@ function handle_mcp_ctrl_ws(state::ServerState, ws)
         # Identity-guarded eviction: a reconnect may have swapped a fresh WS
         # in before this stale handler's finally ran.
         lock(state.lock) do
-            get(MCP_CTRL, project_id, nothing) === ws && delete!(MCP_CTRL, project_id)
+            get(state.mcp_ctrl, project_id, nothing) === ws && delete!(state.mcp_ctrl, project_id)
         end
         @info "MCP control channel closed" project_id
     end
@@ -530,15 +528,13 @@ end
 # The worker→host frame relay and the browser→worker routing are bound to the
 # tab's STABLE root session (the one that owns the websocket), NOT to a transient
 # `dom_in_js` subsession that the chat tears down on every tool-body re-render.
-# Attached exactly once per (worker, root); torn down when the root closes.
-const BRIDGE_ATTACHED = Set{String}()              # "$prefix|$root_id" already wired
-const BRIDGE_ATTACH_LOCK = ReentrantLock()
-
+# Attached exactly once per (worker, root); torn down when the root closes. The
+# attach-once guard is a per-bridge `eb.attached_roots` set of root ids (the bridge
+# IS the prefix), not a module-global keyed by "prefix|root".
 function attach_bridge_host!(root::Bonito.Session, eb::EvalBridge)
-    tag = string(eb.prefix, '|', root.id)
-    lock(BRIDGE_ATTACH_LOCK) do
-        tag in BRIDGE_ATTACHED && return false
-        push!(BRIDGE_ATTACHED, tag); return true
+    lock(eb.wire_lock) do
+        root.id in eb.attached_roots && return false
+        push!(eb.attached_roots, root.id); return true
     end || return
 
     # worker → browser frames are written to this connection by the dial-back
@@ -559,7 +555,7 @@ function attach_bridge_host!(root::Bonito.Session, eb::EvalBridge)
         # Close any worker subsessions still mounted for this tab so they don't
         # outlive the page.
         for sid in take_mounts!(root, eb); close_remote_sub!(eb, sid); end
-        lock(BRIDGE_ATTACH_LOCK) do; delete!(BRIDGE_ATTACHED, tag); end
+        lock(eb.wire_lock) do; delete!(eb.attached_roots, root.id); end
     end
     return
 end
@@ -575,24 +571,24 @@ end
 # the worker sub releases its asset (1→0) AND — because the bridge parent is
 # marked ready — emits `Bonito.free_session(sub_id)` to the browser, dropping the
 # stale listeners a removed mount left on shared observables.
-const MOUNTS = Dict{String, String}()              # "$root_id|$prefix|$app_id" => current sub_id
-const MOUNTS_LOCK = ReentrantLock()
-mount_key(root, eb, app_id) = string(root.id, '|', eb.prefix, '|', app_id)
+# Mount bookkeeping lives on the bridge (`eb.mounts`), so the key drops the prefix
+# (the bridge IS the prefix): "root.id|app_id" => current sub_id.
+mount_key(root, app_id) = string(root.id, '|', app_id)
 
 # Record `sub_id` as the live mount for (root, app); return the superseded one (or nothing).
 function swap_mount!(root, eb, app_id, sub_id)
-    lock(MOUNTS_LOCK) do
-        k = mount_key(root, eb, app_id)
-        old = get(MOUNTS, k, nothing); MOUNTS[k] = sub_id; old
+    lock(eb.wire_lock) do
+        k = mount_key(root, app_id)
+        old = get(eb.mounts, k, nothing); eb.mounts[k] = sub_id; old
     end
 end
 
 # Drop + return every mounted sub_id for this (root, bridge) — used on tab close.
 function take_mounts!(root, eb)
-    lock(MOUNTS_LOCK) do
-        pre = string(root.id, '|', eb.prefix, '|')
-        ks = filter(k -> startswith(k, pre), collect(keys(MOUNTS)))
-        sids = String[MOUNTS[k] for k in ks]; foreach(k -> delete!(MOUNTS, k), ks); sids
+    lock(eb.wire_lock) do
+        pre = string(root.id, '|')
+        ks = filter(k -> startswith(k, pre), collect(keys(eb.mounts)))
+        sids = String[eb.mounts[k] for k in ks]; foreach(k -> delete!(eb.mounts, k), ks); sids
     end
 end
 

@@ -54,8 +54,8 @@ end
         res = BonitoMCP.julia_show_app_handler(Dict("code"=>APPCODE, "env_path"=>ROOT))
         @test res["isError"] == false
         appid = String(strip(replace(res["content"][1]["text"], "shown_app:"=>"")))
-        @test timedwait(()->haskey(BT.EVAL_WORKERS, pid), 30.0) === :ok
-        eb = BT.EVAL_WORKERS[pid]
+        @test timedwait(()->haskey(h.state.eval_workers, pid), 30.0) === :ok
+        eb = h.state.eval_workers[pid]
         count_id = Malt.remote_eval_fetch(root_worker(), :(E2E_COUNT.id))
 
         # A page on the DEV SERVER: a `#slot` we mount the app body into via

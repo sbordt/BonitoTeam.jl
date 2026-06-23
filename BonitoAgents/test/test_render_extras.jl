@@ -231,7 +231,7 @@ end
     # The card-teardown broadcast went out.
     @test any(e -> get(e, "type", "") == "permission_done", events)
     # Nothing left pending.
-    @test !haskey(BT.PENDING_PERMISSIONS, String(perm["key"]))
+    @test !haskey(BT.shared(chat).pending_asks, String(perm["key"]))
 end
 
 # ── 5b. Form elicitation (AskUserQuestion) round-trip ───────────────────────

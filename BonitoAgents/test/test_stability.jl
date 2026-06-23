@@ -55,7 +55,7 @@ end
     #       bring-up) and gets its result;
     #   (b) when the model is already cached, no bring-up runs at all.
     # Both are the exact branches `ensure_project_session!` takes under the lock.
-    @testset "T1 SESSION_INFLIGHT funnels concurrent callers to one bring-up" begin
+    @testset "T1 session_inflight funnels concurrent callers to one bring-up" begin
         state = stab_newstate()
         wid = "w1"
         state.workers[][wid] = BT.WorkerInfo(wid, "W1", "ws://x", "x", nothing,
@@ -74,19 +74,19 @@ end
             sentinel = (:model, p.id)
             # Mirror the real owner: clear the funnel entry when done.
             BT.lock(state.lock) do
-                get(BT.SESSION_INFLIGHT, p.id, nothing) === current_task() &&
-                    delete!(BT.SESSION_INFLIGHT, p.id)
+                get(state.session_inflight, p.id, nothing) === current_task() &&
+                    delete!(state.session_inflight, p.id)
             end
             sentinel
         end
         BT.lock(state.lock) do
-            BT.SESSION_INFLIGHT[p.id] = inflight
+            state.session_inflight[p.id] = inflight
         end
         schedule(inflight)
         result = BT.ensure_project_session!(state, p)   # must await inflight
         @test result == (:model, p.id)
         @test ran[] == 1                                # only the one bring-up
-        @test !haskey(BT.SESSION_INFLIGHT, p.id)        # entry cleared
+        @test !haskey(state.session_inflight, p.id)        # entry cleared
 
         # (b) Now the model is cached → no bring-up, returns the cached model.
         cached = BT.ChatModel(state, mktempdir(); transport = stab_normal_transport())

@@ -7,7 +7,17 @@ struct ChatSession
     cwd::String             # project working dir (for claude --cwd / display)
     created::DateTime
     path::String            # absolute path to chat.md (server-state-managed)
+    # Serializes all chat.md writes for this chat (appends vs the header
+    # read-modify-write in `update_session_id!`). A FIELD, not a module-global
+    # `Dict{path => lock}` pool. CARRIED across `update_session_id!` (which
+    # rebuilds the session for the SAME path) so a path keeps one lock; per-session
+    # views share it because they share the one ChatSession.
+    write_lock::ReentrantLock
 end
+# Default the lock for the common 4-arg construction; update_session_id! passes
+# the prior session's lock explicitly to keep it path-stable across the rebuild.
+ChatSession(session_id, cwd, created, path) =
+    ChatSession(session_id, cwd, created, path, ReentrantLock())
 
 """
     chat_storage_dir(state, project_id, cwd) -> String
@@ -61,16 +71,10 @@ session_file(chat_dir::AbstractString) = joinpath(String(chat_dir), "chat.md")
 # and the header read-modify-write (`update_session_id!`). Without a lock the
 # RMW reads the whole file, then rewrites it — an append landing in that window
 # is silently lost, and a crash mid-rewrite truncates the history. We serialize
-# all chat.md writes for a given path through one lock, keyed by the absolute
-# path so per-chat views (which each build their own ChatSession) still share it.
-const CHAT_FILE_LOCKS = Dict{String,ReentrantLock}()
-const CHAT_FILE_LOCKS_GUARD = ReentrantLock()
-function chat_file_lock(path::AbstractString)
-    p = abspath(String(path))
-    lock(CHAT_FILE_LOCKS_GUARD) do
-        get!(() -> ReentrantLock(), CHAT_FILE_LOCKS, p)
-    end
-end
+# all chat.md writes for a chat through the lock carried on its `ChatSession`
+# (`write_lock`) — one per chat, shared by every per-session view (they share the
+# one session) and kept stable across `update_session_id!`. No module-global pool.
+chat_file_lock(session::ChatSession) = session.write_lock
 
 # ── ACP wire-frame log ──────────────────────────────────────────────────────
 # Raw ACP JSON-RPC traffic (both directions), one envelope per line:
@@ -232,7 +236,7 @@ function atomic_write_text(f, path::AbstractString)
 end
 
 function write_session_header(session::ChatSession)
-    lock(chat_file_lock(session.path)) do
+    lock(chat_file_lock(session)) do
         atomic_write_text(session.path) do io
             println(io, "+++")
             println(io, "session_id = $(repr(session.session_id))")
@@ -249,11 +253,14 @@ function update_session_id!(session::ChatSession, new_id::String)
     # The read-modify-write runs under the per-file lock so an `append_*` can't
     # land between the read and the rewrite (lost append), and the write is
     # atomic (tmp + mv) so a crash can't truncate the file (T13).
-    lock(chat_file_lock(path)) do
+    lock(chat_file_lock(session)) do
         content = isfile(path) ? read(path, String) : "\n"
         # Strip existing +++ block
         body = replace(content, r"^\+\+\+.*?\+\+\+\n"s => ""; count=1)
-        new_session = ChatSession(new_id, session.cwd, session.created, path)
+        # CARRY the same write_lock: this rebuilds the session for the SAME path,
+        # so a concurrent writer (using the old or new session view) must take the
+        # SAME lock — a fresh one would reopen the race this lock exists to close.
+        new_session = ChatSession(new_id, session.cwd, session.created, path, session.write_lock)
         atomic_write_text(path) do io
             println(io, "+++")
             println(io, "session_id = $(repr(new_session.session_id))")
@@ -320,7 +327,7 @@ end
 # interleave with `update_session_id!`'s read-modify-write (which would drop the
 # append) and concurrent appenders from different tasks stay whole.
 function append_user(session::ChatSession, msg::UserMsg)
-    lock(chat_file_lock(session.path)) do
+    lock(chat_file_lock(session)) do
         open(session.path, "a") do io
             println(io, "!!! user \"$(now(UTC))\"")
             for line in split(msg.text, '\n')
@@ -333,7 +340,7 @@ end
 
 function finalize_agent(session::ChatSession, msg::AgentMsg)
     isempty(msg.text) && return
-    lock(chat_file_lock(session.path)) do
+    lock(chat_file_lock(session)) do
         open(session.path, "a") do io
             println(io, "!!! assistant \"$(now(UTC))\"")
             for line in split(msg.text, '\n')
@@ -350,7 +357,7 @@ end
 # replay edge cases) are skipped to keep chat.md clean.
 function append_thought(session::ChatSession, msg::ThoughtMsg)
     isempty(strip(msg.text)) && return
-    lock(chat_file_lock(session.path)) do
+    lock(chat_file_lock(session)) do
         open(session.path, "a") do io
             println(io, "!!! thought \"$(msg.id)\"")
             for line in split(msg.text, '\n')
@@ -362,7 +369,7 @@ function append_thought(session::ChatSession, msg::ThoughtMsg)
 end
 
 function append_tool(session::ChatSession, msg::ToolMsg)
-    lock(chat_file_lock(session.path)) do
+    lock(chat_file_lock(session)) do
         open(session.path, "a") do io
             # 4th field: the resolved filter key (`tool_key`) — persisting it makes
             # the typed variants (Bash/Task/MCP…) reload with stable per-tool
@@ -382,7 +389,7 @@ function append_tool(session::ChatSession, msg::ToolMsg)
 end
 
 function append_plan(session::ChatSession, msg::TodoListMsg)
-    lock(chat_file_lock(session.path)) do
+    lock(chat_file_lock(session)) do
         open(session.path, "a") do io
             println(io, "!!! plan")
             # Write as plain lines (not markdown list) so admonition_text can round-trip them
@@ -399,7 +406,7 @@ end
 # have to re-classify by matching the verbatim Claude Code prefix every time.
 function append_summary(session::ChatSession, msg::SummaryMsg)
     isempty(strip(msg.text)) && return
-    lock(chat_file_lock(session.path)) do
+    lock(chat_file_lock(session)) do
         open(session.path, "a") do io
             println(io, "!!! summary \"$(now(UTC))\"")
             for line in split(msg.text, '\n')

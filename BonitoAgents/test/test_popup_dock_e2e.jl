@@ -70,7 +70,7 @@ Bonito.App(s -> Bonito.DOM.div("popup-dock test"; id = "dock_app_root"))
             "code"     => "using Bonito; Bonito.App(s -> Bonito.DOM.div(\"dial\"))",
             "env_path" => ROOT,
         ))["isError"] == false
-        @test timedwait(() -> haskey(BT.EVAL_WORKERS, pid), 30.0) === :ok
+        @test timedwait(() -> haskey(h.state.eval_workers, pid), 30.0) === :ok
 
         # 4. Build a ChatModel + pre-register it so the sidebar/navigation
         #    skips the ACP bring-up path. Mock transport — we don't need a

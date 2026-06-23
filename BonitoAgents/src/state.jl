@@ -192,6 +192,17 @@ mutable struct ServerState
     # either the explicit `public_url` argument or `Bonito.online_url`. A Ref
     # so per-session copies share the one value. "" until `serve()` fills it.
     base_url :: Ref{String}
+
+    # Per-project runtime registries. FIELDS, not module-global Dicts: this state
+    # is scoped to ONE server (a second server in the same process must not share
+    # it) and dies with the server. All guarded by `lock` (the first field), the
+    # same mutex their old globals were already taken under.
+    eval_workers       :: Dict{String,Any}              # project_id => EvalBridge (bt_show_app dial-back)
+    mcp_ctrl           :: Dict{String,Any}              # project_id => live MCP control WS
+    session_inflight   :: Dict{String,Task}             # project_id => in-flight ensure_project_session! task
+    # Per-path serialization lock for fetched `bt_show` files (server_dst => lock);
+    # a process-level coordination pool, server-scoped here so it dies with the server.
+    show_fetch_inflight :: Dict{String,ReentrantLock}
 end
 
 """
@@ -216,6 +227,10 @@ function ServerState(; state_dir::String,
         Dict{String,Channel{Any}}(),              # pending_rpcs
         Observable(Dict{String,Vector{Dict{String,Any}}}()),  # discovered
         Ref(""),                                  # base_url (set by serve())
+        Dict{String,Any}(),                       # eval_workers
+        Dict{String,Any}(),                       # mcp_ctrl
+        Dict{String,Task}(),                      # session_inflight
+        Dict{String,ReentrantLock}(),             # show_fetch_inflight
     )
     load_workers!(s)
     load_projects!(s)
@@ -246,6 +261,10 @@ function Base.copy(s::ServerState, session::Bonito.Session)
             s.pending_rpcs,
             map(identity, session, s.discovered),
             s.base_url,
+            s.eval_workers,            # shared registries — one per server, all
+            s.mcp_ctrl,                # sessions cooperate on the same tables
+            s.session_inflight,
+            s.show_fetch_inflight,
         )
     end
 end
@@ -347,7 +366,13 @@ is_stale_session_error(e) =
     e isa Base.IOError ||
     e isa HTTP.WebSockets.WebSocketError ||
     e isa EOFError ||
-    (e isa ArgumentError && occursin("closed", lowercase(e.msg)))
+    (e isa ArgumentError && occursin("closed", lowercase(e.msg))) ||
+    # Bonito's `update_session_dom!` does `error("Updating the session dom for a
+    # closed session")` (a plain ErrorException) when a mapped UI observable fires
+    # into a browser session that already closed — e.g. during server shutdown.
+    # Definitionally a stale-session signal, so drop that listener instead of
+    # unwinding the server-side notify.
+    (e isa ErrorException && occursin("closed session", lowercase(e.msg)))
 
 # Best-effort `notify(obs)` — fires listeners without changing the value. Use
 # after in-place mutation of `state.workers[]` / `state.projects[]`.

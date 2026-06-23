@@ -305,12 +305,12 @@ function ensure_project_session!(state::ServerState, p::ProjectInfo;
     local task::Task
     own = lock(state.lock) do
         haskey(state.chat_models, p.id) && return (state.chat_models[p.id]::ChatModel, false)
-        existing = get(SESSION_INFLIGHT, p.id, nothing)
+        existing = get(state.session_inflight, p.id, nothing)
         if existing !== nothing
             return (existing, false)
         end
         t = @task bring_up_project_session!(state, p; progress = progress)
-        SESSION_INFLIGHT[p.id] = t
+        state.session_inflight[p.id] = t
         task = t
         return (t, true)
     end
@@ -323,8 +323,8 @@ function ensure_project_session!(state::ServerState, p::ProjectInfo;
             return fetch_bring_up(task)
         finally
             lock(state.lock) do
-                get(SESSION_INFLIGHT, p.id, nothing) === task &&
-                    delete!(SESSION_INFLIGHT, p.id)
+                get(state.session_inflight, p.id, nothing) === task &&
+                    delete!(state.session_inflight, p.id)
             end
         end
     else
@@ -352,7 +352,6 @@ end
 # is a bring-up in flight / start one" decision is atomic. Keyed by the stable
 # project id (a String) rather than the ProjectInfo so two per-session views of
 # the same project funnel together. Entry lifetime is one bring-up.
-const SESSION_INFLIGHT = Dict{String,Task}()
 
 # The actual bring-up, run inside the single in-flight task funnelled by
 # `ensure_project_session!`. Never call this directly from concurrent callers —

@@ -124,19 +124,22 @@ option_by_id(opts, id) = opts[findfirst(o -> o.id == id, opts)]
         pill = BT.header_pill(option_by_id(opts, "model"))
         @test occursin("Opus 4.7 with 1M context", string(pill))
         @test occursin("bt-header-meta-item", string(pill))
-        # Non-model options read as "name: value".
-        @test occursin("mode: Default", string(BT.header_pill(option_by_id(opts, "mode"))))
+        # Non-model options show just their value (no "name:" prefix); the full
+        # label lives in the tooltip.
+        @test occursin("Default", string(BT.header_pill(option_by_id(opts, "mode"))))
+        @test !occursin("mode:", string(BT.header_pill(option_by_id(opts, "mode"))))
         # Unknown meta kind degrades to its string form.
         @test occursin("whatever", string(BT.header_pill("whatever")))
 
-        # Display policy: only the MODEL is shown — mode/effort report
-        # unhelpful "default"s. They stay in the data, not in the line.
+        # Display policy: model, permission mode, AND effort are all shown now —
+        # their values are trustworthy because we assert them at bring-up
+        # (`apply_session_config!`) rather than echoing claude's resume "default".
         line = string(BT.header_meta_line(Any[opts...]))
         @test occursin("bt-header-meta", line)
         @test occursin("Opus 4.7 with 1M context", line)
-        @test !occursin("mode:", line)
+        @test !occursin("mode:", line)    # no name prefixes
         @test !occursin("effort:", line)
-        @test count("bt-header-meta-item", line) == 1   # single item shown
+        @test count("bt-header-meta-item", line) == 3   # model + mode + effort
         # Future meta kinds default to visible, joined with the separator.
         line2 = string(BT.header_meta_line(Any[option_by_id(opts, "model"), "v2.1"]))
         @test occursin(" · ", line2) && occursin("v2.1", line2)
@@ -158,8 +161,9 @@ option_by_id(opts, id) = opts[findfirst(o -> o.id == id, opts)]
 
         # On prompt: chunk → config update (effort flips) → chunk → end_turn.
         # The metadata update must NOT split the streaming agent bubble.
-        # NOTE: bring-up fires NO extra requests (no set_config_option) —
-        # the responder would hang any unexpected RPC, failing the test.
+        # NOTE: bring-up now asserts the desired config (effort=xhigh differs from
+        # the reported "default"), so the responder MUST ack set_config_option or
+        # the synchronous bring-up call hangs.
         flipped = deepcopy(config_options_json())
         flipped[3]["currentValue"] = "high"
         on_setup = (outgoing::Channel{String}, incoming::Channel{String}) -> begin
@@ -172,6 +176,8 @@ option_by_id(opts, id) = opts[findfirst(o -> o.id == id, opts)]
                         put!(incoming, resp(id, Dict()))
                     elseif method == "session/new" && id !== nothing
                         put!(incoming, resp(id, session_result()))
+                    elseif method == "session/set_config_option" && id !== nothing
+                        put!(incoming, resp(id, Dict{String,Any}()))
                     elseif method == "session/prompt" && id !== nothing
                         put!(incoming, upd_chunk("hello "))
                         put!(incoming, upd_config(flipped))
@@ -242,6 +248,19 @@ option_by_id(opts, id) = opts[findfirst(o -> o.id == id, opts)]
         @test !occursin("<select", plain)
     end
 
+    @testset "mode + effort are interactive selects too" begin
+        opts = ACP.parse_config_options(session_result())
+        pick = BT.Bonito.Observable{Any}(["", ""])
+        for id in ("mode", "effort", "model")
+            s = string(BT.header_pill(option_by_id(opts, id), pick))
+            @test occursin("<select", s)
+            @test occursin("bt-header-meta-pick", s)
+        end
+        # No name prefixes on the pills — just the value (label is in the tooltip).
+        @test !occursin("mode:", string(BT.header_pill(option_by_id(opts, "mode"), pick)))
+        @test !occursin("effort:", string(BT.header_pill(option_by_id(opts, "effort"), pick)))
+    end
+
     @testset "model picker: single-choice collapses to a span" begin
         # An agent that only offers one model — no point showing a dropdown.
         r = session_result()
@@ -309,12 +328,17 @@ option_by_id(opts, id) = opts[findfirst(o -> o.id == id, opts)]
         @test option_by_id(opts, "model").current_value == "sonnet"
 
         # The RPC is dispatched off-task; wait for it to land in sent_rpcs.
+        # Bring-up also asserts effort=xhigh via set_config_option, so match the
+        # MODEL set specifically rather than the first set_config_option seen.
         deadline = time() + 5.0
         set_cfg = nothing
         while time() < deadline && set_cfg === nothing
             if isready(sent_rpcs)
                 m = take!(sent_rpcs)
-                get(m, "method", "") == "session/set_config_option" && (set_cfg = m)
+                if get(m, "method", "") == "session/set_config_option" &&
+                   get(get(m, "params", Dict()), "configId", "") == "model"
+                    set_cfg = m
+                end
             else
                 sleep(0.05)
             end

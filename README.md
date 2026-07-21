@@ -66,13 +66,13 @@ The full inventory lives in [`FEATURES.md`](FEATURES.md).
 ### Install (Linux / macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SimonDanisch/BonitoAgents.jl/main/install.sh | sh
+curl -fsSL https://agents.bonito.sh/install.sh | sh
 ```
 
 ### Install (Windows, PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/SimonDanisch/BonitoAgents.jl/main/install.ps1 | iex
+irm https://agents.bonito.sh/install.ps1 | iex
 ```
 
 This downloads the prebuilt bundle for your machine (a self-contained Julia +

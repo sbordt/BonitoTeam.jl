@@ -11,13 +11,13 @@ this machine, opened in your browser.
 Linux / macOS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SimonDanisch/BonitoAgents.jl/main/install.sh | sh
+curl -fsSL https://agents.bonito.sh/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/SimonDanisch/BonitoAgents.jl/main/install.ps1 | iex
+irm https://agents.bonito.sh/install.ps1 | iex
 ```
 
 Start it again any time with `bonito-agents`. **Re-run the same install line to

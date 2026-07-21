@@ -36,3 +36,31 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
+
+      # Serve the installers from the site root so
+      # `curl -fsSL https://agents.bonito.sh/install.sh | sh` works. Documenter
+      # owns the versioned subdirs + the root redirect/CNAME; install.sh and
+      # install.ps1 are extra root files it leaves untouched, and this step
+      # re-publishes them after every deploy (self-healing if ever dropped).
+      # Real deploys only — never PR previews.
+      - name: Check out gh-pages
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages-site
+
+      - name: Publish install scripts to the site root
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        run: |
+          cp install.sh install.ps1 gh-pages-site/
+          cd gh-pages-site
+          if [ -n "$(git status --porcelain install.sh install.ps1)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add install.sh install.ps1
+            git commit -m "Publish install scripts to site root"
+            git push origin gh-pages
+          else
+            echo "install scripts unchanged — nothing to publish"
+          fi

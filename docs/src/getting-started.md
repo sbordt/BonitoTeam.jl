@@ -1,20 +1,53 @@
 # Getting Started
 
-## Requirements
+## Install
 
-- [Julia](https://julialang.org/install/) 1.12 or newer on every machine.
-- For Claude Code agents: Node 20+, the two npm packages
+The fastest way onto one machine is the installer. It downloads the prebuilt
+bundle for your platform (a self-contained Julia + BonitoAgents — no separate
+Julia install needed), puts a `bonito-agents` command on your PATH, and
+immediately starts the desktop app: a local dashboard server plus a worker for
+this machine, opened in your browser.
 
-  ```bash
-  npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp
-  ```
+Linux / macOS:
 
-  and a logged-in `claude` CLI (run `claude` once and authenticate).
+```bash
+curl -fsSL https://raw.githubusercontent.com/SimonDanisch/BonitoAgents.jl/main/install.sh | sh
+```
 
-## Everything on one machine
+Windows (PowerShell):
 
-The desktop entry point starts the dashboard server plus a worker for the
-local machine in one process, and opens the UI in your browser:
+```powershell
+irm https://raw.githubusercontent.com/SimonDanisch/BonitoAgents.jl/main/install.ps1 | iex
+```
+
+Start it again any time with `bonito-agents`. **Re-run the same install line to
+auto-update** to the newest release; it skips the download when you are already
+current. Useful flags: `bonito-agents --port=8038` (fixed port), `--no-window`
+(don't open a browser), `--data-dir=PATH` (relocate state). Pass installer
+options after `-- `, e.g. `… | sh -s -- --no-run` to install without starting
+or `… | sh -s -- --uninstall` to remove it (raw `.tar.gz` bundles are also
+attached to
+[GitHub releases](https://github.com/SimonDanisch/BonitoAgents.jl/releases)).
+
+Projects, chat history and the machine's worker identity persist across
+restarts and updates under the platform data directory
+(`~/.local/share/BonitoAgents` on Linux, `~/Library/Application
+Support/BonitoAgents` on macOS, `%LOCALAPPDATA%\BonitoAgents` on Windows) and
+are never touched by install/update/uninstall.
+
+For Claude Code agents you also need Node 20+, the two npm packages
+
+```bash
+npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp
+```
+
+and a logged-in `claude` CLI (run `claude` once and authenticate).
+
+## From source
+
+If you would rather run from a checkout (you need
+[Julia](https://julialang.org/install/) 1.12+), the desktop entry point does
+the same thing — dashboard server + local worker + UI in your browser:
 
 ```bash
 git clone https://github.com/SimonDanisch/BonitoAgents.jl
@@ -23,24 +56,17 @@ julia --project=BonitoAgentsApp -e 'using Pkg; Pkg.instantiate()'
 julia --project=BonitoAgentsApp -m BonitoAgentsApp
 ```
 
-Projects, chat history and the machine's worker identity persist across
-restarts under the platform data directory (`~/.local/share/BonitoAgents` on
-Linux, `~/Library/Application Support/BonitoAgents` on macOS,
-`%LOCALAPPDATA%\BonitoAgents` on Windows).
-
-Flags: `--port=8038` for a fixed port, `--no-window` to skip opening the
-browser, `--data-dir=PATH` to relocate the state. Prebuilt bundles (snap /
-dmg / msix) are attached to
-[GitHub releases](https://github.com/SimonDanisch/BonitoAgents.jl/releases).
-
 ## One server, many machines
 
-Run the server somewhere always reachable, like a home server or a VPS:
+Run the server somewhere always reachable, like a home server or a VPS. After
+the installer above, this is the `server` mode of the same command:
 
 ```bash
-julia --project=BonitoAgentsApp -m BonitoAgentsApp server --host=0.0.0.0 --port=8038
+bonito-agents server --host=0.0.0.0 --port=8038
 ```
 
+(from a source checkout, use
+`julia --project=BonitoAgentsApp -m BonitoAgentsApp server --host=0.0.0.0 --port=8038`.)
 For a permanent install there is a systemd setup script,
 [`BonitoAgents/assets/install_server.sh`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/BonitoAgents/assets/install_server.sh),
 which installs the server as a service, generates the worker secret, and

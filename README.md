@@ -63,12 +63,45 @@ The full inventory lives in [`FEATURES.md`](FEATURES.md).
 
 ## Quick start
 
-Requirements: [Julia](https://julialang.org/install/) 1.12+. For Claude Code
-agents also Node 20+,
+### Install (Linux / macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SimonDanisch/BonitoAgents.jl/main/install.sh | sh
+```
+
+### Install (Windows, PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/SimonDanisch/BonitoAgents.jl/main/install.ps1 | iex
+```
+
+This downloads the prebuilt bundle for your machine (a self-contained Julia +
+BonitoAgents, no separate Julia install needed), puts a `bonito-agents` command
+on your PATH, and immediately starts the desktop app: a local dashboard server
+plus a worker for this machine, opened in your browser. Everything runs on your
+box; nothing is sent to a cloud.
+
+Afterwards, start it any time with:
+
+```bash
+bonito-agents
+```
+
+Re-run the same install line to **auto-update** to the newest release (it skips
+the download when you are already current). State persists across restarts and
+updates under the platform data dir (`~/.local/share/BonitoAgents` on Linux,
+`~/Library/Application Support/BonitoAgents` on macOS,
+`%LOCALAPPDATA%\BonitoAgents` on Windows) and is never touched by updates.
+Useful flags: `bonito-agents --port=8038`, `--no-window`, `--data-dir=PATH`;
+`… | sh -s -- --no-run` to install without starting, `--uninstall` to remove
+(the raw bundles are also attached to
+[releases](https://github.com/SimonDanisch/BonitoAgents.jl/releases)).
+
+For Claude Code agents you also need Node 20+,
 `npm install -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp`,
 and a logged-in `claude`.
 
-### Everything on this machine
+### From source
 
 ```bash
 git clone https://github.com/SimonDanisch/BonitoAgents.jl
@@ -77,21 +110,20 @@ julia --project=BonitoAgentsApp -e 'using Pkg; Pkg.instantiate()'
 julia --project=BonitoAgentsApp -m BonitoAgentsApp
 ```
 
-This starts the dashboard server plus a worker for the local machine and
-opens the UI in your browser. State persists across restarts under the
-platform data dir (`~/.local/share/BonitoAgents` on Linux). Flags:
-`--port=8038`, `--no-window`, `--data-dir=PATH`. Prebuilt bundles (snap /
-dmg / msix) are attached to
-[releases](https://github.com/SimonDanisch/BonitoAgents.jl/releases).
+Requires [Julia](https://julialang.org/install/) 1.12+. Same result as the
+installer: dashboard server + local worker + UI in your browser.
 
 ### One server, many machines
 
-Run the server somewhere always reachable:
+Run the server somewhere always reachable. With the installer above it is just
+the `server` mode of the same command:
 
 ```bash
-julia --project=BonitoAgentsApp -m BonitoAgentsApp server --host=0.0.0.0 --port=8038
+bonito-agents server --host=0.0.0.0 --port=8038
 ```
 
+(from a source checkout:
+`julia --project=BonitoAgentsApp -m BonitoAgentsApp server --host=0.0.0.0 --port=8038`)
 or install it as a systemd service with
 [`BonitoAgents/assets/install_server.sh`](BonitoAgents/assets/install_server.sh).
 Then, on each machine that should run agents, paste the one-liner from the

@@ -9,8 +9,9 @@
 #     stays literal (legacy #6; reuses chat_features' markdown asserts and adds
 #     the underscore-eating regression the legacy script flagged)
 #   • tool wide-mode toggle (legacy #2) — expand the body, click the
-#     `.bt-tool-fullwidth` button, assert `.bt-tool-wide-active` toggles on/off
-#     and that the wide click does NOT toggle the body (`data-expanded` stays)
+#     `.bt-tool-fullwidth` button, assert `.bt-tool-wide-active` toggles on/off,
+#     the card actually WIDENS (max-width beats the embed cap), and the wide
+#     click does NOT toggle the body (`data-expanded` stays)
 #   • tool title stays text-selectable (legacy #5) — computed user-select != none
 #   • localStorage `bt-last-pid` persistence on view change (legacy #8) — value
 #     is `<boot>|<pid>`, so we match the `|pid` suffix and the empty-pid suffix
@@ -83,8 +84,7 @@
 
     # The wide button is in the header but CSS reveals it (display:inline-flex)
     # ONLY while the body is expanded (styles.jl: `.bt-tool-header[data-expanded=
-    # "true"] .bt-tool-fullwidth`). So expand the tool body first, the same way
-    # tool_rendering's `expand()` does, then drive the button.
+    # "true"] .bt-tool-fullwidth`). So expand the tool body first, then drive it.
     tool_of = id -> """(() => { for (const m of document.querySelectorAll('.bt-tool-msg')) {
         if (m.querySelector('.bt-tool-body[data-tool-id="$(id)"]')) return m; }
         return null; })()"""
@@ -103,17 +103,22 @@
             const b = m && m.querySelector('.bt-tool-fullwidth');
             return !!b && b.offsetParent !== null; })()"""; timeout = 8) == true
 
-    # Before clicking: not in wide mode.
+    # Before clicking: not in wide mode. Record the default width.
     @test TK.eval_js(s, "$(tool_of("t-wide")).classList.contains('bt-tool-wide-active')") == false
-    # Click the fullwidth button → wide-active turns ON.
+    w_before = TK.eval_js(s, "Math.round($(tool_of("t-wide")).getBoundingClientRect().width)")
+    # Click the fullwidth button → wide-active turns ON and the card WIDENS
+    # (the toggle actually does something — the regression this pins is the
+    # button looking dead because a cap held the width).
     TK.eval_js(s, "$(tool_of("t-wide")).querySelector('.bt-tool-fullwidth').click(); true")
     @test TK.wait_for(s, "wide-active after click",
         "$(tool_of("t-wide")).classList.contains('bt-tool-wide-active')"; timeout = 8) == true
+    @test TK.wait_for(s, "card actually widened",
+        "Math.round($(tool_of("t-wide")).getBoundingClientRect().width) > $(w_before) + 20"; timeout = 8) == true
     # Critical legacy contract: the wide click MUST NOT toggle expand/collapse —
     # the header stays expanded (stopPropagation in the JS handler).
     @test TK.eval_js(s,
         "$(tool_of("t-wide")).querySelector('.bt-tool-header').dataset.expanded") == "true"
-    # Toggle off → wide-active turns back OFF.
+    # Toggle off → wide-active turns back OFF and the width returns.
     TK.eval_js(s, "$(tool_of("t-wide")).querySelector('.bt-tool-fullwidth').click(); true")
     @test TK.wait_for(s, "wide-active removed",
         "!$(tool_of("t-wide")).classList.contains('bt-tool-wide-active')"; timeout = 8) == true

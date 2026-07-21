@@ -85,10 +85,30 @@
         # padding + gap-after-spacer, landing ~a row short — so the follow-up
         # refresh re-anchored the NEIGHBOUR and the view jumped ~1 row (stuck).
         scroll_frac!(0.55)
-        before = TK.eval_js(s, TOP_PROBE)
+        # Wait for the virtual-scroll geometry to SETTLE first: under
+        # full-suite load, range fetches + estimate→real corrections keep
+        # shifting the transcript for a while after the scroll, and probing
+        # mid-settle compares against a state the anchor never saw (the
+        # filter_scroll one-row-drift disease, here worth many rows).
+        @test TK.wait_for(s, "geometry settled before churn", """(() => {
+            const c = [...document.querySelectorAll('.bt-messages')].find(e=>e.offsetParent);
+            const key = c.scrollHeight + '|' + Math.round(c.scrollTop);
+            window.__saN = (window.__saPrev === key) ? (window.__saN || 0) + 1 : 0;
+            window.__saPrev = key;
+            return window.__saN >= 4;
+        })()"""; timeout = 30, interval = 0.25) == true
+        # Probe + churn ATOMICALLY (one synchronous JS execution): the
+        # invariant is "the compensation preserves the view AS OF THE CHURN
+        # INSTANT" — a probe taken a round-trip earlier measures settle
+        # noise, not the compensation.
+        r = TK.eval_js(s, """(() => {
+            const probe = $TOP_PROBE;
+            const inflated = $INFLATE;
+            return { probe, inflated };
+        })()""")
+        before = r["probe"]
         @test before !== nothing
-        inflated = TK.eval_js(s, INFLATE)
-        @test Int(inflated) > 3          # the churn genuinely hit rows above
+        @test Int(r["inflated"]) > 3     # the churn genuinely hit rows above
         # Poll until the top marker STABILISES (the compensation is a synchronous
         # bump plus a few async correction passes; all settle well under 1s even
         # under load), then assert the view didn't move. No fixed-sleep gamble —
@@ -105,6 +125,10 @@
             prev = after
         end
         @test after !== nothing
+        ok = after !== nothing && after["text"] == before["text"] &&
+             abs(Int(after["off"]) - Int(before["off"])) <= 3
+        ok || @info "scroll_anchor churn FAILED" before after anchor =
+            TK.eval_js(s, "JSON.stringify(($CH)._anchorDebugG ?? null)")
         @test after["text"] == before["text"]
         @test abs(Int(after["off"]) - Int(before["off"])) <= 3
     end
@@ -154,11 +178,50 @@
     end
 
     @testset "hidden panes stop backfilling the transcript" begin
-        n_requests = TK.eval_js(s, """(() => new Promise(resolve => {
+        # Prior testsets' fetch cascades (forced refresh + refetch above) can
+        # still be in flight under load — their msgs.request would be counted
+        # against _startPrefetch (the intermittent `116 == 0`). Wait for
+        # REQUEST QUIESCENCE (no msgs.request for 800ms) before hooking.
+        quiesced = TK.eval_js(s, """(() => new Promise(resolve => {
             const ch = $CH;
+            const orig = ch.comm.notify.bind(ch.comm);
+            let last = performance.now();
+            const t0 = last;
+            ch.comm.notify = (m) => {
+                if (m && m.type === 'msgs.request') last = performance.now();
+                return orig(m);
+            };
+            const tick = setInterval(() => {
+                const idle = performance.now() - last > 800;
+                if (idle || performance.now() - t0 > 15000) {
+                    clearInterval(tick);
+                    ch.comm.notify = orig;
+                    resolve(idle);
+                }
+            }, 100);
+        }))()""")
+        @test quiesced == true
+        # Stash the chat object + poke holes in its cache (so a running
+        # prefetcher WOULD have rows to fetch), then REALLY hide the pane by
+        # navigating to the dashboard — the product drives onHidden itself.
+        # Manually faking ch.onHidden() on a still-visible pane was a
+        # synthetic state: any product-side visibility resync — e.g. the
+        # chat-LRU eviction (cap 8) updating the sidebar, which only happens
+        # once the full soak has accumulated enough chats — flipped it back
+        # to shown MID-COUNT, the backfill legitimately resumed (the
+        # intermittent `188 == 0`), and by the explicit onShown phase it had
+        # already finished (its `0 > 0` twin).
+        TK.eval_js(s, """(() => {
+            const ch = $CH;
+            window.__saBf = ch;
             for (const k of [...ch.cache.keys()]) if (k % 2 === 0) { ch.cache.get(k)?.remove(); ch.cache.delete(k); ch.rendered.delete(k); }
             ch._prefetchStarted = false; ch._prefetchCursor = null;
-            ch.onHidden();
+            return true;
+        })()""")
+        TK.to_dashboard(s)
+        sleep(0.5)
+        n_requests = TK.eval_js(s, """(() => new Promise(resolve => {
+            const ch = window.__saBf;
             let n = 0;
             const orig = ch.comm.notify.bind(ch.comm);
             ch.comm.notify = (m) => { if (m && m.type === 'msgs.request') n++; return orig(m); };
@@ -166,15 +229,19 @@
             setTimeout(() => { ch.comm.notify = orig; resolve(n); }, 1500);
         }))()""")
         @test Int(n_requests) == 0
-        n_after = TK.eval_js(s, """(() => new Promise(resolve => {
-            const ch = $CH;
-            let n = 0;
+        # Navigate back: the pane shows for real and the backfill resumes.
+        TK.eval_js(s, """(() => {
+            const ch = window.__saBf;
+            window.__saBfN = 0;
             const orig = ch.comm.notify.bind(ch.comm);
-            ch.comm.notify = (m) => { if (m && m.type === 'msgs.request') n++; return orig(m); };
-            ch.onShown();
-            setTimeout(() => { ch.comm.notify = orig; resolve(n); }, 1500);
-        }))()""")
-        @test Int(n_after) > 0
+            window.__saBfRestore = () => { ch.comm.notify = orig; };
+            ch.comm.notify = (m) => { if (m && m.type === 'msgs.request') window.__saBfN++; return orig(m); };
+            return true;
+        })()""")
+        TK.open_chat(s, pid)
+        @test TK.wait_for(s, "backfill resumes once shown",
+            "window.__saBfN > 0"; timeout = 15) == true
+        TK.eval_js(s, "window.__saBfRestore(); delete window.__saBf; true")
         sleep(1.5)   # let the resumed backfill settle
     end
 

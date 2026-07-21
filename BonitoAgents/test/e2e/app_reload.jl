@@ -1,19 +1,19 @@
 # A browser page RELOAD must not kill live embeds: re-opening a chat must
-# re-mount its bt_show_app apps fully ALIVE, not as dead DOM.
+# re-mount its live eval-result apps fully ALIVE, not as dead DOM.
 #
 # The regression this pins: the worker-side RemoteProxy bridge parent is a
-# long-lived root session serving many browser pages. Bonito dedups
-# serialization (`session_objects`), asset emission (`imports` /
-# `global_stylesheets`) and integration state (root `metadata`, e.g.
-# WGLMakie's scene-init order counter) against that root "for the page's
-# lifetime" — but a reload replaces the page while the bridge root lives on.
-# Without `switch_page!` wiping that state per page, a re-mounted embed's
-# fragment references cached objects the new page never received: the DOM
-# still mounts (it rides in the html fragment), but interpolated observables
-# are undefined on the JS side, so interaction is silently dead (and a
-# WGLMakie canvas stays black forever). The interaction round trip below is
-# therefore THE assertion: it only passes if the remount shipped full values
-# against the blank page.
+# long-lived root session serving many browser pages, while stock Bonito
+# dedups serialization (`session_objects`) and asset emission against a root
+# "for the page's lifetime". A reload replaces the page but the bridge root
+# lives on — a re-mounted embed whose fragment references already-shipped
+# cached objects gets DOM (it rides in the html) with every cached payload
+# silently missing: interaction dead, a WGLMakie canvas black forever. Ours
+# closes this structurally: proxied roots opt out of dedup entirely (dev
+# Bonito `dedup_cached_objects`), and every RemoteRef mount renders a FRESH
+# disposable subsession of the worker-held value (`update_session_dom!`), so
+# a remount always ships full values against the blank page. The interaction
+# round trip below is therefore THE assertion: it only passes if the remount
+# was fully self-contained AND the browser→worker wiring re-attached.
 #
 # UI-only: real reload, DOM clicks, rendered-DOM assertions.
 
@@ -22,12 +22,17 @@ isdefined(@__MODULE__, :TestKit) || include(joinpath(@__DIR__, "..", "testkit", 
 using .TestKit
 const TK = TestKit
 
-const APP_ENV = abspath(joinpath(@__DIR__, "..", "appenv"))
+# The committed eval env (dev Bonito via [sources]) — the live-embed bridge
+# needs Bonito ≥ 5 in the eval project (a fresh empty env resolves pre-v5,
+# the bridge gate skips setup, and the result degrades to a static echo).
+const APP_ENV = abspath(joinpath(@__DIR__, "..", "evalenv"))
 
-# Same shape as app_interactive.jl: the visible output is a Julia `map`
-# (11×clicks) computed in the Malt worker, so a correct value can only appear
-# if the click round-tripped through the eval bridge. Observables are created
-# inside `App() do` — every (re)mount starts a fresh instance at 0.
+# The app is the RESULT of a real bt_julia_eval: the worker parks the App in
+# a RemoteRef holder, the chat mounts it live. The visible output is a Julia
+# `map` (11×clicks) computed in the Malt worker, so a correct value can only
+# appear if the click round-tripped through the eval bridge. Observables are
+# created inside `App() do` — every (re)mount renders the held App afresh,
+# so each mount starts a fresh instance at 0.
 function agent_script(prompt::AbstractString)
     occursin("app", lowercase(prompt)) || return [TK.text("Echo: $(prompt)")]
     appcode = """using Bonito
@@ -49,7 +54,7 @@ function agent_script(prompt::AbstractString)
     return [TK.text("reload app:"),
             TK.tool(kind = "edit", title = "Edit src/thing.jl", tool_name = "Edit",
                     content = Any[diff]),
-            TK.bt_show_app(appcode; env_path = APP_ENV)]
+            TK.bt_eval(appcode; env_path = APP_ENV, id = "reload-app")]
 end
 
 # Expand the replayed Edit pill by clicking its header (the whole header is
@@ -95,7 +100,6 @@ end
 
 function run_suite(server)
     server.agent_fn[] = agent_script
-    TK.refresh_eval_session!(APP_ENV)
 
     @testset "live embed survives page reload (UI-only)" begin
         pid = TK.new_chat(server; title = "ReloadApp")
@@ -104,9 +108,15 @@ function run_suite(server)
         # Baseline: first mount on the first page, live round trip.
         @test TK.wait_for(server, "app renders",
             "document.body.innerText.includes('RELOAD-APP')"; timeout = 180) == true
+        # The FIRST live value is the coldest wait in the whole test: "app renders"
+        # only checks the static RELOAD-APP string, which is in the DOM before the
+        # embed's WGLMakie/Bonito live-init (shader compile + observable subscribe +
+        # first frame) finishes, and that init is what puts RAPP=0 on screen. Give
+        # it a cold-start budget in line with the 180s render / 15s reload waits,
+        # not the old 10s (the shortest budget for the slowest step — an oversight).
         @test TK.wait_for(server, "initial out",
             "(() => { const e=document.querySelector('.rapp-out'); return !!(e && e.innerText==='RAPP=0'); })()";
-            timeout = 10) == true
+            timeout = 30) == true
         @test reload_click_until(server, "RAPP=11")
 
         # Reload #1: first page→page transition on the bridge. The re-mounted

@@ -1,15 +1,53 @@
 # Loaded into every Malt-managed Julia subprocess on startup. Provides two
 # pure formatting functions called from the wrapper expression in
-# session.jl::execute. Returns Vector{Dict{String,Any}} of MCP content
-# blocks — base types only, so Malt's serialiser never sees user-defined
-# types it can't reconstruct on the parent side.
+# session.jl::execute. Returns a `(; blocks, html, errored, echo)` payload of
+# base types only, so Malt's serialiser never sees user-defined types it
+# can't reconstruct on the parent side.
 
 module BonitoMCPHelper
 
 using Base64
 
+# Soft-scope transform for REPL-style top-level eval (see `repl_eval`). REPL is
+# a stdlib (always in the sysimage), so this import is essentially free; fall
+# back to hard scope (identity) only if it somehow can't resolve.
+const SOFTSCOPE = try
+    @eval import REPL
+    REPL.softscope
+catch
+    identity
+end
+
 const DEFAULT_MAX_RESPONSE_BYTES = 10_000
 const LARGE_CONTAINER_THRESHOLD  = 100      # array / dict elements
+
+"""
+    repl_eval(code) -> value
+
+Evaluate `code` exactly as a Julia REPL would, and return the value of the LAST
+top-level statement. Each top-level statement is evaluated SEPARATELY in `Main`
+(via `include_string`), which is what makes bt_julia_eval behave like a REPL
+and not like a single spliced expression:
+
+  * A `function` / `struct` / `const` definition advances the world age before
+    later statements use it — so `f(x) = ...; f(1)` in ONE call no longer warns
+    "access to binding `f` in a world prior to its definition" (Julia ≥ 1.12).
+  * Soft scope: a top-level `for` / `while` may assign to a global
+    (`acc = 0; for i in 1:n; acc += i; end`) — the REPL's behavior, which hard
+    (file/`include`) scope rejects.
+
+The previous path spliced the parsed block as a function ARGUMENT
+(`format_value(<whole block>, …)`), flattening it into one expression that got
+neither property. Backtrace noise from `include_string` is already trimmed
+(see `BACKTRACE_NOISE_FRAMES`).
+"""
+repl_eval(code::AbstractString) =
+    Base.include_string(SOFTSCOPE, Main, String(code), "bt_julia_eval")
+
+# One worker call: REPL-eval the code, then format the result value. A user
+# error thrown by the eval propagates to the caller's try/catch (→ format_error).
+eval_and_format(code::AbstractString, out_dir::AbstractString, max_bytes::Int, full_output::Bool) =
+    format_value(repl_eval(code), out_dir, max_bytes, full_output)
 
 # On-disk cap for rich-output files (PNG/SVG written by try_save_rich).
 # This is SEPARATE from `max_bytes` (the per-block RESPONSE cap, 10KB default):
@@ -30,36 +68,80 @@ const BACKTRACE_NOISE_FRAMES = (
 )
 
 # ── Public entries ──────────────────────────────────────────────────────────
+# Both formatters return the same typed payload NamedTuple:
+#   blocks  — extra agent-facing content blocks (rich-file refs; usually empty)
+#   html    — the result DESCRIPTOR json (`{"remote_ref": "...", "errored": ...}`)
+#             when a ref was parked, else nothing. NEVER rendered markup.
+#   errored — the eval threw (a USER error — typed, never sniffed from text)
+#   echo    — text appended to the OUTPUT stream, terminal-faithful: the
+#             result's repr (a REPL echoes the value) or the red ERROR text.
 """
-    format_value(val, max_bytes, full_output) → Vector{Dict{String,Any}}
+    format_value(val, out_dir, max_bytes, full_output)
 
-Turn a Julia value into MCP content blocks. `nothing` returns are suppressed.
-2-D color arrays render to PNG when PNGFiles is loaded in the env. Large
-containers are summarised. Always-text blocks use the `result:\\n<body>` shape
-so the chat-side renderer picks them up as labeled Monaco sections.
+Turn a Julia value into the eval result payload. In a chat context the value
+is PARKED in a page-invisible holder session (`RemoteProxy.remote_ref`) — no
+render at eval time; the descriptor identifies it and the chat's `RemoteRef`
+mounts it serialize-on-mount over the bridge. The agent reads the value from
+the output echo. 2-D color arrays additionally render to an on-disk PNG when
+PNGFiles is loaded in the env; large container reprs are summarised.
 """
 function format_value(val, out_dir::AbstractString, max_bytes::Int, full_output::Bool)
-    val === nothing && return Dict{String,Any}[]   # suppress nothing-result
+    val === nothing &&
+        return (; blocks = Dict{String,Any}[], html = nothing, errored = false,
+                  echo = nothing)
 
+    repr = truncate_text(
+        !full_output && is_large_container(val) ? summarize_container(val) : result_repr(val),
+        max_bytes, full_output, "result")
+
+    ref = nothing
+    if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :remote_ref)
+        ref = try
+            Main.RemoteProxy.remote_ref(val)
+        catch e
+            @warn "format_value: remote_ref failed; falling back to text/file preview" exception = (e, catch_backtrace())
+            nothing
+        end
+    end
+    # A parked ref IS displayed live as the result embed — the pane shows the
+    # value, so there must be ZERO Output for it (`echo = nothing`): the Output
+    # section is captured STDOUT only, never the result repr. The agent still
+    # reads the result from the descriptor's `repr` field.
+    ref === nothing ||
+        return (; blocks = Dict{String,Any}[],
+                  html = result_descriptor(ref, false, repr),
+                  errored = false, echo = nothing)
+
+    # No bridge (standalone MCP): no embed, so the repr echo IS the result —
+    # append it to the output; add an on-disk rich preview when genuinely visual.
     blocks = Dict{String,Any}[]
-
-    # Always include a text representation first so the agent has SOMETHING
-    # readable about the result. Truncated to keep the response small.
-    repr = !full_output && is_large_container(val) ?
-        summarize_container(val) : sprint(show, "text/plain", val)
-    push!(blocks, Dict{String,Any}(
-        "type" => "text",
-        "text" => "result:\n$(truncate_text(repr, max_bytes, full_output, "result"))",
-    ))
-
-    # If the value supports a richer MIME, render it to a file alongside —
-    # the chat-side render_tool_body picks up the `shown:` reference and
-    # auto-displays the file as a collapsible preview, but the BYTES never
-    # leave the worker until the user actually expands the tool. The agent
-    # sees only the path + mime + size.
     show_block = try_save_rich(val, out_dir, max_bytes)
     show_block === nothing || push!(blocks, show_block)
-    return blocks
+    return (; blocks = blocks, html = nothing, errored = false, echo = repr)
+end
+
+# The result descriptor json the chat decodes (BonitoAgents remote_app.jl):
+# `{"remote_ref": "...", "errored": bool, "repr": "..."}`. `repr` is the result
+# echo for the AGENT (the chat renders the live embed instead, and never shows
+# `repr` — the value is already displayed). No JSON dep in the worker env, so
+# escape the string by hand.
+result_descriptor(ref::AbstractString, errored::Bool, repr::AbstractString) =
+    string("{\"remote_ref\":\"", ref, "\",\"errored\":", errored ? "true" : "false",
+           ",\"repr\":\"", json_escape_string(repr), "\"}")
+
+function json_escape_string(s::AbstractString)
+    io = IOBuffer()
+    for c in s
+        if     c == '"';  print(io, "\\\"")
+        elseif c == '\\'; print(io, "\\\\")
+        elseif c == '\n'; print(io, "\\n")
+        elseif c == '\r'; print(io, "\\r")
+        elseif c == '\t'; print(io, "\\t")
+        elseif c < ' ';   print(io, "\\u", lpad(string(UInt16(c), base = 16), 4, '0'))
+        else              print(io, c)
+        end
+    end
+    return String(take!(io))
 end
 
 # Walk the IMAGE MIME chain (PNG → SVG, plus PNGFiles for Colorant matrices)
@@ -166,21 +248,34 @@ function format_bytes_short(n::Integer)
 end
 
 """
-    format_error(err, bt, max_bytes, full_output) → Vector{Dict{String,Any}}
+    format_error(err, bt, max_bytes, full_output)
 
-Render an exception + trimmed backtrace as a single error block.
+An error is a VALUE: the `CapturedException` is parked via `remote_ref`
+exactly like any result (the chat mounts it live and Bonito renders it via
+`jsrender(::Session, ::CapturedException)`), the descriptor carries
+`errored: true`, and the terminal-faithful red `ERROR: …` text (with the
+trimmed backtrace) goes to the output echo — what a REPL would print.
 """
 function format_error(err, bt, max_bytes::Int, full_output::Bool)
-    text = sprint() do io
-        showerror(io, err)
-        println(io)
-        Base.show_backtrace(io, bt)
+    ce = CapturedException(err, bt)
+    text = trim_backtrace(sprint(showerror, ce))
+    echo = "\e[91mERROR: " * truncate_text(text, max_bytes, full_output, "error") * "\e[39m"
+
+    ref = nothing
+    if isdefined(Main, :RemoteProxy) && isdefined(Main.RemoteProxy, :remote_ref)
+        ref = try
+            Main.RemoteProxy.remote_ref(ce)
+        catch e
+            @warn "format_error: remote_ref failed; error stays text-only" exception = (e, catch_backtrace())
+            nothing
+        end
     end
-    text = trim_backtrace(text)
-    return [Dict{String,Any}(
-        "type" => "text",
-        "text" => "error:\n$(truncate_text(text, max_bytes, full_output, "error"))",
-    )]
+    # Unlike a value, an ERROR keeps its echo in the output stream: the agent
+    # must SEE the failure prominently (not buried in a descriptor) to fix the
+    # code, and the red console error is the terminal-faithful view. The embed
+    # renders the exception too — redundancy is warranted for errors.
+    html = ref === nothing ? nothing : result_descriptor(ref, true, "")
+    return (; blocks = Dict{String,Any}[], html = html, errored = true, echo = echo)
 end
 
 # ── Output discipline ──────────────────────────────────────────────────────
@@ -204,6 +299,29 @@ function trim_backtrace(text::AbstractString)
     suppressed = length(lines) - length(kept)
     suppressed > 1 && push!(kept, "  [+ $suppressed internal frames]")
     return strip(join(kept, "\n"))
+end
+
+# The result repr — the AGENT-facing text of the value (it rides in the
+# descriptor's `repr`, or the output stream in the no-bridge fallback).
+# Terminal-faithful: normally the value's `show(text/plain)` repr. BUT a value
+# with a rich display (a Bonito App, a Makie figure) has NO meaningful text
+# form: `show(text/plain)` falls back to the default struct dump (opaque
+# closures / Refs / `nothing`s), which a real REPL would never print — it
+# would DISPLAY the object instead. In the chat that display IS the live
+# result embed, so a struct dump would be useless to the agent. For those,
+# use a concise `summary` (e.g. "Bonito.App"). Plain data structs (no rich
+# display) keep their struct dump — that IS their REPL repr and it's useful.
+const GENERIC_SHOW2 = which(Base.show, (IO, Any))
+const GENERIC_SHOW3 = which(Base.show, (IO, MIME"text/plain", Any))
+has_readable_repr(v) =
+    which(Base.show, (IO, typeof(v))) !== GENERIC_SHOW2 ||
+    which(Base.show, (IO, MIME"text/plain", typeof(v))) !== GENERIC_SHOW3
+is_richly_displayable(v) =
+    showable(MIME"text/html"(), v) || showable(MIME"image/png"(), v) ||
+    showable(MIME"image/svg+xml"(), v)
+function result_repr(v)
+    (!has_readable_repr(v) && is_richly_displayable(v)) && return summary(v)
+    return sprint(show, "text/plain", v)
 end
 
 function is_large_container(value)

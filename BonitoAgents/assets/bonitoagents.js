@@ -49,6 +49,11 @@ export class Collapsable {
         this.toggle  = opts.toggleEl || null;
         this.native  = opts.native || false;          // hosted in <details>/<summary>
         this.editMode = opts.editMode || false;
+        // Eval cards: the body stays MOUNTED across collapse (live embeds /
+        // Monaco survive) but collapse hides it via display — the height
+        // clamping happens per SUB-SECTION inside the body (see styles.jl
+        // .bt-clamped), never on the card body as a whole.
+        this.hideBodyOnCollapse = opts.hideBodyOnCollapse || false;
         this.compactHeight  = opts.compactHeight  || 240;
         this.expandedHeight = opts.expandedHeight || 2000;
         this.fetchEachExpand   = this.editMode ? false : (opts.fetchEachExpand || false);
@@ -61,7 +66,8 @@ export class Collapsable {
         // in COMPACT visual state (Monaco capped to 240px) but their body
         // element is rendered/visible from the start; the initial
         // `setMaxHeight` lookup is deferred to the first toggle (Monaco may
-        // not have finished its async init when createNode runs).
+        // not have finished its async init when createNode runs). Compact
+        // EVAL bodies are capped by the CSS clamp instead (styles.jl).
         this.expanded = false;
 
         if (this.native) {
@@ -93,12 +99,17 @@ export class Collapsable {
         if (!this.native) {
             this.header.dataset.expanded = expanded ? 'true' : 'false';
             if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
-            if (this.editMode) {
-                // Body stays visible; size via Monaco's own API so the
-                // resize is animated by Monaco itself instead of CSS clip.
+            if (this.editMode && !this.hideBodyOnCollapse) {
+                // Edit tools: body stays visible; size via Monaco's own API
+                // so the resize is animated by Monaco itself instead of CSS
+                // clip.
                 this.body.style.display = '';
                 this._applyEditHeight(expanded ? this.expandedHeight : this.compactHeight);
             } else {
+                // Plain lazy bodies AND eval compact bodies hide on collapse;
+                // for the latter the node stays mounted (editMode skips the
+                // discard below), so re-expanding is instant and live embeds
+                // keep their sessions.
                 this.body.style.display = expanded ? '' : 'none';
             }
         }
@@ -127,7 +138,12 @@ export class Collapsable {
     // construction" (the body has the .monaco-diff-editor-div but no
     // __btMonacoDiff yet) and multi-diff bodies (just resize the first; the
     // sibling diffs are sized by the same body wrapper). No-op if the
-    // editor finished tearing down or never mounted.
+    // editor finished tearing down or never mounted — and for compact-body
+    // EVAL tools, whose plain Code editor has no such API: their ~4-line cap
+    // is a pure CSS clamp on the body wrapper keyed off
+    // `[data-compact-body] .bt-tool-header[data-expanded] ~ .bt-tool-body`
+    // (see styles.jl), so it holds for EVERY mount path (eager mount,
+    // terminal re-render, history reload) with no lifecycle hook.
     _applyEditHeight(h) {
         const divs = this.body.querySelectorAll('.monaco-diff-editor-div');
         divs.forEach(div => {
@@ -761,6 +777,10 @@ class BonitoChat {
 
     destroy() {
         this.destroyed = true;
+        if (this._elapsedTimer) {
+            clearInterval(this._elapsedTimer);
+            this._elapsedTimer = null;
+        }
         if (this._onScroll) {
             this.container.removeEventListener('scroll', this._onScroll);
         }
@@ -800,6 +820,11 @@ class BonitoChat {
         if (this._onTextInputKeyCapture && this.textInput) {
             this.textInput.removeEventListener('keydown', this._onTextInputKeyCapture, true);
         }
+        if (this.textInput) {
+            this._onCmdInput && this.textInput.removeEventListener('input', this._onCmdInput);
+            this._onCmdBlur  && this.textInput.removeEventListener('blur',  this._onCmdBlur);
+        }
+        if (this.cmdAc) { this.cmdAc.remove(); this.cmdAc = null; }
         if (this._onAppClickCapture && this.app) {
             this.app.removeEventListener('click', this._onAppClickCapture, true);
         }
@@ -855,6 +880,7 @@ class BonitoChat {
             case 'msgs.count':   return this.applyCount(msg.n);
             case 'msgs.reload':  return this.onMsgsReload(msg.n);
             case 'turn_begin':   this.turnSeq = msg.seq; return;
+            case 'commands':     this.slashCommands = msg.items || []; return;
             case 'lens.vocab':   this.lensVocab = msg.keys || []; return;
             case 'lens.saved':   return this.onLensSaved(msg);
             case 'lens.result':  return this.onLensResult(msg);
@@ -1341,14 +1367,20 @@ class BonitoChat {
     // the toggle, so anchoring on one would lose the read position (setKeyHidden).
     _captureAnchor(excludeKey = null) {
         const st = this.container.scrollTop;
+        // Same 4px bottom-overhang tolerance as the key anchor and the
+        // top-marker probes: a row with a couple of pixels hanging into the
+        // viewport is not the reading position, and pinning such a sliver is
+        // how one-row drifts are born (see _captureKeyAnchor).
         for (const i of [...this.rendered].sort((a, b) => a - b)) {
             const n = this.cache.get(i);
             if (!n || !n.isConnected || n.style.display === 'none') continue;
             if (excludeKey && n.dataset.filterKey === excludeKey) continue;
-            if (n.offsetTop + n.offsetHeight > st) {
+            if (n.offsetTop + n.offsetHeight > st + 4) {
+                this._anchorDebugG = { st, idx: i, off: n.offsetTop - st };
                 return { idx: i, off: n.offsetTop - st };
             }
         }
+        this._anchorDebugG = { st, idx: -1, off: 0 };
         return null;
     }
 
@@ -1383,11 +1415,116 @@ class BonitoChat {
         }
     }
 
+    // ── Key-toggle anchor (setKeyHidden) — VIRTUAL and STICKY ───────────────
+    //
+    // The DOM-based `_captureAnchor` is wrong for a type toggle, twice over:
+    //   1. The rendered window can have HOLES around the viewport (rows still
+    //      being fetched after a scroll), so the first *rendered* surviving row
+    //      may sit far below the top — and every to-be-hidden row between the
+    //      real top and that anchor collapses, so pinning it cannot hold the
+    //      view (observed: anchor picked ~1000px below, view landed a row off).
+    //   2. A single restore doesn't survive the ASYNC settle that follows the
+    //      reflow (range fetches + ResizeObserver re-measures): each subsequent
+    //      `updateDOM` re-anchored on the CURRENT top row, faithfully
+    //      preserving the drift the collapse just caused.
+    // So the toggle anchor is (a) computed in the VIRTUAL coordinate
+    // (indexAt/cumHeight — immune to holes), and (b) kept STICKY: `updateDOM`
+    // re-pins IT for the settle window instead of re-capturing, until it
+    // expires or the user scrolls.
+    _captureKeyAnchor(excludeKey) {
+        const st = this.container.scrollTop;
+        // The row to hold is the FIRST surviving row at/below the viewport top
+        // in VIRTUAL order — anchoring any row further down cannot preserve
+        // the reading position when toggled rows above it collapse/expand.
+        let vi = this.indexAt(st);
+        while (vi < this.totalCount &&
+               (this.keyByIdx.get(vi) === excludeKey || this.effHeight(vi) === 0)) vi++;
+        if (vi >= this.totalCount) return null;
+        // Two candidates, because both sources can lie in different ways:
+        //  * vi (above) — the first survivor in VIRTUAL order. The right row
+        //    inside a rendered HOLE (previously-rendered rows keep measured
+        //    heights), but `indexAt` runs on height ESTIMATES, which drift
+        //    under load and can land one row too far DOWN.
+        //  * di — the first RENDERED, visible survivor whose REAL bottom
+        //    hangs below the viewport top. Ground truth where it exists, but
+        //    blind to evicted rows: on a SHOW toggle the true first survivor
+        //    may not be rendered, and di would sit BELOW re-appearing rows.
+        // Rule: a DOM candidate at/above the virtual pick means the virtual
+        // pick was estimate-drifted — trust the DOM. All rendered survivors
+        // BELOW vi means vi is in a hole — anchor it virtually; the sticky
+        // re-pins converge as the re-window materializes it.
+        // A row whose last couple of pixels hang into the viewport is NOT the
+        // reading position — anchoring such a sliver (observed: a row at
+        // st-41 with 3px overhang) pins the view one row above what the user
+        // sees, and the sliver's own reflow arithmetic then drifts the view
+        // by a full row. Same 4px tolerance the top-marker probes use.
+        const OVERHANG = 4;
+        let di = -1, doff = 0;
+        for (const i of [...this.rendered].sort((a, b) => a - b)) {
+            const n = this.cache.get(i);
+            if (!n || !n.isConnected || n.style.display === 'none') continue;
+            if (this.keyByIdx.get(i) === excludeKey) continue;
+            if (n.offsetTop + n.offsetHeight > st + OVERHANG) {
+                di = i; doff = n.offsetTop - st;
+                break;
+            }
+        }
+        // Stash the decision for post-mortems (the filter_scroll e2e dumps it
+        // on failure): a tiny overwritten object, no rolling log.
+        this._anchorDebug = { st, vi, di, doff,
+                              pickedDom: di >= 0 && di <= vi };
+        if (di >= 0 && di <= vi) {
+            return { idx: di, off: doff, dom: true };
+        }
+        return { idx: vi, dom: false,
+                 off: this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, vi) - st };
+    }
+
+    // Re-pin the sticky anchor at its captured viewport offset. A DOM-captured
+    // anchor restores against the row's REAL offset whenever it is rendered
+    // (exact); the virtual fallback covers an evicted/unmaterialized anchor
+    // (effHeight already reflects the toggled hiddenTypes).
+    _restoreKeyAnchor(a) {
+        if (!a) return;
+        let want;
+        const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
+        if (a.dom && n && n.isConnected && n.style.display !== 'none') {
+            want = n.offsetTop - a.off;
+        } else if (a.dom) {
+            // DOM anchor currently evicted: hold its virtual position until the
+            // re-window brings it back (the next sticky re-pin is exact again).
+            want = this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, a.idx) - a.off;
+        } else {
+            want = this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, a.idx) - a.off;
+        }
+        want = Math.max(0, want);
+        if (Math.abs(this.container.scrollTop - want) > 1) {
+            this.container.scrollTop = want;
+            this._prevScrollTop = this.container.scrollTop;
+        }
+    }
+
+    // The live sticky anchor, or null. Expires by time, and immediately on any
+    // user scroll input AFTER the toggle (the user owns the position again).
+    _activeKeyAnchor() {
+        const a = this._keyAnchor;
+        if (!a) return null;
+        if (performance.now() > a.until || this._lastUserInputT > a.setAt) {
+            this._keyAnchor = null;
+            return null;
+        }
+        return a;
+    }
+
     updateDOM(s, e) {
         if (s > e) return;
         // Anchor BEFORE any mutation; restored after the spacer writes below.
         // Skipped during the initial mount cascade (scrollToBottom owns it).
-        const anchor = this.initialLoad ? null : this._captureAnchor();
+        // While a key-toggle sticky anchor is live, use IT instead of a fresh
+        // DOM capture — re-capturing mid-settle would faithfully preserve the
+        // drift the toggle reflow just caused (see _captureKeyAnchor).
+        const sticky = this._activeKeyAnchor();
+        const anchor = (this.initialLoad || sticky) ? null : this._captureAnchor();
         for (const idx of [...this.rendered]) {
             if (idx < s || idx > e) {
                 const node = this.cache.get(idx);
@@ -1450,7 +1587,8 @@ class BonitoChat {
             this.spacerBottom.style.height = botH + 'px';
             this._spacerBotH = botH;
         }
-        this._restoreAnchor(anchor);
+        if (sticky) this._restoreKeyAnchor(sticky);
+        else this._restoreAnchor(anchor);
         // NOTE: no drag-time scrollHeight freeze here. An earlier freeze
         // (pin total at drag-start, absorb deltas in the spacers) turned
         // estimate-vs-real drift into PHANTOM BLANK at the end of the
@@ -1986,6 +2124,20 @@ class BonitoChat {
         }
     }
 
+    // The `.bt-console` of an eval body's Output section (the pin_end
+    // Collapsable the live stdout stream writes into), or null before the
+    // body has mounted. Matched by the section's "Output" label so a Code /
+    // error console can't be picked by mistake.
+    _evalOutputConsole(node) {
+        const secs = node.querySelectorAll('.bt-tool-body .bt-subsection');
+        for (const d of secs) {
+            const label = d.querySelector('.bt-subsection-label');
+            if (label && (label.textContent || '').trim() === 'Output')
+                return d.querySelector('.bt-console');
+        }
+        return null;
+    }
+
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
@@ -1993,12 +2145,23 @@ class BonitoChat {
             const s = node.querySelector('.bt-tool-status');
             if (s) { s.textContent = msg.status; s.className = `bt-tool-status bt-status-${msg.status}`; }
             // Pulsing glow + taskbar slot are gated on the `bt-tool-live`
-            // class. Terminal status sheds it; mid-flight gets it.
+            // class. Terminal status sheds it; mid-flight gets it (and the
+            // shared elapsed ticker with it).
             const live = !(msg.status === 'completed' || msg.status === 'failed');
             node.classList.toggle('bt-tool-live', live);
-            // The live code preview's job ends with the eval — the completed
-            // body renders the same code as its Monaco "Code" section.
-            if (!live) node.querySelector('.bt-eval-preview')?.remove();
+            if (live) this._ensureElapsedTicker();
+            // Compact-body evals mount their body DURING the run (the live
+            // stream pane inside the Output section) and editMode never
+            // re-fetches on expand, so the completed content would stay
+            // stale forever. Re-render once at terminal status — the fresh
+            // body carries the COMPLETE output text (same bytes the stream
+            // showed, atomic with the result) and the result embed.
+            if (!live) {
+                if (node.dataset.compactBody === '1' && node.collapsable &&
+                    node.collapsable.loaded && node.isConnected) {
+                    this.comm.notify({ type: 'tool.render', id: msg.id });
+                }
+            }
         }
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
@@ -2034,6 +2197,18 @@ class BonitoChat {
             const s = node.querySelector('.bt-tool-summary');
             if (s) s.textContent = msg.summary;
         }
+        // Eval compact-body mode can arrive LATE (claude streams tool input;
+        // the typed extras ride a later update). Flip the Collapsable into
+        // editMode BEFORE the expand handling below so the eager-mount takes
+        // the compact path.
+        if (msg.compact_body === true && node.collapsable && !node.collapsable.editMode) {
+            const c = node.collapsable;
+            c.editMode = true;
+            c.hideBodyOnCollapse = true;
+            c.fetchEachExpand = false;
+            c.discardOnCollapse = false;
+            node.dataset.compactBody = '1';
+        }
         // bt_show: the completion update is when we learn it's a "show me
         // this" tool (and its mime). Native-media mode takes precedence:
         // chrome off + body mounted; otherwise auto-expand the pill
@@ -2050,15 +2225,37 @@ class BonitoChat {
                 // compact size). A click on the header is what expands
                 // Monaco; this auto-mount just makes the diff visible
                 // without requiring a click.
+                // Eval compact bodies (hideBodyOnCollapse) DO flip expanded:
+                // their visible-body state IS the expanded state (sections
+                // self-clamp), so the arrow must read ▼ while the body shows.
                 if (node.isConnected) {
                     if (!node.collapsable.loaded) {
                         node.collapsable.loaded = true;
                         this.comm.notify({type: 'tool.render', id: msg.id});
                     }
+                    if (node.collapsable.hideBodyOnCollapse)
+                        node.collapsable.setExpanded(true);
                 } else {
                     node.dataset.btAutoMount = '1';
+                    if (node.collapsable.hideBodyOnCollapse)
+                        node.dataset.btAutoExpand = '1';
                 }
             } else if (node.isConnected) {
+                node.collapsable.setExpanded(true);
+            } else {
+                node.dataset.btAutoExpand = '1';
+            }
+        }
+        // FULL uncollapse (server-typed, e.g. a completed eval whose result is
+        // non-empty): mount if needed, then actually flip expanded — unlike
+        // `expand`, which in compact-body mode only eager-mounts at compact
+        // height.
+        if (msg.expand_full && node.collapsable) {
+            if (node.isConnected) {
+                if (!node.collapsable.loaded) {
+                    node.collapsable.loaded = true;
+                    this.comm.notify({ type: 'tool.render', id: msg.id });
+                }
                 node.collapsable.setExpanded(true);
             } else {
                 node.dataset.btAutoExpand = '1';
@@ -2092,24 +2289,53 @@ class BonitoChat {
             headerEl.insertBefore(sb,
                 headerEl.querySelector('.bt-tool-fullwidth') || null);
         }
-        if (msg.code && stillLive && headerEl && !node.querySelector('.bt-eval-preview')) {
-            const pv = document.createElement('div');
-            pv.className = 'bt-eval-preview';
-            const pre = document.createElement('pre');
-            pre.textContent = msg.code;
-            const tg = document.createElement('button');
-            tg.type = 'button';
-            tg.className = 'bt-eval-preview-toggle';
-            tg.title = 'Enlarge';
-            tg.textContent = '⌄';
-            tg.addEventListener('click', (e) => {
-                e.stopPropagation();
-                const full = pv.classList.toggle('bt-eval-preview-full');
-                tg.textContent = full ? '⌃' : '⌄';
-                tg.title = full ? 'Collapse' : 'Enlarge';
-            });
-            pv.append(pre, tg);
-            headerEl.insertAdjacentElement('afterend', pv);
+        // The completed update announced a LIVE result embed (worker-parked
+        // value mounted via RemoteRef): give the card bt_show_app's output
+        // handling — keep-alive parking on scroll-off (btApp LRU; plain
+        // virtualization would close the sub-session and kill e.g. a
+        // WGLMakie canvas) and the ⤢ detach button (embed adopted into its
+        // own workspace panel; same wiring as createNode's).
+        if (msg.live_embed) {
+            node.dataset.btApp = '1';
+            if (headerEl && !headerEl.querySelector('.bt-tool-detach')) {
+                const db = document.createElement('button');
+                db.type = 'button';
+                db.className = 'bt-tool-detach';
+                db.title = 'Detach to floating window';
+                db.textContent = '⤢';
+                db.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.comm.notify({ type: 'detach_app', id: msg.id });
+                });
+                headerEl.insertBefore(db,
+                    headerEl.querySelector('.bt-tool-fullwidth') || null);
+            }
+        }
+        // Live stdout of a RUNNING eval, fed by `stream_tail` updates (the
+        // server tails the eval session's log). The stream IS the body's
+        // Output section — a `pin_end` Collapsable whose `.bt-console` shows
+        // the text; write into it and pin its scroller (the .bt-subsection-
+        // body) to the newest line. Same widget the terminal re-render swaps
+        // the complete text into, so there's no styling jump on completion.
+        // Fallback: if the update raced the body mount, park a plain pane
+        // under the header (the mount, which carries the same text, drops it).
+        if (msg.stream_tail != null && stillLive && headerEl) {
+            const con = this._evalOutputConsole(node);
+            if (con) {
+                for (const stray of node.querySelectorAll('.bt-eval-stream')) stray.remove();
+                con.textContent = msg.stream_tail;
+                const scroller = con.closest('.bt-subsection-body');
+                if (scroller) scroller.scrollTop = scroller.scrollHeight;
+            } else {
+                let sp = node.querySelector('.bt-eval-stream');
+                if (!sp) {
+                    sp = document.createElement('pre');
+                    sp.className = 'bt-eval-stream';
+                    headerEl.insertAdjacentElement('afterend', sp);
+                }
+                sp.textContent = msg.stream_tail;
+                sp.scrollTop = sp.scrollHeight;
+            }
         }
         // The file path usually arrives with a later update (the initial
         // header has no arguments/content yet) — turn the title into a
@@ -2263,7 +2489,7 @@ class BonitoChat {
         // different message. So capture the top-visible SURVIVING row now (before
         // the reflow, excluding the type being toggled) and re-pin it after
         // refresh has trued up the spacers/window.
-        const anchor = this.followMode ? null : this._captureAnchor(key);
+        const anchor = this.followMode ? null : this._captureKeyAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
         for (const [idx, node] of this.cache) {
             // applyVisibility, not a raw display write: un-hiding a key must
@@ -2273,9 +2499,18 @@ class BonitoChat {
         // Hiding the agent stream also hides the idle "waiting" line that
         // would otherwise dangle under messages that aren't there.
         if (key === 'agent') this._updateWaiting();
+        if (anchor) {
+            // Sticky through the async settle (range fetches, re-measures) that
+            // follows the reflow — updateDOM keeps re-pinning THIS anchor
+            // instead of re-capturing the already-drifted top (see
+            // _captureKeyAnchor). Set BEFORE refresh so the refresh's own
+            // updateDOM already honors it.
+            this._keyAnchor = { ...anchor, setAt: performance.now(),
+                                until: performance.now() + 1500 };
+        }
         this.refresh();
         if (this.followMode) this._queueScrollToBottom();
-        else if (anchor) this._restoreAnchor(anchor);
+        else if (anchor) this._restoreKeyAnchor(anchor);
     }
 
     // The idle "waiting for your next instruction" line only makes sense
@@ -2366,7 +2601,7 @@ class BonitoChat {
                 div.innerHTML = this.toolHTML(msg);
                 // Live Bonito/WGLMakie embeds get kept alive (display:none) on
                 // scroll-off instead of removed — see the keep-alive LRU.
-                if (msg.kind === 'bonito_app') div.dataset.btApp = '1';
+                if (msg.kind === 'bonito_app' || msg.live_embed) div.dataset.btApp = '1';
                 // Live state + start/finish time live on the message node.
                 // Status `pending` / `in_progress` count as live until a
                 // terminal update flips the class via `onToolUpdate`; the
@@ -2383,7 +2618,10 @@ class BonitoChat {
                 // / Task land here; regular tools don't.
                 const liveTool = !(msg.status === 'completed' || msg.status === 'failed') &&
                                   msg.finished_at == null;
-                if (liveTool) div.classList.add('bt-tool-live');
+                if (liveTool) {
+                    div.classList.add('bt-tool-live');
+                    this._ensureElapsedTicker();
+                }
                 const id = msg.id;
                 // Click-header host; the body is re-rendered (Monaco etc.) on
                 // every expand via tool.render → dom_in_js, and discarded on
@@ -2392,13 +2630,20 @@ class BonitoChat {
                 // header eagerly (no click required). The Collapsable's
                 // editMode keeps the body mounted across collapse — toggle
                 // just calls Monaco.setMaxHeight to swap compact↔full.
-                const isEdit = msg.kind === 'edit';
+                // Eval tools reuse editMode's KEEP-MOUNTED semantics via
+                // `compact_body` (server-typed) but not its height games:
+                // their body shows all sections (Code / Output each clamped
+                // to ~4 lines SECTION-side, result embed unclamped) and the
+                // header toggle plainly hides/shows the mounted body.
+                const compactBody = msg.kind === 'edit' || msg.compact_body === true;
+                if (msg.compact_body === true) div.dataset.compactBody = '1';
                 div.collapsable = new Collapsable(
                     div.querySelector('.bt-tool-header'),
                     div.querySelector('.bt-tool-body'),
                     { toggleEl: div.querySelector('.bt-tool-toggle'),
-                      editMode: isEdit,
-                      fetchEachExpand: !isEdit, discardOnCollapse: !isEdit,
+                      editMode: compactBody,
+                      hideBodyOnCollapse: msg.compact_body === true,
+                      fetchEachExpand: !compactBody, discardOnCollapse: !compactBody,
                       onExpand: () => this.comm.notify({type: 'tool.render', id}) });
                 // Subagent Task: rebuild the live activity feed from the
                 // header's snapshot (live growth rides task_activity events).
@@ -2416,12 +2661,10 @@ class BonitoChat {
                     e.stopPropagation();
                     this.comm.notify({ type: 'detach_app', id });
                 });
-                // Full-chat-width toggle, vertically centered on the bubble's
-                // right edge (CSS reveals it only while the body is expanded —
-                // there's no point widening an empty header). Extends the pill to
-                // span the whole message column so wide content (diffs / tables /
-                // remote-app embeds) gets room. Must NOT toggle expand/collapse,
-                // so stopPropagation.
+                // Full-chat-width toggle: extends the pill to span the whole
+                // message column so wide content (the result embed, a plot, a
+                // table, a long diff) gets the room it needs. Must NOT toggle
+                // expand/collapse, so stopPropagation.
                 const wideBtn = div.querySelector('.bt-tool-fullwidth');
                 if (wideBtn) wideBtn.addEventListener('click', (e) => {
                     e.stopPropagation();
@@ -2438,17 +2681,6 @@ class BonitoChat {
                     e.stopPropagation();
                     this.comm.notify({ type: 'stop_tool', id });
                 });
-                // Live code preview enlarge/collapse — same small-preview →
-                // grow interaction as the diff view, no re-fetch.
-                const pvToggle = div.querySelector('.bt-eval-preview-toggle');
-                if (pvToggle) pvToggle.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    const pv = div.querySelector('.bt-eval-preview');
-                    if (!pv) return;
-                    const full = pv.classList.toggle('bt-eval-preview-full');
-                    pvToggle.textContent = full ? '⌃' : '⌄';
-                    pvToggle.title = full ? 'Collapse' : 'Enlarge';
-                });
                 // The show's mime (bt_show results) — the native-media
                 // toggles key on it.
                 if (msg.show_mime) div.dataset.showMime = msg.show_mime;
@@ -2457,15 +2689,26 @@ class BonitoChat {
                     // first insertion.
                     div.classList.add('bt-tool-native');
                     div.dataset.btAutoExpand = '1';
-                } else if (msg.expand) {
-                    // Auto-expand (e.g. bt_show) — DEFERRED until the node
-                    // first enters the document (insertSorted). The history
-                    // prefetcher creates nodes detached; expanding those
-                    // immediately fired tool.render whose dom_in_js reply
-                    // found no slot in the document — the body stayed on
-                    // "loading…" forever (and every off-screen bt_show in
-                    // history cost a render round-trip up front).
-                    div.dataset.btAutoExpand = '1';
+                } else if (msg.expand || msg.expand_full) {
+                    // Auto-expand (bt_show refs, eval eager-mount /
+                    // expand_full) — DEFERRED until the node first enters the
+                    // document (insertSorted). The history prefetcher creates
+                    // nodes detached; expanding those immediately fired
+                    // tool.render whose dom_in_js reply found no slot in the
+                    // document — the body stayed on "loading…" forever (and
+                    // every off-screen auto-expand in history cost a render
+                    // round-trip up front). Same split as onToolUpdate's
+                    // detached fallback: editMode bodies need the explicit
+                    // MOUNT flag (their applyExpanded never lazy-fetches),
+                    // plus the expanded flip for expand_full / evals whose
+                    // visible-body state IS the expanded state.
+                    if (div.collapsable.editMode) {
+                        div.dataset.btAutoMount = '1';
+                        if (msg.expand_full || div.collapsable.hideBodyOnCollapse)
+                            div.dataset.btAutoExpand = '1';
+                    } else {
+                        div.dataset.btAutoExpand = '1';
+                    }
                 }
                 break;
             }
@@ -2577,22 +2820,20 @@ class BonitoChat {
             ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
         const live = !(msg.status === 'completed' || msg.status === 'failed') &&
                      msg.finished_at == null;
-        const evalPreview = (msg.code && live) ? `
-            <div class="bt-eval-preview">
-                <pre>${escapeHTML(msg.code)}</pre>
-                <button class="bt-eval-preview-toggle" type="button"
-                        title="Enlarge">⌄</button>
-            </div>` : '';
+        // (The old <pre> eval code preview is gone: eval cards mount their
+        // BODY compactly instead — the real Monaco Code editor capped at ~4
+        // lines via Collapsable compact-body mode, see `msg.compact_body`.)
         // "What ran", ALWAYS visible (persists past completion — there's no Monaco
         // "Code" section afterwards) and never hidden in a tooltip: the bash command,
         // OR a control MCP tool's action (interrupt/restart/list its target session).
         // A tool ships either `code` (eval preview above) or `command` (this).
         const cmdPreview = msg.command ? `
             <div class="bt-cmd-preview"><pre>${escapeHTML(msg.command)}</pre></div>` : '';
-        // Elapsed timer — empty until the pill finishes, then filled ONCE
-        // with the final duration by `_writeToolElapsed` (on creation of an
-        // already-finished pill, and on the completion update). Live elapsed
-        // time is the taskbar's job (Julia clock); no JS timer touches this.
+        // Elapsed timer — ticks at 1Hz while the pill is LIVE (see
+        // _ensureElapsedTicker; running evals sit at "pending" for the whole
+        // MCP call, so this is how a user tells a hang from slow work) and
+        // freezes at the final duration on the terminal update
+        // (`_writeToolElapsed`).
         // The full-width toggle lives IN the header (right edge, after the
         // status pill) — an overlay button floating over the body covered
         // the actual app/diff content. CSS reveals it only while the body
@@ -2609,24 +2850,23 @@ class BonitoChat {
                 <span class="bt-tool-timer"></span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
                 ${stopBtn}
-                ${msg.kind === 'bonito_app'
+                ${(msg.kind === 'bonito_app' || msg.live_embed)
                     ? `<button class="bt-tool-detach" type="button"
                               title="Detach to floating window">⤢</button>`
                     : ''}
                 <button class="bt-tool-fullwidth" type="button"
                         title="Expand to full chat width">»</button>
             </div>
-            ${evalPreview}${cmdPreview}
+            ${cmdPreview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
     }
 
     // ── Live tools / todos: pulse + timer + taskbar ──────────────────────
-    // A single 1s interval drives all live-state UX:
-    //   1) Update the inline `.bt-tool-timer` on each live pill (> 1s only).
-    //   2) Rebuild the floating taskbar from current live DOM (one slot per
-    //      live pill; click → scrollIntoView on the source).
-    // No per-pill timers, no server-pushed taskbar state — DOM is the source
-    // of truth. Cheap: scans at most a few dozen nodes once a second.
+    // Live-pill UX: the shared 1Hz `_ensureElapsedTicker` writes each live
+    // pill's `.bt-tool-timer` (> 1s only); the taskbar is a Julia-rendered
+    // component wired in `_setupLiveTicker` (click-to-scroll only here).
+    // No per-pill timers — DOM is the source of truth, scanned once a second
+    // while anything is live.
     onPlanUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
@@ -2690,11 +2930,35 @@ class BonitoChat {
             };
             this.taskbarEl.addEventListener('click', this._onTaskbarClick);
         }
-        // NO ticker here. Live elapsed time is shown in the TASKBAR, driven
-        // by a Julia clock (taskbar.jl / ensure_taskbar_clock!). In-chat tool
-        // pills show their FINAL duration, written ONCE on completion
-        // (`_writeToolElapsed`) — event-driven, never polled, so the scroll
-        // container is never queried on a timer.
+        // The in-chat elapsed ticker lives in `_ensureElapsedTicker` below —
+        // started on demand when a live pill appears, self-stopping when the
+        // last one finishes. (The taskbar keeps its own Julia clock.)
+    }
+
+    // One shared 1Hz interval ticks the inline `.bt-tool-timer` of every
+    // LIVE pill. Self-managing: call whenever a pill becomes live; the
+    // interval clears itself once no live pill exists anywhere (checked
+    // against `nodeById`, not the container — a live pill the virtual
+    // scroll has DETACHED must keep the ticker alive so it shows the right
+    // time the moment it scrolls back in). Ticks only write a span's
+    // textContent (no height change → no scroll perturbation), and the
+    // value is recomputed from `toolStarted` each tick, so the 1s cadence
+    // is purely cosmetic (background throttling clamps intervals to 1Hz —
+    // exactly this rate).
+    _ensureElapsedTicker() {
+        if (this._elapsedTimer) return;
+        this._elapsedTimer = setInterval(() => {
+            let any = false;
+            for (const node of this.nodeById.values()) {
+                if (!node.classList || !node.classList.contains('bt-tool-live')) continue;
+                any = true;
+                if (node.isConnected) _writeToolElapsed(node);
+            }
+            if (!any) {
+                clearInterval(this._elapsedTimer);
+                this._elapsedTimer = null;
+            }
+        }, 1000);
     }
 
     // ── Lens search bar (header) ─────────────────────────────────────────
@@ -3393,12 +3657,102 @@ class BonitoChat {
 
         // Enter-to-send on the textarea (Shift+Enter newline as usual).
         this._onTextInputKeyCapture = (e) => {
+            if (this._cmdAcHandleKey(e)) return;   // autocomplete owns the key
             if (e.key !== 'Enter' || e.shiftKey) return;
             e.preventDefault();
             e.stopImmediatePropagation();
             this._submit();
         };
         this.textInput.addEventListener('keydown', this._onTextInputKeyCapture, true);
+
+        // ── Slash-command autocomplete ────────────────────────────────────
+        // `this.slashCommands` ({name, description, hint}) = the agent's
+        // command set — seeded via connect(init) for late-mounted tabs,
+        // refreshed by the 'commands' comm event (available_commands_update
+        // re-pushes the complete set whenever it changes). The popup opens
+        // while the composer holds ONLY a "/partial" first token; ↑/↓ move,
+        // Enter/Tab accept, Escape closes (swallowed before the global
+        // ESC-cancels-turn handler — see _onEscapeKey).
+        this.cmdAc = document.createElement('div');
+        this.cmdAc.className = 'bt-cmd-ac';
+        this.inputArea.appendChild(this.cmdAc);
+        this._cmdAcItems = [];
+        this._cmdAcSel = 0;
+        const acClose = () => {
+            this._cmdAcItems = [];
+            this.cmdAc.classList.remove('bt-cmd-ac-open');
+        };
+        this._cmdAcClose = acClose;
+        const acAccept = (cmd) => {
+            this.textInput.value = '/' + cmd.name + ' ';
+            this.textInput.focus();
+            acClose();
+        };
+        const acRender = () => {
+            this.cmdAc.innerHTML = '';
+            this._cmdAcItems.forEach((cmd, i) => {
+                const row = document.createElement('div');
+                row.className = 'bt-cmd-ac-item' +
+                    (i === this._cmdAcSel ? ' bt-cmd-ac-sel' : '');
+                const name = document.createElement('span');
+                name.className = 'bt-cmd-ac-name';
+                name.textContent = '/' + cmd.name;
+                row.appendChild(name);
+                if (cmd.hint) {
+                    const hint = document.createElement('span');
+                    hint.className = 'bt-cmd-ac-hint';
+                    hint.textContent = cmd.hint;
+                    row.appendChild(hint);
+                }
+                if (cmd.description) {
+                    const desc = document.createElement('span');
+                    desc.className = 'bt-cmd-ac-desc';
+                    desc.textContent = cmd.description;
+                    row.appendChild(desc);
+                }
+                // mousedown, not click: fires before the textarea blurs, so
+                // the blur-close below can't beat the accept.
+                row.addEventListener('mousedown', (e) => {
+                    e.preventDefault();
+                    acAccept(cmd);
+                });
+                this.cmdAc.appendChild(row);
+            });
+            this.cmdAc.classList.toggle('bt-cmd-ac-open', this._cmdAcItems.length > 0);
+        };
+        this._cmdAcHandleKey = (e) => {
+            if (!this._cmdAcItems.length) return false;
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                const d = e.key === 'ArrowDown' ? 1 : -1;
+                this._cmdAcSel = (this._cmdAcSel + d + this._cmdAcItems.length)
+                               % this._cmdAcItems.length;
+                acRender();
+            } else if (e.key === 'Enter' || e.key === 'Tab') {
+                acAccept(this._cmdAcItems[this._cmdAcSel]);
+            } else if (e.key === 'Escape') {
+                acClose();
+            } else {
+                return false;
+            }
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return true;
+        };
+        this._onCmdInput = () => {
+            const m = (this.textInput.value || '').match(/^\/([\w:-]*)$/);
+            const cmds = this.slashCommands || [];
+            if (!m || !cmds.length) { acClose(); return; }
+            const q = m[1].toLowerCase();
+            const starts = cmds.filter(c => c.name.toLowerCase().startsWith(q));
+            const incl   = cmds.filter(c => !c.name.toLowerCase().startsWith(q) &&
+                                            c.name.toLowerCase().includes(q));
+            this._cmdAcItems = starts.concat(incl).slice(0, 8);
+            this._cmdAcSel = 0;
+            acRender();
+        };
+        this._onCmdBlur = () => acClose();
+        this.textInput.addEventListener('input', this._onCmdInput);
+        this.textInput.addEventListener('blur', this._onCmdBlur);
 
         // ESC anywhere → cancel. Listener on `document` so the user's
         // current focus (textarea, scroll position, anywhere) can't
@@ -3415,6 +3769,14 @@ class BonitoChat {
             // ancestor-level unmount: self-destroy.
             if (!this.container.isConnected) { this._lazyDestroy(); return; }
             if (this.container.offsetParent === null) return;
+            // The slash-command popup owns ESC while open (this document-level
+            // capture fires BEFORE the textarea's own capture handler, so the
+            // popup must be dismissed here or ESC would cancel the turn).
+            if (this._cmdAcItems && this._cmdAcItems.length) {
+                e.preventDefault();
+                this._cmdAcClose();
+                return;
+            }
             const t = e.target;
             if (t && t.closest && t.closest('.monaco-editor')) return;
             e.preventDefault();
@@ -3601,9 +3963,7 @@ class BonitoChat {
             this._cancelPendingScroll();
         }
         if (this.followMode) return;
-        if (atBot || (scrollTop > prevTop &&
-                      scrollHeight - scrollTop - clientHeight < clientHeight &&
-                      !this.lastMessageFullyOutOfView())) {
+        if (atBot) {
             this.setFollowMode(true);
             // Pin the viewport. The chase rAF defers while the gesture is
             // still in flight and re-arms itself (see _queueScrollToBottom),
@@ -3612,7 +3972,11 @@ class BonitoChat {
             this._queueScrollToBottom();
         } else {
             // Off-bottom without re-engaging: any pending chase yields to
-            // the user's position (same cancel the old handler did).
+            // the user's position. Re-engagement requires actually reaching
+            // the bottom (AT_BOTTOM_PX) or clicking the jump-to-bottom pill
+            // — the old "within one viewport of bottom" shortcut was too
+            // aggressive on mobile, snapping the view while the user was
+            // still reading the previous sentence.
             this._cancelPendingScroll();
         }
     }
@@ -3842,19 +4206,25 @@ function _formatElapsed(sec) {
     return s === 0 ? `${m}m` : `${m}m${s}s`;
 }
 
-// Write a tool pill's FINAL duration into its `.bt-tool-timer`, once, from
-// its started/finished data attrs. Event-driven (called on creation of an
-// already-finished pill and on the completion update) — there is no timer.
-// A still-running pill (no finished attr) shows nothing; its live elapsed
-// is the taskbar's job (Julia clock).
+// Write a tool pill's duration into its `.bt-tool-timer` from its data
+// attrs. A finished pill freezes at finished−started (event-driven writes on
+// creation of an already-finished pill and on the terminal update); a LIVE
+// pill (no finished attr) shows elapsed against the browser clock, driven by
+// the shared 1Hz ticker (`_ensureElapsedTicker`) — a running eval sits at
+// "pending" for its whole MCP call on the real wire, and without a clock
+// there's no telling a hang from slow work. The value is always RECOMPUTED
+// from the server's `started_at` timestamp (never accumulated tick counts),
+// so background-throttled or missed ticks and machine sleep can't drift it,
+// and a page reloaded mid-run still shows the true elapsed. Clamped ≥ 0
+// against minor server/browser clock skew.
 function _writeToolElapsed(node) {
     if (!node) return;
     const timer = node.querySelector('.bt-tool-timer');
     if (!timer) return;
     const started  = parseFloat(node.dataset.toolStarted  ?? '0');
     const finished = parseFloat(node.dataset.toolFinished ?? '0');
-    if (!started || !finished) return;
-    const dt = finished - started;
+    if (!started) return;
+    const dt = Math.max(0, (finished || Date.now() / 1000) - started);
     timer.textContent = dt > 1 ? _formatElapsed(dt) : '';
 }
 
@@ -3870,6 +4240,48 @@ function arrayBufferToBase64(buf) {
     }
     return btoa(binary);
 }
+
+// ── Searchable config select (model search) ────────────────────────────────
+// Replaces the native <select> when there are many choices (e.g. OpenCode's
+// ~100 models). All filtering is pure DOM — no Julia round-trips per keystroke.
+
+// Exposed on window so inline onclick= handlers (outside ES6 module scope) can call them.
+window.btMSearchFilter = function btMSearchFilter(inputEl) {
+    const q = inputEl.value.toLowerCase();
+    const wrap = inputEl.closest('.bt-msearch');
+    wrap.querySelectorAll('.bt-msearch-item').forEach(item => {
+        item.hidden = q.length > 0 && !item.dataset.label.includes(q);
+    });
+};
+
+window.btMSearchOpen = function btMSearchOpen(triggerEl) {
+    // Close any other open dropdown first.
+    document.querySelectorAll('.bt-msearch-open').forEach(el =>
+        el.classList.remove('bt-msearch-open'));
+    const wrap = triggerEl.closest('.bt-msearch');
+    wrap.classList.add('bt-msearch-open');
+    const input = wrap.querySelector('.bt-msearch-input');
+    if (input) { input.value = ''; window.btMSearchFilter(input); }
+    // Register close-on-outside-click after one frame so the triggering click
+    // doesn't immediately close the dropdown we just opened.
+    requestAnimationFrame(() => {
+        function onOutside(e) {
+            if (!e.target.closest('.bt-msearch-open')) {
+                document.querySelectorAll('.bt-msearch-open').forEach(el =>
+                    el.classList.remove('bt-msearch-open'));
+                document.removeEventListener('click', onOutside, true);
+            }
+        }
+        document.addEventListener('click', onOutside, true);
+        if (input) input.focus();
+    });
+};
+
+window.btMSearchSelect = function btMSearchSelect(itemEl, pickObs, cfgId, value) {
+    pickObs.notify([cfgId, value]);
+    const wrap = itemEl.closest('.bt-msearch');
+    if (wrap) wrap.classList.remove('bt-msearch-open');
+};
 
 // ── ES6 module exports ─────────────────────────────────────────────────────
 // `connect(node, comm)` is the public entry point — Julia calls it inline
@@ -3903,8 +4315,12 @@ export function toolSlot(id) {
     return null;
 }
 
-export function connect(node, comm) {
+export function connect(node, comm, init = {}) {
     const chat = new BonitoChat(node, comm);
+    // Late-mount snapshot: comm events fired before this tab connected are
+    // gone, so the server bakes the current slash-command set into the init
+    // call; live changes keep flowing via the 'commands' comm event.
+    if (Array.isArray(init.commands)) chat.slashCommands = init.commands;
     node.__bt_chat = chat;     // devtools/test inspection hook
     CHAT_INSTANCES.add(chat);
 

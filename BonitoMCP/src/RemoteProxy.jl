@@ -13,9 +13,8 @@ module RemoteProxy
 # Bonito's stock inbox-reader runs the normal decompress + unpack + dispatch.
 #
 # `C` (control) frames are the few request/response ops that aren't a plain Bonito
-# frame: `delegate` an app (render a subsession, return its init bundle),
-# `asset_read` (lazy range fetch), `register` (eval + register an app), `close` a
-# subsession. The worker reuses Bonito's `render_subsession` / `get_messages!` /
+# frame: `asset_read` (lazy range fetch), `asset_url` (expose a worker-disk file
+# as a streamable proxied asset), `close` a subsession. The worker reuses Bonito's
 # `ProxyAssetServer` — none of that is re-implemented here.
 #
 # Bootstrapping (include this module, build the bridge, start the dial) happens
@@ -29,28 +28,50 @@ const TAG_DATA = UInt8('D')
 const TAG_CTRL = UInt8('C')
 
 # ── Worker-side proxy driver: relays Bonito's proxy verbs onto the dial-back ws ──
+# Cap on frames buffered while disconnected (below) — a backstop against a worker
+# that builds a bridge but never dials (the queue would otherwise grow unbounded).
+# Generous: an eval result's init bundle is a handful of frames; a flood this large
+# means something is wrong, so we drop + warn rather than OOM the worker.
+const MAX_PENDING_FRAMES = 4096
+
 mutable struct BridgeDriver
     ws::Ref{Any}            # current dial-back websocket (set by serve_bridge); nothing ⇒ disconnected
-    wlock::ReentrantLock    # serialize concurrent frame sends
+    wlock::ReentrantLock    # serialize concurrent frame sends + the connect/flush transition
+    pending::Vector{Vector{UInt8}}   # tagged frames produced while disconnected; flushed in order on connect
 end
-BridgeDriver() = BridgeDriver(Ref{Any}(nothing), ReentrantLock())
+BridgeDriver() = BridgeDriver(Ref{Any}(nothing), ReentrantLock(), Vector{Vector{UInt8}}())
+
+# Low-level: write one already-tagged frame to the live socket (caller holds wlock).
+function write_frame(ws, buf::Vector{UInt8})
+    try
+        WebSockets.send(ws, buf)
+    catch e
+        # A send racing socket teardown/reconnect is the expected failure mode
+        # (worker redials via dial_loop). Anything else is real signal we don't
+        # want to lose — `@debug` is silent at default level, so `@warn`.
+        @warn "RemoteProxy: frame send failed" exception = (e, catch_backtrace()) bytes = length(buf)
+    end
+end
 
 function send_frame(d::BridgeDriver, tag::UInt8, payload::AbstractVector{UInt8})
-    ws = d.ws[]
-    ws === nothing && return nothing
     buf = Vector{UInt8}(undef, length(payload) + 1)
     @inbounds buf[1] = tag
     copyto!(buf, 2, payload, firstindex(payload), length(payload))
     lock(d.wlock) do
-        try
-            WebSockets.send(ws, buf)
-        catch e
-            # A send racing socket teardown/reconnect is the expected failure
-            # mode (worker is supposed to redial via dial_loop). Anything else
-            # is real signal we don't want to lose — `@debug` would be silent
-            # at default log level, so use `@warn` so the actual exception
-            # type/message is visible during diagnosis.
-            @warn "RemoteProxy: frame send failed" exception = (e, catch_backtrace()) tag = Char(tag) bytes = length(buf)
+        ws = d.ws[]
+        if ws === nothing
+            # Not dialed yet. A result rendered at eval-time (its `proxy_asset_add`
+            # for the init bundle, say) fires BEFORE the dial-back connects — drop
+            # it and the host never learns `/assets/<key>` is proxied, so the
+            # browser's later fetch isn't forwarded to the worker. Accumulate and
+            # flush in order when `serve_bridge` attaches the socket.
+            if length(d.pending) >= MAX_PENDING_FRAMES
+                @warn "RemoteProxy: pending frame buffer full before dial-back; dropping frame" cap = MAX_PENDING_FRAMES
+            else
+                push!(d.pending, buf)
+            end
+        else
+            write_frame(ws, buf)
         end
     end
     return nothing
@@ -66,18 +87,19 @@ Bonito.proxy_asset_add(d::BridgeDriver, key, mime, total, cached) =
 Bonito.proxy_asset_remove(d::BridgeDriver, key) =
     send_control(d, Dict("op" => "asset_remove", "key" => key))
 
-# ── The bridge: one long-lived proxied root session + an app route table ─────
+# ── The bridge: one long-lived proxied root session over the dial-back driver ─
 mutable struct RemoteBridge
     parent::Bonito.Session
     driver::BridgeDriver
-    routes::Bonito.Routes
-    # The browser PAGE (the host's root-session id) that `parent`'s
-    # serialization cache currently reflects — see `switch_page!`. "" until
-    # the first delegate names one.
-    page::String
 end
 
 const BRIDGE = Ref{Union{Nothing, RemoteBridge}}(nothing)
+
+# The running `dial_loop` task, tracked so `stop_dial!` can WAIT for it to exit
+# before anything re-dials — a second loop starting while the first is still
+# alive would fight over `driver.ws[]` forever (see the warning in session.jl's
+# ensure_eval_dialed_locked!). Set by `start_dial!`, cleared by `stop_dial!`.
+const DIAL_TASK = Ref{Union{Nothing, Task}}(nothing)
 
 """
     RemoteBridge(; compression=false)
@@ -99,7 +121,7 @@ function RemoteBridge(; compression::Bool = false)
     # writes reach the browser through the host relay — mark it ready so
     # `close`ing a subsession can emit `free_session` through the bridge.
     isready(parent.connection_ready) || put!(parent.connection_ready, true)
-    return RemoteBridge(parent, driver, Bonito.Routes(), "")
+    return RemoteBridge(parent, driver)
 end
 
 """
@@ -112,11 +134,27 @@ the dial handshake so the host knows the namespace before any frame flows.
 function ensure_bridge!(; compression::Bool = false)
     if BRIDGE[] === nothing
         BRIDGE[] = RemoteBridge(; compression)
-        # Log every (re)build with the prefix — a rebuild discards prior
-        # `register_app!` routes, which is otherwise invisible.
+        # Log every (re)build with the prefix — a rebuild starts a fresh proxied
+        # parent session, which is otherwise invisible.
         @info "RemoteProxy: BRIDGE built" prefix = BRIDGE[].parent.id
     end
     return BRIDGE[].parent.id
+end
+
+"""
+    get_parent_session(; compression=false) -> Bonito.Session
+
+The worker's ONE proxied parent session — this IS the bridge: its connection is
+the dial-back proxy driver and its asset_server the `ProxyAssetServer`, so every
+subsession rendered against it (one per eval result) relays its frames + assets
+down the dial-back socket. Built lazily on first use; `force_subsession!(true)`
+makes all rendering resolve to subsessions of this parent rather than standalone
+pages. This is the single entry point the render path asks for the page session.
+"""
+function get_parent_session(; compression::Bool = false)
+    ensure_bridge!(; compression)
+    Bonito.force_subsession!(true)
+    return BRIDGE[].parent
 end
 
 """
@@ -126,9 +164,9 @@ Run the dial-and-serve loop until BRIDGE[] goes away. Each iteration opens a
 fresh websocket to `wsurl`, sends the `handshake` line, and runs `serve_bridge`.
 When the socket dies (clean EOF, network drop, host restart), we sleep with
 exponential backoff and dial again — so a transient WS drop doesn't leave the
-bridge silently disconnected. `BRIDGE[].routes` survives the drop, so
-already-registered apps keep working on the new socket (the host recognises the
-dial-back as a *reconnect* by `prefix` and swaps the WS rather than rebuilding).
+bridge silently disconnected. `BRIDGE[]` (the proxied parent session + its asset
+server) survives the drop, so the host recognises the dial-back as a *reconnect*
+by `prefix` and swaps the WS rather than rebuilding.
 """
 function dial_loop(wsurl::AbstractString, handshake::AbstractString;
                    min_backoff::Float64 = 0.5, max_backoff::Float64 = 8.0)
@@ -154,6 +192,54 @@ function dial_loop(wsurl::AbstractString, handshake::AbstractString;
 end
 
 """
+    start_dial!(wsurl, handshake)
+
+Build the bridge (if needed) and spawn the self-reconnecting `dial_loop`,
+remembering its task in `DIAL_TASK` so `stop_dial!` can join it. Called once per
+(re)dial from the host's `ensure_eval_dialed!` bootstrap.
+"""
+function start_dial!(wsurl::AbstractString, handshake::AbstractString)
+    ensure_bridge!()
+    DIAL_TASK[] = @async try
+        dial_loop(wsurl, handshake)
+    catch e
+        @warn "BonitoMCP eval-ws dial loop crashed" exception = (e, catch_backtrace())
+    end
+    return nothing
+end
+
+"""
+    stop_dial!(; timeout = 10.0) -> Bool
+
+Tear the dial-back down WITHOUT killing the worker: clear `BRIDGE[]` so the loop's
+`while BRIDGE[] !== nothing` exits, close the live socket to unblock a connected
+`serve_bridge`, then WAIT (bounded) for the task to finish. The warm Malt session
+and its compiled state are untouched; the next eval rebuilds the bridge and dials
+whatever server is current. `timeout` exceeds `dial_loop`'s `max_backoff` (8s) so
+a loop caught mid-backoff still exits before we return. Returns whether the loop
+actually stopped (so a caller can avoid re-dialing on top of a lingering loop).
+"""
+function stop_dial!(; timeout::Float64 = 10.0)
+    b = BRIDGE[]
+    BRIDGE[] = nothing                        # loop exits at its next `while` check
+    if b !== nothing
+        try
+            ws = b.driver.ws[]
+            ws === nothing || close(ws)        # unblock serve_bridge if connected
+        catch
+        end
+    end
+    t = DIAL_TASK[]
+    DIAL_TASK[] = nothing
+    t === nothing && return true
+    t0 = time()
+    while !istaskdone(t) && time() - t0 < timeout
+        sleep(0.05)
+    end
+    return istaskdone(t)
+end
+
+"""
     serve_bridge(ws)
 
 Run the bridge's frame loop on the dial-back websocket `ws`. Points the driver at
@@ -165,7 +251,21 @@ function serve_bridge(ws)
     b = BRIDGE[]
     b === nothing && error("RemoteProxy: bridge not built before serve_bridge")
     d = b.driver
-    d.ws[] = ws
+    # Attach the socket AND flush anything buffered while disconnected, atomically
+    # under wlock: a concurrent `send_frame` either ran before (its frame is in
+    # `pending`, so the flush below sends it) or after (it sees `ws` set and sends
+    # directly) — never lost, never out of order.
+    lock(d.wlock) do
+        d.ws[] = ws
+        if !isempty(d.pending)
+            n = length(d.pending)
+            for buf in d.pending
+                write_frame(ws, buf)
+            end
+            empty!(d.pending)
+            @info "RemoteProxy: flushed buffered frames on dial-back connect" frames = n
+        end
+    end
     try
         for msg in ws
             data = msg isa AbstractVector{UInt8} ? msg :
@@ -191,37 +291,46 @@ function serve_bridge(ws)
         e isa WebSockets.WebSocketError || e isa EOFError || e isa Base.IOError ||
             @warn "RemoteProxy.serve_bridge loop ended" exception = (e, catch_backtrace())
     finally
-        d.ws[] = nothing
+        lock(d.wlock) do
+            d.ws[] = nothing
+        end
     end
     return
 end
 
 # Control request/response (the only ops that aren't a plain frame).
 #
-# The request-shaped ops (`delegate`, `asset_read`, `register`) carry an `id` the
-# host waits on. Any exception below MUST come back as a reply with an `err` field
-# — otherwise the host's `call_ctrl` only learns about the failure after a 30s
-# timeout, freezing the chat tool-render path. Notifications (`close`) carry no id.
+# The request-shaped ops (`asset_read`, `asset_url`) carry an `id` the host waits
+# on. Any exception below MUST come back as a reply with an `err` field — otherwise
+# the host's `call_ctrl` only learns about the failure after a 30s timeout,
+# freezing the chat tool-render path. Notifications (`close`) carry no id.
+# ── RemoteRef: page-invisible value holder + serialize-on-mount ─────────────
+# (spec: BonitoAgents/docs/superpowers/specs/2026-07-15-remote-ref-design.md)
+#
+# An eval result is PARKED, not rendered: a subsession of the bridge parent
+# holds `App(value)` in `current_app` and is never shipped to any page (so the
+# page-side session GC can't touch it; it dies with the worker). The session
+# tree is the registry — `get_session` finds it by id. Rendering happens per
+# MOUNT via the "mount" control op below: `update_session_dom!` creates a
+# fresh, disposable render-subsession and delivers html + init messages as one
+# atomic UpdateSession through the relay. Each mount is independent, so
+# collapse/re-expand loops and page reloads can never race each other.
+function remote_ref(@nospecialize(value))
+    parent = get_parent_session()
+    holder = Bonito.Session(parent)
+    holder.current_app[] = Bonito.App(display_value(bound_for_render(value)))
+    return holder.id
+end
+
 function handle_control(b::RemoteBridge, msg::AbstractDict)
     op = msg["op"]
     d = b.driver
     id = get(msg, "id", nothing)
     try
-        if op == "delegate"
-            # `page` = the host's root session id (absent from old hosts → "",
-            # which keeps today's single-page behavior).
-            sub_id, html, init_url = render_embed(b, String(msg["app"]),
-                                                  String(get(msg, "page", "")))
-            send_control(d, Dict("op" => "reply", "id" => id,
-                                 "val" => Any[sub_id, html, init_url]))
-        elseif op == "asset_read"
+        if op == "asset_read"
             bytes = Bonito.read_proxy_asset(b.parent.asset_server.registry,
                         String(msg["key"]), Int(msg["start"]), Int(msg["stop"]))
             send_control(d, Dict("op" => "reply", "id" => id, "val" => bytes))
-        elseif op == "register"
-            app = Base.include_string(Main, String(msg["code"]))
-            register_app!(String(msg["app"]), app)
-            send_control(d, Dict("op" => "reply", "id" => id, "val" => String(msg["app"])))
         elseif op == "asset_url"
             # Expose a worker-disk file to the browser through the NORMAL proxy
             # asset path: `url` registers a `Bonito.Asset` on the bridge's asset
@@ -229,11 +338,25 @@ function handle_control(b::RemoteBridge, msg::AbstractDict)
             # `RemoteAsset` and serves `/assets/<key>` with on-demand range reads.
             # Returns that host-relative url to drop into a plain <img>/<video>
             # src — no App/subsession needed for media.
-            url = Bonito.url(b.parent.asset_server, Bonito.Asset(abspath(String(msg["path"]))))
-            send_control(d, Dict("op" => "reply", "id" => id, "val" => url))
+            # Append ?v=<mtime> so the browser treats each file version as a
+            # distinct URL (cache-bust). The HTTP handler strips the query string
+            # before the asset lookup, so the server always finds the asset.
+            path_str = abspath(String(msg["path"]))
+            url = Bonito.url(b.parent.asset_server, Bonito.Asset(path_str))
+            mt  = isfile(path_str) ? round(Int, mtime(path_str)) : 0
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => url * "?v=" * string(mt)))
         elseif op == "close"
             s = Bonito.get_session(b.parent, String(msg["sub"]))
             s === nothing || close(s)
+        elseif op == "mount"
+            holder = Bonito.get_session(b.parent, String(msg["sub"]))
+            holder === nothing &&
+                error("result session $(msg["sub"]) not found (worker restarted or result evicted)")
+            app = holder.current_app[]
+            app === nothing && error("result session $(msg["sub"]) holds no app")
+            Bonito.force_subsession!(true)
+            sub = Bonito.update_session_dom!(holder, String(msg["node"]), app)
+            send_control(d, Dict("op" => "reply", "id" => id, "val" => sub.id))
         end
     catch e
         # Surface the failure to the host so its 30s timedwait turns into a fast,
@@ -251,144 +374,68 @@ function handle_control(b::RemoteBridge, msg::AbstractDict)
     return
 end
 
-# ── App registration + per-embed render ──────────────────────────────────────
-register_app!(id::AbstractString, app::Bonito.App) =
-    (Bonito.HTTPServer.route!(BRIDGE[], String(id) => app); nothing)
-
-Bonito.HTTPServer.route!(b::RemoteBridge, p::Pair{String, <:Bonito.App}) =
-    (b.routes[p.first] = p.second; nothing)
-
-# Cache of (sub_id, html, init_url) bundles rendered at `bt_show_app` time,
-# keyed by app id. The first `delegate` returns the cached bundle verbatim;
-# subsequent delegates (re-expand, new tab) render fresh.
+# ── Rendering an eval RESULT value into a chat-mountable HTML fragment ────────
+# `bt_julia_eval` ships its result to the chat as ONE self-contained HTML string,
+# rendered as a SUBSESSION of the bridge's per-page `parent`. Because the parent
+# carries the PROXIED connection + asset server, the fragment's asset/observable
+# URLs point at the host proxy and that traffic rides the dial-back ws — exactly
+# like Bonito serving a page to a browser, only proxied. There's no app registry
+# and no `shown_app:` token: the HTML string IS the result (and a persistable one
+# — the server can save it and re-mount it later, a static snapshot when the
+# worker is gone).
 #
-# Lifecycle / messages: `render_and_pack` drains `sub.message_queue` into the
-# bundle, but the sub stays alive in `b.parent.children`. Any messages emitted
-# AFTER the drain (Observable updates, plots that hand the session a Channel,
-# etc.) sit in the post-drain queue. When the browser mounts the bundle and
-# fires `JSDoneLoading`, the parent's protocol dispatcher routes it to this
-# sub, which invokes the default `on_connection_ready = init_session` —
-# `connection_ready` flips, `OPEN` is set, the post-drain queue flushes over
-# the dial-back. No need for the worker to keep a stash and drain later: the
-# queue-then-flush contract handles the entire window between render and
-# JSDoneLoading naturally.
-const PRERENDERED = Dict{String, Tuple{String,String,String}}()
+# `App(value)` is the WHOLE renderer: per-type rendering is `Bonito.jsrender`'s
+# job at render time (a type that wants a richer display adds a
+# `jsrender(::Session, ::MyType)` method — never isa-sniff here). No `NoSplat`
+# wrapper is needed: `App(value)` routes through `jsrender(value)`, which renders
+# an array/matrix/vector-of-nodes via its text repr; Hyperscript's child-splat
+# (`DOM.div(array...)`) only bites the `DOM.div(value)` container path, which we
+# never take. `force_subsession!(true)` makes nested jsrender resolve to
+# subsessions of the parent too.
+# Caps so a huge RETURN value can't balloon the chat message / hang the browser.
+# Containers (arrays/dicts/dataframes) are already row/elem-truncated by `:limit`
+# in the render io_context, and images ship their bytes via the asset proxy (the
+# html only carries a URL) — so neither balloons. A bare `String`/`Symbol` is the
+# main offender (rendered verbatim, not `:limit`-truncated); cap it up front. The
+# final byte cap is a backstop for any other type whose `show` ignores `:limit`.
+const MAX_RENDER_STRING = 100_000     # chars kept from a huge string value
+const MAX_RENDER_BYTES  = 1_000_000   # cap on the rendered fragment
 
-# Render an app into a fresh subsession and pack its init bundle. Re-raises
-# any init/render error recorded on `sub.init_error[]` (by Bonito's
-# `handle_render_error`) so a broken `App`/`jsrender` body propagates to the
-# agent at `bt_show_app` time rather than only painting into the browser.
-# Drains messages here — late messages flow through Bonito's flush-on-open
-# (`JSDoneLoading` → `init_session(sub)`).
-function render_and_pack(b::RemoteBridge, app_id::AbstractString)
-    app = b.routes.routes[String(app_id)]
-    sub, dom = Bonito.render_subsession(b.parent, app; init = false)
-    err = sub.init_error[]
-    if err !== nothing
-        try; close(sub); catch; end
-        throw(err)
-    end
-    html     = sprint(io -> show(io, dom))
-    msgs     = Bonito.get_messages!(sub)
-    init_url = Bonito.url(sub, Bonito.BinaryAsset(sub, msgs))
-    return String(sub.id), html, init_url
+function bound_for_render(s::AbstractString)
+    length(s) <= MAX_RENDER_STRING && return s
+    cut = thisind(s, min(MAX_RENDER_STRING, lastindex(s)))
+    return SubString(s, firstindex(s), cut) *
+        "\n[… truncated: string was $(length(s)) characters]"
 end
+bound_for_render(@nospecialize x) = x
 
-# Called by `bt_show_app` right after `register_app!`. Renders once, caches the
-# bundle for the first display. A throwing App body re-raises here, so the
-# agent's tool errors propagate at bt_show_app time instead of being a silent
-# "broken bubble appears later".
-function prerender_app(id::AbstractString)
-    b = BRIDGE[]
-    b === nothing && error("RemoteProxy bridge not installed")
-    PRERENDERED[String(id)] = render_and_pack(b, String(id))
-    return nothing
-end
+# A returned String renders through Bonito's plain-text child path
+# (`jsrender(::Session, ::String)` returns the string as-is), which never hits
+# the `render_mime` ANSI handling — so a result string carrying ANSI codes
+# (e.g. from `sprint` with color) would show raw escapes while the SAME text on
+# stdout renders as a colored terminal block. Route ANSI strings through
+# `RichText` so both paths display alike.
+display_value(@nospecialize x) = x
+display_value(s::AbstractString) =
+    Bonito.has_ansi_codes(String(s)) ? Bonito.RichText(String(s)) : s
+# Callables would be swallowed by `App`'s handler constructor (`App(sqrt)`
+# reads as "sqrt IS the app" and rejects its signature) — show them as the
+# REPL would instead. Matches `App`'s handler dispatch surface exactly
+# (functions AND types are callable).
+display_value(f::Union{Function, Type}) =
+    Bonito.RichText(sprint(show, MIME"text/plain"(), f; context = :color => true))
 
-"""
-    switch_page!(b, page) -> Bool
-
-Reset the bridge's serialization state when the browser PAGE changes.
-
-The bridge parent is a long-lived ROOT session that serves many pages over
-its lifetime (reloads, later tabs). Bonito's serialization dedups against the
-root's `session_objects` and ships a bare `TrackingOnly` reference for
-anything already sent — an assumption that holds per PAGE, not per bridge:
-after a reload the browser's global object cache is empty, so a bundle built
-against the old cache references objects the page never received. The DOM
-still mounts (it rides in the html fragment), observables still round-trip,
-but every CACHED payload — plot buffers, textures, attribute dicts — is
-silently missing; a re-mounted WGLMakie embed shows an eternal spinner with
-no error anywhere.
-
-So each `delegate` names the page (the host's root session id); when it
-differs from the page the cache reflects, we close the previous page's
-subsessions (their browser side is gone) and drop ALL of the parent's
-page-lifetime state — object cache, asset/style emission dedup, root
-metadata — so the next bundle ships full values against a blank page again.
-
-Known limitation: two pages alternating over ONE bridge reset each other's
-cache and close each other's live subs — the fix for that is a per-page
-parent session, which needs Bonito-side support. Before this function, a
-second page never worked at all, so this is strictly an improvement.
-"""
-function switch_page!(b::RemoteBridge, page::AbstractString)
-    (isempty(page) || page == b.page) && return false
-    if isempty(b.page)
-        # First page this bridge serves: the cache state (and any prerendered
-        # bundle from registration time) was built FOR whichever page mounts
-        # first — adopt it, don't wipe. Only a real page→page transition
-        # invalidates the browser-cache assumption.
-        b.page = String(page)
-        return false
+function render_eval_html(value)
+    parent = get_parent_session()
+    render1(v) = (io = IOBuffer();
+                  Bonito.show_html(io, Bonito.App(v); parent = parent);
+                  String(take!(io)))
+    html = render1(display_value(bound_for_render(value)))
+    if ncodeunits(html) > MAX_RENDER_BYTES
+        html = render1(string(typeof(value), ": rendered output too large (",
+                              ncodeunits(html), " bytes) — display suppressed"))
     end
-    for (id, child) in collect(b.parent.children)
-        try
-            close(child)
-        catch e
-            @warn "RemoteProxy: closing stale page subsession failed" id exception = e
-        end
-    end
-    root = b.parent
-    lock(root.deletion_lock) do
-        for key in collect(keys(root.session_objects))
-            Bonito.force_delete!(root, key)
-        end
-        # Asset emission: pre-#406 Bonito deduped sub emissions against
-        # `root.imports` "for the page's lifetime" — on a BRIDGE root that
-        # outlives many pages, a new page's embed fragment then omitted e.g.
-        # the WGLMakie module script (module never loads, `$(WGL).then(...)`
-        # pends forever, black canvas, zero errors). Bonito#406 made subs
-        # re-emit their own imports (no union into root), so these sets stay
-        # empty for subs — clearing is now belt-and-suspenders for anything
-        # the root itself emitted and for older Bonito semantics.
-        empty!(root.imports)
-        empty!(root.global_stylesheets)
-        # Root metadata is page-lifetime state too: integrations persist
-        # browser-mirrored counters here. WGLMakie's `get_order!` keeps
-        # `:wglmakie_scene_order` on the root, mirrored by a module-level
-        # `orderedExecutor.nextExpected` counter in its JS — which a reload
-        # resets to 1. A remount then ships order N>1 and `execute_in_order`
-        # waits forever for the N-1 slots that died with the old page:
-        # `setup_scene_init` never runs, the canvas is never measured, no
-        # `real_size` notify, no scene (black canvas, zero errors).
-        empty!(root.metadata)
-    end
-    # Prerendered bundles were built against the old cache state — void now.
-    empty!(PRERENDERED)
-    b.page = String(page)
-    return true
-end
-
-# Render-or-reuse for the host's `delegate` call: cached bundle if any
-# (consumed by this delegate), otherwise render fresh. `page` identifies the
-# requesting browser page; a page change resets the dedup cache first (which
-# also discards prerendered bundles, so a stale one can never be served to a
-# page whose object cache doesn't match it).
-function render_embed(b::RemoteBridge, app_id::AbstractString, page::AbstractString = "")
-    switch_page!(b, page)
-    cached = pop!(PRERENDERED, String(app_id), nothing)
-    return cached === nothing ? render_and_pack(b, String(app_id)) : cached
+    return html
 end
 
 end # module RemoteProxy

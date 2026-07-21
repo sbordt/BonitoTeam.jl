@@ -465,6 +465,21 @@ const ChatStyles = Bonito.Styles(
     # in the strip AND in the collapsed-header panel). The rule un-applies by
     # itself the moment pills arrive.
     CSS(".bt-header-meta:empty", "display" => "none"),
+    # Context meter ("21.8k/200k · 11% · $0.42", usage_update telemetry).
+    # Muted mono text, no pill chrome — telemetry, not a control. Empty until
+    # the first turn reports; same :empty treatment as the meta div so it
+    # never costs a gap slot while blank.
+    CSS(".bt-header-usage",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "11px",
+        "color" => "var(--bt-text-muted)",
+        "white-space" => "nowrap",
+        "flex" => "0 0 auto",
+        "align-self" => "center",
+        "text-align" => "center"),
+    # The label is a Bonito string-Observable: it renders as an INNER span
+    # (the fast-path swap node), so the outer node is never `:empty` itself.
+    CSS(".bt-header-usage:has(> span:empty)", "display" => "none"),
     CSS(".bt-header-meta",
         "font-size" => "12px",
         "color" => "var(--bt-text-muted)",
@@ -534,6 +549,40 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-header-meta-cat",
         "color" => "var(--bt-text-muted)",
         "user-select" => "none"),
+
+    # ── Searchable config dropdown (model search) ────────────────────────────
+    # Appears when a ConfigOption has more choices than MODEL_SEARCH_THRESHOLD.
+    CSS(".bt-msearch",
+        "position" => "relative", "display" => "inline-block"),
+    CSS(".bt-msearch-trigger",
+        "cursor" => "pointer", "user-select" => "none"),
+    CSS(".bt-msearch-list",
+        "display" => "none",
+        "position" => "absolute", "top" => "calc(100% + 4px)", "left" => "0",
+        "z-index" => "200",
+        "min-width" => "240px", "max-height" => "320px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "6px",
+        "box-shadow" => "0 4px 16px rgba(0,0,0,0.15)",
+        "flex-direction" => "column", "overflow" => "hidden"),
+    CSS(".bt-msearch-open > .bt-msearch-list", "display" => "flex"),
+    CSS(".bt-msearch-input",
+        "flex" => "0 0 auto",
+        "border" => "none", "border-bottom" => "1px solid var(--bt-border)",
+        "background" => "transparent", "color" => "var(--bt-text)",
+        "font" => "inherit", "font-size" => "12px",
+        "padding" => "6px 10px", "outline" => "none"),
+    CSS(".bt-msearch-items",
+        "overflow-y" => "auto", "flex" => "1"),
+    CSS(".bt-msearch-item",
+        "padding" => "5px 10px",
+        "cursor" => "pointer", "font-size" => "12px",
+        "white-space" => "nowrap", "overflow" => "hidden",
+        "text-overflow" => "ellipsis", "color" => "var(--bt-text)"),
+    CSS(".bt-msearch-item:hover", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-msearch-item-cur",
+        "font-weight" => "600", "color" => "var(--bt-accent)"),
 
     # ── Home "Defaults" control ───────────────────────────────────────────────
     # A labelled row of the same config pills, wired to the server-wide defaults.
@@ -771,23 +820,24 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "13px",
         "box-shadow" => "var(--bt-shadow-sm)",
         "overflow" => "hidden",
-        # Positioning context for the absolute `.bt-tool-fullwidth` button that
-        # floats at the bubble's right-edge center.
         "position" => "relative",
-        # Transition so flipping the wide toggle animates smoothly rather than
-        # snapping in at a different width and tearing the layout.
+        # Transition so a content-driven width change (e.g. a wide embed
+        # mounting) animates smoothly rather than snapping and tearing layout.
         "transition" => "max-width 160ms ease, align-self 160ms ease"),
-    # Full-chat-width toggle. Spans the entire message column so wide content
-    # (diffs / tables / `bt_show_app` embeds) has the room it needs. Flipped by
-    # the .bt-tool-wide button in the tool header.
-    CSS(".bt-tool-msg.bt-tool-wide-active",
-        "align-self" => "stretch",
-        "max-width" => "100%"),
     # Live app embeds get a wider default cap than text pills: the visuals ARE
     # the content, and a responsive (resize_to = :parent) canvas will actually
     # use the room.
     CSS(".bt-tool-msg:has(.bt-embed)",
         "max-width" => "min(98%, 1100px)"),
+    # Full-chat-width toggle (`»` header button): span the ENTIRE message
+    # column so wide content — the result embed, a plot, a table, a long diff —
+    # gets all the room. Declared AFTER `:has(.bt-embed)` so it wins at equal
+    # specificity (source order): an embed card's 1100px cap was exactly why
+    # the toggle looked "not functional" — it clicked, but the cap held it.
+    # `!important` on the width so it also out-ranks any per-element inline cap.
+    CSS(".bt-tool-msg.bt-tool-wide-active",
+        "align-self" => "stretch",
+        "max-width" => "100% !important"),
     # Detach button in the tool header (rendered only for bonito_app tools).
     # ⤢ is the conventional "open in a window" glyph; clicking pops the embed
     # into the floating window. Small, neutral, sits at the right of the header.
@@ -805,11 +855,9 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-tool-detach:hover",
         "background" => "var(--bt-surface-2)",
         "color" => "var(--bt-accent)"),
-    # Full-chat-width toggle — a slim, quiet header button (same chrome as the
-    # ⤢ detach button), NOT an overlay floating over the body: an absolutely
-    # positioned button covered the actual app/diff content and looked bulky.
-    # Hidden by default; revealed only while the tool body is expanded —
-    # there's nothing to widen on a collapsed header.
+    # Full-chat-width toggle — a slim, quiet header button (same chrome as ⤢).
+    # Hidden by default; revealed only while the body is expanded — there is
+    # nothing to widen on a collapsed header.
     CSS(".bt-tool-fullwidth",
         "display" => "none",
         "background" => "transparent",
@@ -825,8 +873,6 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-tool-fullwidth:hover",
         "background" => "var(--bt-surface-2)",
         "color" => "var(--bt-accent)"),
-    # Reveal the full-width toggle only while the body is expanded
-    # (Collapsable flips `data-expanded` on the header it lives in).
     CSS(".bt-tool-header[data-expanded=\"true\"] .bt-tool-fullwidth",
         "display" => "inline-flex"),
     # NOTE: deliberately NO `user-select: none` here — every piece of text in
@@ -1161,52 +1207,24 @@ const ChatStyles = Bonito.Styles(
     # The Monaco wrapper chain must pass full height down to the editor div.
     CSS(".bt-file-editor-body > div, .bt-file-editor-body .monaco-editor-div",
         "height" => "100%", "min-height" => "0"),
-    # Live code preview: the code a running bt_julia_eval is executing,
-    # painted under the header BEFORE any result exists. Compact by default
-    # (capped height + bottom fade), the ⌄ toggle grows it — same
-    # small-preview → enlarge interaction as the diff view. Removed when the
-    # eval completes (the body's Monaco "Code" section takes over).
-    CSS(".bt-eval-preview",
-        "position" => "relative",
+    # Live stdout tail of a RUNNING bt_julia_eval: a small terminal-style
+    # pane under the header (~4 lines, auto-scrolled to the newest output by
+    # the client). Removed when the eval completes — the body's "Output"
+    # section carries the full (ANSI-colored) output afterwards. The code
+    # "preview" is no longer a separate element: the eval body eager-mounts
+    # compactly (Collapsable compact-body mode), so the real Monaco Code
+    # editor is what shows at ~4 lines.
+    CSS(".bt-eval-stream",
+        "margin" => "0",
         "border-top" => "1px solid var(--bt-border)",
         "background" => "#0f172a",
-        "max-height" => "132px",
-        "overflow" => "hidden"),
-    CSS(".bt-eval-preview pre",
-        "margin" => "0",
-        "padding" => "8px 12px",
+        "color" => "#e2e8f0",
         "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
         "font-size" => "12px", "line-height" => "1.5",
-        "color" => "#e2e8f0",
+        "padding" => "6px 12px",
+        "max-height" => "78px",           # ≈ 4 lines at 12px/1.5
+        "overflow-y" => "auto",
         "white-space" => "pre-wrap", "word-break" => "break-word"),
-    # Bottom fade hints that the preview is clipped; gone when enlarged.
-    CSS(".bt-eval-preview::after",
-        "content" => "\"\"",
-        "position" => "absolute",
-        "left" => "0", "right" => "0", "bottom" => "0",
-        "height" => "28px",
-        "pointer-events" => "none",
-        "background" => "linear-gradient(to bottom, rgba(15,23,42,0), rgba(15,23,42,0.92))"),
-    CSS(".bt-eval-preview.bt-eval-preview-full",
-        "max-height" => "600px",
-        "overflow-y" => "auto"),
-    CSS(".bt-eval-preview.bt-eval-preview-full::after",
-        "display" => "none"),
-    CSS(".bt-eval-preview-toggle",
-        "position" => "absolute",
-        "right" => "6px", "bottom" => "4px",
-        "z-index" => "2",
-        "background" => "rgba(255,255,255,0.08)",
-        "border" => "1px solid rgba(255,255,255,0.15)",
-        "border-radius" => "var(--bt-radius-sm)",
-        "color" => "#e2e8f0",
-        "font-size" => "12px", "line-height" => "1",
-        "padding" => "2px 8px",
-        "cursor" => "pointer",
-        "user-select" => "none",
-        "transition" => "background 80ms"),
-    CSS(".bt-eval-preview-toggle:hover",
-        "background" => "rgba(255,255,255,0.18)"),
 
     # The command a Bash tool ran — ALWAYS visible (unlike the eval preview there
     # is no Monaco "Code" section afterwards to fall back on), same dark code look,
@@ -1323,20 +1341,6 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "13px", "line-height" => "1.5",
         "padding-top" => "8px"),
 
-    # Eval-section blocks (BonitoMCP bt_julia_eval output): a tiny uppercase
-    # label (STDOUT / RESULT / ERROR) above the Monaco-rendered body of each
-    # section, so the input code, captured output, and return value are
-    # visually distinct in the tool body.
-    CSS(".bt-section-label",
-        "font-size" => "10.5px", "font-weight" => "600",
-        "letter-spacing" => "0.08em", "text-transform" => "uppercase",
-        "color" => "var(--bt-text-faint)",
-        "margin" => "12px 0 4px"),
-    CSS(".bt-eval-section + .bt-eval-section",
-        "margin-top" => "4px"),
-    CSS(".bt-eval-section:first-child .bt-section-label",
-        "margin-top" => "8px"),
-
     # Tool-body sub-section collapsibles (`<details>`). Used by bt_julia_eval
     # bodies to split Code / Output into two independently foldable blocks.
     # The disclosure marker is a `::before` glyph swapped on `[open]` — a
@@ -1356,11 +1360,18 @@ const ChatStyles = Bonito.Styles(
         "list-style" => "none",
         "background" => "var(--bt-surface-2)"),
     CSS(".bt-subsection-summary::-webkit-details-marker", "display" => "none"),
+    # THREE distinct disclosure markers, one per state of the cycle
+    # (collapsed → full → summary): the amount of "ink" tracks how much
+    # content is shown. ▸ closed (nothing), ▿ hollow = summary preview (some),
+    # ▾ filled = full (all). Base rule is the collapsed marker; the two
+    # `[open]` rules (more specific) override it while open.
     CSS(".bt-subsection-summary::before",
         "content" => "\"▸\"",
         "color" => "var(--bt-text-faint)", "font-size" => "10px",
         "flex-shrink" => "0"),
-    CSS("details.bt-subsection[open] > .bt-subsection-summary::before",
+    CSS("details.bt-subsection[open][data-state=\"summary\"] > .bt-subsection-summary::before",
+        "content" => "\"▿\""),
+    CSS("details.bt-subsection[open][data-state=\"full\"] > .bt-subsection-summary::before",
         "content" => "\"▾\""),
     CSS(".bt-subsection-summary:hover",
         "background" => "var(--bt-surface)"),
@@ -1374,22 +1385,51 @@ const ChatStyles = Bonito.Styles(
         "color" => "var(--bt-text-faint)",
         "overflow" => "hidden", "text-overflow" => "ellipsis",
         "white-space" => "nowrap", "min-width" => "0"),
+    # THE scrollbar lives HERE, on the Collapsable body — not on the content
+    # inside it. So a section behaves identically whether it holds a live
+    # stdout stream or the same text after completion: capped height, its own
+    # scrollbar, pinned to the newest line (`data-pin-end`, driven from JS).
+    # A single line-height unit (console 12px/1.5 = 18px; Monaco ~ same) makes
+    # `summary_lines` mean exactly what it says.
     CSS(".bt-subsection-body",
-        "padding" => "8px 10px"),
+        "padding" => "8px 10px",
+        "overflow-y" => "auto"),
+    # SUMMARY state: the restricted preview — `summary_lines` tall, scrolls.
+    # +16px for the body's own vertical padding so N lines are actually
+    # visible above the scrollbar. The cap lives on the SECTION, never on the
+    # tool card — every section (and the result embed below them) stays
+    # reachable in the card's default state.
+    CSS("""details.bt-subsection[data-state="summary"] > .bt-subsection-body""",
+        "max-height" => "calc(var(--bt-summary-lines, 4) * 18px + 16px)"),
+    # FULL state: the whole content, still capped generously so one huge
+    # output can't blow up the card — the body scrolls past that.
+    CSS("""details.bt-subsection[data-state="full"] > .bt-subsection-body""",
+        "max-height" => "480px"),
 
     # Console block — wraps a `Bonito.RichText` terminal pane (ANSI → styled
     # HTML). Captured stdout / stderr / error backtraces render here instead
-    # of in a Monaco editor: lighter, ANSI-aware, scrolls on overflow.
+    # of in a Monaco editor: lighter, ANSI-aware. NO own scroll cap — the
+    # Collapsable body owns height + scrollbar (see `.bt-subsection-body`), so
+    # the console looks and scrolls the same streaming or done.
     CSS(".bt-console",
         "background" => "var(--bt-surface-2)",
         "border" => "1px solid var(--bt-border)",
         "border-radius" => "var(--bt-radius-sm)",
         "padding" => "8px 10px",
-        "max-height" => "360px",
-        "overflow" => "auto"),
+        # Streaming writes the live stdout tail as a raw text node straight into
+        # `.bt-console` (see bonitoagents.js `_evalOutputConsole`), so it needs
+        # its own `pre-wrap` — otherwise newlines collapse and the tail renders
+        # as one wrapped line, unlike the completed `.terminal-output` <pre>.
+        "white-space" => "pre-wrap", "word-break" => "break-word",
+        "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
+        "font-size" => "12px", "line-height" => "1.5"),
     CSS(".bt-console .terminal-output",
         "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
         "font-size" => "12px", "line-height" => "1.5",
+        # Match the streaming tail exactly (the completed pane is a <pre>, which
+        # defaults to `white-space: pre` — force `pre-wrap` so long lines wrap
+        # the same streaming or done).
+        "white-space" => "pre-wrap", "word-break" => "break-word",
         "margin" => "0"),
 
     # ── Edit-tool body container ─────────────────────────────────────────────
@@ -1774,7 +1814,44 @@ const ChatStyles = Bonito.Styles(
         "padding-bottom" => "max(12px, env(safe-area-inset-bottom))",
         "display" => "flex", "flex-direction" => "column", "align-items" => "center",
         "gap" => "8px",
+        # Anchor for the slash-command autocomplete popup (.bt-cmd-ac).
+        "position" => "relative",
         "background" => "var(--bt-surface)"),
+    # Slash-command autocomplete: floats ABOVE the composer while the input
+    # holds a lone "/partial" token (built/driven in bonitoagents.js
+    # _setupInputs; fed by available_commands_update via the 'commands' comm
+    # event + the connect-time init snapshot).
+    CSS(".bt-cmd-ac",
+        "position" => "absolute", "bottom" => "100%",
+        "left" => "14px", "right" => "14px",
+        "display" => "none", "flex-direction" => "column",
+        "margin-bottom" => "6px", "padding" => "4px",
+        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "10px",
+        "box-shadow" => "var(--bt-shadow-md)",
+        "z-index" => "40",
+        "max-height" => "40vh", "overflow-y" => "auto"),
+    CSS(".bt-cmd-ac.bt-cmd-ac-open", "display" => "flex"),
+    CSS(".bt-cmd-ac-item",
+        "display" => "flex", "align-items" => "baseline", "gap" => "8px",
+        "padding" => "5px 9px", "border-radius" => "6px",
+        "cursor" => "pointer",
+        "white-space" => "nowrap", "overflow" => "hidden"),
+    CSS(".bt-cmd-ac-item:hover", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-cmd-ac-item.bt-cmd-ac-sel", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-cmd-ac-name",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "12.5px", "font-weight" => "600",
+        "flex" => "0 0 auto"),
+    CSS(".bt-cmd-ac-hint",
+        "font-family" => "ui-monospace, monospace",
+        "font-size" => "11px", "color" => "var(--bt-text-faint)",
+        "flex" => "0 0 auto"),
+    CSS(".bt-cmd-ac-desc",
+        "font-size" => "11.5px", "color" => "var(--bt-text-muted)",
+        "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "flex" => "1 1 auto"),
     CSS(".bt-input-row",
         "display" => "flex", "gap" => "8px", "align-items" => "flex-end",
         "width" => "100%"),
@@ -1860,9 +1937,8 @@ const ChatStyles = Bonito.Styles(
         "box-shadow" => "none",
         "overflow" => "visible"),
     CSS(".bt-tool-native .bt-tool-header", "display" => "none"),
-    # The full-width toggle lives inside the (hidden) header now, but keep an
-    # explicit hide that out-ranks the expanded-state reveal rule in case a
-    # future layout moves it back out of the header.
+    # Native media has no header, so keep the fullwidth toggle hidden even if a
+    # future layout moves it out of the header.
     CSS(".bt-tool-native .bt-tool-fullwidth, " *
         ".bt-tool-native .bt-tool-header[data-expanded=\"true\"] .bt-tool-fullwidth",
         "display" => "none"),

@@ -1,4 +1,4 @@
-# Headless unit test for the WORKER side of the remote-app bridge (RemoteProxy.jl)
+# Headless unit test for the WORKER side of the remote bridge (RemoteProxy.jl)
 # in isolation — no real eval worker, no Malt, no dial-back socket, no browser.
 #
 # The dial-back websocket is replaced by `CapWS`, a fake that records every frame
@@ -9,14 +9,16 @@
 # real render + observable round-trip without standing up the whole stack.
 #
 # This guards the pieces a "reuse Bonito's ProxyConnection / render_proxied"
-# refactor would touch: the connection's write→frame path, render_embed's
-# namespaced subsession + init bundle, the ProxyAssetServer asset push, and the
-# control plane (delegate / register / close).
+# refactor would touch: `render_eval_html`'s namespaced subsession + init bundle,
+# the connection's write→frame path, the ProxyAssetServer asset push, and the
+# control plane (asset_read / asset_url / close). The bt_julia_eval RESULT render
+# (`render_eval_html`) is the only render path on the bridge now — there is no
+# app registry / delegate.
 
 using Test
 import Bonito
 using Bonito: Session, App, DOM, Observable, on, onjs, @js_str, process_message,
-              connection, get_session, root_session, MsgPack
+              connection, get_session, root_session, MsgPack, show_html
 using Bonito.HTTP.WebSockets: WebSockets
 
 include(joinpath(@__DIR__, "..", "src", "RemoteProxy.jl"))
@@ -77,6 +79,16 @@ function updates(ws::CapWS)
     out
 end
 
+# Render an App(value) as a subsession of the bridge parent — exactly what
+# `render_eval_html` does — and hand back the live subsession so the test can
+# drive the browser→worker round-trip against it. `render_eval_html` itself only
+# returns the HTML string; we re-create its parent + the freshly-rendered sub
+# here so we can reach the Session object.
+function render_app_sub(b, app)
+    sub, dom = Bonito.render_subsession(b.parent, app; init = false)
+    return sub, dom
+end
+
 # Fresh bridge + capture ws for each testset (BRIDGE[] is a process singleton).
 function fresh_bridge!()
     RP.BRIDGE[] = nothing
@@ -89,21 +101,21 @@ end
 
 @testset "RemoteProxy worker bridge (headless)" begin
 
-    @testset "render_embed: namespaced subsession + init bundle on the asset server" begin
+    @testset "render_eval_html: namespaced subsession + init bundle on the asset server" begin
         b, cap = fresh_bridge!()
         prefix = b.parent.id
         o = Observable(0)
-        RP.register_app!("app1", App(s -> (onjs(s, o, js"(x)=>{}"); DOM.div(DOM.span(o)))))
+        app = App(s -> (onjs(s, o, js"(x)=>{}"); DOM.div(DOM.span(o))))
 
-        sub_id, html, init_url = RP.render_embed(b, "app1")
-        @test startswith(sub_id, prefix * "/")        # subsession id namespaced under the bridge
+        # `render_eval_html` renders App(value) as a subsession of the bridge
+        # parent and returns its HTML fragment — the only render path now.
+        html = RP.render_eval_html(app)
         @test !isempty(html)
         @test occursin(prefix, html)                  # fragment carries the bridge namespace
-        @test !isempty(init_url)
-        @test get_session(b.parent, sub_id) !== nothing
 
-        # The init bundle registered on the bridge's ProxyAssetServer, which pushed
-        # an `asset_add` control frame down the (captured) socket.
+        # Rendering a subsession registers its init bundle on the bridge's
+        # ProxyAssetServer, which pushes an `asset_add` control frame down the
+        # (captured) socket.
         adds = filter(d -> get(d, "op", "") == "asset_add", ctrl_frames(cap))
         @test !isempty(adds)
     end
@@ -119,9 +131,9 @@ end
             onjs(s, doubled, js"(x)=>{}")
             DOM.div(DOM.span(doubled))
         end
-        RP.register_app!("rt", app)
-        sub_id, _, _ = RP.render_embed(b, "rt")
-        sub = get_session(b.parent, sub_id)
+        sub, _ = render_app_sub(b, app)
+        sub_id = sub.id
+        @test startswith(sub_id, prefix * "/")        # subsession id namespaced under the bridge
 
         # Browser says the subsession finished loading → it goes ready + flushes.
         process_message(b.parent, Dict{String,Any}("msg_type"=>"8","session"=>sub_id,"exception"=>"nothing"))
@@ -138,44 +150,52 @@ end
         @test timedwait(() -> want in updates(cap), 5.0) === :ok
     end
 
-    @testset "control plane: register → delegate → close" begin
+    @testset "control plane: asset_url + close" begin
         b, cap = fresh_bridge!()
         prefix = b.parent.id
 
-        # register: ship app source, worker include_strings + registers it.
-        RP.handle_control(b, Dict{String,Any}("op"=>"register","id"=>1,"app"=>"reg1",
-            "code"=>"using Bonito; Bonito.App(s -> Bonito.DOM.div(\"hi\"))"))
-        reg_reply = only(filter(d -> get(d,"op","")=="reply" && get(d,"id",0)==1, ctrl_frames(cap)))
-        @test reg_reply["val"] == "reg1"
+        # asset_url: expose a worker-disk file as a proxied asset, reply its url.
+        tmp = tempname() * ".txt"
+        write(tmp, "hello bridge")
+        RP.handle_control(b, Dict{String,Any}("op"=>"asset_url","id"=>1,"path"=>tmp))
+        url_reply = only(filter(d -> get(d,"op","")=="reply" && get(d,"id",0)==1, ctrl_frames(cap)))
+        @test !haskey(url_reply, "err")
+        @test occursin("/assets/", String(url_reply["val"]))
 
-        # delegate: render it into a subsession, reply (sub_id, html, init_url).
-        RP.handle_control(b, Dict{String,Any}("op"=>"delegate","id"=>2,"app"=>"reg1"))
-        del_reply = only(filter(d -> get(d,"op","")=="reply" && get(d,"id",0)==2, ctrl_frames(cap)))
-        @test !haskey(del_reply, "err")
-        sub_id = String(del_reply["val"][1])
-        @test startswith(sub_id, prefix * "/")
+        # Registering the asset pushed an `asset_add` control frame.
+        @test !isempty(filter(d -> get(d, "op", "") == "asset_add", ctrl_frames(cap)))
+
+        # close: tears a subsession down. Render one first to have a sub to close.
+        sub, _ = render_app_sub(b, App(s -> DOM.div("x")))
+        sub_id = sub.id
         @test get_session(b.parent, sub_id) !== nothing
-
-        # close: tears the subsession down.
         RP.handle_control(b, Dict{String,Any}("op"=>"close","sub"=>sub_id))
         @test timedwait(() -> get_session(b.parent, sub_id) === nothing, 5.0) === :ok
 
-        # A delegate for an unknown app must reply with an `err` (so the host's
-        # call_ctrl fails fast instead of a 30s hang) BEFORE rethrowing — the
-        # rethrow is by design (serve_bridge's @async wrapper logs the trace), so
-        # here we swallow it and assert the err reply went out first.
+        # An unknown asset key is GRACEFUL: `read_proxy_asset` returns empty bytes,
+        # so the reply carries `val` (empty), never `err` — and never a 30s hang.
+        RP.handle_control(b, Dict{String,Any}("op"=>"asset_read","id"=>3,
+            "key"=>"does-not-exist","start"=>0,"stop"=>1))
+        ok_reply = only(filter(d -> get(d,"op","")=="reply" && get(d,"id",0)==3, ctrl_frames(cap)))
+        @test !haskey(ok_reply, "err")   # graceful: carries a (here empty) `val`, not an error
+        @test haskey(ok_reply, "val")
+
+        # A genuinely malformed control request (here: missing `key`) MUST reply with
+        # an `err` (so the host's call_ctrl fails fast instead of a 30s hang) BEFORE
+        # rethrowing — the rethrow is by design (serve_bridge's @async wrapper logs
+        # the trace), so here we swallow it and assert the err reply went out first.
         try
-            RP.handle_control(b, Dict{String,Any}("op"=>"delegate","id"=>3,"app"=>"does-not-exist"))
+            RP.handle_control(b, Dict{String,Any}("op"=>"asset_read","id"=>4,
+                "start"=>0,"stop"=>1))
         catch
         end
-        err_reply = only(filter(d -> get(d,"op","")=="reply" && get(d,"id",0)==3, ctrl_frames(cap)))
+        err_reply = only(filter(d -> get(d,"op","")=="reply" && get(d,"id",0)==4, ctrl_frames(cap)))
         @test haskey(err_reply, "err")
     end
 
-    @testset "bridge + routes survive a socket drop and redial" begin
+    @testset "bridge survives a socket drop and redial" begin
         b, _ = fresh_bridge!()
         b.driver.ws[] = nothing                       # pre-dial: no socket
-        RP.register_app!("survivor", App(s -> DOM.div("x")))
 
         # Dial 1: serve on a socket, then drop it. serve_bridge owns the ws for the
         # socket's lifetime and clears it on exit — it does NOT tear the bridge down.
@@ -186,96 +206,72 @@ end
         @test timedwait(() -> istaskdone(t1), 3.0) === :ok
         @test b.driver.ws[] === nothing               # socket cleared, BRIDGE intact
 
-        # Dial 2 (same BRIDGE[], no rebuild): the registered app + routes survived
-        # the drop, so it still renders on the new socket. This is the invariant the
-        # dial_loop reconnect relies on (host swaps the WS, routes intact).
+        # Dial 2 (same BRIDGE[], no rebuild): the parent session + asset server
+        # survived the drop, so a fresh result still renders on the new socket.
+        # This is the invariant the dial_loop reconnect relies on (host swaps the
+        # WS, bridge intact).
         cap2 = CapWS()
         t2 = @async RP.serve_bridge(cap2)
         @test timedwait(() -> b.driver.ws[] === cap2, 3.0) === :ok
-        sub_id, _, _ = RP.render_embed(b, "survivor")
-        @test startswith(sub_id, b.parent.id * "/")
+        sub, _ = render_app_sub(b, App(s -> DOM.div("survivor")))
+        @test startswith(sub.id, b.parent.id * "/")
         close(cap2); wait(t2)
     end
 
-    @testset "page change resets the dedup cache (reload -> self-contained bundle)" begin
-        # Regression: the bridge parent is a long-lived ROOT session, and
-        # Bonito's serialization dedups against its `session_objects`, sending
-        # bare TrackingOnly references for anything already shipped. That
-        # assumption holds per browser PAGE, not per bridge: after a reload the
-        # page's global object cache is empty, so a re-mounted embed got
-        # references to objects it never received — DOM up, observables alive,
-        # but every cached payload missing (the eternal-spinner WGLMakie embed).
-        # `delegate` now names the page and `switch_page!` resets the cache on
-        # a page change, making the first bundle per page self-contained.
+    @testset "every render is self-contained (no cross-mount dedup on the proxied root)" begin
+        # The bridge parent is a long-lived ROOT session that outlives browser
+        # pages (reloads, later tabs). Stock Bonito dedups serialization
+        # against the root's `session_objects` and ships bare TrackingOnly
+        # references for anything already sent — an assumption that holds per
+        # PAGE, not per bridge: after a reload the page's object cache is
+        # empty, so a re-mounted embed would reference objects the fresh page
+        # never received (DOM up, observables alive, every cached payload
+        # silently missing — the eternal-spinner WGLMakie embed).
+        #
+        # Ours resolves this at the SERIALIZATION layer instead of tracking
+        # pages: proxied roots opt out of dedup entirely (dev Bonito's
+        # `dedup_cached_objects(::Session{<:ProxyConnection}) = false`), so
+        # EVERY mount — first, re-expand, post-reload — ships full values.
+        # (Root METADATA hazards went with `get_order!`: GlyphSync ships glyph
+        # batches as root evaljs and the page PULLS whatever it lacks.)
         b, cap = fresh_bridge!()
         marker = "PAGE_CACHE_MARKER_" * "x"^64
         payload = Observable(marker)
-        RP.register_app!("pg", App(s -> (onjs(s, payload, js"(x)=>{}");
-                                         DOM.div(DOM.span("app")))))
+        mkapp() = App(s -> (onjs(s, payload, js"(x)=>{}");
+                            DOM.div(DOM.span("app"))))
 
-        bundle_bytes(init_url) = begin
-            key = first(split(last(split(init_url, '/')), '?'))
-            Bonito.read_proxy_asset(b.parent.asset_server.registry, String(key))
+        # Self-contained ≡ the marker VALUE rides in the fragment itself or in
+        # the init bundle its render registered on the proxy asset server.
+        shipped_marker(html) = begin
+            occursin(marker, html) && return true
+            adds = filter(d -> get(d, "op", "") == "asset_add", ctrl_frames(cap))
+            any(adds) do d
+                bytes = Bonito.read_proxy_asset(b.parent.asset_server.registry,
+                                                String(d["key"]))
+                occursin(marker, String(copy(bytes)))
+            end
         end
-        has_marker(bytes) = occursin(marker, String(copy(bytes)))
 
-        # Page 1, first mount: the bundle carries the observable's VALUE.
-        _, _, url1 = RP.render_embed(b, "pg", "page-1")
-        @test has_marker(bundle_bytes(url1))
-        # Page 1, second mount: dedup is correct within a page — no re-ship.
-        _, _, url2 = RP.render_embed(b, "pg", "page-1")
-        @test !has_marker(bundle_bytes(url2))
-        # Page 2 = a reload: the bundle must be self-contained again (this is
-        # exactly the assertion that failed before switch_page!).
-        _, _, url3 = RP.render_embed(b, "pg", "page-2")
-        @test has_marker(bundle_bytes(url3))
-        @test b.page == "page-2"
-        # A prerendered bundle from the old page must never be served across a
-        # page switch: it was built against the old cache state.
-        RP.prerender_app("pg")                      # built for page-2's cache
-        _, _, url4 = RP.render_embed(b, "pg", "page-3")
-        @test has_marker(bundle_bytes(url4))
-        # No page named (old host) -> no reset, dedup persists (back-compat).
-        _, _, url5 = RP.render_embed(b, "pg")
-        @test !has_marker(bundle_bytes(url5))
+        # First mount ships the observable's value...
+        @test shipped_marker(RP.render_eval_html(mkapp()))
+        empty!(cap.sent)
+        # ...and so does every LATER mount of the same shared observable — the
+        # assertion that failed on stock dedup after a page reload.
+        @test shipped_marker(RP.render_eval_html(mkapp()))
 
-        # JS module emission: every embed fragment must be SELF-CONTAINED —
-        # the <script type=module> tag has to ride along wherever the
-        # fragment mounts. The original failure mode was a WGLMakie embed
-        # whose module script was omitted after a reload because pre-#406
-        # Bonito deduped emission against `root.imports` "for the page's
-        # lifetime" while the bridge root outlived the page (module never
-        # loads, scene never builds, spinner forever, no error anywhere).
-        # Bonito#406 changed the model — subs re-emit their own imports and
-        # never union into the root — so we assert per-page self-containment
-        # only, NOT same-page dedup (version-dependent, and duplicate module
-        # tags are idempotent in the browser's module registry anyway).
+        # JS module emission: every fragment must carry its <script type=module>
+        # tag wherever it mounts. Pre-Bonito#406 sub emissions were deduped
+        # against `root.imports` "for the page's lifetime" — on a bridge root
+        # outliving pages, a post-reload fragment omitted e.g. the WGLMakie
+        # module script (module never loads, `$(WGL).then(...)` pends forever,
+        # black canvas, zero errors). #406 made subs re-emit their own imports;
+        # duplicate module tags are idempotent in the browser's registry.
         js_file = joinpath(mktempdir(), "probemod.js")
         write(js_file, "export function probe() { return 42; }\n")
         probemod = Bonito.ES6Module(js_file)
-        RP.register_app!("imp", App(s -> DOM.div(Bonito.jsrender(s,
-            js"\$(probemod).then(m => m.probe())"))))
-        _, html1, _ = RP.render_embed(b, "imp", "page-4")
-        @test occursin("probemod", html1)             # first page ships the module
-        _, html3, _ = RP.render_embed(b, "imp", "page-5")
-        @test occursin("probemod", html3)             # a NEW page ships it too
-
-        # Root METADATA is page-lifetime state too: integrations keep counters
-        # there that mirror module-level JS state, which a reload resets.
-        # WGLMakie's `get_order!` is the canonical case: it increments
-        # `:wglmakie_scene_order` on the root, and the JS `orderedExecutor`
-        # (fresh per page, nextExpected = 1) queues every scene init until the
-        # counter it expects arrives. A remount shipping order N>1 to a fresh
-        # page therefore waits forever — `setup_scene_init` never runs, the
-        # canvas is never measured, no scene is ever requested: a black canvas
-        # with zero errors anywhere. A page switch must drop root metadata so
-        # per-page counters restart in lockstep with the page's JS.
-        Bonito.set_metadata!(b.parent, :wglmakie_scene_order, 7)
-        RP.render_embed(b, "imp", "page-6")
-        @test Bonito.get_metadata(b.parent, :wglmakie_scene_order, 1) == 1
-        # Same page: metadata persists (in-page renders must keep counting up).
-        Bonito.set_metadata!(b.parent, :wglmakie_scene_order, 3)
-        RP.render_embed(b, "imp", "page-6")
-        @test Bonito.get_metadata(b.parent, :wglmakie_scene_order, 1) == 3
+        impapp() = App(s -> DOM.div(Bonito.jsrender(s,
+            js"$(probemod).then(m => m.probe())")))
+        @test occursin("probemod", RP.render_eval_html(impapp()))
+        @test occursin("probemod", RP.render_eval_html(impapp()))   # re-emitted, never deduped away
     end
 end

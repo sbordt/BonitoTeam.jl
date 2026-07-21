@@ -59,6 +59,40 @@ end
     end
 end
 
+# ── REPL semantics: soft scope + world-age-clean defs (execute path) ──────────
+# The worker evals the code STRING per-top-level-statement (`repl_eval` →
+# `include_string`, soft scope), NOT as one spliced expression. Regression for
+# two things the old splice-as-argument path broke.
+@testset "REPL semantics: soft-scope loops + world-age-clean defs" begin
+    m   = M.manager()
+    s   = M.JuliaSession(nothing; is_temp = true)
+    key = "test-repl-" * string(rand(UInt32))
+    lock(m.lock) do; m.sessions[key] = s; end
+    outtext(r) = join(String[get(b, "text", "") for b in get(r, :blocks, Dict{String,Any}[])
+                             if get(b, "type", "") == "text"], "\n")
+    try
+        # (1) Soft scope: a top-level for-loop assigns to a global. Under hard
+        # scope this errored "acc not defined in local scope". No bridge in a
+        # temp session → the result repr rides in the output text.
+        r1 = M.execute(s, "acc = 0\nfor i in 1:5\n    acc += i\nend\nacc"; timeout = 30.0)
+        @test r1.status == :completed
+        @test r1.is_error == false
+        @test occursin("15", outtext(r1))
+        @test !occursin("local scope", outtext(r1))
+
+        # (2) World age: define a function and call it in the SAME eval — no
+        # "access to binding … in a world prior to its definition" warning.
+        r2 = M.execute(s, "dbl(x) = 2x\ndbl(21)"; timeout = 30.0)
+        @test r2.status == :completed
+        @test r2.is_error == false
+        @test occursin("42", outtext(r2))
+        @test !occursin("prior to its definition", outtext(r2))
+    finally
+        lock(m.lock) do; delete!(m.sessions, key); end
+        M.kill_session!(s)
+    end
+end
+
 # ── M5: continue/interrupt are pure lookups (never get_or_create!) ─────────────
 @testset "M5: continue/interrupt error on absent session (no resurrection)" begin
     m = M.manager()
@@ -164,13 +198,13 @@ end
 @testset "M9: requestId maps cancel to one session" begin
     # Pure mapping check — no workers needed.
     M.note_inflight_request!(42, "/some/env")
-    got = lock(M.INFLIGHT_LOCK) do
-        get(M.INFLIGHT_REQUESTS, 42, :missing)
+    got = lock(M.SERVER.inflight_lock) do
+        get(M.SERVER.inflight, 42, :missing)
     end
     @test got == "/some/env"
     M.clear_inflight_request!(42)
-    gone = lock(M.INFLIGHT_LOCK) do
-        get(M.INFLIGHT_REQUESTS, 42, :missing)
+    gone = lock(M.SERVER.inflight_lock) do
+        get(M.SERVER.inflight, 42, :missing)
     end
     @test gone === :missing
 end
@@ -234,13 +268,16 @@ Base.show(io::IO, ::MIME"text/html", ::HtmlOnly) = print(io, "<ul><li>hi</li></u
         @test Helper.try_save_rich(methods(push!), dir, 10_000) === nothing
         @test isempty(filter(f -> endswith(f, ".html"), readdir(dir)))
     end
-    # format_value still ships the readable text repr for such values — one
-    # text block, no `shown:` reference, no markup.
+    # format_value still ships the readable text repr for such values. With no
+    # RemoteProxy bridge loaded here, there's no parked ref → the repr rides in
+    # `echo` (the terminal output), NOT the descriptor. No rich file block, no
+    # markup, no `html` descriptor.
     mktempdir() do dir
-        blocks = Helper.format_value(methods(push!), dir, 10_000, false)
-        @test length(blocks) == 1
-        @test startswith(blocks[1]["text"], "result:")
-        @test occursin("push!", blocks[1]["text"])
-        @test !occursin("<li>", blocks[1]["text"])
+        r = Helper.format_value(methods(push!), dir, 10_000, false)
+        @test isempty(r.blocks)          # html-only value → no rich file block
+        @test r.html === nothing         # no bridge → no descriptor
+        @test r.echo !== nothing
+        @test occursin("push!", r.echo)
+        @test !occursin("<li>", r.echo)
     end
 end

@@ -13,6 +13,7 @@ class Collapsable {
         this.toggle = opts.toggleEl || null;
         this.native = opts.native || false;
         this.editMode = opts.editMode || false;
+        this.hideBodyOnCollapse = opts.hideBodyOnCollapse || false;
         this.compactHeight = opts.compactHeight || 240;
         this.expandedHeight = opts.expandedHeight || 2000;
         this.fetchEachExpand = this.editMode ? false : opts.fetchEachExpand || false;
@@ -45,7 +46,7 @@ class Collapsable {
         if (!this.native) {
             this.header.dataset.expanded = expanded ? 'true' : 'false';
             if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
-            if (this.editMode) {
+            if (this.editMode && !this.hideBodyOnCollapse) {
                 this.body.style.display = '';
                 this._applyEditHeight(expanded ? this.expandedHeight : this.compactHeight);
             } else {
@@ -423,6 +424,10 @@ class BonitoChat {
     }
     destroy() {
         this.destroyed = true;
+        if (this._elapsedTimer) {
+            clearInterval(this._elapsedTimer);
+            this._elapsedTimer = null;
+        }
         if (this._onScroll) {
             this.container.removeEventListener('scroll', this._onScroll);
         }
@@ -461,6 +466,14 @@ class BonitoChat {
         }
         if (this._onTextInputKeyCapture && this.textInput) {
             this.textInput.removeEventListener('keydown', this._onTextInputKeyCapture, true);
+        }
+        if (this.textInput) {
+            this._onCmdInput && this.textInput.removeEventListener('input', this._onCmdInput);
+            this._onCmdBlur && this.textInput.removeEventListener('blur', this._onCmdBlur);
+        }
+        if (this.cmdAc) {
+            this.cmdAc.remove();
+            this.cmdAc = null;
         }
         if (this._onAppClickCapture && this.app) {
             this.app.removeEventListener('click', this._onAppClickCapture, true);
@@ -509,6 +522,9 @@ class BonitoChat {
                 return this.onMsgsReload(msg.n);
             case 'turn_begin':
                 this.turnSeq = msg.seq;
+                return;
+            case 'commands':
+                this.slashCommands = msg.items || [];
                 return;
             case 'lens.vocab':
                 this.lensVocab = msg.keys || [];
@@ -858,13 +874,23 @@ class BonitoChat {
             const n = this.cache.get(i);
             if (!n || !n.isConnected || n.style.display === 'none') continue;
             if (excludeKey && n.dataset.filterKey === excludeKey) continue;
-            if (n.offsetTop + n.offsetHeight > st) {
+            if (n.offsetTop + n.offsetHeight > st + 4) {
+                this._anchorDebugG = {
+                    st,
+                    idx: i,
+                    off: n.offsetTop - st
+                };
                 return {
                     idx: i,
                     off: n.offsetTop - st
                 };
             }
         }
+        this._anchorDebugG = {
+            st,
+            idx: -1,
+            off: 0
+        };
         return null;
     }
     _restoreAnchor(a) {
@@ -882,9 +908,74 @@ class BonitoChat {
             this._prevScrollTop = this.container.scrollTop;
         }
     }
+    _captureKeyAnchor(excludeKey) {
+        const st = this.container.scrollTop;
+        let vi = this.indexAt(st);
+        while(vi < this.totalCount && (this.keyByIdx.get(vi) === excludeKey || this.effHeight(vi) === 0))vi++;
+        if (vi >= this.totalCount) return null;
+        let di = -1, doff = 0;
+        for (const i of [
+            ...this.rendered
+        ].sort((a, b)=>a - b)){
+            const n = this.cache.get(i);
+            if (!n || !n.isConnected || n.style.display === 'none') continue;
+            if (this.keyByIdx.get(i) === excludeKey) continue;
+            if (n.offsetTop + n.offsetHeight > st + 4) {
+                di = i;
+                doff = n.offsetTop - st;
+                break;
+            }
+        }
+        this._anchorDebug = {
+            st,
+            vi,
+            di,
+            doff,
+            pickedDom: di >= 0 && di <= vi
+        };
+        if (di >= 0 && di <= vi) {
+            return {
+                idx: di,
+                off: doff,
+                dom: true
+            };
+        }
+        return {
+            idx: vi,
+            dom: false,
+            off: this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, vi) - st
+        };
+    }
+    _restoreKeyAnchor(a) {
+        if (!a) return;
+        let want;
+        const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
+        if (a.dom && n && n.isConnected && n.style.display !== 'none') {
+            want = n.offsetTop - a.off;
+        } else if (a.dom) {
+            want = this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, a.idx) - a.off;
+        } else {
+            want = this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, a.idx) - a.off;
+        }
+        want = Math.max(0, want);
+        if (Math.abs(this.container.scrollTop - want) > 1) {
+            this.container.scrollTop = want;
+            this._prevScrollTop = this.container.scrollTop;
+        }
+    }
+    _activeKeyAnchor() {
+        const a = this._keyAnchor;
+        if (!a) return null;
+        if (performance.now() > a.until || this._lastUserInputT > a.setAt) {
+            this._keyAnchor = null;
+            return null;
+        }
+        return a;
+    }
     updateDOM(s, e) {
         if (s > e) return;
-        const anchor = this.initialLoad ? null : this._captureAnchor();
+        const sticky = this._activeKeyAnchor();
+        const anchor = this.initialLoad || sticky ? null : this._captureAnchor();
         for (const idx of [
             ...this.rendered
         ]){
@@ -930,7 +1021,8 @@ class BonitoChat {
             this.spacerBottom.style.height = botH + 'px';
             this._spacerBotH = botH;
         }
-        this._restoreAnchor(anchor);
+        if (sticky) this._restoreKeyAnchor(sticky);
+        else this._restoreAnchor(anchor);
     }
     touchApp(idx) {
         const i = this.appLru.indexOf(idx);
@@ -1293,6 +1385,14 @@ class BonitoChat {
             node.classList?.remove('bt-stream-active');
         }
     }
+    _evalOutputConsole(node) {
+        const secs = node.querySelectorAll('.bt-tool-body .bt-subsection');
+        for (const d of secs){
+            const label = d.querySelector('.bt-subsection-label');
+            if (label && (label.textContent || '').trim() === 'Output') return d.querySelector('.bt-console');
+        }
+        return null;
+    }
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
@@ -1304,7 +1404,15 @@ class BonitoChat {
             }
             const live = !(msg.status === 'completed' || msg.status === 'failed');
             node.classList.toggle('bt-tool-live', live);
-            if (!live) node.querySelector('.bt-eval-preview')?.remove();
+            if (live) this._ensureElapsedTicker();
+            if (!live) {
+                if (node.dataset.compactBody === '1' && node.collapsable && node.collapsable.loaded && node.isConnected) {
+                    this.comm.notify({
+                        type: 'tool.render',
+                        id: msg.id
+                    });
+                }
+            }
         }
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
@@ -1334,6 +1442,14 @@ class BonitoChat {
             const s = node.querySelector('.bt-tool-summary');
             if (s) s.textContent = msg.summary;
         }
+        if (msg.compact_body === true && node.collapsable && !node.collapsable.editMode) {
+            const c = node.collapsable;
+            c.editMode = true;
+            c.hideBodyOnCollapse = true;
+            c.fetchEachExpand = false;
+            c.discardOnCollapse = false;
+            node.dataset.compactBody = '1';
+        }
         if (msg.show_mime) node.dataset.showMime = msg.show_mime;
         if (this._wantsNative(node)) {
             this._applyNative(node);
@@ -1347,10 +1463,26 @@ class BonitoChat {
                             id: msg.id
                         });
                     }
+                    if (node.collapsable.hideBodyOnCollapse) node.collapsable.setExpanded(true);
                 } else {
                     node.dataset.btAutoMount = '1';
+                    if (node.collapsable.hideBodyOnCollapse) node.dataset.btAutoExpand = '1';
                 }
             } else if (node.isConnected) {
+                node.collapsable.setExpanded(true);
+            } else {
+                node.dataset.btAutoExpand = '1';
+            }
+        }
+        if (msg.expand_full && node.collapsable) {
+            if (node.isConnected) {
+                if (!node.collapsable.loaded) {
+                    node.collapsable.loaded = true;
+                    this.comm.notify({
+                        type: 'tool.render',
+                        id: msg.id
+                    });
+                }
                 node.collapsable.setExpanded(true);
             } else {
                 node.dataset.btAutoExpand = '1';
@@ -1383,24 +1515,41 @@ class BonitoChat {
             });
             headerEl.insertBefore(sb, headerEl.querySelector('.bt-tool-fullwidth') || null);
         }
-        if (msg.code && stillLive && headerEl && !node.querySelector('.bt-eval-preview')) {
-            const pv = document.createElement('div');
-            pv.className = 'bt-eval-preview';
-            const pre = document.createElement('pre');
-            pre.textContent = msg.code;
-            const tg = document.createElement('button');
-            tg.type = 'button';
-            tg.className = 'bt-eval-preview-toggle';
-            tg.title = 'Enlarge';
-            tg.textContent = '⌄';
-            tg.addEventListener('click', (e)=>{
-                e.stopPropagation();
-                const full = pv.classList.toggle('bt-eval-preview-full');
-                tg.textContent = full ? '⌃' : '⌄';
-                tg.title = full ? 'Collapse' : 'Enlarge';
-            });
-            pv.append(pre, tg);
-            headerEl.insertAdjacentElement('afterend', pv);
+        if (msg.live_embed) {
+            node.dataset.btApp = '1';
+            if (headerEl && !headerEl.querySelector('.bt-tool-detach')) {
+                const db = document.createElement('button');
+                db.type = 'button';
+                db.className = 'bt-tool-detach';
+                db.title = 'Detach to floating window';
+                db.textContent = '⤢';
+                db.addEventListener('click', (e)=>{
+                    e.stopPropagation();
+                    this.comm.notify({
+                        type: 'detach_app',
+                        id: msg.id
+                    });
+                });
+                headerEl.insertBefore(db, headerEl.querySelector('.bt-tool-fullwidth') || null);
+            }
+        }
+        if (msg.stream_tail != null && stillLive && headerEl) {
+            const con = this._evalOutputConsole(node);
+            if (con) {
+                for (const stray of node.querySelectorAll('.bt-eval-stream'))stray.remove();
+                con.textContent = msg.stream_tail;
+                const scroller = con.closest('.bt-subsection-body');
+                if (scroller) scroller.scrollTop = scroller.scrollHeight;
+            } else {
+                let sp = node.querySelector('.bt-eval-stream');
+                if (!sp) {
+                    sp = document.createElement('pre');
+                    sp.className = 'bt-eval-stream';
+                    headerEl.insertAdjacentElement('afterend', sp);
+                }
+                sp.textContent = msg.stream_tail;
+                sp.scrollTop = sp.scrollHeight;
+            }
         }
         if (msg.editable && msg.edit_path && headerEl) {
             const t = headerEl.querySelector('.bt-tool-title');
@@ -1490,15 +1639,22 @@ class BonitoChat {
         this.refresh();
     }
     setKeyHidden(key, hidden) {
-        const anchor = this.followMode ? null : this._captureAnchor(key);
+        const anchor = this.followMode ? null : this._captureKeyAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
         for (const [idx, node] of this.cache){
             if (node.dataset.filterKey === key) this.applyVisibility(idx, node);
         }
         if (key === 'agent') this._updateWaiting();
+        if (anchor) {
+            this._keyAnchor = {
+                ...anchor,
+                setAt: performance.now(),
+                until: performance.now() + 1500
+            };
+        }
         this.refresh();
         if (this.followMode) this._queueScrollToBottom();
-        else if (anchor) this._restoreAnchor(anchor);
+        else if (anchor) this._restoreKeyAnchor(anchor);
     }
     _updateWaiting() {
         if (!this.waitingEl) return;
@@ -1572,20 +1728,25 @@ class BonitoChat {
                 {
                     div.className = 'bt-tool-msg';
                     div.innerHTML = this.toolHTML(msg);
-                    if (msg.kind === 'bonito_app') div.dataset.btApp = '1';
+                    if (msg.kind === 'bonito_app' || msg.live_embed) div.dataset.btApp = '1';
                     if (msg.id) div.dataset.msgId = msg.id;
                     if (msg.started_at != null) div.dataset.toolStarted = String(msg.started_at);
                     if (msg.finished_at != null) div.dataset.toolFinished = String(msg.finished_at);
                     _writeToolElapsed(div);
                     const liveTool = !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
-                    if (liveTool) div.classList.add('bt-tool-live');
+                    if (liveTool) {
+                        div.classList.add('bt-tool-live');
+                        this._ensureElapsedTicker();
+                    }
                     const id = msg.id;
-                    const isEdit = msg.kind === 'edit';
+                    const compactBody = msg.kind === 'edit' || msg.compact_body === true;
+                    if (msg.compact_body === true) div.dataset.compactBody = '1';
                     div.collapsable = new Collapsable(div.querySelector('.bt-tool-header'), div.querySelector('.bt-tool-body'), {
                         toggleEl: div.querySelector('.bt-tool-toggle'),
-                        editMode: isEdit,
-                        fetchEachExpand: !isEdit,
-                        discardOnCollapse: !isEdit,
+                        editMode: compactBody,
+                        hideBodyOnCollapse: msg.compact_body === true,
+                        fetchEachExpand: !compactBody,
+                        discardOnCollapse: !compactBody,
                         onExpand: ()=>this.comm.notify({
                                 type: 'tool.render',
                                 id
@@ -1618,21 +1779,17 @@ class BonitoChat {
                             id
                         });
                     });
-                    const pvToggle = div.querySelector('.bt-eval-preview-toggle');
-                    if (pvToggle) pvToggle.addEventListener('click', (e)=>{
-                        e.stopPropagation();
-                        const pv = div.querySelector('.bt-eval-preview');
-                        if (!pv) return;
-                        const full = pv.classList.toggle('bt-eval-preview-full');
-                        pvToggle.textContent = full ? '⌃' : '⌄';
-                        pvToggle.title = full ? 'Collapse' : 'Enlarge';
-                    });
                     if (msg.show_mime) div.dataset.showMime = msg.show_mime;
                     if (this._wantsNative(div)) {
                         div.classList.add('bt-tool-native');
                         div.dataset.btAutoExpand = '1';
-                    } else if (msg.expand) {
-                        div.dataset.btAutoExpand = '1';
+                    } else if (msg.expand || msg.expand_full) {
+                        if (div.collapsable.editMode) {
+                            div.dataset.btAutoMount = '1';
+                            if (msg.expand_full || div.collapsable.hideBodyOnCollapse) div.dataset.btAutoExpand = '1';
+                        } else {
+                            div.dataset.btAutoExpand = '1';
+                        }
                     }
                     break;
                 }
@@ -1703,13 +1860,7 @@ class BonitoChat {
         const stopBtn = msg.stoppable ? `<button class="bt-tool-stop bt-stop-mini" type="button"
                      title="Stop"></button>` : '';
         const titleLink = msg.edit_path ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
-        const live = !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
-        const evalPreview = msg.code && live ? `
-            <div class="bt-eval-preview">
-                <pre>${escapeHTML(msg.code)}</pre>
-                <button class="bt-eval-preview-toggle" type="button"
-                        title="Enlarge">⌄</button>
-            </div>` : '';
+        !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
         const cmdPreview = msg.command ? `
             <div class="bt-cmd-preview"><pre>${escapeHTML(msg.command)}</pre></div>` : '';
         return `
@@ -1723,12 +1874,12 @@ class BonitoChat {
                 <span class="bt-tool-timer"></span>
                 <span class="${statusCls}">${escapeHTML(msg.status || '')}</span>
                 ${stopBtn}
-                ${msg.kind === 'bonito_app' ? `<button class="bt-tool-detach" type="button"
+                ${msg.kind === 'bonito_app' || msg.live_embed ? `<button class="bt-tool-detach" type="button"
                               title="Detach to floating window">⤢</button>` : ''}
                 <button class="bt-tool-fullwidth" type="button"
                         title="Expand to full chat width">»</button>
             </div>
-            ${evalPreview}${cmdPreview}
+            ${cmdPreview}
             <div class="bt-tool-body" data-tool-id="${escapeAttr(msg.id || '')}"></div>`;
     }
     onPlanUpdate(msg) {
@@ -1772,6 +1923,21 @@ class BonitoChat {
             };
             this.taskbarEl.addEventListener('click', this._onTaskbarClick);
         }
+    }
+    _ensureElapsedTicker() {
+        if (this._elapsedTimer) return;
+        this._elapsedTimer = setInterval(()=>{
+            let any = false;
+            for (const node of this.nodeById.values()){
+                if (!node.classList || !node.classList.contains('bt-tool-live')) continue;
+                any = true;
+                if (node.isConnected) _writeToolElapsed(node);
+            }
+            if (!any) {
+                clearInterval(this._elapsedTimer);
+                this._elapsedTimer = null;
+            }
+        }, 1000);
     }
     _setupLens() {
         const host = (this.app || this.container.closest('.bt-app') || this.container.parentElement).querySelector('.bt-lens-bar');
@@ -2331,12 +2497,91 @@ class BonitoChat {
         };
         this.app.addEventListener('click', this._onAppClickCapture, true);
         this._onTextInputKeyCapture = (e)=>{
+            if (this._cmdAcHandleKey(e)) return;
             if (e.key !== 'Enter' || e.shiftKey) return;
             e.preventDefault();
             e.stopImmediatePropagation();
             this._submit();
         };
         this.textInput.addEventListener('keydown', this._onTextInputKeyCapture, true);
+        this.cmdAc = document.createElement('div');
+        this.cmdAc.className = 'bt-cmd-ac';
+        this.inputArea.appendChild(this.cmdAc);
+        this._cmdAcItems = [];
+        this._cmdAcSel = 0;
+        const acClose = ()=>{
+            this._cmdAcItems = [];
+            this.cmdAc.classList.remove('bt-cmd-ac-open');
+        };
+        this._cmdAcClose = acClose;
+        const acAccept = (cmd)=>{
+            this.textInput.value = '/' + cmd.name + ' ';
+            this.textInput.focus();
+            acClose();
+        };
+        const acRender = ()=>{
+            this.cmdAc.innerHTML = '';
+            this._cmdAcItems.forEach((cmd, i)=>{
+                const row = document.createElement('div');
+                row.className = 'bt-cmd-ac-item' + (i === this._cmdAcSel ? ' bt-cmd-ac-sel' : '');
+                const name = document.createElement('span');
+                name.className = 'bt-cmd-ac-name';
+                name.textContent = '/' + cmd.name;
+                row.appendChild(name);
+                if (cmd.hint) {
+                    const hint = document.createElement('span');
+                    hint.className = 'bt-cmd-ac-hint';
+                    hint.textContent = cmd.hint;
+                    row.appendChild(hint);
+                }
+                if (cmd.description) {
+                    const desc = document.createElement('span');
+                    desc.className = 'bt-cmd-ac-desc';
+                    desc.textContent = cmd.description;
+                    row.appendChild(desc);
+                }
+                row.addEventListener('mousedown', (e)=>{
+                    e.preventDefault();
+                    acAccept(cmd);
+                });
+                this.cmdAc.appendChild(row);
+            });
+            this.cmdAc.classList.toggle('bt-cmd-ac-open', this._cmdAcItems.length > 0);
+        };
+        this._cmdAcHandleKey = (e)=>{
+            if (!this._cmdAcItems.length) return false;
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                const d = e.key === 'ArrowDown' ? 1 : -1;
+                this._cmdAcSel = (this._cmdAcSel + d + this._cmdAcItems.length) % this._cmdAcItems.length;
+                acRender();
+            } else if (e.key === 'Enter' || e.key === 'Tab') {
+                acAccept(this._cmdAcItems[this._cmdAcSel]);
+            } else if (e.key === 'Escape') {
+                acClose();
+            } else {
+                return false;
+            }
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return true;
+        };
+        this._onCmdInput = ()=>{
+            const m = (this.textInput.value || '').match(/^\/([\w:-]*)$/);
+            const cmds = this.slashCommands || [];
+            if (!m || !cmds.length) {
+                acClose();
+                return;
+            }
+            const q = m[1].toLowerCase();
+            const starts = cmds.filter((c)=>c.name.toLowerCase().startsWith(q));
+            const incl = cmds.filter((c)=>!c.name.toLowerCase().startsWith(q) && c.name.toLowerCase().includes(q));
+            this._cmdAcItems = starts.concat(incl).slice(0, 8);
+            this._cmdAcSel = 0;
+            acRender();
+        };
+        this._onCmdBlur = ()=>acClose();
+        this.textInput.addEventListener('input', this._onCmdInput);
+        this.textInput.addEventListener('blur', this._onCmdBlur);
         this._onEscapeKey = (e)=>{
             if (e.key !== 'Escape' || e.repeat) return;
             if (!this.container.isConnected) {
@@ -2344,6 +2589,11 @@ class BonitoChat {
                 return;
             }
             if (this.container.offsetParent === null) return;
+            if (this._cmdAcItems && this._cmdAcItems.length) {
+                e.preventDefault();
+                this._cmdAcClose();
+                return;
+            }
             const t = e.target;
             if (t && t.closest && t.closest('.monaco-editor')) return;
             e.preventDefault();
@@ -2482,7 +2732,7 @@ class BonitoChat {
             this._cancelPendingScroll();
         }
         if (this.followMode) return;
-        if (atBot || scrollTop > prevTop && scrollHeight - scrollTop - clientHeight < clientHeight && !this.lastMessageFullyOutOfView()) {
+        if (atBot) {
             this.setFollowMode(true);
             this._queueScrollToBottom();
         } else {
@@ -2674,8 +2924,8 @@ function _writeToolElapsed(node) {
     if (!timer) return;
     const started = parseFloat(node.dataset.toolStarted ?? '0');
     const finished = parseFloat(node.dataset.toolFinished ?? '0');
-    if (!started || !finished) return;
-    const dt = finished - started;
+    if (!started) return;
+    const dt = Math.max(0, (finished || Date.now() / 1000) - started);
     timer.textContent = dt > 1 ? _formatElapsed(dt) : '';
 }
 function arrayBufferToBase64(buf) {
@@ -2687,6 +2937,41 @@ function arrayBufferToBase64(buf) {
     }
     return btoa(binary);
 }
+window.btMSearchFilter = function btMSearchFilter(inputEl) {
+    const q = inputEl.value.toLowerCase();
+    const wrap = inputEl.closest('.bt-msearch');
+    wrap.querySelectorAll('.bt-msearch-item').forEach((item)=>{
+        item.hidden = q.length > 0 && !item.dataset.label.includes(q);
+    });
+};
+window.btMSearchOpen = function btMSearchOpen(triggerEl) {
+    document.querySelectorAll('.bt-msearch-open').forEach((el)=>el.classList.remove('bt-msearch-open'));
+    const wrap = triggerEl.closest('.bt-msearch');
+    wrap.classList.add('bt-msearch-open');
+    const input = wrap.querySelector('.bt-msearch-input');
+    if (input) {
+        input.value = '';
+        window.btMSearchFilter(input);
+    }
+    requestAnimationFrame(()=>{
+        function onOutside(e) {
+            if (!e.target.closest('.bt-msearch-open')) {
+                document.querySelectorAll('.bt-msearch-open').forEach((el)=>el.classList.remove('bt-msearch-open'));
+                document.removeEventListener('click', onOutside, true);
+            }
+        }
+        document.addEventListener('click', onOutside, true);
+        if (input) input.focus();
+    });
+};
+window.btMSearchSelect = function btMSearchSelect(itemEl, pickObs, cfgId, value) {
+    pickObs.notify([
+        cfgId,
+        value
+    ]);
+    const wrap = itemEl.closest('.bt-msearch');
+    if (wrap) wrap.classList.remove('bt-msearch-open');
+};
 const CHAT_INSTANCES = new Set();
 if (typeof window !== 'undefined') window.__btChats = CHAT_INSTANCES;
 function toolSlot(id) {
@@ -2699,8 +2984,9 @@ function toolSlot(id) {
     }
     return null;
 }
-function connect(node, comm) {
+function connect(node, comm, init = {}) {
     const chat = new BonitoChat(node, comm);
+    if (Array.isArray(init.commands)) chat.slashCommands = init.commands;
     node.__bt_chat = chat;
     CHAT_INSTANCES.add(chat);
     const parent = node.parentNode;

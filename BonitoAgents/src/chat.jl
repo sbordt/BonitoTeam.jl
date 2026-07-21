@@ -128,6 +128,16 @@ mutable struct ChatModel
     # bring-up (`start_chat_client!`); ephemeral, never persisted.
     session_meta::Observable{Vector{Any}}
 
+    # Live context/cost telemetry off `usage_update` (sent after every
+    # assistant message): `nothing` until the first turn, then a NamedTuple
+    # (used, size, cost, origin). Drives the header context meter. Ephemeral
+    # like session_meta.
+    usage::Observable{Any}
+
+    # Claude's slash-command set (`available_commands_update`; complete state,
+    # re-pushed on change). Shipped to JS for composer `/` autocomplete.
+    available_commands::Observable{Vector{AgentClientProtocol.CommandInfo}}
+
     # The single `run_chat!` consumer task. Started once (guarded) by
     # `start_chat_client!`; survives `restart_chat_session!` (which only swaps
     # the ACP client, not the consumer). Shared across per-session views.
@@ -254,6 +264,8 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         Observable(false),          # yolo (auto-continue mode; off by default)
         Observable(""),             # yolo_reminders (appended to each continue-prompt)
         Observable(Any[]),          # session_meta
+        Observable{Any}(nothing),   # usage (context/cost telemetry)
+        Observable(AgentClientProtocol.CommandInfo[]),  # available_commands
         Ref{Union{Task,Nothing}}(nothing),   # consumer_task
         Ref{Union{Task,Nothing}}(nothing),   # poller_task
         Ref(false),                 # restart_inflight
@@ -327,6 +339,8 @@ function Base.copy(m::ChatModel, session::Bonito.Session)
             map(identity, session, m.yolo),
             map(identity, session, m.yolo_reminders),
             map(identity, session, m.session_meta),
+            any_bridge(session, m.usage),   # Any-typed: nothing → NamedTuple
+            map(identity, session, m.available_commands),
             m.consumer_task,           # shared → only the parent runs the loop
             m.poller_task,             # shared → one poller per chat
             m.restart_inflight,        # shared → one restart coordinator per chat
@@ -467,12 +481,29 @@ Abstract supertype for one tool-call bubble in the chat. Concrete subtypes:
         `JuliaEvalToolMsg` / `JuliaContinueToolMsg` (the `JuliaEvalCall` pair) /
         `JuliaInterruptToolMsg` / `JuliaRestartToolMsg` / `JuliaListSessionsToolMsg`
         / `ShowToolMsg`, and `GenericMCPToolMsg` (any third-party server)
-  • `BonitoAppMsg`    — a live worker Bonito app (`bt_show_app` / `show_remote_app!`)
 
 All variants share `id` / `kind` / `title` / `status` / `summary`, plus
 `started_at` / `finished_at` epoch seconds used by the tool-pill timer.
 """
 abstract type ToolMsg <: ChatMsg end
+
+# Shared bubble state of every tool-call message, COMPOSED into each concrete
+# variant as `m.message` (Julia structs don't inherit fields, and repeating the
+# block per struct is noise). The per-tool DATA are real typed fields on the
+# variant, parsed out of the streamed rawInput by `apply_input!` — a message
+# never lugs an argument Dict around unless the tool is genuinely unknown
+# (the two Generic fallbacks).
+mutable struct Message
+    id::String
+    kind::String              # ACP kind ("read"/"edit"/…), shipped to JS (icon + gating)
+    name::String              # ACP tool name ("Read"/"Grep"/…); "" if the agent sent no meta
+    title::String
+    status::String
+    summary::String           # cached header summary; full content on disk
+    started_at::Float64
+    finished_at::Union{Float64,Nothing}
+    chat::Union{ChatModel,Nothing}
+end
 
 # The "built-in" tool family: Claude's native tools (Read/Edit/Grep/Glob/
 # WebFetch/…). One CONCRETE type per ACP `kind` — the axis that decides how the
@@ -482,37 +513,44 @@ abstract type ToolMsg <: ChatMsg end
 # Glob are both `SearchToolMsg`, told apart only by `name`. `GenericToolMsg` is
 # the fallback for kinds with no special rendering (think/delete/other) and for
 # unknown future tools. Bash (`execute`) is NOT here — it's `BashToolMsg`, which
-# carries the background lifecycle. Every variant shares the SAME field block; a
-# mutable struct can't inherit fields in Julia, so `@builtin_msg` stamps it.
+# carries the background lifecycle.
+#
+# Typed argument fields start empty ("" etc.): claude-agent-acp STREAMS tool
+# input — the initial `tool_call` usually has an EMPTY rawInput and the real
+# arguments ride a later `tool_call_update` (see `apply_input!`).
 abstract type BuiltinToolMsg <: ToolMsg end
 
-macro builtin_msg(name)
-    esc(quote
-        mutable struct $name <: BuiltinToolMsg
-            id::String
-            kind::String                   # ACP kind, still shipped to JS (icon + gating)
-            name::String                   # ACP tool name ("Read"/"Grep"/…); "" if the agent sent no meta
-            title::String
-            status::String
-            summary::String                # cached header summary; full content on disk
-            started_at::Float64
-            finished_at::Union{Float64,Nothing}
-            chat::Union{ChatModel,Nothing}
-            # The call's arguments. Claude's native tools (Read/Edit/Write/…)
-            # carry the REAL file path here (`file_path`) — their titles are
-            # display strings like "Read CONVENTIONS.md", NOT paths. Arrives late
-            # (streamed input, see update_from_snap!), so it starts empty.
-            raw_input::Dict{String,Any}
-        end
-    end)
+mutable struct GenericToolMsg <: BuiltinToolMsg   # fallback: think/delete/other/unknown
+    message::Message
+    raw_input::Dict{String,Any}   # unknown tool ⇒ untyped args (path-hint probing)
+end
+GenericToolMsg(message::Message) = GenericToolMsg(message, Dict{String,Any}())
+
+mutable struct EditToolMsg <: BuiltinToolMsg      # kind "edit" (Edit / Write / MultiEdit)
+    message::Message
+    file_path::String             # the REAL path (titles are display strings) — ✎ affordance
+end
+EditToolMsg(message::Message) = EditToolMsg(message, "")
+
+mutable struct ReadToolMsg <: BuiltinToolMsg      # kind "read" (Read)
+    message::Message
+    file_path::String             # ✎ affordance + worker-streamed image results
+end
+ReadToolMsg(message::Message) = ReadToolMsg(message, "")
+
+mutable struct SearchToolMsg <: BuiltinToolMsg    # kind "search" (Grep / Glob)
+    message::Message
+    path::String                  # the searched root, when the call carries one
+end
+SearchToolMsg(message::Message) = SearchToolMsg(message, "")
+
+mutable struct MoveToolMsg <: BuiltinToolMsg      # kind "move"
+    message::Message
 end
 
-@builtin_msg GenericToolMsg   # fallback: think / delete / other / unknown tools
-@builtin_msg EditToolMsg      # kind "edit"   (Edit / Write / MultiEdit)
-@builtin_msg ReadToolMsg      # kind "read"   (Read)
-@builtin_msg SearchToolMsg    # kind "search" (Grep / Glob)
-@builtin_msg MoveToolMsg      # kind "move"
-@builtin_msg FetchToolMsg     # kind "fetch"  (WebFetch)
+mutable struct FetchToolMsg <: BuiltinToolMsg     # kind "fetch" (WebFetch)
+    message::Message
+end
 
 # The ONE place a wire `kind` maps to a built-in type (build/replay), mirroring
 # `mcp_msg_type`. Kinds with no special rendering + anything unknown → the
@@ -526,23 +564,25 @@ const BUILTIN_MSG_TYPES = Dict{String,DataType}(
 )
 builtin_msg_type(kind::AbstractString) = get(BUILTIN_MSG_TYPES, kind, GenericToolMsg)
 
-# Back-compat forms: 8-arg (pre-`name`) and 9-arg (pre-`raw_input`) — used by
-# test fixtures and legacy call sites. Build a GenericToolMsg (the reload path
-# re-derives the specific type from `kind` via `builtin_msg_type`).
-GenericToolMsg(id, kind, title, status, summary, started_at, finished_at, chat) =
-    GenericToolMsg(id, kind, "", title, status, summary, started_at, finished_at, chat)
-GenericToolMsg(id, kind, name, title, status, summary, started_at, finished_at, chat) =
-    GenericToolMsg(id, kind, name, title, status, summary, started_at, finished_at, chat,
-                   Dict{String,Any}())
+# ── Streamed-input parsing ──────────────────────────────────────────────────
+# Parse the wire rawInput into the variant's TYPED fields. Called at build time
+# AND per `tool_call_update` snap (the arguments stream in late), so every
+# method must tolerate partial/empty dicts and only overwrite on real values.
+apply_input!(::ToolMsg, ::AbstractDict) = nothing
+apply_input!(m::GenericToolMsg, raw::AbstractDict) = (merge!(m.raw_input, raw); nothing)
+function apply_input!(m::Union{EditToolMsg,ReadToolMsg}, raw::AbstractDict)
+    fp = get(raw, "file_path", nothing)
+    fp isa AbstractString && !isempty(fp) && (m.file_path = String(fp))
+    return nothing
+end
+function apply_input!(m::SearchToolMsg, raw::AbstractDict)
+    p = get(raw, "path", nothing)
+    p isa AbstractString && !isempty(p) && (m.path = String(p))
+    return nothing
+end
 
 mutable struct BashToolMsg <: ToolMsg
-    id::String
-    kind::String
-    title::String
-    status::String
-    summary::String
-    started_at::Float64
-    finished_at::Union{Float64,Nothing}
+    message::Message
     command::String
     # Claude's human-readable summary of WHAT the command does ("Monitor
     # system load for 30 min"). Arrives late (streamed input); when present
@@ -559,34 +599,20 @@ mutable struct BashToolMsg <: ToolMsg
     bg_output_path::String
     bg_offset::Int
     bg_text::String
-    chat::Union{ChatModel,Nothing}
     # The chat's TaskBar while this background bash is live; `nothing` otherwise.
     # MEMBERSHIP IS LIVENESS — `push!`/`finished!` are the only mutators. Init
     # nothing (foreground bashes never enter the bar).
     task_bar::Union{TaskBar,Nothing}
 end
 
-# Full form without task_bar (defaults to nothing) — every existing call site
-# lands here since the auto inner constructor now takes the extra field.
-BashToolMsg(id, kind, title, status, summary, started_at, finished_at,
-            command, description, is_background, bg_output_path, bg_offset,
-            bg_text, chat) =
-    BashToolMsg(id, kind, title, status, summary, started_at, finished_at,
-                command, description, is_background, bg_output_path, bg_offset,
-                bg_text, chat, nothing)
-
-# Back-compat form (pre-`description`): test fixtures.
-BashToolMsg(id, kind, title, status, summary, started_at, finished_at,
-            command, is_background, bg_output_path, bg_offset,
-            bg_text, chat) =
-    BashToolMsg(id, kind, title, status, summary, started_at, finished_at,
-                command, nothing, is_background, bg_output_path, bg_offset,
-                bg_text, chat)
+BashToolMsg(message::Message; command = "", description = nothing,
+            is_background = false) =
+    BashToolMsg(message, command, description, is_background, "", 0, "", nothing)
 
 # What the pill/taskbar shows for a bash: the human-readable description
 # when claude sent one, else the ACP title (usually the raw command).
 bash_display_title(b::BashToolMsg) =
-    b.description === nothing || isempty(b.description) ? b.title : b.description
+    b.description === nothing || isempty(b.description) ? b.message.title : b.description
 
 # One line of a subagent's live activity, kept on its parent `TaskToolMsg`.
 # RAM-only: the feed is never persisted — `stamp_feed_summary!` leaves a
@@ -609,17 +635,10 @@ struct TaskActivityEntry
 end
 
 mutable struct TaskToolMsg <: ToolMsg
-    id::String
-    kind::String
-    title::String
-    status::String
-    summary::String
-    started_at::Float64
-    finished_at::Union{Float64,Nothing}
+    message::Message
     description::String
     is_background::Bool
     task_name::Union{String,Nothing}      # SDK `name` — for SendMessage addressing
-    chat::Union{ChatModel,Nothing}
     # Live subagent feed (route_subagent_activity!), bounded to the most
     # recent entries. `activity_seq` counts every entry EVER created (it
     # outlives the bounded window and feeds the persisted "N steps" trace);
@@ -644,49 +663,112 @@ mutable struct TaskToolMsg <: ToolMsg
     task_bar::Union{TaskBar,Nothing}
 end
 
-# Back-compat short form (pre-feed): the build/replay paths and test fixtures.
-TaskToolMsg(id, kind, title, status, summary, started_at, finished_at,
-            description, is_background, task_name, chat) =
-    TaskToolMsg(id, kind, title, status, summary, started_at, finished_at,
-                description, is_background, task_name, chat,
+TaskToolMsg(message::Message; description = "", is_background = false,
+            task_name = nothing) =
+    TaskToolMsg(message, description, is_background, task_name,
                 TaskActivityEntry[], 0, time(), false, "", 0, nothing)
 
 # MCP tool calls (`mcp__<server>__<tool>`). One TYPE per BonitoMCP tool, so all
 # behavior dispatches on the type — the raw `tool_name` is consulted in exactly
-# ONE place (`mcp_msg_type`, at build time, like `is_bonito_app`), never at a call
-# site. `MCPToolMsg` is abstract; shared MCP behavior (server badge, tool_key,
-# path hint, streamed-input merge, the `executed`-input preview) dispatches on it.
-# `JuliaEvalCall` groups the two code-running eval tools that share the code/⊗/⏱
-# affordances. Concrete subtypes all carry the SAME fields — a mutable struct
-# can't inherit fields in Julia, so `@mcp_msg` stamps the identical field block.
+# ONE place (`mcp_msg_type`, at build time), never at a call site. `MCPToolMsg`
+# is abstract; shared MCP behavior (server badge, tool_key, path hint, the
+# `executed`-input preview) dispatches on it. `JuliaEvalCall` groups the two
+# code-running eval tools that share the code/⊗/⏱ affordances. Each concrete
+# type composes `Message` and carries its OWN typed arguments, parsed from the
+# streamed rawInput by `apply_input!` — the bare `tool_name` string lives only
+# on the unknown-tool fallback (for the known tools the TYPE is the name, see
+# `tool_key`).
 abstract type MCPToolMsg <: ToolMsg end
 abstract type JuliaEvalCall <: MCPToolMsg end   # bt_julia_eval / bt_julia_continue
 
-macro mcp_msg(name, super)
-    esc(quote
-        mutable struct $name <: $super
-            id::String
-            kind::String
-            title::String
-            status::String
-            summary::String
-            started_at::Float64
-            finished_at::Union{Float64,Nothing}
-            server::String                     # "bonitoagents" / "playwright" / …
-            tool_name::String                  # bare name (without `mcp__<server>__`)
-            raw_input::Dict{String,Any}        # `code`/`timeout`/`env_path`/`path`/…
-            chat::Union{ChatModel,Nothing}
-        end
-    end)
+mutable struct GenericMCPToolMsg <: MCPToolMsg  # third-party MCP tools + fallback
+    message::Message
+    server::String                # "bonitoagents" / "playwright" / …
+    tool_name::String             # bare name (without `mcp__<server>__`)
+    raw_input::Dict{String,Any}   # unknown tool ⇒ untyped args (path-hint probing)
+end
+GenericMCPToolMsg(message::Message, server, tool_name) =
+    GenericMCPToolMsg(message, server, tool_name, Dict{String,Any}())
+
+mutable struct ShowToolMsg <: MCPToolMsg        # bt_show
+    message::Message
+    server::String
+    path::String                  # the shown file — feeds the ✎ affordance
+end
+ShowToolMsg(message::Message, server) = ShowToolMsg(message, server, "")
+
+mutable struct JuliaEvalToolMsg <: JuliaEvalCall     # bt_julia_eval
+    message::Message
+    server::String
+    code::String                  # the code being executed (live preview + Code section)
+    env_path::String              # project env; "" ⇒ ephemeral temp session
+    timeout::Union{Float64,Nothing}   # soft checkpoint cadence; nothing ⇒ default
+    # Live stdout tail while the eval runs (`eval_stream_loop!` drains the MCP's
+    # forwarded stream): rolling text window + the drain task (nothing until the
+    # eval turns pending/in_progress).
+    stream_text::String
+    stream_task::Union{Task,Nothing}
+end
+JuliaEvalToolMsg(message::Message, server) =
+    JuliaEvalToolMsg(message, server, "", "", nothing, "", nothing)
+
+mutable struct JuliaContinueToolMsg <: JuliaEvalCall # bt_julia_continue
+    message::Message
+    server::String
+    code::String                  # continue carries none — stays "" (shared render path)
+    env_path::String
+    timeout::Union{Float64,Nothing}
+    stream_text::String
+    stream_task::Union{Task,Nothing}
+end
+JuliaContinueToolMsg(message::Message, server) =
+    JuliaContinueToolMsg(message, server, "", "", nothing, "", nothing)
+
+mutable struct JuliaInterruptToolMsg <: MCPToolMsg   # bt_julia_interrupt
+    message::Message
+    server::String
+    env_path::String              # which session it SIGINTs; "" ⇒ the active one
+end
+JuliaInterruptToolMsg(message::Message, server) =
+    JuliaInterruptToolMsg(message, server, "")
+
+mutable struct JuliaRestartToolMsg <: MCPToolMsg     # bt_julia_restart
+    message::Message
+    server::String
+    env_path::String
+end
+JuliaRestartToolMsg(message::Message, server) =
+    JuliaRestartToolMsg(message, server, "")
+
+mutable struct JuliaListSessionsToolMsg <: MCPToolMsg # bt_julia_list_sessions
+    message::Message
+    server::String
 end
 
-@mcp_msg GenericMCPToolMsg        MCPToolMsg     # third-party MCP tools + fallback
-@mcp_msg ShowToolMsg              MCPToolMsg     # bt_show
-@mcp_msg JuliaInterruptToolMsg    MCPToolMsg     # bt_julia_interrupt
-@mcp_msg JuliaRestartToolMsg      MCPToolMsg     # bt_julia_restart
-@mcp_msg JuliaListSessionsToolMsg MCPToolMsg     # bt_julia_list_sessions
-@mcp_msg JuliaEvalToolMsg         JuliaEvalCall  # bt_julia_eval
-@mcp_msg JuliaContinueToolMsg     JuliaEvalCall  # bt_julia_continue
+# Streamed-argument parsing for the typed MCP variants (see `apply_input!` above).
+function apply_input!(m::GenericMCPToolMsg, raw::AbstractDict)
+    merge!(m.raw_input, raw)
+    return nothing
+end
+function apply_input!(m::ShowToolMsg, raw::AbstractDict)
+    p = get(raw, "path", nothing)
+    p isa AbstractString && !isempty(p) && (m.path = String(p))
+    return nothing
+end
+function apply_input!(m::JuliaEvalCall, raw::AbstractDict)
+    c = get(raw, "code", nothing)
+    c isa AbstractString && !isempty(c) && (m.code = String(c))
+    e = get(raw, "env_path", nothing)
+    e isa AbstractString && !isempty(e) && (m.env_path = String(e))
+    t = get(raw, "timeout", nothing)
+    t isa Real && (m.timeout = Float64(t))
+    return nothing
+end
+function apply_input!(m::Union{JuliaInterruptToolMsg,JuliaRestartToolMsg}, raw::AbstractDict)
+    e = get(raw, "env_path", nothing)
+    e isa AbstractString && !isempty(e) && (m.env_path = String(e))
+    return nothing
+end
 
 # The ONE place a raw MCP tool name maps to a message type (build/replay). Unknown
 # tools (any third-party MCP server) fall back to `GenericMCPToolMsg`.
@@ -700,41 +782,28 @@ const MCP_MSG_TYPES = Dict{String,DataType}(
 )
 mcp_msg_type(tool_name::AbstractString) = get(MCP_MSG_TYPES, tool_name, GenericMCPToolMsg)
 
-# Bare `MCPToolMsg(...)` builds a generic one (back-compat for callers/fixtures).
-# Both arities: the 11-field primary and the 10-arg pre-`raw_input` form.
-MCPToolMsg(id, kind, title, status, summary, started_at, finished_at,
-           server, tool_name, raw_input, chat) =
-    GenericMCPToolMsg(id, kind, title, status, summary, started_at, finished_at,
-                      server, tool_name, raw_input, chat)
-MCPToolMsg(id, kind, title, status, summary, started_at, finished_at,
-           server, tool_name, chat) =
-    GenericMCPToolMsg(id, kind, title, status, summary, started_at, finished_at,
-                      server, tool_name, Dict{String,Any}(), chat)
+# Uniform MCP construction: the known types don't store the tool name (the TYPE
+# is the identity); only the unknown-tool fallback keeps it as data.
+build_mcp_msg(T::Type{<:MCPToolMsg}, message::Message, server, tool_name) = T(message, String(server))
+build_mcp_msg(::Type{GenericMCPToolMsg}, message::Message, server, tool_name) =
+    GenericMCPToolMsg(message, String(server), String(tool_name))
 
-# A live worker Bonito app (its own type, NOT a generic/MCP tool — it renders an
-# interactive embed and offers Detach, see render_tool_body / augment_header!
-# below). Recognised at BUILD time from the tool NAME (`bt_show_app`) or KIND
-# (`bonito_app`, the programmatic `show_remote_app!` path) — never by sniffing
-# the persisted result content, which isn't on disk yet for a just-completed
-# live tool (that race is why the detach button vanished on fresh apps). The
-# registered app id is resolved lazily at render time (it lives in the result
-# content for `bt_show_app`, or is the tool id itself for `show_remote_app!`).
-mutable struct BonitoAppMsg <: ToolMsg
-    id::String
-    kind::String                          # always "bonito_app"
-    title::String
-    status::String
-    summary::String
-    started_at::Float64
-    finished_at::Union{Float64,Nothing}
-    server::String                        # MCP server badge ("" for programmatic)
-    # The id the worker registered the app under. `show_remote_app!` registers
-    # under the message id (so it's known immediately); `bt_show_app` returns it
-    # in its result, captured ONCE on completion. Empty ⇒ fall back to `id` at
-    # render. Render/header read this field — NEVER the content.
-    app_id::String
-    chat::Union{ChatModel,Nothing}
-end
+# ── Shared-header accessors ─────────────────────────────────────────────────
+# Every ToolMsg variant COMPOSES the shared bubble state as `m.message`; these
+# are the generic read paths (writers mutate `m.message.field` directly).
+tool_id(m::ToolMsg)          = m.message.id
+tool_kind(m::ToolMsg)        = m.message.kind
+tool_title(m::ToolMsg)       = m.message.title
+tool_status(m::ToolMsg)      = m.message.status
+tool_summary(m::ToolMsg)     = m.message.summary
+tool_started_at(m::ToolMsg)  = m.message.started_at
+tool_finished_at(m::ToolMsg) = m.message.finished_at
+tool_chat(m::ToolMsg)        = m.message.chat
+
+# Message id across ALL ChatMsg variants (tools compose it; the rest carry it
+# flat) — for generic code like the orphan sweep and taskbar logging.
+msg_id(m::ToolMsg) = m.message.id
+msg_id(m::ChatMsg) = m.id
 
 mutable struct ThoughtMsg <: ChatMsg
     id::String
@@ -781,17 +850,15 @@ TodoListMsg(chat::ChatModel, entries) =
 # A live tool message is one whose `status` hasn't yet hit a terminal state.
 # The tool pill's pulsing glow + the taskbar slot both subscribe to this.
 is_live(m::ToolMsg) =
-    m.finished_at === nothing && !(m.status in ("completed", "failed"))
+    tool_finished_at(m) === nothing && !(tool_status(m) in ("completed", "failed"))
 # A background bash's tool_call "completes" at LAUNCH but the shell runs on, so
 # liveness is NOT the tool_call status. Membership IS liveness: a Bash/Task
 # that's in the bar is live — the bubble keeps pulsing (taskbar slot + timer
 # stay) until the bar `finished!`es it on the output file's fd-close. The `||`
 # status clause covers the sub-second window before `push!` (and foreground
 # tools that never enter the bar) — when done: not in the bar AND terminal.
-is_live(m::BashToolMsg) = in_taskbar(m) ||
-    (m.finished_at === nothing && !(m.status in ("completed", "failed")))
-is_live(m::TaskToolMsg) = in_taskbar(m) ||
-    (m.finished_at === nothing && !(m.status in ("completed", "failed")))
+is_live(m::Union{BashToolMsg,TaskToolMsg}) = in_taskbar(m) ||
+    (tool_finished_at(m) === nothing && !(tool_status(m) in ("completed", "failed")))
 # `finished_at` flips to non-nothing inside `try_absorb_todo!` once the
 # absorbed entries become all-done — `is_live` checking that field is what
 # lets the next TodoWrite start a fresh bubble instead of absorbing into
@@ -806,10 +873,8 @@ is_live(::ChatMsg) = false
 # `run_turn!` end-of-turn sweep as a defense-in-depth backstop. Keyed on
 # `status` (NOT `is_live`) so it does NOT match a backgrounded bash whose
 # tool_call already reported `"completed"` at launch (those have a separate
-# lifecycle owned by the bg poller). A live worker app (`BonitoAppMsg`) also
-# stays terminal-status here for the same reason — its app lifetime is owned
-# by the EvalBridge, not the chat-message close.
-is_turn_orphan(m::ToolMsg)    = !(m.status in ("completed", "failed"))
+# lifecycle owned by the bg poller).
+is_turn_orphan(m::ToolMsg)    = !(tool_status(m) in ("completed", "failed"))
 # Streaming AgentMsg / ThoughtMsg whose `close` never ran (session died
 # mid-stream so `process_update!` / `process!` exited via exception before
 # their close-in-finally). The sweep's `close(m)` ships the missing wire
@@ -861,7 +926,7 @@ in_taskbar(m::TodoListMsg) = m.task_bar !== nothing
 # The chat's single shared TaskBar (source of truth for what's live).
 chat_taskbar(chat::ChatModel) = shared(chat).taskbar
 is_pinned(chat::ChatModel, id::AbstractString) =
-    any(t -> t.id == id, shared(chat).taskbar.items[])
+    any(t -> msg_id(t) == id, shared(chat).taskbar.items[])
 
 # Enter the bar (become live): add to the live set, mark membership, make sure
 # the bar's poll loop is running.
@@ -883,7 +948,7 @@ function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg})
     try
         finalize!(m)
     catch e
-        @warn "finalize! failed" id = m.id exception = (e, catch_backtrace())
+        @warn "finalize! failed" id = msg_id(m) exception = (e, catch_backtrace())
     end
     lock(bar.lock) do
         bar.items[] = filter(t -> t !== m, bar.items[])
@@ -891,7 +956,7 @@ function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg})
     return nothing
 end
 
-taskbar_item_for(m::ToolMsg)     = tool_taskbar_item(m.chat, m)
+taskbar_item_for(m::ToolMsg)     = tool_taskbar_item(tool_chat(m), m)
 taskbar_item_for(m::TodoListMsg) = todo_taskbar_item(m)
 
 # ── isdone: each message type owns "what being done means" ───────────────────
@@ -905,7 +970,7 @@ isdone(m::TodoListMsg) = !any(e -> e.status in ("pending", "in_progress"), m.ent
 # No file yet ⇒ still launching (stay) unless it already reached a terminal
 # status (a failed/inline launch that produced no file) ⇒ done.
 isdone(m::BashToolMsg) =
-    isempty(m.bg_output_path) ? (m.status in ("completed", "failed")) :
+    isempty(m.bg_output_path) ? (tool_status(m) in ("completed", "failed")) :
     poll_output_file!(m; stream = true)
 # A background subagent is done ONLY on a signal we can trust — no timeouts, no
 # staleness heuristic, no guessing. Verified against a live claude-agent-acp agent:
@@ -930,9 +995,10 @@ isdone(m::TaskToolMsg) = !isempty(m.bg_output_path) && subagent_transcript_done(
 # presence anywhere in the transcript is the deterministic "subagent finished".
 const SUBAGENT_DONE_MARKER = "\"stop_reason\":\"end_turn\""
 function subagent_transcript_done(m::TaskToolMsg)
-    m.chat === nothing && return false
-    state = m.chat.state
-    wid   = bg_worker_id(state, m.chat)
+    chat = tool_chat(m)
+    chat === nothing && return false
+    state = chat.state
+    wid   = bg_worker_id(state, chat)
     wid === nothing && return false
     # Read the whole transcript (bounded) from the top each poll: `end_turn` sits
     # at the END, and reading forward from a rolling offset could split the marker
@@ -941,7 +1007,7 @@ function subagent_transcript_done(m::TaskToolMsg)
         tail_worker_file(state, wid, m.bg_output_path; offset = 0,
                          max_bytes = 4_000_000, timeout = 10.0)
     catch e
-        @debug "subagent transcript read failed (will retry)" id = m.id exception = e
+        @debug "subagent transcript read failed (will retry)" id = tool_id(m) exception = e
         return false
     end
     return r.exists && occursin(SUBAGENT_DONE_MARKER, r.chunk)
@@ -952,18 +1018,19 @@ end
 # deterministic done-signal for BOTH a background shell and an async subagent
 # (its transcript `outputFile`).
 function poll_output_file!(m::ToolMsg; stream::Bool)
-    m.chat === nothing && return false
-    state = m.chat.state
-    wid   = bg_worker_id(state, m.chat)
+    chat = tool_chat(m)
+    chat === nothing && return false
+    state = chat.state
+    wid   = bg_worker_id(state, chat)
     wid === nothing && return false
     r = try
         tail_worker_file(state, wid, m.bg_output_path; offset = m.bg_offset, timeout = 10.0)
     catch e
-        @debug "taskbar tail failed (will retry)" id = m.id exception = e
+        @debug "taskbar tail failed (will retry)" id = tool_id(m) exception = e
         return false
     end
     if r.exists && r.offset > m.bg_offset
-        stream && m isa BashToolMsg && (m.bg_text *= r.chunk; stream_bg_update!(m.chat, m))
+        stream && m isa BashToolMsg && (m.bg_text *= r.chunk; stream_bg_update!(chat, m))
         m.bg_offset = r.offset
     end
     # Done ONLY when the file EXISTS and its writer fd has closed (Linux /proc
@@ -985,29 +1052,31 @@ end
 # while it ran, see `process_update!`) to completed. `request_tool_stop!` overrides
 # this with "stopped" right after.
 function finalize!(m::TaskToolMsg)
-    m.status in ("completed", "failed") || (m.status = "completed")
+    h = m.message
+    h.status in ("completed", "failed") || (h.status = "completed")
     close(m)
-    m.chat === nothing || chat_emit(m.chat, Dict{String,Any}(
-        "type" => "tool_update", "id" => m.id, "status" => m.status,
-        "summary" => m.summary,
-        "finished_at" => m.finished_at === nothing ? time() : m.finished_at))
+    h.chat === nothing || chat_emit(h.chat, Dict{String,Any}(
+        "type" => "tool_update", "id" => h.id, "status" => h.status,
+        "summary" => h.summary,
+        "finished_at" => h.finished_at === nothing ? time() : h.finished_at))
     return nothing
 end
 function finalize!(m::BashToolMsg)
-    model = m.chat
+    h = m.message
+    model = h.chat
     model === nothing && return nothing
-    m.status = "completed"
-    m.finished_at === nothing && (m.finished_at = time())
+    h.status = "completed"
+    h.finished_at === nothing && (h.finished_at = time())
     write_bg_content!(model.chat_dir, m)
     try
         append_tool(model.chat_session, m)
     catch e
-        @warn "append_tool for finished bg task failed" id = m.id exception = e
+        @warn "append_tool for finished bg task failed" id = h.id exception = e
     end
     n = bg_line_count(m)
-    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => m.id,
+    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => h.id,
         "status" => "completed", "summary" => "done · $n line$(n == 1 ? "" : "s")",
-        "finished_at" => m.finished_at))
+        "finished_at" => h.finished_at))
     return nothing
 end
 function finalize!(m::TodoListMsg)
@@ -1032,7 +1101,7 @@ pin_immediately(::BashToolMsg)  = true
 pin_immediately(::TaskToolMsg)  = true
 pin_immediately(::JuliaEvalCall) = true  # runs code + offers ⊗ interrupt → show a pill at once
 
-taskbar_label(b::ToolMsg)     = first(pretty_tool_title(b.title))
+taskbar_label(b::ToolMsg)     = first(pretty_tool_title(tool_title(b)))
 taskbar_label(b::BashToolMsg) = first(pretty_tool_title(bash_display_title(b)))
 
 # Live slot label (taskbar.jl calls this per clock tick): re-derive from the
@@ -1041,7 +1110,8 @@ taskbar_label(b::BashToolMsg) = first(pretty_tool_title(bash_display_title(b)))
 # 1 Hz clock is the tick; this is why `refresh_pin!` (a re-emit that KeyedList
 # ignored for same-key slots anyway) is gone.
 taskbar_slot_label(m::ToolMsg, _fallback) =
-    m.chat === nothing ? taskbar_label(m) : lock(() -> taskbar_label(m), shared(m.chat).lock)
+    tool_chat(m) === nothing ? taskbar_label(m) :
+        lock(() -> taskbar_label(m), shared(tool_chat(m)).lock)
 
 # `taskbar_dyn_key(msg)` — a cheap fingerprint of the slot's CHANGING content
 # (see taskbar.jl); folded into the KeyedList key so a change re-renders the slot
@@ -1052,8 +1122,8 @@ taskbar_dyn_key(m::BashToolMsg) = taskbar_slot_label(m, "")
 # pill's activity one-liner whenever a new frame lands. The elapsed timer is NOT
 # here (it's the JS ticker; a key change every second would churn).
 taskbar_dyn_key(m::TaskToolMsg) =
-    m.chat === nothing ? string(length(m.activity)) :
-    lock(shared(m.chat).lock) do
+    tool_chat(m) === nothing ? string(length(m.activity)) :
+    lock(shared(tool_chat(m)).lock) do
         string(length(m.activity), ":", isempty(m.activity) ? "" : last(m.activity).label)
     end
 taskbar_dyn_key(m::TodoListMsg) =
@@ -1068,8 +1138,8 @@ function tool_taskbar_item(chat::ChatModel, b::ToolMsg)
         i = findfirst(m -> m === b, s.msgs_store)
         i === nothing ? -1 : i - 1
     end
-    TaskbarItem(b.id, :tool, tool_icon(b.kind), taskbar_label(b);
-                started = b.started_at, stoppable = true, msg_index = idx,
+    TaskbarItem(tool_id(b), :tool, tool_icon(tool_kind(b)), taskbar_label(b);
+                started = tool_started_at(b), stoppable = true, msg_index = idx,
                 source = b)
 end
 
@@ -1081,9 +1151,10 @@ end
 has_activity_feed(::TaskToolMsg) = true
 function taskbar_activity(m::TaskToolMsg, ::Float64)
     is_live(m) || return nothing
-    label = m.chat === nothing ?
+    chat = tool_chat(m)
+    label = chat === nothing ?
         (isempty(m.activity) ? "" : last(m.activity).label) :
-        lock(() -> isempty(m.activity) ? "" : last(m.activity).label, shared(m.chat).lock)
+        lock(() -> isempty(m.activity) ? "" : last(m.activity).label, shared(chat).lock)
     isempty(label) ? nothing : label
 end
 
@@ -1222,34 +1293,42 @@ end
 # groups by. The ACP tool NAME, not the title (a Bash title is the literal
 # command line). Reloads land as `GenericToolMsg` with the persisted key in
 # `name` (see `append_tool`); pre-name chats fall back to the ACP kind.
-tool_key(m::BuiltinToolMsg) = isempty(m.name) ? m.kind : m.name
+tool_key(m::BuiltinToolMsg) =
+    isempty(m.message.name) ? m.message.kind : m.message.name
 tool_key(::BashToolMsg)     = "Bash"
 tool_key(::TaskToolMsg)     = "Task"
-tool_key(m::MCPToolMsg)     = m.tool_name          # bare name: "bt_show", "bt_julia_eval"
-tool_key(::BonitoAppMsg)    = "bt_show_app"
+# Known MCP tools: the TYPE is the name — no string field needed. Only the
+# unknown-tool fallback carries the wire name as data.
+tool_key(m::GenericMCPToolMsg)       = m.tool_name
+tool_key(::ShowToolMsg)              = "bt_show"
+tool_key(::JuliaEvalToolMsg)         = "bt_julia_eval"
+tool_key(::JuliaContinueToolMsg)     = "bt_julia_continue"
+tool_key(::JuliaInterruptToolMsg)    = "bt_julia_interrupt"
+tool_key(::JuliaRestartToolMsg)      = "bt_julia_restart"
+tool_key(::JuliaListSessionsToolMsg) = "bt_julia_list_sessions"
 
 function tool_header_dict(m::ToolMsg, chat_dir::AbstractString="")
-    pretty_title, server = pretty_tool_title(m.title)
+    pretty_title, server = pretty_tool_title(tool_title(m))
     d = Dict{String,Any}(
         "type" => "tool",
-        "id" => m.id,
-        "kind" => m.kind,
+        "id" => tool_id(m),
+        "kind" => tool_kind(m),
         # Filter identity for the per-tool show/hide toolbar (see filterKey
         # in bonitoagents.js).
         "tool" => tool_key(m),
-        "icon" => tool_icon(m.kind),
+        "icon" => tool_icon(tool_kind(m)),
         "title" => pretty_title,
         # "" for non-MCP tools; the MCP server name otherwise so the JS
         # header can show it as a dim prefix badge.
         "server" => server,
-        "status" => m.status,
-        "summary" => m.summary,
-        "started_at" => m.started_at,
+        "status" => tool_status(m),
+        "summary" => tool_summary(m),
+        "started_at" => tool_started_at(m),
         # Only background-y tools deserve a taskbar slot. A regular Read in
         # `in_progress` pulses briefly but doesn't crowd the taskbar.
         "taskbar" => is_taskbar_item(m),
     )
-    m.finished_at === nothing || (d["finished_at"] = m.finished_at)
+    tool_finished_at(m) === nothing || (d["finished_at"] = tool_finished_at(m))
     augment_header!(d, m, chat_dir)
     return d
 end
@@ -1270,7 +1349,7 @@ function augment_header!(d::Dict, m::BashToolMsg, chat_dir::AbstractString)
     # History reload drops the in-RAM description — recover it from the
     # persisted rawInput so old bash pills keep their readable title.
     if (m.description === nothing || isempty(m.description)) && !isempty(chat_dir)
-        ri = stored_raw_input(chat_dir, m.id)
+        ri = stored_raw_input(chat_dir, tool_id(m))
         if ri isa AbstractDict
             v = get(ri, "description", nothing)
             v isa AbstractString && !isempty(v) && (m.description = String(v))
@@ -1292,19 +1371,18 @@ function augment_header!(d::Dict, m::TaskToolMsg, chat_dir::AbstractString)
     # activity section from the header alone (live growth rides the
     # `task_activity` events). Copied under the shared lock — the feed is
     # mutated on the turn's coalescer task.
-    entries = m.chat === nothing ? copy(m.activity) :
-        lock(() -> copy(m.activity), shared(m.chat).lock)
+    entries = tool_chat(m) === nothing ? copy(m.activity) :
+        lock(() -> copy(m.activity), shared(tool_chat(m)).lock)
     isempty(entries) || (d["task_feed"] = [entry_wire(e) for e in entries])
     augment_generic_header!(d, chat_dir)
 end
 # Mirrors BonitoMCP's DEFAULT_TIMEOUT / Pkg auto-disable (session.jl) so the
 # badge shows what the server will actually do when no explicit timeout rides
 # on the call.
-function eval_timeout_label(raw::AbstractDict)
-    t = get(raw, "timeout", nothing)
-    t isa Real && return t > 0 ? "$(round(Int, t))s" : "no timeout"
-    code = get(raw, "code", "")
-    return occursin(r"\bPkg\.", String(code)) ? "no timeout" : "30s"
+function eval_timeout_label(m::JuliaEvalCall)
+    m.timeout === nothing ||
+        return m.timeout > 0 ? "$(round(Int, m.timeout))s" : "no timeout"
+    return occursin(r"\bPkg\.", m.code) ? "no timeout" : "30s"
 end
 
 # Per-type input affordances shipped to the client — dispatched on the TYPE.
@@ -1316,13 +1394,17 @@ end
 # (1) The eval code/timeout/⊗ affordances — only `JuliaEvalCall` (eval + continue).
 eval_extras!(d::Dict, ::MCPToolMsg) = d
 function eval_extras!(d::Dict, m::JuliaEvalCall)
-    isempty(m.raw_input) && return d              # args not streamed in yet
+    # Args not streamed in yet (both fields empty) ⇒ nothing to show.
+    isempty(m.code) && isempty(m.env_path) && m.timeout === nothing && return d
     # Ship the code being executed so the client paints a compact preview while
     # the eval runs (the post-completion body renders the same code in Monaco).
-    code = get(m.raw_input, "code", nothing)      # `continue` has none — that's fine
-    code isa AbstractString && !isempty(code) && (d["code"] = code)
-    d["timeout_s"] = eval_timeout_label(m.raw_input)
+    isempty(m.code) || (d["code"] = m.code)       # `continue` has none — that's fine
+    d["timeout_s"] = eval_timeout_label(m)
     d["stoppable"] = true                         # a JuliaEvalCall holds an eval in flight
+    # The client builds the eval card's Collapsable in compact-body mode (the
+    # edit-tool mechanism): the body stays mounted, collapse is a HEIGHT cap
+    # (~4 code lines) — so the "preview" is the real Monaco Code editor.
+    d["compact_body"] = true
     return d
 end
 
@@ -1330,8 +1412,8 @@ end
 # (same block as the bash command) — the control tools have no output to show
 # their action otherwise. Default: none. `env_path` streams in like every arg.
 executed_preview(::MCPToolMsg) = nothing
-mcp_env(m::MCPToolMsg) = (e = get(m.raw_input, "env_path", nothing);
-                          e isa AbstractString && !isempty(e) ? e : "the active session")
+mcp_env(m::Union{JuliaInterruptToolMsg,JuliaRestartToolMsg}) =
+    isempty(m.env_path) ? "the active session" : m.env_path
 executed_preview(m::JuliaInterruptToolMsg)   = "interrupt (SIGINT) " * mcp_env(m)
 executed_preview(m::JuliaRestartToolMsg)     = "restart (fresh process) " * mcp_env(m)
 executed_preview(::JuliaListSessionsToolMsg) = "list active Julia sessions"
@@ -1345,29 +1427,30 @@ function mcp_input_extras!(d::Dict, m::MCPToolMsg)
 end
 
 function augment_header!(d::Dict, m::MCPToolMsg, chat_dir::AbstractString)
-    # Server already lives in `d` from `pretty_tool_title`, but the raw bare
-    # tool name (without `mcp__server__`) is more authoritative — prefer it.
-    isempty(m.server)    || (d["server"] = m.server)
-    isempty(m.tool_name) || (d["title"]  = m.tool_name)
+    # Server already lives in `d` from `pretty_tool_title`, but the stored one
+    # is more authoritative — prefer it. The title is the bare tool name (the
+    # TYPE, via tool_key).
+    isempty(m.server) || (d["server"] = m.server)
+    d["title"] = tool_key(m)
     mcp_input_extras!(d, m)
+    # Same typed auto-expand contract as the live tool_update path: a header
+    # rebuilt for a FRESH page (reload, late scroll-in) must render the way
+    # the live update did — an eval eager-mounts its body while running and
+    # fully uncollapses once completed with a result descriptor. Without
+    # this, a completed eval's live result embed only re-mounted after a
+    # manual click post-reload (dead transcript where the live run showed
+    # the result). Content via the render cache (disk fallback) — the
+    # composed ToolMsg holds it on the inner Message, not as a field here.
+    let content = tool_content_for_render(m, chat_dir)
+        auto_expand_body(m, content) && (d["expand"] = true)
+        auto_expand_full(m, content) && (d["expand_full"] = true)
+        live_result_embed(m, content) && (d["live_embed"] = true)
+    end
     # A path argument on the call (bt_show's `path`, …) feeds the ✎
     # editable derivation in augment_generic_header! below.
-    hint = mcp_path_hint(m.raw_input)
+    hint = tool_path_hint(m)
     hint === nothing || (d["path_hint"] = hint)
     augment_generic_header!(d, chat_dir)
-end
-# A live worker app. Its `kind` is already "bonito_app" (the JS gates the ⤢
-# detach button on that). The body auto-opens — but ONLY once we know the
-# worker-registered app id; expanding on the initial "new" event (before
-# `bt_show_app` has returned its `shown_app: <id>` content and we've
-# populated `b.app_id`) would trigger a body render with `m.id` as the
-# app id, which the worker has no route for — a `KeyError "toolu_…"`
-# painted into the chat. The follow-up `process_update!` emits a fresh
-# `tool_update` with `expand=true` once `b.app_id` is captured.
-function augment_header!(d::Dict, m::BonitoAppMsg, chat_dir::AbstractString)
-    isempty(m.server) || (d["server"] = m.server)
-    isempty(m.app_id) || (d["expand"] = true)
-    return d
 end
 
 # `bt_show` auto-expand is shared across the generic tool variants and depends
@@ -1441,9 +1524,13 @@ function mcp_path_hint(raw::AbstractDict)
     return nothing
 end
 
-tool_path_hint(::ToolMsg)         = nothing
-tool_path_hint(m::MCPToolMsg)     = mcp_path_hint(m.raw_input)
-tool_path_hint(m::BuiltinToolMsg) = mcp_path_hint(m.raw_input)
+tool_path_hint(::ToolMsg)          = nothing
+tool_path_hint(m::GenericMCPToolMsg) = mcp_path_hint(m.raw_input)
+tool_path_hint(m::GenericToolMsg)    = mcp_path_hint(m.raw_input)
+tool_path_hint(m::Union{EditToolMsg,ReadToolMsg}) =
+    isempty(m.file_path) ? nothing : m.file_path
+tool_path_hint(m::SearchToolMsg)   = isempty(m.path) ? nothing : m.path
+tool_path_hint(m::ShowToolMsg)     = isempty(m.path) ? nothing : m.path
 
 # The worker-side file path a tool's ✎ "open in editor" button should edit.
 # Sources, in priority order: a `bt_show` reference in the output, an edit
@@ -1567,6 +1654,24 @@ function todolist_summary(entries)
     return "$done/$(length(entries)) done"
 end
 
+# ── Header context meter ─────────────────────────────────────────────────────
+# "21.8k/200k · 11% · \$0.42" off the shared `usage` observable (usage_update
+# telemetry). Empty string until the first turn reports — the pill hides via
+# CSS `:empty`.
+fmt_tokens(n::Integer) =
+    n >= 1_000_000 ? short_num(n / 1_000_000) * "M" :
+    n >= 1_000     ? short_num(n / 1_000) * "k"     : string(n)
+# "21.8" but "200", never "200.0".
+short_num(x) = (r = round(x; digits = 1); isinteger(r) ? string(Int(r)) : string(r))
+
+function usage_label(u)
+    u === nothing && return ""
+    parts = [string(fmt_tokens(u.used), "/", fmt_tokens(u.size))]
+    u.size > 0 && push!(parts, string(round(Int, 100 * u.used / u.size), "%"))
+    u.cost === nothing || push!(parts, string("\$", round(u.cost; digits = 2)))
+    return join(parts, " · ")
+end
+
 # ── Edit-tool body sizing ────────────────────────────────────────────────────
 # Edit-tool bodies render as a Monaco `DiffEditor` (see `render_diff_block`).
 # To keep multi-edit tool calls from flooding the chat with full-height
@@ -1647,32 +1752,17 @@ console_block(body::AbstractString) = DOM.div(Bonito.RichText(body); class="bt-c
 #     "stdout" / "result" / "error".
 #  3. ANSI-bearing prose                 → RichText (terminal block).
 #  4. Mixed prose                        → Markdown.parse fallback.
-const EVAL_SECTION_LABELS = ("stdout", "stderr", "result", "error")
-
+# Render a single GENERIC tool-content text block (third-party tools whose
+# text has no typed contract). This is text PRESENTATION, not protocol
+# decoding: fenced code is standard markdown → Monaco; ANSI-bearing text →
+# terminal pane; everything else → markdown. Our own eval wire carries no
+# in-band shapes to recognize (contract v3: output text + descriptor).
 function render_text_block(text::AbstractString)
     m = match(r"^\s*```(\w*)\r?\n(.*?)\r?\n```\s*$"s, text)
     if m !== nothing
         lang = isempty(m.captures[1]) ? "plaintext" : String(m.captures[1])
         return monaco_readonly(String(m.captures[2]), lang)
     end
-    m = match(Regex("^(" * join(EVAL_SECTION_LABELS, "|") * "):\n(.*)\$", "s"), text)
-    if m !== nothing
-        label = String(m.captures[1])
-        body = String(m.captures[2])
-        # `result` is a Julia value's repr → julia syntax highlighting.
-        # stdout / stderr / error are unstructured console output (captured
-        # prints, stack traces) → RichText so ANSI colors survive and the
-        # block stays a lightweight monospace pane, not a full editor.
-        rendered = label == "result" ?
-                   monaco_readonly(body, "julia") : console_block(body)
-        return DOM.div(
-            DOM.div(uppercase(label); class="bt-section-label"),
-            rendered;
-            class="bt-eval-section")
-    end
-    # Raw console dump that didn't match a section label but still carries
-    # ANSI — render as a terminal block rather than letting Markdown.parse
-    # mangle the escape codes.
     Bonito.has_ansi_codes(text) && return console_block(text)
     return DOM.div(Markdown.parse(text), class="bt-tool-md")
 end
@@ -1681,32 +1771,71 @@ end
 # JS `Collapsable` in bonitoagents.js. Renders a native <details>: the `body` is
 # present from the start (no lazy fetch), used for eval Code/Output sub-sections
 # inside an already-expanded tool card. `label` is the always-visible heading;
-# `preview` (optional) is dim text next to it; `open` shows it expanded.
+# `preview` (optional) is dim text next to it.
+#
+# THE default three-state collapsible: clicking the header cycles
+# [full → summary → collapsed → full]. `summary_lines` is the height of the
+# SUMMARY state (the restricted preview) in text lines — the body is capped
+# to that height and SCROLLS (the scrollbar belongs to the Collapsable, not
+# to its content), so nothing is ever clipped away: the summary is a window
+# onto the full content, not a truncation. `pin_end` keeps that window
+# pinned to the END (console panes — the newest output is what matters,
+# streaming or done). The cap lives on the SECTION, never on the tool card —
+# every section (and the result embed below them) stays reachable.
 struct Collapsable
     label::String
     body::Any
     preview::String
-    open::Bool
+    summary_lines::Int
+    state::Symbol           # initial state: :full | :summary | :collapsed
+    pin_end::Bool
 end
-Collapsable(label::AbstractString, body; preview::AbstractString="", open::Bool=true) =
-    Collapsable(String(label), body, String(preview), open)
+function Collapsable(label::AbstractString, body; preview::AbstractString = "",
+                     summary_lines::Integer = 4, state::Symbol = :summary,
+                     pin_end::Bool = false)
+    state in (:full, :summary, :collapsed) ||
+        throw(ArgumentError("Collapsable state must be :full, :summary or :collapsed, got $(state)"))
+    return Collapsable(String(label), body, String(preview), Int(summary_lines),
+                       state, pin_end)
+end
 
 function Bonito.jsrender(session::Session, c::Collapsable)
     summary_kids = Any[DOM.span(c.label; class="bt-subsection-label")]
     isempty(c.preview) || push!(summary_kids,
         DOM.span(c.preview; class="bt-subsection-preview"))
-    Bonito.jsrender(session, DOM.details(
-        DOM.summary(summary_kids...; class="bt-subsection-summary"),
-        DOM.div(c.body; class="bt-subsection-body");
+    body = DOM.div(c.body; class="bt-subsection-body")
+    # Header click cycles the three states. preventDefault keeps the click
+    # from ALSO firing the native <details> toggle — `open` is driven here
+    # (open ⇔ not collapsed; `data-state` carries full vs summary while
+    # open). Entering summary/full re-pins a `pin_end` body to its end.
+    cycle = js"""e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const d = e.target.closest('.bt-subsection');
+        if (!d.open) { d.open = true; d.dataset.state = 'full'; }
+        else if (d.dataset.state === 'full') { d.dataset.state = 'summary'; }
+        else { d.open = false; return; }
+        if (d.dataset.pinEnd === '1') {
+            const b = d.querySelector('.bt-subsection-body');
+            if (b) b.scrollTop = b.scrollHeight;
+        }
+    }"""
+    kids = Any[DOM.summary(summary_kids...; class="bt-subsection-summary", onclick=cycle), body]
+    # Initial end-pin, once the subtree is parsed (inline JSCode children run
+    # right after their surrounding DOM — the Bonito idiom for init steps).
+    c.pin_end && push!(kids, js"""(() => {
+        const b = $(body);
+        if (b) b.scrollTop = b.scrollHeight;
+    })()""")
+    Bonito.jsrender(session, DOM.details(kids...;
         class="bt-subsection",
-        open=c.open ? true : nothing))
+        dataState=c.state === :collapsed ? "summary" : String(c.state),
+        dataPinEnd=c.pin_end ? "1" : nothing,
+        style=Styles("--bt-summary-lines" => string(c.summary_lines)),
+        open=c.state === :collapsed ? nothing : true))
 end
 
-# Open by default — an already-expanded tool card should show everything without
-# extra clicks; the collapsible just lets the user fold away a long code block
-# or a noisy output to focus on the other.
-tool_subsection(label::AbstractString, body; preview::AbstractString="", open::Bool=true) =
-    Collapsable(label, body; preview, open)
+tool_subsection(label::AbstractString, body; kwargs...) = Collapsable(label, body; kwargs...)
 
 # bt_julia_eval tool bodies: a ```julia code echo followed by stdout / result
 # / error sections. Render as two collapsibles — "Code" (Monaco julia, same
@@ -1716,7 +1845,8 @@ tool_subsection(label::AbstractString, body; preview::AbstractString="", open::B
 function render_eval_body(content)
     isempty(content) && return nothing
     code = nothing
-    rest = []
+    texts = String[]
+    media = []
     for c in content
         if c isa TextContent && code === nothing
             m = match(r"^\s*```julia\r?\n(.*?)\r?\n```\s*$"s, c.text)
@@ -1726,14 +1856,14 @@ function render_eval_body(content)
             end
         end
         if c isa TextContent
-            push!(rest, render_text_block(c.text))
+            push!(texts, c.text)
         elseif c isa DiffContent
-            push!(rest, render_diff_block(c))
+            push!(media, render_diff_block(c))
         elseif c isa ImageContent
             # Eval output images (the MCP renders 2-D arrays as PNG) get the same
             # click-to-enlarge lightbox as Read / bt_show images — previously this
             # was a bare <img> with no enlarge affordance.
-            push!(rest, media_element("data:$(c.mime_type);base64,$(c.data)",
+            push!(media, media_element("data:$(c.mime_type);base64,$(c.data)",
                 c.mime_type, false))
         end
     end
@@ -1744,10 +1874,86 @@ function render_eval_body(content)
                    SubString(first_line, 1, prevind(first_line, 60)) * "…" : first_line
     code_section = tool_subsection("Code", monaco_readonly(code, "julia");
         preview=code_preview)
-    output_section = isempty(rest) ?
+    # One terminal pane for all the text + any media blocks.
+    merged = join(texts, "\n")
+    kids = Any[]
+    isempty(strip(merged)) || push!(kids, console_block(merged))
+    append!(kids, media)
+    output_section = isempty(kids) ?
                      tool_subsection("Output", DOM.div("(no output)"; class="bt-tool-empty")) :
-                     tool_subsection("Output", DOM.div(rest...))
+                     tool_subsection("Output", DOM.div(kids...); pin_end=true)
     return DOM.div(code_section, output_section; class="bt-eval-body")
+end
+
+# Generic tool-body bridge: every tool type renders through `jsrender` so the
+# `ToolRenderCommand` handler can hand the MESSAGE (not a pre-rendered Node) to
+# `dom_in_js`. Most variants keep their existing `render_tool_body`; the eval
+# pair (`JuliaEvalCall`) overrides this with its own `jsrender` below. With no
+# live chat (replay/tests) there's nothing to render against, so emit a tiny
+# placeholder.
+Bonito.jsrender(session::Bonito.Session, m::ToolMsg) =
+    tool_chat(m) === nothing ?
+        Bonito.jsrender(session, Bonito.DOM.div("(tool)")) :
+        Bonito.jsrender(session, render_tool_body(tool_chat(m).state, m, tool_chat(m).cwd,
+            tool_chat(m).chat_dir; project_id = tool_chat(m).project_id))
+
+# The typed eval body: Code / Output / live Result. The worker PARKS the
+# result value in a holder session (`RemoteProxy.remote_ref`); the FINAL
+# content block is its descriptor, and `RemoteRef`'s jsrender mounts it
+# serialize-on-mount over the eval bridge (assets/observables proxy to the
+# worker; interaction round-trips). Everything between the code echo and the
+# result block is console output. No content sniffing: position + the TYPE
+# carry it all. The pill summary carries the env; the code lives in the Code
+# section.
+function Bonito.jsrender(session::Bonito.Session, m::JuliaEvalCall)
+    chat = tool_chat(m)
+    chat === nothing && return Bonito.jsrender(session,
+        DOM.div(DOM.div("(no live session)"; class = "bt-tool-empty"); class = "bt-eval-body"))
+
+    content   = tool_content_for_render(m, chat.chat_dir)
+    # bt_julia_continue carries NO code (it reattaches to the original eval,
+    # whose card sits above with the source) — an empty Monaco box under a
+    # "Code" heading helps nobody, so the section only renders when there is
+    # code. The content-position invariant is unchanged either way: the
+    # worker echoes the ORIGINAL code as content[1] even for continue.
+    sections  = Any[]
+    # Code preview: the summary state shows ~4 lines (the Monaco editor sizes
+    # itself to the content; the Collapsable body caps + scrolls). Header
+    # click cycles full → summary → collapsed.
+    isempty(m.code) || push!(sections,
+        tool_subsection("Code", monaco_readonly(m.code, "julia")))
+    # Wire contract v3: content is `[output_text?, descriptor?]` — the
+    # descriptor (exact decode of our own json, see `result_descriptor`) is
+    # the LAST block of a completed call whenever a result ref exists (values
+    # AND errors — the worker parks a thrown `CapturedException` like any
+    # value, `errored: true` marks it). Every other text block IS the
+    # terminal output, verbatim. Zero content sniffing. A checkpoint /
+    # `nothing` result simply has no descriptor.
+    desc = nothing
+    if tool_status(m) == "completed" && !isempty(content)
+        last = content[end]
+        desc = last isa AgentClientProtocol.TextContent ?
+            result_descriptor(last.text) : nothing
+    end
+    # The Output section is the SAME widget streaming or done: a `pin_end`
+    # Collapsable in summary state — its body owns the scrollbar and stays
+    # pinned to the newest line. While running, the worker's captured stdout
+    # lands in `m.stream_text` (grown by `stream_tail` updates, which also
+    # re-pin the body); the terminal re-render swaps in the complete text
+    # from the content block — same bytes, same chrome, no styling jump.
+    if tool_status(m) in ("pending", "in_progress")
+        push!(sections, tool_subsection("Output",
+            console_block(m.stream_text); pin_end = true))
+    else
+        stop   = desc === nothing ? lastindex(content) : lastindex(content) - 1
+        output = join(String[c.text for c in content[begin:stop]
+                             if c isa AgentClientProtocol.TextContent], "\n")
+        isempty(strip(output)) || push!(sections,
+            tool_subsection("Output", console_block(output); pin_end = true))
+    end
+    desc === nothing || push!(sections,
+        wrap_for_detach(tool_id(m), remote_result(chat.state, content[end].text, chat.project_id)))
+    return Bonito.jsrender(session, DOM.div(sections...; class = "bt-eval-body"))
 end
 
 # Load the persisted ACP params for `tool_id` and parse the content array back
@@ -1780,14 +1986,16 @@ function tool_content_for_render(m::ToolMsg, chat_dir::AbstractString)
     # written by the consumer task; a concurrent read during a rehash is a data
     # race (T8). Guard the lookup under the chat's lock; the disk fallback runs
     # off-lock (it's I/O and the key was absent under the lock).
-    if m.chat !== nothing
-        hit = lock(m.chat.lock) do
-            haskey(m.chat.tool_content_cache, m.id) ?
-                m.chat.tool_content_cache[m.id] : nothing
+    chat = tool_chat(m)
+    if chat !== nothing
+        id = tool_id(m)
+        hit = lock(chat.lock) do
+            haskey(chat.tool_content_cache, id) ?
+                chat.tool_content_cache[id] : nothing
         end
         hit === nothing || return hit
     end
-    return load_tool_content(chat_dir, m.id)
+    return load_tool_content(chat_dir, tool_id(m))
 end
 
 # Cap on how many tool bodies the in-RAM cache keeps. Every entry is also on
@@ -1962,7 +2170,7 @@ end
 # carry the `.bt-tool-error` the UI/tests key on).
 function Bonito.jsrender(session::Bonito.Session, st::ShowTool)
     body = try
-        render_show_file(st)
+        render_show_file(st, session)
     catch e
         @warn "bt_show: could not render file" path = st.path exception = (e, catch_backtrace())
         DOM.div("could not show $(basename(st.path)): $(sprint(showerror, e))";
@@ -2130,23 +2338,28 @@ end
 # Source for a worker media file: a streamed proxied-asset url when the worker
 # bridge is live (range reads on demand, no whole-file copy), else the
 # copy-then-serve local Asset fallback (e.g. a reloaded chat with no live worker).
-function show_media_src(st::ShowTool)
+# The URL always includes a ?v=<mtime> cache-buster so the browser fetches the
+# latest bytes after a file is regenerated (video re-recorded, image re-rendered).
+# The bridge path bakes the mtime into the URL in RemoteProxy.jl's asset_url handler;
+# for the fallback path we append it here using the server-side mirror's mtime.
+function show_media_src(st::ShowTool, session::Union{Bonito.Session,Nothing} = nothing)
     eb = eval_bridge_for(st.state, st.project_id)
     if eb !== nothing
         proj = get(st.state.projects[], st.project_id, nothing)
         worker_src = (isabspath(st.path) || proj === nothing) ? st.path :
             joinpath(proj.worker_path, st.path)
         try
-            return worker_asset_url(eb, worker_src)
+            return worker_asset_url(eb, worker_src)  # mtime baked in by RemoteProxy
         catch e
             @warn "bt_show: stream via bridge failed; copying instead" exception = (e, catch_backtrace()) path = st.path
         end
     end
-    return Bonito.Asset(fetch_show_file(st))
+    local_path = fetch_show_file(st)
+    asset = Bonito.Asset(local_path)
+    session === nothing && return asset
+    mt = round(Int, mtime(local_path))
+    return Bonito.url(session, asset) * "?v=$(mt)"
 end
-
-# Not every ToolMsg subtype carries `raw_input` (Bash/Task/BonitoApp don't).
-tool_raw_input(m) = hasproperty(m, :raw_input) ? m.raw_input : Dict{String,Any}()
 
 # Inline image from a tool result (e.g. Read on a PNG ships an ACP ImageContent).
 # Stream it from the worker when we can resolve a file path + live bridge (so big
@@ -2154,7 +2367,8 @@ tool_raw_input(m) = hasproperty(m, :raw_input) ? m.raw_input : Dict{String,Any}(
 # base64 the agent sent. Either way it gets the lightbox via `media_element`.
 function read_image_element(state::ServerState, project_id::AbstractString,
                             m::ToolMsg, c::ImageContent)
-    fp = get(tool_raw_input(m), "file_path", nothing)
+    fp = m isa Union{EditToolMsg,ReadToolMsg} && !isempty(m.file_path) ?
+        m.file_path : nothing
     fname = fp === nothing ? "" : basename(String(fp))
     eb = isempty(project_id) ? nothing : eval_bridge_for(state, project_id)
     if fp !== nothing && eb !== nothing
@@ -2167,12 +2381,12 @@ function read_image_element(state::ServerState, project_id::AbstractString,
     return media_element("data:$(c.mime_type);base64,$(c.data)", c.mime_type, false; filename = fname)
 end
 
-function render_show_file(st::ShowTool)
+function render_show_file(st::ShowTool, session::Union{Bonito.Session,Nothing} = nothing)
     ext = lowercase(splitext(st.path)[2])
     if ext in SHOW_IMAGE_EXTS
-        return media_element(show_media_src(st), "", false; filename = basename(st.path))
+        return media_element(show_media_src(st, session), "", false; filename = basename(st.path))
     elseif haskey(SHOW_VIDEO_MIME, ext)
-        return media_element(show_media_src(st), SHOW_VIDEO_MIME[ext], true; filename = basename(st.path))
+        return media_element(show_media_src(st, session), SHOW_VIDEO_MIME[ext], true; filename = basename(st.path))
     end
     # Non-media: the bytes have to be on the server (Monaco / caption read them).
     path = fetch_show_file(st)
@@ -2330,15 +2544,6 @@ function push_editor_save_to_worker(fe::FileEditor)
     return true
 end
 
-# A live worker app embeds against the per-tab Session via the placeholder's
-# jsrender (not loaded from disk). The registered app id lives on the message
-# (`app_id`, captured once on completion); empty ⇒ the app was registered under
-# the message id (`show_remote_app!`). No content is read here.
-render_tool_body(state::ServerState, m::BonitoAppMsg, cwd::AbstractString,
-    chat_dir::AbstractString=cwd; project_id::AbstractString="") =
-    wrap_for_detach(m.id, remote_app_placeholder(state, m.id, project_id,
-                                                 isempty(m.app_id) ? m.id : m.app_id))
-
 function render_tool_body(state::ServerState, m::ToolMsg, cwd::AbstractString,
     chat_dir::AbstractString=cwd;
     project_id::AbstractString="")
@@ -2421,7 +2626,7 @@ end
 function render_tool_content(state::ServerState, m::ReadToolMsg, content, project_id::AbstractString)
     text = join((c.text for c in content if c isa TextContent), "\n")
     isempty(text) && return render_tool_parts(state, m, content, project_id)
-    return monaco_readonly(text, detect_language(m.title))
+    return monaco_readonly(text, detect_language(tool_title(m)))
 end
 function render_tool_content(state::ServerState, m::BashToolMsg, content, project_id::AbstractString)
     text = join((c.text for c in content if c isa TextContent), "\n")
@@ -2567,31 +2772,33 @@ stamp_feed_summary!(::ToolMsg) = nothing
 function stamp_feed_summary!(m::TaskToolMsg)
     (m.feed_summarized || m.activity_seq == 0) && return nothing
     m.feed_summarized = true
+    h = m.message
     n = m.activity_seq
     note = "$(n) step$(n == 1 ? "" : "s"), finished $(Dates.format(Dates.now(), "HH:MM"))"
-    m.summary = isempty(m.summary) ? note : "$(m.summary) · $note"
+    h.summary = isempty(h.summary) ? note : "$(h.summary) · $note"
     # The last snap's tool_update already shipped the pre-note summary;
     # re-ship so the live header shows the trace without a reload. (The
     # non-terminal branch of `close` below emits too, but a Task that
     # completed normally never takes that branch.)
-    m.chat === nothing || chat_emit(m.chat, Dict{String,Any}(
-        "type" => "tool_update", "id" => m.id,
-        "status" => m.status, "summary" => m.summary))
+    h.chat === nothing || chat_emit(h.chat, Dict{String,Any}(
+        "type" => "tool_update", "id" => h.id,
+        "status" => h.status, "summary" => h.summary))
     return nothing
 end
 
 function Base.close(m::ToolMsg)
     stamp_feed_summary!(m)
-    if !(m.status in ("completed", "failed"))
-        m.status = "failed"
-        pretty_title, _ = pretty_tool_title(m.title)
-        m.finished_at === nothing && (m.finished_at = time())
-        chat_emit(m.chat, Dict{String,Any}("type" => "tool_update", "id" => m.id,
+    h = m.message
+    if !(h.status in ("completed", "failed"))
+        h.status = "failed"
+        pretty_title, _ = pretty_tool_title(h.title)
+        h.finished_at === nothing && (h.finished_at = time())
+        chat_emit(h.chat, Dict{String,Any}("type" => "tool_update", "id" => h.id,
             "status" => "failed", "title" => pretty_title,
-            "summary" => m.summary, "finished_at" => m.finished_at))
+            "summary" => h.summary, "finished_at" => h.finished_at))
     end
-    m.finished_at === nothing && (m.finished_at = time())
-    append_tool(m.chat.chat_session, m)
+    h.finished_at === nothing && (h.finished_at = time())
+    append_tool(h.chat.chat_session, m)
     nothing
 end
 Base.close(m::SummaryMsg) = (ensure_html!(m); append_summary(m.chat.chat_session, m); chat_emit(m.chat, wire_final(m)); nothing)
@@ -2765,6 +2972,28 @@ function process!(chat::ChatModel, m::AgentClientProtocol.ModeUpdate)
     return nothing
 end
 
+# Context/cost telemetry (after every assistant message): pure header
+# metadata, no bubble, no persistence — the next turn refreshes it.
+function process!(chat::ChatModel, m::AgentClientProtocol.UsageUpdate)
+    shared(chat).usage[] = (used = m.used, size = m.size,
+                            cost = m.cost_amount, origin = m.origin_kind)
+    return nothing
+end
+
+# The agent's slash-command set (complete state): store + ship to JS for the
+# composer's `/` autocomplete (see `commands` in bonitoagents.js dispatch).
+function process!(chat::ChatModel, m::AgentClientProtocol.CommandsUpdate)
+    s = shared(chat)
+    s.available_commands[] = m.commands
+    chat_emit(chat, commands_event(m.commands))
+    return nothing
+end
+
+commands_event(cmds) = Dict{String,Any}("type" => "commands",
+    "items" => [Dict{String,Any}("name" => c.name, "description" => c.description,
+                                 "hint" => something(c.hint, ""))
+                for c in cmds])
+
 # Adopt the AUTHORITATIVE config state the agent returns in a session/new,
 # session/load, or session/set_config_option result. The `set_config_option`
 # RESPONSE carries the complete updated `configOptions` (verified on the wire,
@@ -2904,47 +3133,50 @@ to_message(chat::ChatModel, tc::AgentClientProtocol.MCPCall)       = build_tool_
 to_message(chat::ChatModel, tc::AgentClientProtocol.TodoWriteCall) = TodoListMsg(chat, tc.entries)
 to_message(chat::ChatModel, m::AgentClientProtocol.Plan)           = TodoListMsg(chat, m.entries)
 
-# Concrete-typed builders for the four ToolMsg variants. Each one knows which
-# tool-specific fields to lift out of its ACP source.
-# `bt_show_app` (an MCP call) and any tool already tagged `bonito_app`
-# (`show_remote_app!`) are live worker apps — route them to `BonitoAppMsg`,
-# decided purely from the tool name / kind (no content sniffing).
-is_bonito_app(tc::AgentClientProtocol.MCPCall)     = tc.tool_name == "bt_show_app"
-is_bonito_app(tc::AgentClientProtocol.GenericTool) = tc.kind == "bonito_app"
-is_bonito_app(::AgentClientProtocol.ToolCall)      = false
+# Concrete-typed builders for the ToolMsg variants: shared bubble state into
+# `Message`, tool-specific arguments parsed into TYPED fields (`apply_input!`).
+# The summary heuristic keys on the ACP KIND (a Bash `mv` wants the move
+# summary), so it always routes through `builtin_msg_type(kind)` — see
+# `content_summary`. `finished` stamps replayed history (never ticks a timer).
+tool_message(tc, chat::Union{ChatModel,Nothing}; finished::Bool = false) =
+    Message(tc.id, tc.kind, tc isa AgentClientProtocol.GenericTool ? tc.name : "",
+            tc.title, tc.status,
+            content_summary(builtin_msg_type(tc.kind), tc.content),
+            time(), finished ? time() : nothing, chat)
 
-bonito_app_msg(tc, server, chat) =
-    BonitoAppMsg(tc.id, "bonito_app", tc.title, tc.status,
-                 content_summary(builtin_msg_type("bonito_app"), tc.content),
-                 time(), nothing, server,
-                 something(find_app_reference(tc.content), ""), chat)
-
-build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.GenericTool) =
-    is_bonito_app(tc) ? bonito_app_msg(tc, "", chat) :
-    builtin_msg_type(tc.kind)(tc.id, tc.kind, tc.name, tc.title, tc.status,
-                   content_summary(builtin_msg_type(tc.kind), tc.content),
-                   time(), nothing, chat, Dict{String,Any}(tc.raw_input))
+function build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.GenericTool)
+    m = builtin_msg_type(tc.kind)(tool_message(tc, chat))
+    apply_input!(m, tc.raw_input)
+    return m
+end
 
 build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.BashCall) =
-    BashToolMsg(tc.id, tc.kind, tc.title, tc.status,
-                content_summary(builtin_msg_type(tc.kind), tc.content),
-                time(), nothing,
-                tc.command, tc.description, tc.run_in_background,
-                "", 0, "", chat)
+    BashToolMsg(tool_message(tc, chat);
+                command = tc.command, description = tc.description,
+                is_background = tc.run_in_background)
 
 build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.TaskCall) =
-    TaskToolMsg(tc.id, tc.kind, tc.title, tc.status,
-                content_summary(builtin_msg_type(tc.kind), tc.content),
-                time(), nothing,
-                tc.description, tc.run_in_background, tc.task_name, chat)
+    TaskToolMsg(tool_message(tc, chat);
+                description = tc.description, is_background = tc.run_in_background,
+                task_name = tc.task_name)
 
-build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.MCPCall) =
-    is_bonito_app(tc) ? bonito_app_msg(tc, tc.server, chat) :
-    mcp_msg_type(tc.tool_name)(
-        tc.id, tc.kind, tc.title, tc.status,
-        content_summary(builtin_msg_type(tc.kind), tc.content),
-        time(), nothing,
-        tc.server, tc.tool_name, Dict{String,Any}(tc.raw_input), chat)
+function build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.MCPCall)
+    T = mcp_msg_type(tc.tool_name)
+    m = build_mcp_msg(T, tool_message(tc, chat), tc.server, tc.tool_name)
+    apply_input!(m, tc.raw_input)
+    return m
+end
+
+# The pill SUMMARY for an eval is the ENV it ran in — NOT the code (redundant
+# with the body's Code section and the `bt_julia_eval` title). Set per-SNAP
+# (`snap_summary`, dispatch on type): `env_path` rides the STREAMED rawInput, so
+# it isn't known at construction — once `update_from_snap!` merged the args, the
+# next summary derivation shows the env.
+eval_env_summary(m::JuliaEvalCall) =
+    "env " * (isempty(m.env_path) ? "<temp>" : m.env_path)
+
+snap_summary(::ToolMsg, snap)         = content_summary(builtin_msg_type(snap.kind), snap.content)
+snap_summary(b::JuliaEvalCall, snap)  = eval_env_summary(b)
 
 # Default: stream the message's text deltas into the bubble, then finalize.
 function process_update!(b::ChatMsg, m::AgentClientProtocol.Message)
@@ -2970,10 +3202,11 @@ end
 # `b::ToolMsg` covers every concrete variant — they all carry the same five
 # header fields the update path touches.
 function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
-    pin_tool!(b.chat, b)
+    h = b.message
+    pin_tool!(h.chat, b)
     try
-        persist_tool_content!(b.chat.chat_dir, m)
-        cache_tool_content!(b.chat, m.id, m.content)
+        persist_tool_content!(h.chat.chat_dir, m)
+        cache_tool_content!(h.chat, m.id, m.content)
         # The "new" wire event (send!, inside process!) fired BEFORE this
         # initial persist, so content-derived header extras — ✎ editable,
         # bt_show auto-expand, media mime — were missing for a tool that
@@ -2981,14 +3214,16 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
         # comes to carry them). Re-emit just those extras when the initial
         # content warrants any.
         if !isempty(m.content)
-            pt0, _ = pretty_tool_title(b.title)
-            d0 = Dict{String,Any}("type" => "tool_update", "id" => b.id,
-                "status" => b.status, "title" => pt0, "summary" => b.summary)
+            pt0, _ = pretty_tool_title(tool_title(b))
+            d0 = Dict{String,Any}("type" => "tool_update", "id" => tool_id(b),
+                "status" => tool_status(b), "title" => pt0, "summary" => tool_summary(b))
             (auto_expand_body(b, m.content) || has_show_reference(m.content)) &&
                 (d0["expand"] = true)
+            auto_expand_full(b, m.content) && (d0["expand_full"] = true)
+            live_result_embed(b, m.content) && (d0["live_embed"] = true)
             mime0 = tool_media_mime(m.content)
             mime0 === nothing || (d0["show_mime"] = mime0)
-            hd0 = Dict{String,Any}("kind" => b.kind, "title" => pt0)
+            hd0 = Dict{String,Any}("kind" => tool_kind(b), "title" => pt0)
             hint0 = tool_path_hint(b)
             hint0 === nothing || (hd0["path_hint"] = hint0)
             ep0 = editable_path_from(hd0, m.content)
@@ -2996,31 +3231,35 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
                 d0["editable"]  = true
                 d0["edit_path"] = ep0
             end
-            (haskey(d0, "expand") || haskey(d0, "show_mime") || haskey(d0, "editable")) &&
-                chat_emit(b.chat, d0)
+            (haskey(d0, "expand") || haskey(d0, "show_mime") ||
+             haskey(d0, "editable") || haskey(d0, "live_embed")) &&
+                chat_emit(h.chat, d0)
         end
         for snap in m.updates
-            prev_status = b.status
-            b.status = snap.status
-            b.title = snap.title
-            b.summary = content_summary(builtin_msg_type(snap.kind), snap.content)
+            prev_status = h.status
+            h.status = snap.status
+            h.title = snap.title
             # Stamp `finished_at` on terminal-transition so the live timer freezes.
-            prev_status in ("completed", "failed") || !(b.status in ("completed", "failed")) ||
-                (b.finished_at = time())
-            persist_tool_content!(b.chat.chat_dir, snap)
-            cache_tool_content!(b.chat, snap.id, snap.content)
-            # Per-type extraction from THIS snap (e.g. BonitoAppMsg pulls the
-            # worker-registered `shown_app: <id>` out of the result content;
+            prev_status in ("completed", "failed") || !(h.status in ("completed", "failed")) ||
+                (h.finished_at = time())
+            persist_tool_content!(h.chat.chat_dir, snap)
+            cache_tool_content!(h.chat, snap.id, snap.content)
+            # Per-type extraction from THIS snap (e.g. an eval call pulls the
+            # streamed arguments off the snap for the code/env extras;
             # TaskToolMsg flips `is_background` off a late run_in_background /
             # outputFile). Re-`pin_tool!` after: a Task that JUST became a
             # background subagent enters the bar now (the top-of-loop pin ran
             # while `is_background` was still false). `pin_tool!`/`push!` are
             # idempotent, so this is a no-op for everything already in/out.
             update_from_snap!(b, snap)
-            pin_tool!(b.chat, b)
-            pretty_title, _ = pretty_tool_title(b.title)
-            d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
-                "status" => b.status, "title" => pretty_title, "summary" => b.summary)
+            pin_tool!(h.chat, b)
+            # Summary AFTER the snap merge (dispatch on type): an eval shows its
+            # env — which only lands once the streamed arguments merged just
+            # above — everything else the content summary.
+            h.summary = snap_summary(b, snap)
+            pretty_title, _ = pretty_tool_title(h.title)
+            d = Dict{String,Any}("type" => "tool_update", "id" => h.id,
+                "status" => h.status, "title" => pretty_title, "summary" => h.summary)
             # A background subagent: mark the bubble so the browser renders its
             # background/taskbar affordance (the pill itself comes from the shared
             # TaskBar observable via the `push!` above).
@@ -3033,16 +3272,24 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
                 # `finalize!` emits the REAL terminal state when it actually ends.
                 d["status"] = "in_progress"
             end
-            (!is_taskbar_item(b) && b.finished_at !== nothing) &&
-                (d["finished_at"] = b.finished_at)
-            # Auto-expand the body: live Bonito app once we've captured its
-            # app_id, `bt_show` tool once content carries a `shown:` ref, or
-            # an edit tool once its first DiffContent has landed (so the
-            # compact Monaco preview shows up under the header without a
+            (!is_taskbar_item(b) && h.finished_at !== nothing) &&
+                (d["finished_at"] = h.finished_at)
+            # Auto-expand the body: `bt_show` tool once content carries a
+            # `shown:` ref, or an edit tool once its first DiffContent has landed
+            # (so the compact Monaco preview shows up under the header without a
             # click). `auto_expand_body` dispatches on the type + content
             # presence — no content sniffing inline here.
             (auto_expand_body(b, snap.content) || has_show_reference(snap.content)) &&
                 (d["expand"] = true)
+            auto_expand_full(b, snap.content) && (d["expand_full"] = true)
+            live_result_embed(b, snap.content) && (d["live_embed"] = true)
+            # A running eval starts its live stdout tail (idempotent). The real
+            # claude wire keeps the status at "pending" for the whole MCP call
+            # (no in_progress transition while the tool runs — observed live;
+            # the old in_progress gate meant the tail never appeared outside
+            # the mock), so any non-terminal status with code counts as running.
+            b isa JuliaEvalCall && h.status in ("pending", "in_progress") &&
+                !isempty(b.code) && start_eval_stream!(b)
             # Displayable media (bt_show mime, or inline image content from
             # e.g. Read on a PNG) — the client's Native Images mode keys on
             # this; ship it with the update that carries the result.
@@ -3050,7 +3297,7 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             mime === nothing || (d["show_mime"] = mime)
             # Path-link affordance — content/arguments usually land with an
             # update, not the initial header, so re-derive it per snap.
-            hd = Dict{String,Any}("kind" => b.kind, "title" => pretty_title)
+            hd = Dict{String,Any}("kind" => tool_kind(b), "title" => pretty_title)
             hint = tool_path_hint(b)
             hint === nothing || (hd["path_hint"] = hint)
             ep = editable_path_from(hd, snap.content)
@@ -3063,7 +3310,7 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
             # so each snap re-ships them once available — the client adds the
             # missing affordances on the fly.
             snap_header_extras!(d, b)
-            chat_emit(b.chat, d)
+            chat_emit(h.chat, d)
         end
     finally
         # Foreground tools finalize here; a background task (in the bar) is
@@ -3074,10 +3321,7 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall)
     return nothing
 end
 
-# Does this tool's body auto-open on render? Three signals:
-#   • BonitoAppMsg with a captured app_id — the worker route exists now, so
-#     the embed can mount (without an app_id the body would try to delegate
-#     with the tool_id as the app id and the worker KeyErrors).
+# Does this tool's body auto-open on render? Two signals:
 #   • Edit tool whose snap content has a `DiffContent` — the body IS the
 #     diff preview now (compact Monaco editor under the header); the user
 #     should see it without an extra click. The auxiliary `snap_content`
@@ -3085,16 +3329,45 @@ end
 #     about to ship, so we don't re-load from cache/disk.
 #   • Everything else stays click-to-expand.
 auto_expand_body(::ToolMsg, snap_content) = false
-auto_expand_body(m::BonitoAppMsg, snap_content) = !isempty(m.app_id)
 auto_expand_body(::EditToolMsg, snap_content) = any(c -> c isa DiffContent, snap_content)
+# Eval: eager-mount the compact body while the code RUNS (the body's first
+# section is the full Monaco Code editor, height-capped by the client's
+# compact mode — "the preview IS the editor, collapsed to ~4 lines"), and
+# again once completed with a result (paired with `auto_expand_full`).
+auto_expand_body(m::JuliaEvalCall, snap_content) =
+    tool_status(m) in ("pending", "in_progress") ? !isempty(m.code) :
+    auto_expand_full(m, snap_content)
+
+# The tool holds a LIVE result embed: a worker-parked value the body mounts
+# via `RemoteRef` (values AND errors — both are parked refs rendered live).
+# The client gives such cards `bt_show_app`'s output handling: the ⤢ detach
+# button (embed adopted into its own workspace panel, same live DOM node)
+# and keep-alive parking on scroll-off (the btApp LRU — plain virtualization
+# would drop the DOM, closing the sub-session and killing e.g. a WGLMakie
+# canvas). Typed, default off; eval: completed + a result descriptor as the
+# final content block (exact decode of our own json — no sniffing).
+live_result_embed(::ToolMsg, snap_content) = false
+function live_result_embed(m::JuliaEvalCall, snap_content)
+    tool_status(m) == "completed" || return false
+    isempty(snap_content) && return false
+    c = snap_content[end]
+    return c isa AgentClientProtocol.TextContent &&
+        result_descriptor(c.text) !== nothing
+end
+
+# FULL uncollapse (not just the compact eager-mount) — typed, default off.
+# Eval: exactly when a live result embed exists (the eval returned
+# != nothing, value or error); the result should be visible without a click.
+auto_expand_full(::ToolMsg, snap_content) = false
+auto_expand_full(m::JuliaEvalCall, snap_content) =
+    live_result_embed(m, snap_content)
 # Two-arg fallback for tests / call sites that don't have the snap yet.
 auto_expand_body(b::ToolMsg) = auto_expand_body(b, Any[])
 
 # Per-snap state mutation, run inside the generic loop BEFORE the expand/emit
-# decisions so freshly-captured state (e.g. BonitoAppMsg's app_id from the
-# `shown_app: <id>` result block) participates in this snap's tool_update —
-# the browser receives the expand event on the SAME update that carried the
-# result, no second round-trip.
+# decisions so freshly-captured state (e.g. MCPToolMsg's streamed arguments)
+# participates in this snap's tool_update — the browser receives the affordances
+# on the SAME update that carried the result, no second round-trip.
 snap_header_extras!(::Dict, ::ToolMsg) = nothing
 snap_header_extras!(d::Dict, b::MCPToolMsg) = (mcp_input_extras!(d, b); nothing)
 
@@ -3123,23 +3396,17 @@ function update_from_snap!(b::TaskToolMsg, snap)
     end
     return nothing
 end
-function update_from_snap!(b::BonitoAppMsg, snap)
-    isempty(b.app_id) || return
-    ref = find_app_reference(snap.content)
-    ref === nothing || (b.app_id = ref)
-    return nothing
-end
-# Streamed tool input: `MCPToolMsg.raw_input` is a COPY taken at build time,
+# Streamed tool input: the typed argument fields were parsed at build time,
 # when claude-agent-acp typically hasn't sent the arguments yet (rawInput
-# arrives on a later tool_call_update; ACP merges it into the live MCPCall).
-# Pull the merged arguments off each snap so the eval extras (code preview,
+# arrives on a later tool_call_update; ACP merges it into the live call).
+# Re-parse the merged arguments off each snap so the eval extras (code preview,
 # timeout, ⊗) and the ✎ path hint see them.
 function update_from_snap!(b::MCPToolMsg, snap)
-    snap isa AgentClientProtocol.MCPCall && merge!(b.raw_input, snap.raw_input)
+    snap isa AgentClientProtocol.MCPCall && apply_input!(b, snap.raw_input)
     return nothing
 end
 function update_from_snap!(b::BuiltinToolMsg, snap)
-    snap isa AgentClientProtocol.GenericTool && merge!(b.raw_input, snap.raw_input)
+    snap isa AgentClientProtocol.GenericTool && apply_input!(b, snap.raw_input)
     return nothing
 end
 
@@ -3151,13 +3418,14 @@ end
 # `finished!`es it when the shell exits. Non-background bashes fall through to
 # the generic ToolMsg handling.
 function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
-    pin_tool!(b.chat, b)
+    h = b.message
+    pin_tool!(h.chat, b)
     try
-        persist_tool_content!(b.chat.chat_dir, m)
+        persist_tool_content!(h.chat.chat_dir, m)
         for snap in m.updates
-            b.status  = snap.status
-            b.title   = snap.title
-            b.summary = content_summary(builtin_msg_type(snap.kind), snap.content)
+            h.status  = snap.status
+            h.title   = snap.title
+            h.summary = content_summary(builtin_msg_type(snap.kind), snap.content)
             # Streamed tool input: command/description/run_in_background are
             # usually EMPTY on the initial tool_call and arrive on a later
             # update (ACP merges them into the live BashCall) — refresh.
@@ -3169,7 +3437,7 @@ function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
                 # tick (`taskbar_slot_label`), so the human description shows up
                 # once it streams in — no explicit re-pin needed.
             end
-            persist_tool_content!(b.chat.chat_dir, snap)
+            persist_tool_content!(h.chat.chat_dir, snap)
             # Detect a background launch from the RESULT ("…running in background…
             # Output is being written to: <path>"), NOT from rawInput's
             # `run_in_background` — some agent builds don't forward it, so
@@ -3179,26 +3447,26 @@ function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
             if isempty(b.bg_output_path)
                 path = parse_bg_output_path(snap.content)
                 if path !== nothing
-                    @debug "background task detected from result" id = b.id path = basename(path)
+                    @debug "background task detected from result" id = h.id path = basename(path)
                     b.is_background  = true
                     b.bg_output_path = path
                     b.bg_offset      = 0
-                    push!(chat_taskbar(b.chat), b)   # enters the bar → the bar's loop owns it (membership IS liveness)
+                    push!(chat_taskbar(h.chat), b)   # enters the bar → the bar's loop owns it (membership IS liveness)
                 end
             end
             # Foreground bash (or a failed launch): stamp finished_at on terminal.
             # A live background task (in the bar) is left unstamped — the bar's
             # loop finalizes it on the output file's fd-close.
-            if !in_taskbar(b) && b.status in ("completed", "failed")
-                b.finished_at === nothing && (b.finished_at = time())
+            if !in_taskbar(b) && h.status in ("completed", "failed")
+                h.finished_at === nothing && (h.finished_at = time())
             end
             # Claude's human-readable description beats the raw script as
             # the visible title ("Monitor system load" vs a 5-line loop).
             # The command itself stays available in the body + tooltip.
             pretty_title, _ = pretty_tool_title(bash_display_title(b))
-            d = Dict{String,Any}("type" => "tool_update", "id" => b.id,
-                "status" => in_taskbar(b) ? "in_progress" : b.status,
-                "title" => pretty_title, "summary" => b.summary)
+            d = Dict{String,Any}("type" => "tool_update", "id" => h.id,
+                "status" => in_taskbar(b) ? "in_progress" : h.status,
+                "title" => pretty_title, "summary" => h.summary)
             # Description took over the title → the raw command rides as a
             # header tooltip.
             b.description === nothing || isempty(b.command) ||
@@ -3210,10 +3478,10 @@ function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall)
                 # know it IS a background task, flip the taskbar slot on.
                 d["taskbar"] = true
             end
-            if !in_taskbar(b) && b.finished_at !== nothing
-                d["finished_at"] = b.finished_at
+            if !in_taskbar(b) && h.finished_at !== nothing
+                d["finished_at"] = h.finished_at
             end
-            chat_emit(b.chat, d)
+            chat_emit(h.chat, d)
         end
     finally
         # A foreground bash finalizes here; a background one (in the bar) is
@@ -3278,7 +3546,7 @@ bg_worker_id(state::ServerState, model::ChatModel) =
 
 function write_bg_content!(chat_dir::AbstractString, m::BashToolMsg)
     body = isempty(strip(m.command)) ? m.bg_text : "\$ $(m.command)\n\n$(m.bg_text)"
-    open(tool_file(chat_dir, m.id), "w") do io
+    open(tool_file(chat_dir, tool_id(m)), "w") do io
         JSON.print(io, Dict("content" => [Dict("type" => "text", "text" => body)]))
     end
     return nothing
@@ -3286,12 +3554,86 @@ end
 
 bg_line_count(m::BashToolMsg) = count(==('\n'), m.bg_text)
 
+# ── Live stdout tail for a RUNNING bt_julia_eval ─────────────────────────────
+# The MCP forwards the eval worker's stdout/stderr live over /mcp-ws (no on-disk
+# log, no polling — see BonitoMCP.stream_forward_loop!). Each chunk lands in a
+# per-eval sink channel (registered here, drained below) and we ship the last
+# lines to the client as `stream_tail` updates — a ~4-line auto-scrolled pane
+# under the header. A fresh JuliaEvalCall starts with empty `stream_text`, so it
+# only ever shows output that arrives while THIS eval runs.
+const EVAL_STREAM_KEEP_CHARS = 8_000
+const EVAL_STREAM_TAIL_LINES = 12
+const EVAL_STREAM_IDLE_S     = 0.1   # sink-drain cadence when no chunk is waiting
+
+strip_ansi_codes(s::AbstractString) = replace(s, r"\e\[[0-9;?]*[A-Za-z]" => "")
+
+function last_lines(s::AbstractString, n::Int)
+    ls = split(s, '\n'; keepempty = true)
+    return join(ls[max(1, end - n + 1):end], '\n')
+end
+
+# Route key for a running eval's stream sink — matched against BonitoMCP.stream_route
+# on the MCP side. Temp sessions (no env_path) collapse onto TEMP_KEY; project
+# sessions use the abspath (the MCP abspaths its env_dir the same way). The
+# documented workflow always passes an absolute env_path, so abspath is a stable,
+# cwd-independent match across the two processes.
+eval_route_key(m::JuliaEvalCall) =
+    isempty(m.env_path) ? BonitoMCP.TEMP_KEY : abspath(m.env_path)
+
+function start_eval_stream!(m::JuliaEvalCall)
+    chat = tool_chat(m)
+    chat === nothing && return nothing
+    m.stream_task === nothing || return nothing
+    m.stream_task = Base.errormonitor(Threads.@spawn eval_stream_loop!(chat, m))
+    return nothing
+end
+
+function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
+    state = chat.state
+    key = eval_sink_key(chat.project_id, eval_route_key(m))
+    ch = Channel{String}(Inf)
+    lock(state.lock) do
+        # A stale sink from a prior eval on the same route can only linger if its
+        # loop died without cleanup; overwrite it (the MCP routes to the newest).
+        state.eval_stream_sinks[key] = ch
+    end
+    deadline = time() + 4 * 3600      # hard stop for a wedged status
+    try
+        while tool_status(m) in ("pending", "in_progress") && time() < deadline
+            if isready(ch)
+                # Drain everything queued this tick, then emit ONCE — the MCP
+                # already coalesced + capped each chunk, so this just merges a
+                # burst into a single tail update.
+                buf = IOBuffer()
+                while isready(ch)
+                    write(buf, take!(ch))
+                end
+                m.stream_text = last(m.stream_text * strip_ansi_codes(String(take!(buf))),
+                                     EVAL_STREAM_KEEP_CHARS)
+                chat_emit(chat, Dict{String,Any}(
+                    "type" => "tool_update", "id" => tool_id(m),
+                    "stream_tail" => last_lines(m.stream_text, EVAL_STREAM_TAIL_LINES)))
+            else
+                sleep(EVAL_STREAM_IDLE_S)
+            end
+        end
+    finally
+        # Identity-guarded: a re-run on the same route may have replaced us.
+        lock(state.lock) do
+            get(state.eval_stream_sinks, key, nothing) === ch &&
+                delete!(state.eval_stream_sinks, key)
+        end
+        close(ch)
+    end
+    return nothing
+end
+
 function stream_bg_update!(model::ChatModel, m::BashToolMsg)
     write_bg_content!(model.chat_dir, m)
     n = bg_line_count(m)
-    m.summary = "running… $n line$(n == 1 ? "" : "s")"
-    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => m.id,
-        "status" => "in_progress", "summary" => m.summary,
+    m.message.summary = "running… $n line$(n == 1 ? "" : "s")"
+    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => tool_id(m),
+        "status" => "in_progress", "summary" => m.message.summary,
         "background" => true, "taskbar" => true))
     return nothing
 end
@@ -3521,7 +3863,7 @@ function route_subagent_activity!(chat::ChatModel,
                                   act::AgentClientProtocol.SubagentActivity)
     s = shared(chat)
     entry = lock(s.lock) do
-        idx = findlast(m -> m isa TaskToolMsg && m.id == act.parent_id, s.msgs_store)
+        idx = findlast(m -> m isa TaskToolMsg && tool_id(m) == act.parent_id, s.msgs_store)
         if idx === nothing
             # Parent Task not committed yet. Subagent activity is delivered out
             # of band (the consumer parks draining the parent Task's own update
@@ -3554,7 +3896,7 @@ end
 function replay_pending_subagent!(chat::ChatModel, m::TaskToolMsg)
     s = shared(chat)
     held = lock(s.lock) do
-        pop!(s.pending_subagent, m.id, nothing)
+        pop!(s.pending_subagent, tool_id(m), nothing)
     end
     held === nothing && return nothing
     # Re-route OUTSIDE the lock (route_subagent_activity! takes it + emits): the
@@ -3997,7 +4339,7 @@ function sweep_turn_orphans!(chat::ChatModel)
             # its initial-persist path AGAIN instead of finalising it.
             finalize_orphan!(m)
         catch e
-            @warn "turn-orphan sweep finalize failed" id = getfield(m, :id) exception = e
+            @warn "turn-orphan sweep finalize failed" id = msg_id(m) exception = e
         end
     end
     return nothing
@@ -4682,11 +5024,19 @@ keep_in_history(m::AgentClientProtocol.UserMessage)  = !isempty(strip(m.text))
 keep_in_history(m::AgentClientProtocol.Thought)      = false
 keep_in_history(m::AgentClientProtocol.ToolCall)     = true
 keep_in_history(m::AgentClientProtocol.Plan)         = true
+# Metadata messages (config/mode/usage/commands) are session state, not
+# history. Explicit methods, not a `::Message` fallback: a NEW message kind
+# reaching the reconciler should fail loudly so its history policy is a
+# decision, not an accident.
+keep_in_history(::AgentClientProtocol.ConfigUpdate)   = false
+keep_in_history(::AgentClientProtocol.ModeUpdate)     = false
+keep_in_history(::AgentClientProtocol.UsageUpdate)    = false
+keep_in_history(::AgentClientProtocol.CommandsUpdate) = false
 
 # Does an existing (chat.md) message correspond to a replayed one? Tools key on
 # claude's tool_use id (the one id that survives the replay, stored as ToolMsg.id);
 # user/agent turns on text; plans on entries. Different shapes never match.
-msg_matches(a::ToolMsg,  b::AgentClientProtocol.ToolCall)     = a.id == b.id
+msg_matches(a::ToolMsg,  b::AgentClientProtocol.ToolCall)     = tool_id(a) == b.id
 msg_matches(a::UserMsg,  b::AgentClientProtocol.UserMessage)  =
     !is_summary_text(b.text) && strip(a.text) == strip(b.text)
 msg_matches(a::SummaryMsg, b::AgentClientProtocol.UserMessage) =
@@ -4810,37 +5160,25 @@ replayed_to_msg(model::ChatModel, m::AgentClientProtocol.Plan) =
 # stamped now so the timer doesn't tick. The typed variants persist their
 # subtype-specific fields too (so e.g. a replayed background bash still
 # rendered the right way).
-# Replayed live app — content is on disk (so the app id is available now); same
-# type-driven recognition as the live path (`is_bonito_app`).
-replayed_bonito_app_msg(tc, server) =
-    BonitoAppMsg(tc.id, "bonito_app", tc.title, tc.status,
-                 content_summary(builtin_msg_type("bonito_app"), tc.content),
-                 time(), time(), server,
-                 something(find_app_reference(tc.content), ""), nothing)
-
-replayed_tool_msg(tc::AgentClientProtocol.GenericTool) =
-    is_bonito_app(tc) ? replayed_bonito_app_msg(tc, "") :
-    builtin_msg_type(tc.kind)(tc.id, tc.kind, tc.name, tc.title, tc.status,
-                   content_summary(builtin_msg_type(tc.kind), tc.content),
-                   time(), time(), nothing, Dict{String,Any}(tc.raw_input))
+function replayed_tool_msg(tc::AgentClientProtocol.GenericTool)
+    m = builtin_msg_type(tc.kind)(tool_message(tc, nothing; finished = true))
+    apply_input!(m, tc.raw_input)
+    return m
+end
 replayed_tool_msg(tc::AgentClientProtocol.BashCall) =
-    BashToolMsg(tc.id, tc.kind, tc.title, tc.status,
-                content_summary(builtin_msg_type(tc.kind), tc.content),
-                time(), time(),
-                tc.command, tc.description, tc.run_in_background,
-                "", 0, "", nothing)   # bg fields: history → already done, never in the bar
+    BashToolMsg(tool_message(tc, nothing; finished = true);
+                command = tc.command, description = tc.description,
+                is_background = tc.run_in_background)   # bg fields default: history → already done, never in the bar
 replayed_tool_msg(tc::AgentClientProtocol.TaskCall) =
-    TaskToolMsg(tc.id, tc.kind, tc.title, tc.status,
-                content_summary(builtin_msg_type(tc.kind), tc.content),
-                time(), time(),
-                tc.description, tc.run_in_background, tc.task_name, nothing)   # replayed = history, never in the bar
-replayed_tool_msg(tc::AgentClientProtocol.MCPCall) =
-    is_bonito_app(tc) ? replayed_bonito_app_msg(tc, tc.server) :
-    mcp_msg_type(tc.tool_name)(
-        tc.id, tc.kind, tc.title, tc.status,
-        content_summary(builtin_msg_type(tc.kind), tc.content),
-        time(), time(),
-        tc.server, tc.tool_name, Dict{String,Any}(tc.raw_input), nothing)
+    TaskToolMsg(tool_message(tc, nothing; finished = true);
+                description = tc.description, is_background = tc.run_in_background,
+                task_name = tc.task_name)               # replayed = history, never in the bar
+function replayed_tool_msg(tc::AgentClientProtocol.MCPCall)
+    T = mcp_msg_type(tc.tool_name)
+    m = build_mcp_msg(T, tool_message(tc, nothing; finished = true), tc.server, tc.tool_name)
+    apply_input!(m, tc.raw_input)
+    return m
+end
 
 # ── Sync watermark ───────────────────────────────────────────────────────────
 # A per-chat stamp recording WHEN we last reconciled against claude's session.
@@ -4979,12 +5317,54 @@ pill_category_label(o::AgentClientProtocol.ConfigOption) =
 # `lowercase_modes` lower-cases the PERMISSION-MODE labels (claude reports them
 # title-cased — "Default", "Bypass Permissions"); set for the Claude provider so
 # the mode pill reads in the same lower-case style as the underlying values.
+const MODEL_SEARCH_THRESHOLD = 8  # use searchable dropdown when choices exceed this
+
+# Custom dropdown with a search/filter input — used when a ConfigOption has many
+# choices (e.g. OpenCode reports ~100 models). Pure DOM manipulation via the
+# btMSearch* JS helpers; no Julia round-trips for keystroke filtering.
+function searchable_config_pill(o::AgentClientProtocol.ConfigOption, pick::Observable;
+                                lc::Bool = false)
+    cfg_id = o.id
+    cur    = o.current_value
+    lab(c) = let s = AgentClientProtocol.choice_label(o, c); lc ? lowercase(s) : s end
+    cur_label = let idx = findfirst(c -> c.value == cur, o.choices)
+        idx !== nothing ? lab(o.choices[idx]) : cur
+    end
+    items = [
+        DOM.div(lab(c);
+            class = "bt-msearch-item" * (c.value == cur ? " bt-msearch-item-cur" : ""),
+            dataLabel = lowercase(lab(c)) * " " * lowercase(c.value),
+            title = isnothing(c.description) ? c.name : c.description,
+            onclick = js"event => window.btMSearchSelect(event.currentTarget, $(pick), $(cfg_id), $(c.value))")
+        for c in o.choices
+    ]
+    search_input = DOM.input(;
+        type = "text", placeholder = "Search…", class = "bt-msearch-input",
+        oninput = js"event => window.btMSearchFilter(event.target)")
+    trigger = DOM.div(
+        DOM.span(pill_category_label(o) * ": "; class = "bt-header-meta-cat"),
+        DOM.span(cur_label),
+        " ▾";
+        class = "bt-header-meta-item bt-header-meta-pick bt-msearch-trigger",
+        onclick = js"event => { event.stopPropagation(); window.btMSearchOpen(event.currentTarget); }",
+        title = pill_tooltip(o))
+    DOM.div(
+        trigger,
+        DOM.div(
+            search_input,
+            DOM.div(items...; class = "bt-msearch-items");
+            class = "bt-msearch-list");
+        class = "bt-msearch")
+end
+
 function header_pill(o::AgentClientProtocol.ConfigOption,
                      pick::Union{Observable,Nothing} = nothing;
                      lowercase_modes::Bool = false)
     lc = lowercase_modes && o.category == "mode"
     if pick !== nothing && o.category in SELECTABLE_CONFIG && length(o.choices) > 1
-        return config_select_pill(o, pick; lc = lc)
+        return length(o.choices) > MODEL_SEARCH_THRESHOLD ?
+            searchable_config_pill(o, pick; lc = lc) :
+            config_select_pill(o, pick; lc = lc)
     end
     label = AgentClientProtocol.pill_label(o)
     lc && (label = lowercase(label))
@@ -5212,6 +5592,13 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
     # lower-case reads fine for any provider's mode option.
     meta_line = map(items -> header_meta_line(items, config_pick; lowercase_modes = true),
                     model.session_meta)
+    # Context meter + running cost, straight off the wire's `usage_update`
+    # (tokens in context / window size after every assistant message; the
+    # cumulative session cost rides along since claude-agent-acp 0.44).
+    # Empty until the first turn — CSS hides the empty pill.
+    usage_node = DOM.span(map(usage_label, model.usage);
+        class = "bt-header-usage",
+        title = "Context window usage · cumulative session cost")
     on(session, config_pick) do pick
         (pick isa AbstractVector || pick isa Tuple) && length(pick) == 2 || return
         cfg_id, value = String(pick[1]), String(pick[2])
@@ -5465,6 +5852,7 @@ function chat_header(session::Bonito.Session, model::ChatModel, sync_modal_state
             DOM.span(provider_status; class="bt-header-status"),
             more_toggle,
             DOM.div(
+                usage_node,
                 meta_line,
                 provider_select,
                 xsync_control,
@@ -5973,23 +6361,23 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
     # `msgs_store` races the consumer's `push!`. The msg object itself is then
     # rendered off-lock below.
     msg = lock(model.lock) do
-        idx = findfirst(m -> m isa ToolMsg && m.id == cmd.tool_id, model.msgs_store)
+        idx = findfirst(m -> m isa ToolMsg && tool_id(m) == cmd.tool_id, model.msgs_store)
         idx === nothing ? nothing : model.msgs_store[idx]
     end
     msg === nothing && return nothing
-    # Run the render OFF the comm task. `render_tool_body` for a `bonito_app`
-    # ToolMsg mounts a `RemoteAppPlaceholder` whose `jsrender` calls
-    # `embed_remote_app` → `call_ctrl(eb, "delegate")`, which blocks up to 30 s
-    # on the worker bridge. If we ran it inline, that 30 s would stop EVERY
-    # other chat event for this tab (scroll fetches, sends, tab switches) until
-    # the timeout — multiple stuck tools compound to minutes of frozen UI.
+    # Run the render OFF the comm task. `render_tool_body` for a live eval result
+    # mounts a `RemoteRef` whose `jsrender` attaches the worker bridge
+    # host wiring (`attach_bridge_host!`) + may pull proxied assets over the dial-back
+    # ws. If we ran it inline, that work would stop EVERY other chat event for this
+    # tab (scroll fetches, sends, tab switches) until it returned — multiple stuck
+    # tools compound to seconds of frozen UI.
     #
     # Renders for the SAME tool serialize (latest wins): auto-expand can fire
-    # more than once, and for a `bonito_app` body two CONCURRENT renders each
-    # delegate their own worker subsession — the interleaved supersede
-    # bookkeeping (`swap_mount!` + `close_remote_sub!`) could close the NEWER
-    # sub while the STALE render's html won the slot, leaving a dead embed on
-    # its spinner forever (hit reproducibly on remounts after a page reload).
+    # more than once, and for a live eval result two CONCURRENT renders each
+    # mount their own worker render-subsession (RemoteRef "mount") — the
+    # STALE render's DOM could win the slot while the newer mount's
+    # subsession is the one still wired, leaving a dead embed on its spinner
+    # (hit reproducibly on remounts after a page reload, pre-RemoteRef).
     # Each request bumps the tool's render generation; the async task takes
     # the tool's render lock and SKIPS if it's no longer the newest — so at
     # most one render is in flight per tool and the last request's html ships
@@ -6010,15 +6398,17 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
         lock(render_lock) do
             # A newer request superseded us while we waited — it will ship.
             lock(() -> gen_ref[], model.lock) == my_gen || return
-            body = render_tool_body(model.state, msg,
-                model.cwd, model.chat_dir; project_id=model.project_id)
+            # Render the MESSAGE via jsrender: `JuliaEvalCall` hits its typed
+            # render, every other tool type the generic `jsrender(::ToolMsg)`
+            # bridge → `render_tool_body`. `dom_in_js` wraps a non-Node through
+            # `render_subsession`, so handing it the message is fine.
             # `toolSlot` (a ChatLib module export — no window.* global) also
             # finds slots on nodes the virtual scroll holds DETACHED (cache
             # window / prefetch) — a plain document.querySelector misses those
             # and the body would be stuck on "loading…".
             Bonito.dom_in_js(
                 session,
-                body,
+                msg,
                 js"""(elem) => {
     $(ChatLib).then(lib => {
         const slot = lib.toolSlot($(cmd.tool_id));
@@ -6031,9 +6421,9 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
         @warn "tool render failed" tool_id = cmd.tool_id exception = e
         # Replace the stale "loading…" with a visible failure so the user knows
         # the body is gone (typically: the eval bridge was rebuilt since this
-        # turn, so the `shown_app:` id is no longer registered on the worker).
-        # We `dom_in_js` a tiny static node — no RemoteAppPlaceholder, no
-        # control round-trip, can't repeat the failure.
+        # turn, so the result's proxied assets no longer resolve on the worker).
+        # We `dom_in_js` a tiny static node — no placeholder, no bridge work,
+        # can't repeat the failure.
         try
             Bonito.dom_in_js(
                 session,
@@ -6196,7 +6586,7 @@ handle_command!(model::ChatModel, ::Any, cmd::QuestionSkipCommand) =
 function handle_command!(model::ChatModel, ::Any, cmd::StopToolCommand)
     isempty(cmd.tool_id) && return nothing
     target = lock(model.lock) do
-        idx = findfirst(m -> m isa ToolMsg && m.id == cmd.tool_id, model.msgs_store)
+        idx = findfirst(m -> m isa ToolMsg && tool_id(m) == cmd.tool_id, model.msgs_store)
         idx === nothing ? nothing : model.msgs_store[idx]
     end
     target === nothing && return nothing
@@ -6228,9 +6618,9 @@ function request_tool_stop!(model::ChatModel, t::BashToolMsg)
     if wid !== nothing && !isempty(t.bg_output_path)
         try
             r = kill_worker_file_writers(model.state, wid, t.bg_output_path)
-            @info "stop bg bash" tool_id = t.id killed = r.killed supported = r.supported
+            @info "stop bg bash" tool_id = tool_id(t) killed = r.killed supported = r.supported
         catch e
-            @warn "kill_file_writers failed; finalizing pill anyway" tool_id = t.id exception = e
+            @warn "kill_file_writers failed; finalizing pill anyway" tool_id = tool_id(t) exception = e
         end
     end
     finished!(t)   # finalize! (persist + emit done) + drop from the bar
@@ -6244,7 +6634,7 @@ end
 function request_tool_stop!(model::ChatModel, t::TaskToolMsg)
     in_taskbar(t) || return nothing   # in the bar ⇒ a live background subagent
     finished!(t)   # finalize! (close → feed trace) + drop from the bar
-    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => t.id,
+    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => tool_id(t),
         "status" => "completed", "summary" => "stopped"))
     return nothing
 end
@@ -6258,20 +6648,20 @@ end
 # unlike the chat-level cancel which kills the whole turn.
 function request_tool_stop!(model::ChatModel, t::JuliaEvalCall)
     is_live(t) || return nothing
-    env_raw  = get(t.raw_input, "env_path", nothing)
-    env_path = env_raw isa AbstractString && !isempty(env_raw) ? String(env_raw) : nothing
+    tid      = tool_id(t)
+    env_path = isempty(t.env_path) ? nothing : t.env_path
     # Immediate visual ack; the result itself arrives with the eval's next
     # checkpoint (tool_update from the agent).
-    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => t.id,
+    chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => tid,
         "status" => "in_progress", "summary" => "interrupting…"))
     Base.errormonitor(@async try
         n = interrupt_project_eval!(model.state, model.project_id; env_path)
         n == 0 && chat_emit(model, Dict{String,Any}("type" => "tool_update",
-            "id" => t.id, "status" => "in_progress",
+            "id" => tid, "status" => "in_progress",
             "summary" => "nothing in flight to interrupt"))
     catch e
-        @warn "eval interrupt failed" tool_id = t.id exception = e
-        chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => t.id,
+        @warn "eval interrupt failed" tool_id = tid exception = e
+        chat_emit(model, Dict{String,Any}("type" => "tool_update", "id" => tid,
             "status" => "in_progress",
             "summary" => "interrupt failed: $(sprint(showerror, e))"))
     end)
@@ -6295,17 +6685,17 @@ function handle_command!(model::ChatModel, session::Session, cmd::EditFileComman
         replace(String(cmd.path), r":\d+$" => "")
     else
         msg = lock(model.lock) do
-            idx = findfirst(m -> m isa ToolMsg && m.id == cmd.tool_id, model.msgs_store)
+            idx = findfirst(m -> m isa ToolMsg && tool_id(m) == cmd.tool_id, model.msgs_store)
             idx === nothing ? nothing : model.msgs_store[idx]
         end
         msg === nothing && return nothing
         content = tool_content_for_render(msg, model.chat_dir)
-        pretty_title, _ = pretty_tool_title(msg.title)
-        hd = Dict{String,Any}("kind" => msg.kind, "title" => pretty_title)
+        pretty_title, _ = pretty_tool_title(tool_title(msg))
+        hd = Dict{String,Any}("kind" => tool_kind(msg), "title" => pretty_title)
         # Live raw_input first; persisted rawInput covers history-reloaded
         # pills whose in-RAM arguments are gone.
         hint = tool_path_hint(msg)
-        hint === nothing && (hint = stored_path_hint(model.chat_dir, msg.id))
+        hint === nothing && (hint = stored_path_hint(model.chat_dir, tool_id(msg)))
         hint === nothing || (hd["path_hint"] = hint)
         editable_path_from(hd, content)
     end
@@ -6545,8 +6935,15 @@ function Bonito.jsrender(session::Session, m::ChatModel)
         DOM.div(class="bt-messages-tail");
         class="bt-messages")
 
+    # Init snapshot: comm events fired before this tab connected are gone, so
+    # bake the CURRENT slash-command set into the connect call (a tab opened
+    # after the session's first turn would otherwise have no autocomplete
+    # until the next available_commands_update).
+    init_snapshot = Dict{String,Any}(
+        "commands" => commands_event(shared(model).available_commands[])["items"])
     init_script = js"""
-        $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm)))
+        $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm),
+                                           $(init_snapshot)))
     """
 
     # Cross-worker sync modal state + apply. `nothing` ⇒ hidden; otherwise
